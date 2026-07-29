@@ -1,0 +1,45 @@
+# ReportBinder runtime data
+app/logs/*
+!app/logs/.gitkeep
+app/cache/
+app/temp/
+app/tmp/
+app/output/
+app/history/
+app/snapshots/
+app/jobs/
+
+# Local/user-specific configuration
+app/config.json
+app/*-config.local.json
+*.local.json
+.env
+.env.*
+
+# Business documents and generated output
+*.xlsx
+*.xlsm
+*.xls
+*.pdf
+*.log
+*.tmp
+*.bak
+*.lock
+
+# Third-party runtime payloads installed by tools/install-thirdparty.ps1
+app/lib/java/
+app/lib/pdfbox/pdfbox-app.jar
+app/web/pdfjs/pdf.min.mjs
+app/web/pdfjs/pdf.worker.min.mjs
+
+# Build and language artifacts
+__pycache__/
+*.py[cod]
+*.class
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
