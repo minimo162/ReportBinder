@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260730_v51">
+  <link rel="stylesheet" href="style.css?v=20260730_v52">
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -153,8 +153,8 @@
           <div id="diff-state-message" class="diff-state-message hidden"></div>
           <div id="diff-mobile-tabs" class="diff-mobile-tabs" aria-label="表示する版"><button class="active" type="button" data-diff-tab="before">前回版</button><button type="button" data-diff-tab="after">現在版</button></div>
           <div id="diff-viewers" class="diff-viewers">
-            <section id="diff-before-pane" class="diff-pane" aria-labelledby="diff-before-label"><header><strong id="diff-before-label">前回版</strong><span id="diff-before-page-label"></span></header><div id="diff-before-viewport" class="diff-viewport" tabindex="0"><div id="diff-before-stage" class="diff-stage"><img id="diff-before-base" class="diff-image-base" alt=""><img id="diff-before-mask" class="diff-image-mask" alt="" aria-hidden="true"><img id="diff-before-overlay" class="diff-image-overlay" alt="" aria-hidden="true"><span id="diff-before-focus" class="diff-region-focus hidden"></span></div><div id="diff-before-empty" class="diff-empty hidden"></div></div></section>
-            <section id="diff-after-pane" class="diff-pane" aria-labelledby="diff-after-label"><header><strong id="diff-after-label">現在版</strong><span id="diff-after-page-label"></span></header><div id="diff-after-viewport" class="diff-viewport" tabindex="0"><div id="diff-after-stage" class="diff-stage"><img id="diff-after-underlay" class="diff-image-underlay hidden" alt="" aria-hidden="true"><img id="diff-after-base" class="diff-image-base" alt=""><img id="diff-after-mask" class="diff-image-mask" alt="" aria-hidden="true"><img id="diff-after-overlay" class="diff-image-overlay" alt="" aria-hidden="true"><span id="diff-after-focus" class="diff-region-focus hidden"></span></div><div id="diff-after-empty" class="diff-empty hidden"></div></div></section>
+            <section id="diff-before-pane" class="diff-pane" aria-labelledby="diff-before-label"><header><strong id="diff-before-label">前回版</strong><span id="diff-before-page-label"></span></header><div id="diff-before-viewport" class="diff-viewport" tabindex="0"><div id="diff-before-stage" class="diff-stage"><img id="diff-before-base" class="diff-image-base" alt=""><div id="diff-before-regions" class="diff-region-layer" aria-hidden="true"></div><span id="diff-before-focus" class="diff-region-focus hidden"></span></div><div id="diff-before-empty" class="diff-empty hidden"></div></div></section>
+            <section id="diff-after-pane" class="diff-pane" aria-labelledby="diff-after-label"><header><strong id="diff-after-label">現在版</strong><span id="diff-after-page-label"></span></header><div id="diff-after-viewport" class="diff-viewport" tabindex="0"><div id="diff-after-stage" class="diff-stage"><img id="diff-after-underlay" class="diff-image-underlay hidden" alt="" aria-hidden="true"><img id="diff-after-base" class="diff-image-base" alt=""><div id="diff-after-regions" class="diff-region-layer" aria-hidden="true"></div><span id="diff-after-focus" class="diff-region-focus hidden"></span></div><div id="diff-after-empty" class="diff-empty hidden"></div></div></section>
           </div>
           <footer class="diff-footer">
             <div class="diff-pager"><button id="diff-prev-page" class="btn ghost compact" type="button">前のページ</button><span id="diff-page-count">1 / 1ページ</span><button id="diff-next-page" class="btn ghost compact" type="button">次のページ</button></div>
@@ -169,6 +169,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260730_v51"></script>
+  <script src="app.js?v=20260730_v52"></script>
 </body>
 </html>

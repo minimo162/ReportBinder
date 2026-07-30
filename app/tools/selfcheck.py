@@ -5,16 +5,16 @@ root = Path(__file__).resolve().parents[2]
 required = [
     '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/launch.ps1',
     'app/web/index.html','app/web/style.css','app/web/app.js','app/lib/pdfbox/ReportPdfComposer.jar',
-    'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/build.ps1',
+    'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
-    'app/tools/diff-image-pages.ps1','app/tools/DiffImageEngine.cs',
+    'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
 if (root/'app/config.json').exists(): raise SystemExit('runtime app/config.json must not be distributed')
 json.loads((root/'app/default-config.json').read_text(encoding='utf-8'))
-for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1']:
+for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
 
 server=(root/'app/server.ps1').read_text(encoding='utf-8-sig')
@@ -640,8 +640,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 7' not in server:
-    raise SystemExit('comparison algorithm changes must bump DiffDetailAlgorithmVersion to 7')
+if '$Script:DiffDetailAlgorithmVersion = 8' not in server:
+    raise SystemExit('batched comparison changes must bump DiffDetailAlgorithmVersion to 8')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -692,7 +692,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 7',
+    '$Script:DiffDetailAlgorithmVersion = 8',
     '$Script:DiffDetailDpi = 120',
     '$Script:DiffDetailThreshold = 24',
     '$Script:DiffDetailMinimumRegionPixels = 24',
@@ -713,5 +713,32 @@ analyzer = (root/'app/lib/pdfbox/src/PdfPageAnalyzer.java').read_text(encoding='
 for needed in ['ANALYZER_VERSION = 2', 'pagePerceptualHashes', 'perceptualHash']:
     if needed not in analyzer:
         raise SystemExit(f'perceptual visual hash missing: {needed}')
+
+# V5.3: all changed sheets share one bounded-concurrency Java raster job,
+# and region decoration is drawn from JSON instead of four PNG layers per page.
+batch_script = (root/'app/tools/diff-image-batch.ps1').read_text(encoding='utf-8-sig')
+for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine', 'items = @($results)', 'rasterMs', 'analysisMs']:
+    if needed not in batch_script:
+        raise SystemExit(f'batched diff rasterization missing: {needed}')
+batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
+for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
+    if needed not in batch_java:
+        raise SystemExit(f'bounded parallel PDF rasterizer missing: {needed}')
+for needed in ['function Invoke-DiffImageBatchGeneration', '$batchRequest', '$batchResultMap',
+               '新旧PDFをまとめて画像化・解析しています']:
+    if needed not in server:
+        raise SystemExit(f'diff job does not use the batch path: {needed}')
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260730_v52']:
+    if needed not in html:
+        raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')
+for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
+    if needed not in appjs:
+        raise SystemExit(f'browser region rendering missing: {needed}')
+compare_page = diff_engine.split('public static ReportBinderDiffPage ComparePage', 1)[1]
+if 'SaveLayerImages(' in compare_page:
+    raise SystemExit('ComparePage must not encode full-page mask/overlay PNGs')
+with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
+    if 'PdfBatchRasterizer.class' not in set(zf.namelist()):
+        raise SystemExit('ReportPdfComposer.jar must contain PdfBatchRasterizer.class')
 
 print('selfcheck ok')

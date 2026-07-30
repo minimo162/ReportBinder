@@ -1496,8 +1496,37 @@ function updateDiffStageScale(){
 function applyDiffHighlightSettings(){
   const enabled=!!$('diff-highlight')?.checked;
   const opacity=Number($('diff-density')?.value||.25);
-  document.querySelectorAll('#diff-modal .diff-image-mask').forEach(el=>{el.style.display=enabled?'block':'none';el.style.opacity=String(opacity);});
-  document.querySelectorAll('#diff-modal .diff-image-overlay').forEach(el=>{el.style.display=enabled?'block':'none';});
+  document.querySelectorAll('#diff-modal .diff-region-layer').forEach(el=>{
+    el.style.display=enabled?'block':'none';
+    el.style.setProperty('--diff-region-opacity',String(opacity));
+  });
+}
+function renderDiffRegionLayer(side,regions){
+  const layer=$(`diff-${side}-regions`);if(!layer)return;
+  layer.replaceChildren();
+  const visible=asArray(regions).filter(region=>{
+    const kind=String(region?.kind||'modified');
+    return kind==='modified'||kind==='unknown'||(kind==='added'&&side==='after')||(kind==='removed'&&side==='before');
+  });
+  const showModifiedTags=visible.length<=12;
+  for(const region of visible){
+    const kind=['modified','added','removed','unknown'].includes(String(region?.kind||''))?String(region.kind):'modified';
+    const box=document.createElement('span');
+    box.className=`diff-region-box ${kind}`;
+    const x=Math.max(0,Math.min(1,Number(region?.x||0)));
+    const y=Math.max(0,Math.min(1,Number(region?.y||0)));
+    const width=Math.max(0,Math.min(1-x,Number(region?.width||0)));
+    const height=Math.max(0,Math.min(1-y,Number(region?.height||0)));
+    box.style.left=`${x*100}%`;box.style.top=`${y*100}%`;box.style.width=`${width*100}%`;box.style.height=`${height*100}%`;
+    if(y<.018)box.classList.add('tag-inside');
+    if(kind!=='modified'||showModifiedTags){
+      const tag=document.createElement('span');
+      tag.className='diff-region-tag';
+      tag.textContent=kind==='added'?'A':kind==='removed'?'D':kind==='unknown'?'?':'M';
+      box.appendChild(tag);
+    }
+    layer.appendChild(box);
+  }
 }
 function applyDiffMode(){
   const overlay=diffViewState.mode==='overlay';
@@ -1521,6 +1550,7 @@ function renderDiffPage(){
   if(!sheet){
     if(messageBox){messageBox.textContent=diffViewState.detail?.message||'比較対象のシートがありません。';messageBox.classList.remove('hidden');}
     setDiffPaneEmpty('before','比較するページがありません。');setDiffPaneEmpty('after','比較するページがありません。');
+    renderDiffRegionLayer('before',[]);renderDiffRegionLayer('after',[]);
     return;
   }
   const pages=asArray(sheet.pages);
@@ -1538,6 +1568,7 @@ function renderDiffPage(){
     setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:pending);
     if($('diff-page-count'))$('diff-page-count').textContent=`0 / ${Math.max(Number(sheet.pageCount||0),0)}ページ`;
     if($('diff-region-count'))$('diff-region-count').textContent='0件';
+    renderDiffRegionLayer('before',[]);renderDiffRegionLayer('after',[]);
     return;
   }
   const beforeEmpty=sheet.kind==='added'?`${beforeLabel}には存在しません`:'';
@@ -1556,11 +1587,8 @@ function renderDiffPage(){
   setDiffImage('diff-before-base',beforeEmpty?'':beforeUrl,`${beforeLabel}、${altBase}`,updateDiffStageScale);
   setDiffImage('diff-after-underlay',beforeUrl,'');
   setDiffImage('diff-after-base',afterEmpty?'':afterUrl,`${afterLabel}、${altBase}`,updateDiffStageScale);
-  setDiffImage('diff-before-mask',page.beforeMaskAsset?diffAssetUrl(sheet,page,'before-mask'):'','');
-  setDiffImage('diff-before-overlay',page.beforeOverlayAsset?diffAssetUrl(sheet,page,'before-overlay'):'','');
-  setDiffImage('diff-after-mask',page.maskAsset?diffAssetUrl(sheet,page,'mask'):'','');
-  setDiffImage('diff-after-overlay',page.overlayAsset?diffAssetUrl(sheet,page,'overlay'):'','');
   const regions=asArray(page.regions);
+  renderDiffRegionLayer('before',regions);renderDiffRegionLayer('after',regions);
   if(diffViewState.regionIndex>=regions.length)diffViewState.regionIndex=-1;
   if($('diff-region-count'))$('diff-region-count').textContent=regions.length?(diffViewState.regionIndex>=0?`${diffViewState.regionIndex+1} / ${regions.length}件`:`${regions.length}件`):'0件';
   $('diff-prev-region').disabled=!diffRegionTargets().length;

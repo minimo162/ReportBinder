@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $src = Join-Path $PSScriptRoot 'src\ReportPdfComposer.java'
 $splitSrc = Join-Path $PSScriptRoot 'src\BatchPdfSplitter.java'
 $analyzerSrc = Join-Path $PSScriptRoot 'src\PdfPageAnalyzer.java'
+$batchRasterizerSrc = Join-Path $PSScriptRoot 'src\PdfBatchRasterizer.java'
 $classes = Join-Path $PSScriptRoot 'classes'
 $outJar = Join-Path $PSScriptRoot 'ReportPdfComposer.jar'
 
@@ -21,7 +22,7 @@ if ($helpText -match '--release') {
   # Keep the composer runnable on the bundled Java 17 runtime even when it is rebuilt with a newer JDK.
   $releaseArgs = @('--release', '8')
 }
-& javac @releaseArgs -encoding UTF-8 -cp $PdfBoxAppJar -d $classes $src $splitSrc $analyzerSrc
+& javac @releaseArgs -encoding UTF-8 -cp $PdfBoxAppJar -d $classes $src $splitSrc $analyzerSrc $batchRasterizerSrc
 if ($LASTEXITCODE -ne 0) { throw 'javac failed' }
 if (Test-Path -LiteralPath $outJar) { Remove-Item -LiteralPath $outJar -Force }
 Push-Location $classes
