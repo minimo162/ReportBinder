@@ -8,6 +8,7 @@ app/output/
 app/history/
 app/snapshots/
 app/jobs/
+app/thirdparty-cache/
 
 # Local/user-specific configuration
 app/config.json

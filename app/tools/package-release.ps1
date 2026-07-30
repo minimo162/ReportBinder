@@ -17,6 +17,41 @@ function Invoke-SelfCheck {
     throw 'Pythonが見つかりません。先に app\tools\selfcheck.py を実行してください。'
 }
 
+function Invoke-ThirdPartyCheck([bool]$RequirePortableJava) {
+    $script = Join-Path $root 'app\tools\verify-thirdparty.ps1'
+    if (-not (Test-Path -LiteralPath $script)) {
+        throw "依存物検証スクリプトが見つかりません: $script"
+    }
+    if ($RequirePortableJava) {
+        & $script -RequirePdfJs -RequirePortableJava
+    } else {
+        & $script -RequirePdfJs
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw '第三者依存物の検証に失敗しました。app\tools\install-thirdparty.cmd を実行してください。'
+    }
+}
+
+function Assert-StagedDependencies([string]$StageRoot, [bool]$IncludeJava) {
+    $required = @(
+        (Join-Path $StageRoot 'app\lib\pdfbox\pdfbox-app.jar'),
+        (Join-Path $StageRoot 'app\lib\pdfbox\ReportPdfComposer.jar'),
+        (Join-Path $StageRoot 'app\web\pdfjs\pdf.min.mjs'),
+        (Join-Path $StageRoot 'app\web\pdfjs\pdf.worker.min.mjs'),
+        (Join-Path $StageRoot 'app\web\pdfjs\LICENSE')
+    )
+    if ($IncludeJava) {
+        $required += (Join-Path $StageRoot 'app\lib\java\bin\java.exe')
+        $required += (Join-Path $StageRoot 'app\lib\java\release')
+        $required += (Join-Path $StageRoot 'app\lib\java\NOTICE')
+        $required += (Join-Path $StageRoot 'app\lib\java\JAVA_VERSION.txt')
+    }
+    $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+    if ($missing.Count -gt 0) {
+        throw ("配布物に必要な依存ファイルがありません:`n" + ($missing -join "`n"))
+    }
+}
+
 function Remove-RuntimeFiles([string]$StageRoot) {
     foreach ($path in @(
         (Join-Path $StageRoot 'app\config.json'),
@@ -36,31 +71,36 @@ function Remove-RuntimeFiles([string]$StageRoot) {
     Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -Directory |
         Where-Object { $_.Name -eq '__pycache__' } |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -Directory | Where-Object { $_.Name -eq '_reportbinder' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -Directory |
+        Where-Object { $_.Name -eq '_reportbinder' } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function New-ReleaseZip([string]$Suffix, [bool]$IncludeJava) {
     $tempBase = Join-Path ([IO.Path]::GetTempPath()) "ReportBinderPackage_$([guid]::NewGuid().ToString('N'))"
     $stage = Join-Path $tempBase 'ReportBinder'
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
-    Copy-Item -Path (Join-Path $root '*') -Destination $stage -Recurse -Force
-    Remove-RuntimeFiles $stage
-    if (-not $IncludeJava) {
-        $java = Join-Path $stage 'app\lib\java'
-        if (Test-Path -LiteralPath $java) { Remove-Item -LiteralPath $java -Recurse -Force }
+    try {
+        Copy-Item -Path (Join-Path $root '*') -Destination $stage -Recurse -Force
+        Remove-RuntimeFiles $stage
+        if (-not $IncludeJava) {
+            $java = Join-Path $stage 'app\lib\java'
+            if (Test-Path -LiteralPath $java) { Remove-Item -LiteralPath $java -Recurse -Force }
+        }
+        Assert-StagedDependencies -StageRoot $stage -IncludeJava $IncludeJava
+        $zip = Join-Path $OutputDir "ReportBinder_V5_${Suffix}_${stamp}.zip"
+        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+        New-Utf8Zip $stage $zip
+        return $zip
+    } finally {
+        if (Test-Path -LiteralPath $tempBase) {
+            Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
-    $zip = Join-Path $OutputDir "ReportBinder_V5_${Suffix}_${stamp}.zip"
-    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-    New-Utf8Zip $stage $zip
-    Remove-Item -LiteralPath $tempBase -Recurse -Force
-    return $zip
 }
 
 function New-Utf8Zip([string]$SourceDir, [string]$ZipPath) {
-    # V5-P0(#1): Compress-Archive はエントリ名を UTF-8 バイトで書くが「言語エンコーディングフラグ(bit11)」を立てない。
-    # そのため日本語 Windows の標準展開(エクスプローラー)が CP932 と誤解し、日本語ファイル名が文字化けする。
-    # ZipArchive を UTF8 エンコーディングで開くと非ASCII名のエントリに bit11 が立ち、標準展開でも文字化けしない。
-    # 併せて、ZIP 仕様どおりパス区切りを '/' に統一する(.NET Framework の CreateFromDirectory は '\' を書いてしまう)。
+    # Compress-Archive does not reliably mark non-ASCII entry names as UTF-8 for Windows Explorer.
     Add-Type -AssemblyName System.IO.Compression | Out-Null
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
     $baseParent = Split-Path -Parent $SourceDir
@@ -69,14 +109,25 @@ function New-Utf8Zip([string]$SourceDir, [string]$ZipPath) {
     try {
         foreach ($file in (Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Force)) {
             $rel = $file.FullName.Substring($baseParent.Length + 1).Replace([char]92, [char]47)
-            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $rel, [System.IO.Compression.CompressionLevel]::Optimal)
+            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive,
+                $file.FullName,
+                $rel,
+                [System.IO.Compression.CompressionLevel]::Optimal
+            )
         }
     } finally {
-        $archive.Dispose(); $fs.Dispose()
+        $archive.Dispose()
+        $fs.Dispose()
     }
 }
 
 Invoke-SelfCheck
+# PDFBox and PDF.js are included in both release variants.
+Invoke-ThirdPartyCheck $false
+# The offline-complete release must contain its own verified portable JRE even if system Java exists.
+Invoke-ThirdPartyCheck $true
+
 $offline = New-ReleaseZip 'オフライン完結版' $true
 $online  = New-ReleaseZip 'オンライン導入版' $false
 Write-Host "作成しました:`n$offline`n$online"
