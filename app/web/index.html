@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260729_v49">
+  <link rel="stylesheet" href="style.css?v=20260730_v51">
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -19,6 +19,7 @@
     <symbol id="i-chevron-right" viewBox="0 0 16 16"><path d="m6 3.5 4.5 4.5L6 12.5"/></symbol>
     <symbol id="i-chevron-down" viewBox="0 0 16 16"><path d="m3.5 6 4.5 4.5L12.5 6"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 5.5V2.75l-1.35 1.3A5.5 5.5 0 1 0 13.3 9"/></symbol>
+    <symbol id="i-history" viewBox="0 0 16 16"><path d="M8 2.25a5.75 5.75 0 1 1-5.1 3.1"/><path d="M2.25 2.75v3.5h3.5M8 4.75V8l2.25 1.5"/></symbol>
     <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></symbol>
     <symbol id="i-close" viewBox="0 0 16 16"><path d="m3.5 3.5 9 9M12.5 3.5l-9 9"/></symbol>
     <symbol id="i-drag" viewBox="0 0 16 16"><circle cx="5" cy="4" r=".7"/><circle cx="11" cy="4" r=".7"/><circle cx="5" cy="8" r=".7"/><circle cx="11" cy="8" r=".7"/><circle cx="5" cy="12" r=".7"/><circle cx="11" cy="12" r=".7"/></symbol>
@@ -32,6 +33,7 @@
         <button class="nav-item active" type="button" data-view-nav="dashboard"><svg class="icon"><use href="#i-home"/></svg><span>ダッシュボード</span></button>
         <button class="nav-item" type="button" data-view-nav="folders"><svg class="icon"><use href="#i-folder"/></svg><span>提出フォルダ</span></button>
         <button class="nav-item" type="button" data-view-nav="excel"><svg class="icon"><use href="#i-grid"/></svg><span>Excel登録・PDF作成</span><span id="nav-excel-count" class="nav-count hidden"></span></button>
+        <button class="nav-item" type="button" data-view-nav="history"><svg class="icon"><use href="#i-history"/></svg><span>履歴・比較</span></button>
         <button class="nav-item" type="button" data-view-nav="pages"><svg class="icon"><use href="#i-list"/></svg><span>ページ構成</span><span id="nav-pages-count" class="nav-count hidden"></span></button>
         <button class="nav-item" type="button" data-view-nav="final"><svg class="icon"><use href="#i-file-pdf"/></svg><span>最終PDF</span><span id="nav-final-dot" class="nav-dot hidden"></span></button>
       </nav>
@@ -83,7 +85,11 @@
           <section id="auto-status" class="card hidden"></section>
           <div class="page-head"><div><h2>Excel登録・PDF作成</h2><p>未登録Excelを登録し、最新の内容をページPDFへ変換します。</p></div><div class="toolbar"><button id="scan-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button><button id="render-all-btn" class="btn secondary" type="button">すべて再作成</button></div></div>
           <div class="excel-grid">
-            <section class="card table-card unregistered-card"><div class="card-head"><div><h3>未登録Excel</h3><p id="file-selection-summary" class="caption">0件中 0件を選択</p></div><label class="search-field"><svg class="icon"><use href="#i-search"/></svg><input id="file-filter" type="search" placeholder="ファイル名で検索"></label></div><div id="file-list"></div><div class="card-actions"><div class="toolbar"><button id="select-visible-files-btn" class="btn ghost" type="button">表示分を選択</button><button id="clear-selected-files-btn" class="btn ghost" type="button">選択解除</button></div><button id="register-selected-btn" class="btn primary" type="button">選択したExcelを登録</button></div></section>
+            <section class="card table-card unregistered-card">
+              <div class="card-head"><div><h3>未登録Excel</h3><p id="file-selection-summary" class="caption">0件中 0件を選択</p></div><label class="search-field"><svg class="icon"><use href="#i-search"/></svg><input id="file-filter" type="search" placeholder="ファイル名で検索"></label></div>
+              <div class="list-action-bar" aria-label="未登録Excelの操作"><div class="toolbar"><button id="select-visible-files-btn" class="btn secondary" type="button">表示分を選択</button><button id="clear-selected-files-btn" class="btn ghost" type="button">選択解除</button></div><button id="register-selected-btn" class="btn primary" type="button">選択したExcelを登録</button></div>
+              <div id="file-list"></div>
+            </section>
             <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済みExcel</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div><div class="toolbar workbook-toolbar"><button id="select-render-needed-btn" class="btn secondary" type="button">必要分を選択</button><button id="render-selected-btn" class="btn primary" type="button">PDF作成</button><button id="clear-selected-workbooks-btn" class="btn ghost" type="button">選択解除</button><button id="unregister-selected-btn" class="btn danger" type="button">登録解除</button></div></div><div id="workbook-list"></div></section>
           </div>
           <section id="progress-panel" class="progress-panel hidden" aria-live="polite"><div class="progress-meta"><strong id="progress-title">PDF作成中</strong><span id="progress-percent">0%</span></div><div class="progress-track"><span id="progress-fill"></span></div><p><span id="progress-count-label"></span><span id="progress-message"></span></p></section>
@@ -103,14 +109,18 @@
           </div>
           <p class="caption final-numbering-caption">ページ番号：- 2 - 形式／先頭ページは番号なし</p>
           <section class="card"><div class="card-head"><h3>出力履歴</h3></div><div id="final-history"></div></section>
-          <section class="card"><div class="card-head"><h3>変更履歴</h3><button id="history-refresh-btn" class="btn ghost compact" type="button">更新</button></div><div id="history-timeline" class="history-table"></div></section>
-          <section class="card"><div class="card-head"><h3>ページ構成の履歴</h3></div><div id="layout-history" class="history-table"></div></section>
-          <section class="card"><div class="card-head"><h3>保存済みの出力</h3></div><div id="final-archives" class="history-table"></div></section>
-          <section class="card"><div class="card-head"><h3>版の履歴・差分・保護</h3></div>
+        </section>
+
+        <section data-view-panel="history" class="view-panel">
+          <div class="page-head"><div><h2>履歴・比較</h2><p>同じExcelの任意の2時点を選び、左右比較・重ね合わせ・差分強調で確認します。</p></div><button id="history-refresh-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>履歴を更新</button></div>
+          <section class="card history-primary-card"><div class="card-head"><div><span class="eyebrow">主要機能</span><h3>任意の2時点を視覚比較</h3><p class="caption">対象Excelを選び、古い版を「比較元」、新しい版を「比較先」に指定してください。</p></div></div>
             <div class="snapshot-history-controls"><label>対象Excel：<select id="snapshot-history-workbook"></select></label></div>
             <div id="snapshot-history" class="history-table"></div>
             <div id="snapshot-history-diff" class="history-table"></div>
           </section>
+          <section class="card"><div class="card-head"><h3>変更履歴</h3></div><div id="history-timeline" class="history-table"></div></section>
+          <section class="card"><div class="card-head"><h3>ページ構成の履歴</h3></div><div id="layout-history" class="history-table"></div></section>
+          <section class="card"><div class="card-head"><h3>保存済みの出力</h3></div><div id="final-archives" class="history-table"></div></section>
         </section>
 
         <details class="dev-log"><summary>開発用ログ</summary><pre id="log"></pre></details>
@@ -159,6 +169,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260730_v50"></script>
+  <script src="app.js?v=20260730_v51"></script>
 </body>
 </html>

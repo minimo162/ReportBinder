@@ -77,6 +77,7 @@ const VIEW_NAMES = {
   dashboard: 'ダッシュボード',
   folders: '提出フォルダ',
   excel: 'Excel登録・PDF作成',
+  history: '履歴・比較',
   pages: 'ページ構成',
   final: '最終PDF'
 };
@@ -94,6 +95,7 @@ function setActiveView(view, options = {}) {
     if (on) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
   });
   if (!options.noScroll) window.scrollTo({top: 0, behavior: options.instant ? 'auto' : 'smooth'});
+  if (activeView === 'history' && state) loadHistoryPanels();
 }
 
 function formatDateTime(value) {
@@ -706,7 +708,7 @@ function renderAll(options={}) {
   renderPageOverview();
   renderFinalOverview();
   renderAutoStatus();
-  if(activeView==='final'&&state?.inputHistoryEnabled)loadHistoryPanels();
+  if(activeView==='history')loadHistoryPanels();
   renderVolumeLinks();
   updateBulkSelectionLabel();
   if (!preserve) {
