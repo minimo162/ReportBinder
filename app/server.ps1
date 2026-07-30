@@ -1007,19 +1007,73 @@ function Repair-StructurePages($Structure) {
     return $changed
 }
 
+function Test-StructureDocument($Structure, [string]$Language) {
+    if ($null -eq $Structure) { return $false }
+    try {
+        $version = [int](Get-DataProperty $Structure 'schemaVersion' 0)
+        if ($version -lt 1 -or $version -gt 2) { return $false }
+        $storedLanguage = [string](Get-DataProperty $Structure 'language' '')
+        if (-not [string]::IsNullOrWhiteSpace($storedLanguage) -and $storedLanguage -ne $Language) { return $false }
+        if (-not (Test-ConfigHasKey $Structure 'workbooks') -or
+            -not (Test-ConfigHasKey $Structure 'pages')) { return $false }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Read-StructureUnlocked([string]$Language, [string]$DataDir = '') {
     $workspace = Get-WorkspacePath $Language $DataDir
     $path = Join-Path $workspace 'structure.json'
     if (-not (Test-Path -LiteralPath $path)) { return New-EmptyStructure $Language }
-    $structure = Read-JsonFile $path (New-EmptyStructure $Language)
+    $backupPath = Join-Path $workspace 'structure.json.last-good'
+    $structure = $null
+    try {
+        $structure = Read-JsonFile $path $null
+        if (-not (Test-StructureDocument $structure $Language)) { throw 'structure.json の内容が不完全です。' }
+    } catch {
+        # Never reinterpret an existing but temporarily unreadable shared-file as
+        # a brand-new empty workspace. That old behavior allowed the next mutation
+        # to unregister every workbook. A verified last-good copy is safe to use;
+        # without one, fail closed and leave the original file untouched.
+        $primaryError = $_.Exception.Message
+        $structure = $null
+        try {
+            if (Test-Path -LiteralPath $backupPath) {
+                $candidate = Read-JsonFile $backupPath $null
+                if (Test-StructureDocument $candidate $Language) { $structure = $candidate }
+            }
+        } catch { $structure = $null }
+        if ($null -eq $structure) {
+            throw "登録情報を安全に読み込めませんでした。structure.json は上書きしていません。管理フォルダの接続を確認して再起動してください。詳細: $primaryError"
+        }
+    }
     return Normalize-StructureCollections $structure
 }
 
 function Write-StructureUnlocked([string]$Language, $Structure, [string]$DataDir = '') {
     $Structure = Normalize-StructureCollections $Structure
+    if (-not (Test-StructureDocument $Structure $Language)) { throw '不完全な登録情報の保存を拒否しました。' }
     Set-NoteProperty $Structure 'updatedAt' (New-NowIso)
     $workspace = Get-WorkspacePath $Language $DataDir
-    Write-JsonFile (Join-Path $workspace 'structure.json') $Structure
+    $path = Join-Path $workspace 'structure.json'
+    $backupPath = Join-Path $workspace 'structure.json.last-good'
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $existing = Read-JsonFile $path $null
+            if (Test-StructureDocument $existing $Language) {
+                Write-JsonFile $backupPath $existing
+            }
+        } catch {
+            # Preserve the previous last-good copy when the primary cannot be read.
+            # The caller's Structure may itself have been recovered from that copy.
+        }
+    }
+    Write-JsonFile $path $Structure
+    $saved = Read-JsonFile $path $null
+    if (-not (Test-StructureDocument $saved $Language)) {
+        throw '登録情報を保存後に検証できませんでした。直前のバックアップを保持しています。'
+    }
 }
 
 function Get-Structure([string]$Language) {
@@ -1384,11 +1438,15 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
     return Invoke-WithLock $lockPath {
         $path = Join-Path $workspace 'structure.json'
         if (-not (Test-Path -LiteralPath $path)) { Write-StructureUnlocked $Language (New-EmptyStructure $Language) $DataDir; return [ordered]@{ created=$true; migrated=$false } }
-        $structure = Read-JsonFile $path (New-EmptyStructure $Language)
+        $structure = Read-StructureUnlocked $Language $DataDir
         $version = 1
         try { $version=[int](Get-DataProperty $structure 'schemaVersion' 1) } catch { $version=1 }
         if ($version -gt 2) { throw "この管理データは新しいschemaVersion=$versionです。対応するReportBinderを使用してください。" }
-        if ($version -eq 2) { return [ordered]@{ created=$false; migrated=$false } }
+        if ($version -eq 2) {
+            $lastGood = Join-Path $workspace 'structure.json.last-good'
+            if (-not (Test-Path -LiteralPath $lastGood)) { Write-JsonFile $lastGood $structure }
+            return [ordered]@{ created=$false; migrated=$false }
+        }
         $backup = Join-Path $workspace 'structure.json.v1.bak'
         if (-not (Test-Path -LiteralPath $backup)) {
             Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
@@ -5546,6 +5604,11 @@ function Get-RenderRecordDir([string]$Language, [string]$WorkbookId, [string]$Sn
     return (Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) (Join-Path 'renders' $VersionId))
 }
 
+function Get-RenderRasterSheetDir([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$SheetName) {
+    $recordDir = Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId
+    return (Join-Path $recordDir (Join-Path 'raster-v1' (Get-DiffSheetKey $SheetName)))
+}
+
 function Get-VisualHashProfile {
     $pdfBoxVersion = ''
     try {
@@ -5632,7 +5695,13 @@ function Invoke-PdfPageAnalyzer([hashtable[]]$Sheets) {
     try {
         $req = Join-Path $tmpDir 'request.json'
         $res = Join-Path $tmpDir 'result.json'
-        Write-JsonFile $req ([ordered]@{ sheets = @($Sheets | ForEach-Object { [ordered]@{ sheetName = [string]$_.sheetName; pdf = [string]$_.pdf } }) })
+        Write-JsonFile $req ([ordered]@{ sheets = @($Sheets | ForEach-Object {
+            [ordered]@{
+                sheetName = [string]$_.sheetName
+                pdf = [string]$_.pdf
+                rasterDirectory = [string](Get-DataProperty $_ 'rasterDirectory' '')
+            }
+        }) })
         $run = Invoke-NativeCapture $javaExe @('-Djava.awt.headless=true', '-cp', $cp, 'PdfPageAnalyzer', '--input', $req, '--output', $res, '--dpi', [string]$Script:VisualHashDpi)
         if ([int]$run.exitCode -ne 0 -or -not (Test-Path -LiteralPath $res)) {
             return [ordered]@{ ok = $false; message = ("exit=" + [string]$run.exitCode + "`n" + [string]$run.text) }
@@ -5900,7 +5969,13 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
                     if (-not (([int]$ws.Visible -eq -1) -and $sheetName -match '^[0-9]+$')) { continue }
                     $outPdf = Join-Path $contentDir ("{0}.pdf" -f $sheetName)
                     [void](Export-WorksheetToPdfSafe $excel $book $ws $outPdf $sheetName $false)
-                    if (Test-Path -LiteralPath $outPdf) { $sheets += @{ sheetName = $sheetName; pdf = $outPdf } }
+                    if (Test-Path -LiteralPath $outPdf) {
+                        $sheets += @{
+                            sheetName = $sheetName
+                            pdf = $outPdf
+                            rasterDirectory = (Get-RenderRasterSheetDir $Language $WorkbookId $SnapshotId $versionId $sheetName)
+                        }
+                    }
                 } catch {
                 } finally { Invoke-ComRelease $ws }
             }
@@ -5944,25 +6019,9 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
     $ptr = Get-ComparisonBaselinePointer $Language $WorkbookId
     $baseSnap = [string](Get-DataProperty $ptr 'snapshotId' '')
     $baseVer = [string](Get-DataProperty $ptr 'versionId' '')
-    # 画像解析はPDFジョブ完了通知の後で走る。短時間に次版を作成した場合や
-    # 同じ版の解析が再実行された場合、baselineポインタが既に今回版を指す
-    # ことがある。manifestの直前版に有効な画像ハッシュがあれば比較元として
-    # 回復し、比較結果を欠落させない。
-    if ([string]::IsNullOrWhiteSpace($baseSnap) -or $baseSnap -eq $CurrentSnapshotId) {
-        $currentManifest = Get-SnapshotManifest $Language $WorkbookId $CurrentSnapshotId
-        $previousSnapshotId = [string](Get-DataProperty $currentManifest 'previousSnapshotId' '')
-        if (-not [string]::IsNullOrWhiteSpace($previousSnapshotId) -and $previousSnapshotId -ne $CurrentSnapshotId) {
-            # ハッシュが無い旧履歴でも source.xlsx が残っていれば、後段で再レンダリングできる。
-            $baseSnap = $previousSnapshotId
-            $baseVer = ''
-            foreach ($candidateVersion in @((Get-RenderVersionIds $Language $WorkbookId $previousSnapshotId) | Sort-Object -Descending)) {
-                if ($null -ne (Get-VisualHashes $Language $WorkbookId $previousSnapshotId ([string]$candidateVersion))) {
-                    $baseVer = [string]$candidateVersion
-                    break
-                }
-            }
-        }
-    }
+    # The baseline pointer is authoritative. Falling back to manifest.previousSnapshotId
+    # is unsafe after registration recovery or hash de-duplication: the "previous"
+    # snapshot can be months old even though the user just recreated a PDF.
     if ([string]::IsNullOrWhiteSpace($baseSnap) -or $baseSnap -eq $CurrentSnapshotId) {
         $result.message = '前回の比較基準がありません。今回版を新しい基準にします。'
         return $result
@@ -6064,7 +6123,13 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
         foreach ($r in @(Get-Array $Rendered)) {
             $pdf = [string](Get-DataProperty $r 'pdf' '')
             $name = [string](Get-DataProperty $r 'sheetName' '')
-            if ($pdf -and $name -and (Test-Path -LiteralPath $pdf)) { $sheets += @{ sheetName = $name; pdf = $pdf } }
+            if ($pdf -and $name -and (Test-Path -LiteralPath $pdf)) {
+                $sheets += @{
+                    sheetName = $name
+                    pdf = $pdf
+                    rasterDirectory = (Get-RenderRasterSheetDir $Language $WorkbookId $SnapshotId $VersionId $name)
+                }
+            }
         }
         if ($sheets.Count -eq 0) { return $null }
         $analysis = Invoke-PdfPageAnalyzer $sheets
@@ -6957,7 +7022,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 8
+$Script:DiffDetailAlgorithmVersion = 9
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7627,6 +7692,14 @@ function Invoke-DiffDetailJobCore($Job) {
                     id = $batchId
                     beforePdf = $beforePdf
                     afterPdf = $afterPdf
+                    beforeRasterDirectory = $(if ($kind -ne 'added') {
+                        Get-RenderRasterSheetDir $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $name
+                    } else { '' })
+                    afterRasterDirectory = $(if ($kind -ne 'removed') {
+                        Get-RenderRasterSheetDir $language $workbookId ([string]$context.currentSnapshotId) ([string]$context.currentVersionId) $name
+                    } else { '' })
+                    beforePageCount = Get-IntDataProperty $sheet 'beforePages' 0
+                    afterPageCount = Get-IntDataProperty $sheet 'afterPages' 0
                     outputDirectory = $sheetDir
                     kind = $kind
                 }

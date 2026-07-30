@@ -32,6 +32,8 @@ $tsvPath = Join-Path $rasterRoot 'requests.tsv'
 $totalWatch = [Diagnostics.Stopwatch]::StartNew()
 $rasterMs = 0
 $analysisMs = 0
+$cacheHitSides = 0
+$rasterizedSides = 0
 
 function ConvertTo-PathBase64([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
@@ -47,30 +49,55 @@ function Get-RasterPages([string]$ItemDirectory, [string]$Prefix) {
         ForEach-Object { $_.FullName })
 }
 
+function Get-CachedRasterPages([string]$Directory, [int]$ExpectedCount) {
+    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return @() }
+    $pages = @(Get-ChildItem -LiteralPath $Directory -File -Filter 'page-*.png' -ErrorAction SilentlyContinue |
+        Sort-Object {
+            $match = [regex]::Match($_.BaseName, '(\d+)$')
+            if ($match.Success) { [int]$match.Groups[1].Value } else { [int]::MaxValue }
+        } |
+        ForEach-Object { $_.FullName })
+    if ($ExpectedCount -gt 0 -and $pages.Count -ne $ExpectedCount) { return @() }
+    return $pages
+}
+
 try {
     $lines = @()
+    $cachedPagesById = @{}
+    $needsRaster = $false
     foreach ($item in $items) {
         $id = [string]$item.id
         if ($id -notmatch '^[A-Za-z0-9_-]+$') { throw "差分一括処理IDが不正です: $id" }
-        $lines += ($id + "`t" + (ConvertTo-PathBase64 ([string]$item.beforePdf)) + "`t" + (ConvertTo-PathBase64 ([string]$item.afterPdf)))
+        $beforeCached = @(Get-CachedRasterPages ([string]$item.beforeRasterDirectory) ([int]$item.beforePageCount))
+        $afterCached = @(Get-CachedRasterPages ([string]$item.afterRasterDirectory) ([int]$item.afterPageCount))
+        $beforePdf = $(if ($beforeCached.Count -gt 0) { '' } else { [string]$item.beforePdf })
+        $afterPdf = $(if ($afterCached.Count -gt 0) { '' } else { [string]$item.afterPdf })
+        if ($beforeCached.Count -gt 0) { $cacheHitSides++ }
+        elseif (-not [string]::IsNullOrWhiteSpace($beforePdf)) { $rasterizedSides++; $needsRaster = $true }
+        if ($afterCached.Count -gt 0) { $cacheHitSides++ }
+        elseif (-not [string]::IsNullOrWhiteSpace($afterPdf)) { $rasterizedSides++; $needsRaster = $true }
+        $cachedPagesById[$id] = [ordered]@{ before = @($beforeCached); after = @($afterCached) }
+        $lines += ($id + "`t" + (ConvertTo-PathBase64 $beforePdf) + "`t" + (ConvertTo-PathBase64 $afterPdf))
     }
     [IO.File]::WriteAllLines($tsvPath, $lines, [Text.UTF8Encoding]::new($false))
 
     $threads = [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount))
-    $nativeOutput = @()
-    $nativeExitCode = -1
     $rasterWatch = [Diagnostics.Stopwatch]::StartNew()
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $nativeOutput = @(& $javaExe '-Djava.awt.headless=true' '-cp' "$composerJar;$pdfBoxJar" 'PdfBatchRasterizer' '--request' $tsvPath '--output' $rasterRoot '--dpi' $Dpi '--threads' $threads 2>&1 |
-            ForEach-Object { [string]$_ })
-        $nativeExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousPreference
-    }
-    if ($nativeExitCode -ne 0) {
-        throw ("PDF一括画像化に失敗しました。`n" + ($nativeOutput -join "`n"))
+    if ($needsRaster) {
+        $nativeOutput = @()
+        $nativeExitCode = -1
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $nativeOutput = @(& $javaExe '-Djava.awt.headless=true' '-cp' "$composerJar;$pdfBoxJar" 'PdfBatchRasterizer' '--request' $tsvPath '--output' $rasterRoot '--dpi' $Dpi '--threads' $threads 2>&1 |
+                ForEach-Object { [string]$_ })
+            $nativeExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if ($nativeExitCode -ne 0) {
+            throw ("PDF一括画像化に失敗しました。`n" + ($nativeOutput -join "`n"))
+        }
     }
     $rasterWatch.Stop()
     $rasterMs = [int64]$rasterWatch.ElapsedMilliseconds
@@ -93,8 +120,11 @@ try {
                     throw (Get-Content -LiteralPath $errorPath -Raw -Encoding UTF8)
                 }
             }
-            $beforePages = @(Get-RasterPages $itemRasterDir 'before')
-            $afterPages = @(Get-RasterPages $itemRasterDir 'after')
+            $cached = $cachedPagesById[$id]
+            $beforePages = @($cached.before)
+            $afterPages = @($cached.after)
+            if ($beforePages.Count -eq 0) { $beforePages = @(Get-RasterPages $itemRasterDir 'before') }
+            if ($afterPages.Count -eq 0) { $afterPages = @(Get-RasterPages $itemRasterDir 'after') }
             $pageCount = [Math]::Max($beforePages.Count, $afterPages.Count)
             if ($pageCount -eq 0) { throw '比較できるPDFページがありません。' }
             $outputDirectory = [IO.Path]::GetFullPath([string]$item.outputDirectory)
@@ -130,7 +160,13 @@ try {
         threshold = $Threshold
         minimumRegionPixels = $MinimumRegionPixels
         padding = $Padding
-        timings = [ordered]@{ totalMs = [int64]$totalWatch.ElapsedMilliseconds; rasterMs = $rasterMs; analysisMs = $analysisMs }
+        timings = [ordered]@{
+            totalMs = [int64]$totalWatch.ElapsedMilliseconds
+            rasterMs = $rasterMs
+            analysisMs = $analysisMs
+            cacheHitSides = $cacheHitSides
+            rasterizedSides = $rasterizedSides
+        }
         items = @($results)
     } | ConvertTo-Json -Depth 12 -Compress
 } finally {
