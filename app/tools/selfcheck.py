@@ -1,5 +1,5 @@
 from pathlib import Path
-import json, re, zipfile
+import json, os, re, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
@@ -651,6 +651,33 @@ engine = (root/'app/tools/DiffImageEngine.cs').read_text(encoding='utf-8-sig')
 for forbidden in ['=>', '$"', 'nameof(', '?.', 'out var ', 'using static ']:
     if forbidden in engine:
         raise SystemExit(f'DiffImageEngine.cs must stay C# 5 compatible for Add-Type: {forbidden}')
+if os.name == 'nt':
+    # The release runtime is Windows PowerShell 5.1. Parse every changed PowerShell
+    # entry point and compile the C# diff engine instead of relying on text checks.
+    ps_paths = [
+        root/'app/server.ps1',
+        root/'app/launch.ps1',
+        root/'app/tools/diff-image-batch.ps1',
+    ]
+    quoted_paths = ','.join("'" + str(path).replace("'", "''") + "'" for path in ps_paths)
+    engine_path = str(root/'app/tools/DiffImageEngine.cs').replace("'", "''")
+    runtime_check = (
+        "$failed=$false;"
+        f"foreach($path in @({quoted_paths})){{"
+        "$tokens=$null;$errors=$null;"
+        "[void][System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors);"
+        "if($errors.Count -gt 0){$errors|ForEach-Object{Write-Error ($path+': '+$_.Message)};$failed=$true}"
+        "};"
+        "if($failed){exit 1};"
+        f"Add-Type -Path '{engine_path}' -ReferencedAssemblies @('System.Drawing')"
+    )
+    checked = subprocess.run(
+        ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', runtime_check],
+        capture_output=True,
+        text=True,
+    )
+    if checked.returncode:
+        raise SystemExit('Windows PowerShell/C# compile check failed:\n' + checked.stdout + checked.stderr)
 # DrawImageUnscaled rescales by the source DPI metadata despite its name.
 if 'DrawImageUnscaled(' in engine:
     raise SystemExit('page normalization must use an explicit destination rectangle, not DrawImageUnscaled')
