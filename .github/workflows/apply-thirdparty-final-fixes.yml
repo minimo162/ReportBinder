@@ -1,0 +1,131 @@
+name: Apply final third-party fixes
+
+on:
+  push:
+    branches:
+      - agent/fix-third-party-installer
+    paths:
+      - '.github/workflows/apply-thirdparty-final-fixes.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-and-commit:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out working branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/fix-third-party-installer
+          fetch-depth: 0
+
+      - name: Apply precise source updates
+        shell: powershell
+        run: |
+          @'
+          from pathlib import Path
+
+          installer_path = Path('app/tools/install-thirdparty.ps1')
+          installer = installer_path.read_text(encoding='utf-8-sig')
+          old_order = '''  if ((Test-Path -LiteralPath $localJava) -and -not $Force) {
+            Write-Host "Portable Java runtime: already present at $localJava"
+            return $true
+          }
+
+          if ($PreferSystemJava -and -not $Force) {
+            $systemJava = Get-Command java.exe -ErrorAction SilentlyContinue
+            if (-not $systemJava) { $systemJava = Get-Command java -ErrorAction SilentlyContinue }
+            if ($systemJava) {
+              Write-Host "System Java selected by -PreferSystemJava: $($systemJava.Source)"
+              return $false
+            }
+          }
+          '''
+          new_order = '''  if ($PreferSystemJava -and -not $Force) {
+            $systemJava = Get-Command java.exe -ErrorAction SilentlyContinue
+            if (-not $systemJava) { $systemJava = Get-Command java -ErrorAction SilentlyContinue }
+            if ($systemJava) {
+              Write-Host "System Java selected by -PreferSystemJava: $($systemJava.Source)"
+              return $false
+            }
+          }
+
+          if ((Test-Path -LiteralPath $localJava) -and -not $Force) {
+            Write-Host "Portable Java runtime: already present at $localJava"
+            return $true
+          }
+          '''
+          if installer.count(old_order) != 1:
+              raise SystemExit('portable/system Java branch block did not match exactly')
+          installer = installer.replace(old_order, new_order)
+          installer_path.write_text(installer, encoding='utf-8-sig', newline='')
+
+          selfcheck_path = Path('app/tools/selfcheck.py')
+          selfcheck = selfcheck_path.read_text(encoding='utf-8')
+          replacements = [
+              (
+                  "'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/select-folder.ps1','app/tools/package-release.ps1',",
+                  "'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',"
+              ),
+              (
+                  "'app/tools/install-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1'",
+                  "'app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1'"
+              ),
+              (
+                  "root_files-{'日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md'}",
+                  "root_files-{'日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md','.gitignore'}"
+              ),
+          ]
+          for old, new in replacements:
+              if selfcheck.count(old) != 1:
+                  raise SystemExit('selfcheck replacement target did not match exactly: ' + old)
+              selfcheck = selfcheck.replace(old, new)
+
+          marker = "print('selfcheck ok')"
+          checks = '''# Third-party installation must stay reproducible and fail closed.
+          installer = (root/'app/tools/install-thirdparty.ps1').read_text(encoding='utf-8-sig')
+          for needed in ['2.0.37', 'Verify-HashFile', 'Verify-SriSha512', 'dist.integrity', 'binary.package.checksum', 'PreferSystemJava', 'verify-thirdparty.ps1']:
+              if needed not in installer: raise SystemExit(f'third-party installer hardening missing: {needed}')
+          if installer.index('$PreferSystemJava') > installer.index('Portable Java runtime: already present'):
+              raise SystemExit('PreferSystemJava must be evaluated before an existing portable JRE')
+          verifier = (root/'app/tools/verify-thirdparty.ps1').read_text(encoding='utf-8-sig')
+          for needed in ['RequirePortableJava', 'SHA-512 verified', 'verified npm package tarball', 'PdfPageAnalyzer.class']:
+              if needed not in verifier: raise SystemExit(f'third-party verifier check missing: {needed}')
+
+          '''
+          if selfcheck.count(marker) != 1:
+              raise SystemExit('selfcheck completion marker not found exactly once')
+          selfcheck = selfcheck.replace(marker, checks + marker)
+          selfcheck_path.write_text(selfcheck, encoding='utf-8', newline='')
+
+          Path('.github/workflows/apply-thirdparty-final-fixes.yml').unlink()
+          '@ | py -3 -
+
+      - name: Install and verify external dependencies
+        shell: powershell
+        run: |
+          .\app\tools\install-thirdparty.ps1 -Force
+          .\app\tools\verify-thirdparty.ps1 -RequirePdfJs -RequirePortableJava
+
+      - name: Rebuild Java tools against PDFBox 2.0.37
+        shell: powershell
+        run: |
+          .\app\lib\pdfbox\build.ps1
+
+      - name: Clean transient caches and run self-check
+        shell: powershell
+        run: |
+          Remove-Item -LiteralPath .\app\thirdparty-cache -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath .\app\lib\pdfbox\classes -Recurse -Force -ErrorAction SilentlyContinue
+          py -3 .\app\tools\selfcheck.py
+
+      - name: Commit validated fixes
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/tools/install-thirdparty.ps1 app/tools/selfcheck.py .github/workflows/apply-thirdparty-final-fixes.yml
+          git commit -m "Finalize third-party dependency hardening"
+          git push origin HEAD:agent/fix-third-party-installer
