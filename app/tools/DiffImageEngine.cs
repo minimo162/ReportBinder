@@ -603,12 +603,12 @@ public static class ReportBinderDiffEngine
                     }
                 }
 
-                string beforeMask;
-                string beforeOverlay;
-                string afterMask;
-                string afterOverlay;
-                SaveLayerImages(outputDirectory, pageNumber, width, height, pixelRegions, true, out beforeMask, out beforeOverlay);
-                SaveLayerImages(outputDirectory, pageNumber, width, height, pixelRegions, false, out afterMask, out afterOverlay);
+                // Region rectangles and labels are rendered by the browser from the JSON below.
+                // Avoid four full-page PNG encodes (before/after mask + overlay) per page.
+                string beforeMask = "";
+                string beforeOverlay = "";
+                string afterMask = "";
+                string afterOverlay = "";
 
                 List<ReportBinderDiffRegion> publicRegions = new List<ReportBinderDiffRegion>();
                 double confidenceTotal = 0;
