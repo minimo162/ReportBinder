@@ -717,7 +717,7 @@ for needed in ['ANALYZER_VERSION = 2', 'pagePerceptualHashes', 'perceptualHash']
 # V5.3: all changed sheets share one bounded-concurrency Java raster job,
 # and region decoration is drawn from JSON instead of four PNG layers per page.
 batch_script = (root/'app/tools/diff-image-batch.ps1').read_text(encoding='utf-8-sig')
-for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine', 'items = @($results)']:
+for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine', 'items = @($results)', 'rasterMs', 'analysisMs']:
     if needed not in batch_script:
         raise SystemExit(f'batched diff rasterization missing: {needed}')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
