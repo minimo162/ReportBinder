@@ -6957,7 +6957,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 7
+$Script:DiffDetailAlgorithmVersion = 8
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7405,6 +7405,25 @@ function Invoke-DiffImagePageGeneration([string]$BeforePdf, [string]$AfterPdf, [
     return ($text | ConvertFrom-Json)
 }
 
+function Invoke-DiffImageBatchGeneration($Items) {
+    $scriptPath = Join-Path $Script:AppRoot 'tools\diff-image-batch.ps1'
+    if (-not (Test-Path -LiteralPath $scriptPath)) { throw '差分画像一括生成ツールが見つかりません。' }
+    $requestPath = Join-Path ([IO.Path]::GetTempPath()) ('rb-diff-request-' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Write-JsonFile $requestPath ([ordered]@{ schemaVersion = 1; items = @($Items) })
+        $raw = @(& $scriptPath -RequestPath $requestPath -Dpi $Script:DiffDetailDpi `
+            -Threshold $Script:DiffDetailThreshold -MinimumRegionPixels $Script:DiffDetailMinimumRegionPixels `
+            -Padding $Script:DiffDetailPadding | ForEach-Object { [string]$_ })
+        $text = ($raw -join '')
+        if ([string]::IsNullOrWhiteSpace($text)) { throw '差分画像一括生成結果を取得できませんでした。' }
+        $result = $text | ConvertFrom-Json
+        if (-not [bool](Get-DataProperty $result 'ok' $false)) { throw '差分画像の一括生成に失敗しました。' }
+        return $result
+    } finally {
+        Remove-Item -LiteralPath $requestPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 
 function Start-DiffDetailJob(
     [string]$Language,
@@ -7580,16 +7599,17 @@ function Invoke-DiffDetailJobCore($Job) {
         Write-JsonFile $detailPath $detail
         $status.total = $workIndexes.Count; $status.currentWorkbookName = [string]$context.workbookName
         Write-RenderJobStatus $statusPath $status
+
+        # 変更シートごとに Java/PDFBox を2回起動していた旧経路を避ける。
+        # 全シートの新旧PDFを1つのJVMへ渡し、最大4並列でラスタライズしてから一括解析する。
+        $batchRequest = @()
+        $batchIdByIndex = @{}
+        $batchPreparationErrors = @{}
         for ($position = 0; $position -lt $workIndexes.Count; $position++) {
-            Refresh-DiffJobLeases $Job
             $i = [int]$workIndexes[$position]
             $sheet = $detail.sheets[$i]
-            $name = [string]$sheet.sheetName; $kind = [string]$sheet.kind
-            $sheet.status = 'generating'; $sheet.message = ''
-            $status.currentSheet = $name
-            $status.message = "差分画像を作成しています: $($position + 1) / $($workIndexes.Count) シート $name"
-            $status.percent = [int][Math]::Max(5, [Math]::Min(95, [Math]::Floor((([double]$position) / [Math]::Max(1, $workIndexes.Count)) * 90) + 5))
-            Write-RenderJobStatus $statusPath $status
+            $name = [string]$sheet.sheetName
+            $kind = [string]$sheet.kind
             try {
                 $beforePdf = ''; $afterPdf = ''
                 if ($kind -ne 'added') { $beforePdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $name }
@@ -7601,7 +7621,53 @@ function Invoke-DiffDetailJobCore($Job) {
                 $sheetDir = Join-Path $cacheDir (Join-Path 'p' ([string]$sheet.sheetKey))
                 if (Test-Path -LiteralPath $sheetDir) { Remove-Item -LiteralPath $sheetDir -Recurse -Force -ErrorAction SilentlyContinue }
                 New-Item -ItemType Directory -Path $sheetDir -Force | Out-Null
-                $generated = Invoke-DiffImagePageGeneration $beforePdf $afterPdf $sheetDir $kind
+                $batchId = 'i' + $position.ToString('0000')
+                $batchIdByIndex[[string]$i] = $batchId
+                $batchRequest += [ordered]@{
+                    id = $batchId
+                    beforePdf = $beforePdf
+                    afterPdf = $afterPdf
+                    outputDirectory = $sheetDir
+                    kind = $kind
+                }
+            } catch {
+                $batchPreparationErrors[[string]$i] = $_.Exception.Message
+            }
+        }
+        $batchResultMap = @{}
+        if ($batchRequest.Count -gt 0) {
+            Refresh-DiffJobLeases $Job
+            $status.message = "新旧PDFをまとめて画像化・解析しています（$($batchRequest.Count)シート）。"
+            $status.currentSheet = ''
+            $status.percent = 5
+            $detail.generation = [ordered]@{ status = 'running'; jobId = $jobId; percent = 5; message = $status.message; currentSheet = '' }
+            Write-JsonFile $detailPath $detail; Write-RenderJobStatus $statusPath $status
+            $batchGenerated = Invoke-DiffImageBatchGeneration $batchRequest
+            foreach ($batchItem in @(Get-Array (Get-DataProperty $batchGenerated 'items' @()))) {
+                $batchResultMap[[string](Get-DataProperty $batchItem 'id' '')] = $batchItem
+            }
+        }
+
+        for ($position = 0; $position -lt $workIndexes.Count; $position++) {
+            Refresh-DiffJobLeases $Job
+            $i = [int]$workIndexes[$position]
+            $sheet = $detail.sheets[$i]
+            $name = [string]$sheet.sheetName; $kind = [string]$sheet.kind
+            $sheet.status = 'generating'; $sheet.message = ''
+            $status.currentSheet = $name
+            $status.message = "差分画像を作成しています: $($position + 1) / $($workIndexes.Count) シート $name"
+            $status.percent = [int][Math]::Max(5, [Math]::Min(95, [Math]::Floor((([double]$position) / [Math]::Max(1, $workIndexes.Count)) * 90) + 5))
+            Write-RenderJobStatus $statusPath $status
+            try {
+                if ($batchPreparationErrors.ContainsKey([string]$i)) { throw [string]$batchPreparationErrors[[string]$i] }
+                $batchId = [string]$batchIdByIndex[[string]$i]
+                if ([string]::IsNullOrWhiteSpace($batchId) -or -not $batchResultMap.ContainsKey($batchId)) {
+                    throw '差分画像一括生成結果に対象シートがありません。'
+                }
+                $generated = $batchResultMap[$batchId]
+                if (-not [bool](Get-DataProperty $generated 'ok' $false)) {
+                    throw [string](Get-DataProperty $generated 'message' '差分画像を生成できませんでした。')
+                }
                 $pages = @(); $regionTotal = 0; $hasUnknownPage = $false
                 foreach ($page in @(Get-Array $generated.pages)) {
                     $regions = @(Get-Array (Get-DataProperty $page 'regions' @())); $regionTotal += $regions.Count
