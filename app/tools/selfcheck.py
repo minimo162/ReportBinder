@@ -462,7 +462,7 @@ for needed in ['function addedSheetSet', '追加 ${added}', "badge('追加','att
 # and serve only manifest-listed PNG assets.
 for needed in ['function Get-DiffDetailContext', 'function Start-DiffDetailJob',
                'function Invoke-DiffDetailJobFromFile', 'function Serve-DiffPage',
-               '$Script:DiffDetailThreshold = 18', '$Script:DiffDetailDpi = 150',
+               '$Script:DiffDetailThreshold = 24', '$Script:DiffDetailDpi = 120',
                'Assert-SafeStorageSegment $CurrentSnapshotId',
                "allowedAssets = @('before','after','before-mask','before-overlay','mask','overlay')"]:
     if needed not in server:
@@ -640,8 +640,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 6' not in server:
-    raise SystemExit('cache layout changes must bump DiffDetailAlgorithmVersion to 6')
+if '$Script:DiffDetailAlgorithmVersion = 7' not in server:
+    raise SystemExit('comparison algorithm changes must bump DiffDetailAlgorithmVersion to 7')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -686,5 +686,32 @@ for needed in ['function Get-CategoryProjectId', 'Get-OutputFileName $Volume $pr
     if needed not in server: raise SystemExit(f'category-aware final filename missing: {needed}')
 if '$outName=Get-OutputFileName $Volume $projectId;' in server:
     raise SystemExit('legacy final output still omits category')
+
+# V5.2: comparison noise tolerance, bounded annotations, and lower-cost raster output.
+for needed in [
+    '$Script:VisualHashProfileVersion = 2',
+    '$Script:VisualHashDpi = 120',
+    'function Test-SheetVisualEquivalent',
+    '$Script:DiffDetailAlgorithmVersion = 7',
+    '$Script:DiffDetailDpi = 120',
+    '$Script:DiffDetailThreshold = 24',
+    '$Script:DiffDetailMinimumRegionPixels = 24',
+]:
+    if needed not in server:
+        raise SystemExit(f'comparison tolerance/performance setting missing: {needed}')
+diff_engine = (root/'app/tools/DiffImageEngine.cs').read_text(encoding='utf-8-sig')
+for needed in [
+    'MaximumModifiedLabelsPerPage = 12',
+    'FindBestOffset',
+    'MergeNearbyRegions',
+    'SaveBaseImage',
+    'sparseFullPage',
+]:
+    if needed not in diff_engine:
+        raise SystemExit(f'diff-region noise control missing: {needed}')
+analyzer = (root/'app/lib/pdfbox/src/PdfPageAnalyzer.java').read_text(encoding='utf-8-sig')
+for needed in ['ANALYZER_VERSION = 2', 'pagePerceptualHashes', 'perceptualHash']:
+    if needed not in analyzer:
+        raise SystemExit(f'perceptual visual hash missing: {needed}')
 
 print('selfcheck ok')
