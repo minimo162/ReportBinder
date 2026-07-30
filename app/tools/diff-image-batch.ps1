@@ -108,6 +108,9 @@ try {
 
     $analysisWatch = [Diagnostics.Stopwatch]::StartNew()
     $results = @()
+    $resultById = @{}
+    $pagesById = @{}
+    $pageRequests = New-Object 'System.Collections.Generic.List[ReportBinderDiffBatchPageRequest]'
     foreach ($item in $items) {
         $id = [string]$item.id
         $kind = [string]$item.kind
@@ -129,7 +132,7 @@ try {
             if ($pageCount -eq 0) { throw '比較できるPDFページがありません。' }
             $outputDirectory = [IO.Path]::GetFullPath([string]$item.outputDirectory)
             if (-not (Test-Path -LiteralPath $outputDirectory)) { New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null }
-            $pages = @()
+            $pagesById[$id] = New-Object System.Collections.ArrayList
             for ($i = 0; $i -lt $pageCount; $i++) {
                 $beforeImage = if ($i -lt $beforePages.Count) { [string]$beforePages[$i] } else { '' }
                 $afterImage = if ($i -lt $afterPages.Count) { [string]$afterPages[$i] } else { '' }
@@ -138,18 +141,49 @@ try {
                     if ([string]::IsNullOrWhiteSpace($beforeImage)) { $pageKind = 'added' }
                     elseif ([string]::IsNullOrWhiteSpace($afterImage)) { $pageKind = 'removed' }
                 }
-                $pages += [ReportBinderDiffEngine]::ComparePage(
-                    $beforeImage, $afterImage, $outputDirectory, ($i + 1), $pageKind,
-                    $Threshold, $MinimumRegionPixels, $Padding)
+                $pageRequests.Add([ReportBinderDiffBatchPageRequest]@{
+                    itemId = $id
+                    beforePath = $beforeImage
+                    afterPath = $afterImage
+                    outputDirectory = $outputDirectory
+                    pageNumber = ($i + 1)
+                    kind = $pageKind
+                })
             }
             $result.ok = $true
             $result.beforePageCount = $beforePages.Count
             $result.afterPageCount = $afterPages.Count
-            $result.pages = @($pages)
         } catch {
             $result.message = $_.Exception.Message
         }
-        $results += [pscustomobject]$result
+        $resultObject = [pscustomobject]$result
+        $resultById[$id] = $resultObject
+        $results += $resultObject
+    }
+    if ($pageRequests.Count -gt 0) {
+        $pageResults = [ReportBinderDiffEngine]::ComparePages(
+            $pageRequests.ToArray(), $threads, $Threshold, $MinimumRegionPixels, $Padding)
+        foreach ($pageResult in @($pageResults)) {
+            $id = [string]$pageResult.itemId
+            $resultObject = $resultById[$id]
+            if ($null -eq $resultObject) { continue }
+            if (-not [string]::IsNullOrWhiteSpace([string]$pageResult.error)) {
+                $resultObject.ok = $false
+                if ([string]::IsNullOrWhiteSpace([string]$resultObject.message)) {
+                    $resultObject.message = [string]$pageResult.error
+                }
+                continue
+            }
+            if ($pagesById.ContainsKey($id)) {
+                [void]$pagesById[$id].Add($pageResult.page)
+            }
+        }
+    }
+    foreach ($resultObject in @($results)) {
+        $id = [string]$resultObject.id
+        if ($pagesById.ContainsKey($id)) {
+            $resultObject.pages = @($pagesById[$id] | Sort-Object pageNumber)
+        }
     }
     $analysisWatch.Stop()
     $analysisMs = [int64]$analysisWatch.ElapsedMilliseconds
@@ -164,6 +198,8 @@ try {
             totalMs = [int64]$totalWatch.ElapsedMilliseconds
             rasterMs = $rasterMs
             analysisMs = $analysisMs
+            analysisThreads = $threads
+            analyzedPages = $pageRequests.Count
             cacheHitSides = $cacheHitSides
             rasterizedSides = $rasterizedSides
         }

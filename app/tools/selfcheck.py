@@ -1,5 +1,5 @@
 from pathlib import Path
-import json, re, zipfile
+import json, os, re, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
@@ -529,6 +529,8 @@ if 'Stop-AutoSchedulerProcess' not in _srv:
     raise SystemExit('Start-LocalTcpServer must stop the auto-scheduler child on exit')
 if _srv.index('try {') > _srv.index('$tcp.Start()'):
     raise SystemExit('listener startup must be covered by the scheduler-stop finally block')
+if _srv.index('$tcp.Start()') > _srv.index('Start-AutoSchedulerProcess'):
+    raise SystemExit('listener must start before the scheduler child to keep startup responsive')
 
 # Workspace switches must not reuse the previous input-history size.
 _hsize = server.split('function Get-InputHistorySizeMb', 1)[1].split('\nfunction ', 1)[0]
@@ -544,6 +546,14 @@ if 'Start-Sleep -Seconds 10' in _child or 'Start-Sleep -Milliseconds 500' not in
     raise SystemExit('auto scheduler must check for stop requests during the 10-second interval')
 if "Remove-Item -LiteralPath $path" not in _child:
     raise SystemExit('auto scheduler must remove its control files on exit')
+if 'Invoke-InputHistoryCleanup $language' not in _child:
+    raise SystemExit('input-history cleanup must run in the deferred scheduler process')
+_startup_recovery = server.split('function Invoke-StartupRecovery', 1)[1].split('\nfunction ', 1)[0]
+for forbidden in ['Clear-ExpiredLeases', 'Clear-StaleEphemeralCopies', 'Recover-AutoStates', 'Invoke-InputHistoryCleanup']:
+    if forbidden in _startup_recovery:
+        raise SystemExit(f'UI startup must not repeat deferred recovery work: {forbidden}')
+if 'Ensure-Package $startupPaths -Languages @((Get-EffectiveLanguage))' not in server:
+    raise SystemExit('normal startup must initialize only the active language package')
 _stop = server.split('function Stop-AutoSchedulerProcess', 1)[1].split('\nfunction ', 1)[0]
 for needed in ['WaitForExit(2500)', '$Script:AutoSchedulerProcessId = 0', "Remove-Item -LiteralPath $path"]:
     if needed not in _stop: raise SystemExit(f'scheduler stop cleanup missing: {needed}')
@@ -641,6 +651,33 @@ engine = (root/'app/tools/DiffImageEngine.cs').read_text(encoding='utf-8-sig')
 for forbidden in ['=>', '$"', 'nameof(', '?.', 'out var ', 'using static ']:
     if forbidden in engine:
         raise SystemExit(f'DiffImageEngine.cs must stay C# 5 compatible for Add-Type: {forbidden}')
+if os.name == 'nt':
+    # The release runtime is Windows PowerShell 5.1. Parse every changed PowerShell
+    # entry point and compile the C# diff engine instead of relying on text checks.
+    ps_paths = [
+        root/'app/server.ps1',
+        root/'app/launch.ps1',
+        root/'app/tools/diff-image-batch.ps1',
+    ]
+    quoted_paths = ','.join("'" + str(path).replace("'", "''") + "'" for path in ps_paths)
+    engine_path = str(root/'app/tools/DiffImageEngine.cs').replace("'", "''")
+    runtime_check = (
+        "$failed=$false;"
+        f"foreach($path in @({quoted_paths})){{"
+        "$tokens=$null;$errors=$null;"
+        "[void][System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors);"
+        "if($errors.Count -gt 0){$errors|ForEach-Object{Write-Error ($path+': '+$_.Message)};$failed=$true}"
+        "};"
+        "if($failed){exit 1};"
+        f"Add-Type -Path '{engine_path}' -ReferencedAssemblies @('System.Drawing')"
+    )
+    checked = subprocess.run(
+        ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', runtime_check],
+        capture_output=True,
+        text=True,
+    )
+    if checked.returncode:
+        raise SystemExit('Windows PowerShell/C# compile check failed:\n' + checked.stdout + checked.stderr)
 # DrawImageUnscaled rescales by the source DPI metadata despite its name.
 if 'DrawImageUnscaled(' in engine:
     raise SystemExit('page normalization must use an explicit destination rectangle, not DrawImageUnscaled')
@@ -658,8 +695,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 9' not in server:
-    raise SystemExit('cached-raster comparison changes must bump DiffDetailAlgorithmVersion to 9')
+if '$Script:DiffDetailAlgorithmVersion = 10' not in server:
+    raise SystemExit('parallel comparison changes must bump DiffDetailAlgorithmVersion to 10')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -710,7 +747,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 9',
+    '$Script:DiffDetailAlgorithmVersion = 10',
     '$Script:DiffDetailDpi = 120',
     '$Script:DiffDetailThreshold = 24',
     '$Script:DiffDetailMinimumRegionPixels = 24',
@@ -725,6 +762,9 @@ for needed in [
     'SaveBaseImage',
     'sparseFullPage',
     'changedIntegral',
+    'Parallel.For',
+    'FindRoot',
+    'MaximumRegionsPerPage * 3',
 ]:
     if needed not in diff_engine:
         raise SystemExit(f'diff-region noise control missing: {needed}')
@@ -742,6 +782,9 @@ for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine',
 for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster']:
     if needed not in batch_script:
         raise SystemExit(f'persistent render-raster reuse missing: {needed}')
+for needed in ['ReportBinderDiffBatchPageRequest', 'ComparePages(', 'analysisThreads', 'analyzedPages']:
+    if needed not in batch_script:
+        raise SystemExit(f'parallel diff analysis missing: {needed}')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
 for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
     if needed not in batch_java:
