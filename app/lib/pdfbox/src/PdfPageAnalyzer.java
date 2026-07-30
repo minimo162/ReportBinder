@@ -4,6 +4,8 @@ import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 
 import javax.imageio.stream.MemoryCacheImageOutputStream;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -31,7 +33,8 @@ import java.util.Map;
  */
 public final class PdfPageAnalyzer {
 
-    public static final int ANALYZER_VERSION = 1;
+    public static final int ANALYZER_VERSION = 2;
+    private static final int PERCEPTUAL_HASH_SIZE = 32;
 
     public static void main(String[] args) {
         String inputPath = null;
@@ -132,16 +135,15 @@ public final class PdfPageAnalyzer {
             PDFRenderer renderer = new PDFRenderer(doc);
             float scale = dpi / 72f;
             List<String> pageHashes = new ArrayList<String>();
+            List<String> pagePerceptualHashes = new ArrayList<String>();
             MessageDigest sheetDigest = MessageDigest.getInstance("SHA-256");
             sheetDigest.update(intBytes(pageCount));
             for (int i = 0; i < pageCount; i++) {
                 BufferedImage img = renderer.renderImage(i, scale, ImageType.RGB);
-                byte[] normalized = normalizedPixels(img);
+                String hex = normalizedPixelHash(img);
+                pagePerceptualHashes.add(perceptualHash(img));
                 img.flush();
-                MessageDigest pageDigest = MessageDigest.getInstance("SHA-256");
-                String hex = toHex(pageDigest.digest(normalized));
                 pageHashes.add(hex);
-                sheetDigest.update(normalized, 0, Math.min(8, normalized.length));
                 sheetDigest.update(hex.getBytes(StandardCharsets.US_ASCII));
             }
             String textHash = "";
@@ -161,6 +163,11 @@ public final class PdfPageAnalyzer {
                 if (i > 0) { sb.append(','); }
                 sb.append(quote(pageHashes.get(i)));
             }
+            sb.append("],\"pagePerceptualHashes\":[");
+            for (int i = 0; i < pagePerceptualHashes.size(); i++) {
+                if (i > 0) { sb.append(','); }
+                sb.append(quote(pagePerceptualHashes.get(i)));
+            }
             sb.append("],\"sheetVisualHash\":").append(quote(toHex(sheetDigest.digest())))
               .append(",\"textHash\":").append(quote(textHash))
               .append('}');
@@ -173,27 +180,66 @@ public final class PdfPageAnalyzer {
         }
     }
 
-    /** [幅(4)][高さ(4)][R,G,B * 画素数] 行優先。alpha は含めない。 */
-    private static byte[] normalizedPixels(BufferedImage img) {
+    /** [幅(4)][高さ(4)][R,G,B * 画素数] を行単位でSHA-256へ投入する。 */
+    private static String normalizedPixelHash(BufferedImage img) throws Exception {
         int w = img.getWidth();
         int h = img.getHeight();
-        byte[] out = new byte[8 + (w * h * 3)];
-        byte[] wb = intBytes(w);
-        byte[] hb = intBytes(h);
-        System.arraycopy(wb, 0, out, 0, 4);
-        System.arraycopy(hb, 0, out, 4, 4);
-        int p = 8;
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        digest.update(intBytes(w));
+        digest.update(intBytes(h));
         int[] row = new int[w];
+        byte[] rgbRow = new byte[w * 3];
         for (int y = 0; y < h; y++) {
             img.getRGB(0, y, w, 1, row, 0, w);
+            int p = 0;
             for (int x = 0; x < w; x++) {
                 int rgb = row[x];
-                out[p++] = (byte) ((rgb >> 16) & 0xFF);
-                out[p++] = (byte) ((rgb >> 8) & 0xFF);
-                out[p++] = (byte) (rgb & 0xFF);
+                rgbRow[p++] = (byte) ((rgb >> 16) & 0xFF);
+                rgbRow[p++] = (byte) ((rgb >> 8) & 0xFF);
+                rgbRow[p++] = (byte) (rgb & 0xFF);
+            }
+            digest.update(rgbRow);
+        }
+        return toHex(digest.digest());
+    }
+
+    /**
+     * 32x32へ縮小した濃淡をページ平均と比較する知覚ハッシュ。
+     * アンチエイリアス等の微小差には強く、文字・罫線・図の配置変更には反応する。
+     */
+    private static String perceptualHash(BufferedImage img) {
+        BufferedImage small = new BufferedImage(
+            PERCEPTUAL_HASH_SIZE, PERCEPTUAL_HASH_SIZE, BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D g = small.createGraphics();
+        try {
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.drawImage(img, 0, 0, PERCEPTUAL_HASH_SIZE, PERCEPTUAL_HASH_SIZE, null);
+        } finally {
+            g.dispose();
+        }
+        int count = PERCEPTUAL_HASH_SIZE * PERCEPTUAL_HASH_SIZE;
+        int[] values = new int[count];
+        long total = 0;
+        int p = 0;
+        for (int y = 0; y < PERCEPTUAL_HASH_SIZE; y++) {
+            for (int x = 0; x < PERCEPTUAL_HASH_SIZE; x++) {
+                int value = small.getRGB(x, y) & 0xFF;
+                values[p++] = value;
+                total += value;
             }
         }
-        return out;
+        small.flush();
+        int mean = (int) (total / Math.max(1, count));
+        StringBuilder result = new StringBuilder(count / 4);
+        for (int i = 0; i < count; i += 4) {
+            int nibble = 0;
+            for (int bit = 0; bit < 4; bit++) {
+                if (values[i + bit] < mean) { nibble |= (1 << (3 - bit)); }
+            }
+            result.append(Character.toUpperCase(Character.forDigit(nibble, 16)));
+        }
+        return result.toString();
     }
 
     private static String normalizeText(String text) {
