@@ -6,7 +6,7 @@ required = [
     '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/launch.ps1',
     'app/web/index.html','app/web/style.css','app/web/app.js','app/lib/pdfbox/ReportPdfComposer.jar',
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/build.ps1',
-    'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/select-folder.ps1','app/tools/package-release.ps1',
+    'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/DiffImageEngine.cs',
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md'
 ]
@@ -14,7 +14,7 @@ missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
 if (root/'app/config.json').exists(): raise SystemExit('runtime app/config.json must not be distributed')
 json.loads((root/'app/default-config.json').read_text(encoding='utf-8'))
-for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1']:
+for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
 
 server=(root/'app/server.ps1').read_text(encoding='utf-8-sig')
@@ -233,7 +233,7 @@ with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
         if cls not in set(zf.namelist()): raise SystemExit(f'jar class missing: {cls}')
 
 root_files={x.name for x in root.iterdir() if x.is_file()}
-extra=sorted(root_files-{'日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md'})
+extra=sorted(root_files-{'日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md','.gitignore'})
 if extra: raise SystemExit('unexpected top files: '+', '.join(extra))
 
 # PowerShell automatic variable $PID is read-only and variable names are case-insensitive.
@@ -433,7 +433,7 @@ for fn in ['function Write-HistoryEvent', 'function Save-LayoutSnapshot']:
 
 # Archive failures must roll the transaction back, not be swallowed.
 _arch = server.split('function New-FinalArchive', 1)[1].split('\nfunction ', 1)[0]
-if 'return \'\'' in _arch: raise SystemExit('New-FinalArchive must not swallow failures')
+if "return ''" in _arch: raise SystemExit('New-FinalArchive must not swallow failures')
 if 'throw (' not in _arch: raise SystemExit('New-FinalArchive must rethrow on failure')
 if _arch.index('New-SnapshotPin') < _arch.index('Move-Item -LiteralPath $stage'):
     raise SystemExit('pins must be created after the archive is moved into place')
@@ -659,5 +659,18 @@ if "addEventListener('click',prepareDiffDetail)" in appjs:
 for needed in ["addEventListener('click',()=>prepareDiffDetail())", "if(selected&&['deferred','failed'].includes", "!['deferred','failed'].includes(targetStatus)", "targetStatus==='failed'&&!joinedExisting", "sheetStatus==='failed'"]:
     if needed not in appjs:
         raise SystemExit(f'diff retry UI regression: {needed}')
+
+# Third-party installation must stay reproducible and fail closed.
+installer = (root/'app/tools/install-thirdparty.ps1').read_text(encoding='utf-8-sig')
+for needed in ['2.0.37', 'Verify-HashFile', 'Verify-SriSha512', 'dist.integrity', 'binary.package.checksum', 'PreferSystemJava', 'verify-thirdparty.ps1']:
+    if needed not in installer: raise SystemExit(f'third-party installer hardening missing: {needed}')
+verifier = (root/'app/tools/verify-thirdparty.ps1').read_text(encoding='utf-8-sig')
+for needed in ['RequirePortableJava', 'SHA-512 verified', 'verified npm package tarball', 'PdfPageAnalyzer.class']:
+    if needed not in verifier: raise SystemExit(f'third-party verifier check missing: {needed}')
+package_release = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
+for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAVA_VERSION.txt']:
+    if needed not in package_release: raise SystemExit(f'release dependency gate missing: {needed}')
+if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
+    raise SystemExit('third-party cache must be ignored by git')
 
 print('selfcheck ok')
