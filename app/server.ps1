@@ -7635,6 +7635,7 @@ function Invoke-DiffDetailJobCore($Job) {
             }
         }
         $batchResultMap = @{}
+        $batchTimings = $null
         if ($batchRequest.Count -gt 0) {
             Refresh-DiffJobLeases $Job
             $status.message = "新旧PDFをまとめて画像化・解析しています（$($batchRequest.Count)シート）。"
@@ -7643,6 +7644,7 @@ function Invoke-DiffDetailJobCore($Job) {
             $detail.generation = [ordered]@{ status = 'running'; jobId = $jobId; percent = 5; message = $status.message; currentSheet = '' }
             Write-JsonFile $detailPath $detail; Write-RenderJobStatus $statusPath $status
             $batchGenerated = Invoke-DiffImageBatchGeneration $batchRequest
+            $batchTimings = Get-DataProperty $batchGenerated 'timings' $null
             foreach ($batchItem in @(Get-Array (Get-DataProperty $batchGenerated 'items' @()))) {
                 $batchResultMap[[string](Get-DataProperty $batchItem 'id' '')] = $batchItem
             }
@@ -7715,11 +7717,12 @@ function Invoke-DiffDetailJobCore($Job) {
             $detail.message = ('差分画像に未完了のシートがあります（' + ($parts -join '、') + '）。再試行してください。')
         }
         $detail.generatedAt = New-NowIso
+        Set-NoteProperty $detail 'performance' $batchTimings
         $detail.generation = [ordered]@{ status = 'completed'; jobId = $jobId; percent = 100; message = '差分詳細を作成しました。'; currentSheet = '' }
         Write-JsonFile $detailPath $detail
         $status.status = $(if ($status.failed -gt 0) { 'completed-with-errors' } else { 'completed' }); $status.percent = 100; $status.currentSheet = ''
         $status.message = $(if ($status.failed -gt 0) { '一部のシートを除き、差分詳細を作成しました。' } else { '差分詳細を作成しました。' })
-        $status.results = @([ordered]@{ workbookId = $workbookId; detailPath = $detailPath; sheetCount = $workIndexes.Count })
+        $status.results = @([ordered]@{ workbookId = $workbookId; detailPath = $detailPath; sheetCount = $workIndexes.Count; performance = $batchTimings })
         Write-RenderJobStatus $statusPath $status
     } catch {
         $status.status = 'failed'; $status.percent = 100; $status.message = '差分詳細を作成できませんでした。'
