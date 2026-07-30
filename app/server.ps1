@@ -840,7 +840,7 @@ function New-EmptyStructure([string]$Language) {
     }
 }
 
-function Ensure-Package($Paths) {
+function Ensure-Package($Paths, [string[]]$Languages = @('ja','en')) {
     foreach ($key in @('submissionDir','dataDir','outputDir')) {
         if ([string]::IsNullOrWhiteSpace([string]$Paths.$key)) { throw "$key が未設定です。" }
     }
@@ -849,23 +849,35 @@ function Ensure-Package($Paths) {
     }
     $dataDir = [string]$Paths.dataDir
     foreach ($dir in @('common','common\audit','common\tmp','common\locks')) {
-        New-Item -ItemType Directory -Path (Join-Path $dataDir $dir) -Force | Out-Null
+        $fullDir = Join-Path $dataDir $dir
+        if (-not (Test-Path -LiteralPath $fullDir)) { New-Item -ItemType Directory -Path $fullDir -Force | Out-Null }
     }
     $pkgPath = Join-Path $dataDir 'package.json'
     if (-not (Test-Path -LiteralPath $pkgPath)) {
         Write-JsonFile $pkgPath ([ordered]@{ schemaVersion = 2; app = 'ReportBinder'; createdAt = New-NowIso })
     }
-    Write-JsonFile (Join-Path $dataDir 'common\paths.json') ([ordered]@{
-        submissionDir = [string]$Paths.submissionDir
-        dataDir = [string]$Paths.dataDir
-        outputDir = [string]$Paths.outputDir
-        updatedAt = New-NowIso
-    })
-    # V5-P2: 初回セットアップ直後に古いキャッシュを返さない。
-    Reset-ConfigCaches
-    foreach ($lang in @('ja','en')) {
+    $commonPathsPath = Join-Path $dataDir 'common\paths.json'
+    $savedPaths = Read-JsonFile $commonPathsPath $null
+    $pathsChanged = (
+        $null -eq $savedPaths -or
+        [string](Get-DataProperty $savedPaths 'submissionDir' '') -ne [string]$Paths.submissionDir -or
+        [string](Get-DataProperty $savedPaths 'dataDir' '') -ne [string]$Paths.dataDir -or
+        [string](Get-DataProperty $savedPaths 'outputDir' '') -ne [string]$Paths.outputDir
+    )
+    if ($pathsChanged) {
+        Write-JsonFile $commonPathsPath ([ordered]@{
+            submissionDir = [string]$Paths.submissionDir
+            dataDir = [string]$Paths.dataDir
+            outputDir = [string]$Paths.outputDir
+            updatedAt = New-NowIso
+        })
+        # V5-P2: セットアップ変更直後に古いキャッシュを返さない。
+        Reset-ConfigCaches
+    }
+    foreach ($lang in @($Languages | Where-Object { $_ -in @('ja','en') } | Select-Object -Unique)) {
         foreach ($dir in @('', 'workbooks', 'pages', 'content-pdf', 'exports', 'state', 'locks', 'logs')) {
-            New-Item -ItemType Directory -Path (Join-Path (Join-Path $dataDir $lang) $dir) -Force | Out-Null
+            $fullDir = Join-Path (Join-Path $dataDir $lang) $dir
+            if (-not (Test-Path -LiteralPath $fullDir)) { New-Item -ItemType Directory -Path $fullDir -Force | Out-Null }
         }
         # Use the selected dataDir directly. On first run the local config is intentionally
         # saved only after package initialization succeeds, so Get-Paths is still empty here.
@@ -4452,12 +4464,13 @@ function Open-ReportBinderBrowser([string]$Url) {
 }
 
 function Start-LocalTcpServer([int]$ListenPort, [string]$OpenUrl, [bool]$SkipOpen) {
-    # スケジューラーはこの関数より先に起動するため、listener の生成・Start が失敗した場合も
-    # finally に入って必ず子プロセスを停止できるよう、初期化全体を try 内に置く。
+    # listener を先に確立し、起動待ちをスケジューラー子プロセスの初期化で遅らせない。
+    # 以降の失敗時も finally で必ず子プロセスを停止する。
     $tcp = $null
     try {
         $tcp = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'), $ListenPort)
         $tcp.Start()
+        try { [void](Start-AutoSchedulerProcess (Get-EffectiveLanguage)) } catch { Write-Warning $_.Exception.Message }
         Write-Host "ReportBinder local server started on 127.0.0.1:$ListenPort"
         Write-Host "ReportBinder URL: $OpenUrl"
         Write-Host "ReportBinder will stop after 30 minutes without browser activity. PDF creation jobs continue even if the tab is closed."
@@ -5450,6 +5463,7 @@ function Invoke-AutoSchedulerFromFile([string]$ControlPath, [int]$ParentProcessI
         if ($null -ne $control) { $language = [string](Get-DataProperty $control 'language' 'ja') }
     } catch { }
     $owned = @{}
+    $historyCleanupPending = $true
     try {
         Clear-ExpiredLeases $language
         Clear-StaleEphemeralCopies $language
@@ -5473,6 +5487,13 @@ function Invoke-AutoSchedulerFromFile([string]$ControlPath, [int]$ParentProcessI
                 Start-Sleep -Milliseconds 500
             }
             if ($stopRequested) { break }
+            # History retention walks every saved workbook/version (including cached
+            # raster pages). Run it after the UI has had time to become ready instead
+            # of making every application launch wait for the full directory scan.
+            if ($historyCleanupPending) {
+                try { Invoke-InputHistoryCleanup $language } catch { Write-Warning $_.Exception.Message }
+                $historyCleanupPending = $false
+            }
         }
     } finally {
         foreach ($k in @($owned.Keys)) { Release-LockHandle $owned[$k] }
@@ -7022,7 +7043,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 9
+$Script:DiffDetailAlgorithmVersion = 10
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7911,11 +7932,9 @@ function Get-WorkbookChangeSummary([string]$Language, [string]$WorkbookId, $Work
 }
 
 function Invoke-StartupRecovery([string]$Language) {
-    try { Clear-ExpiredLeases $Language } catch { }
-    try { Clear-StaleEphemeralCopies $Language } catch { }
-    try { Recover-AutoStates $Language } catch { }
+    # lease・一時コピー・自動状態は直後に起動するスケジューラー子プロセスが
+    # 復旧するため、UI サーバー側では二重に共有ドライブを走査しない。
     try { Recover-FinalTransactions $Language } catch { }
-    try { Invoke-InputHistoryCleanup $Language } catch { }
 }
 
 # V5-P0: スケジューラーモード。これが無いと子プロセスが通常サーバーとして起動し、
@@ -7937,13 +7956,14 @@ if (-not [string]::IsNullOrWhiteSpace($RenderJobPath)) {
 
 if ($Port -le 0) { $Port = Get-FreePort }
 $config0 = Get-AppConfig
-$config0.lastMode = $Mode
-Save-AppConfig $config0
-try { $startupPaths=Get-Paths; if($startupPaths.dataDir -and (Test-Path -LiteralPath ([string]$startupPaths.dataDir))){Ensure-Package $startupPaths} } catch { Write-Warning $_.Exception.Message }
+if ([string](Get-DataProperty $config0 'lastMode' '') -ne $Mode) {
+    $config0.lastMode = $Mode
+    Save-AppConfig $config0
+}
+try { $startupPaths=Get-Paths; if($startupPaths.dataDir -and (Test-Path -LiteralPath ([string]$startupPaths.dataDir))){Ensure-Package $startupPaths -Languages @((Get-EffectiveLanguage))} } catch { Write-Warning $_.Exception.Message }
 
-# V5: 起動時リカバリー(期限切れlease、孤児の一時コピー、自動状態、未完了トランザクション、履歴の掃除)
+# 未完了の最終PDFトランザクションだけは、UI操作を受け付ける前に復旧する。
 try { Invoke-StartupRecovery (Get-EffectiveLanguage) } catch { Write-Warning $_.Exception.Message }
-try { [void](Start-AutoSchedulerProcess (Get-EffectiveLanguage)) } catch { Write-Warning $_.Exception.Message }
 
 $prefix = "http://127.0.0.1:$Port/"
 $url = ("http://127.0.0.1:{0}/?token={1}&mode={2}" -f $Port, $Script:Token, $Mode)

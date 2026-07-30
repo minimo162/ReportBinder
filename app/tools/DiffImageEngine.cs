@@ -6,6 +6,7 @@ using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 public sealed class ReportBinderDiffRegion
 {
@@ -37,6 +38,24 @@ public sealed class ReportBinderDiffPage
     public string beforeOverlayFile;
     public string afterMaskFile;
     public string afterOverlayFile;
+}
+
+public sealed class ReportBinderDiffBatchPageRequest
+{
+    public string itemId;
+    public string beforePath;
+    public string afterPath;
+    public string outputDirectory;
+    public int pageNumber;
+    public string kind;
+}
+
+public sealed class ReportBinderDiffBatchPageResult
+{
+    public string itemId;
+    public int pageNumber;
+    public ReportBinderDiffPage page;
+    public string error;
 }
 
 public static class ReportBinderDiffEngine
@@ -351,35 +370,82 @@ public static class ReportBinderDiffEngine
 
     private static List<PixelRegion> MergeNearbyRegions(List<PixelRegion> source, int gap)
     {
-        List<PixelRegion> merged = new List<PixelRegion>(source);
-        bool changed;
-        do
+        int count = source.Count;
+        if (count < 2) return source;
+
+        int[] parent = new int[count];
+        int[] rank = new int[count];
+        for (int i = 0; i < count; i++) parent[i] = i;
+
+        // Merge in one bounded pairwise pass. The previous remove-and-rescan loop
+        // repeatedly restarted after every match and became cubic on noisy pages.
+        for (int i = 0; i < count; i++)
         {
-            changed = false;
-            for (int i = 0; i < merged.Count && !changed; i++)
+            for (int j = i + 1; j < count; j++)
             {
-                for (int j = i + 1; j < merged.Count; j++)
-                {
-                    PixelRegion a = merged[i];
-                    PixelRegion b = merged[j];
-                    if (!RegionsAreNear(a, b, gap)) continue;
-                    a.minX = Math.Min(a.minX, b.minX);
-                    a.minY = Math.Min(a.minY, b.minY);
-                    a.maxX = Math.Max(a.maxX, b.maxX);
-                    a.maxY = Math.Max(a.maxY, b.maxY);
-                    a.count += b.count;
-                    a.added += b.added;
-                    a.removed += b.removed;
-                    a.modified += b.modified;
-                    a.diffTotal += b.diffTotal;
-                    FinalizeRegion(a);
-                    merged.RemoveAt(j);
-                    changed = true;
-                    break;
-                }
+                if (!RegionsAreNear(source[i], source[j], gap)) continue;
+                int rootA = FindRoot(parent, i);
+                int rootB = FindRoot(parent, j);
+                if (rootA == rootB) continue;
+                if (rank[rootA] < rank[rootB]) parent[rootA] = rootB;
+                else if (rank[rootA] > rank[rootB]) parent[rootB] = rootA;
+                else { parent[rootB] = rootA; rank[rootA]++; }
             }
-        } while (changed);
+        }
+
+        Dictionary<int, PixelRegion> byRoot = new Dictionary<int, PixelRegion>();
+        for (int i = 0; i < count; i++)
+        {
+            int root = FindRoot(parent, i);
+            PixelRegion target;
+            if (!byRoot.TryGetValue(root, out target))
+            {
+                PixelRegion value = source[i];
+                target = new PixelRegion
+                {
+                    minX = value.minX,
+                    minY = value.minY,
+                    maxX = value.maxX,
+                    maxY = value.maxY,
+                    count = value.count,
+                    added = value.added,
+                    removed = value.removed,
+                    modified = value.modified,
+                    diffTotal = value.diffTotal
+                };
+                byRoot[root] = target;
+            }
+            else
+            {
+                PixelRegion value = source[i];
+                target.minX = Math.Min(target.minX, value.minX);
+                target.minY = Math.Min(target.minY, value.minY);
+                target.maxX = Math.Max(target.maxX, value.maxX);
+                target.maxY = Math.Max(target.maxY, value.maxY);
+                target.count += value.count;
+                target.added += value.added;
+                target.removed += value.removed;
+                target.modified += value.modified;
+                target.diffTotal += value.diffTotal;
+            }
+        }
+
+        List<PixelRegion> merged = new List<PixelRegion>(byRoot.Values);
+        for (int i = 0; i < merged.Count; i++) FinalizeRegion(merged[i]);
         return merged;
+    }
+
+    private static int FindRoot(int[] parent, int value)
+    {
+        int root = value;
+        while (parent[root] != root) root = parent[root];
+        while (parent[value] != value)
+        {
+            int next = parent[value];
+            parent[value] = root;
+            value = next;
+        }
+        return root;
     }
 
     private static List<PixelRegion> FindRegions(
@@ -390,6 +456,7 @@ public static class ReportBinderDiffEngine
         int threshold,
         int minimumRegionPixels,
         int padding,
+        bool pageSizeChanged,
         out double changedRatio,
         out double averageDifference)
     {
@@ -419,6 +486,9 @@ public static class ReportBinderDiffEngine
         }
         changedRatio = pixels == 0 ? 0 : (double)rawCount / pixels;
         averageDifference = rawCount == 0 ? 0 : (double)rawDiff / rawCount;
+        if (rawCount == 0) return new List<PixelRegion>();
+        if (!pageSizeChanged && changedRatio > 0.28 && averageDifference < 36)
+            return new List<PixelRegion>();
 
         // Count changed neighbours with a summed-area table. The previous nested
         // 5x5 scan performed up to 25 lookups for every changed pixel and dominated
@@ -516,6 +586,9 @@ public static class ReportBinderDiffEngine
             region.maxY = Math.Min(height - 1, region.maxY + padding);
             regions.Add(region);
         }
+        // The caller will switch to the safer side-by-side view when this many
+        // disconnected candidates exist. Avoid quadratic merging work first.
+        if (regions.Count > MaximumRegionsPerPage * 3) return regions;
         regions = MergeNearbyRegions(regions, Math.Max(padding * 2, Math.Min(width, height) / 130));
         regions.Sort(delegate (PixelRegion a, PixelRegion b)
         {
@@ -597,6 +670,7 @@ public static class ReportBinderDiffEngine
                         Math.Max(1, threshold),
                         Math.Max(1, minimumRegionPixels),
                         Math.Max(0, padding),
+                        sizeChanged,
                         out changedRatio,
                         out averageDifference);
                     bool sparseFullPage = false;
@@ -675,5 +749,51 @@ public static class ReportBinderDiffEngine
             if (beforeSource != null) beforeSource.Dispose();
             if (afterSource != null) afterSource.Dispose();
         }
+    }
+
+    public static ReportBinderDiffBatchPageResult[] ComparePages(
+        ReportBinderDiffBatchPageRequest[] requests,
+        int maximumDegreeOfParallelism,
+        int threshold,
+        int minimumRegionPixels,
+        int padding)
+    {
+        if (requests == null || requests.Length == 0)
+            return new ReportBinderDiffBatchPageResult[0];
+
+        ReportBinderDiffBatchPageResult[] results = new ReportBinderDiffBatchPageResult[requests.Length];
+        ParallelOptions options = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, maximumDegreeOfParallelism))
+        };
+        Parallel.For(0, requests.Length, options, delegate (int index)
+        {
+            ReportBinderDiffBatchPageRequest request = requests[index];
+            ReportBinderDiffBatchPageResult result = new ReportBinderDiffBatchPageResult
+            {
+                itemId = request == null ? "" : request.itemId,
+                pageNumber = request == null ? 0 : request.pageNumber,
+                error = ""
+            };
+            try
+            {
+                if (request == null) throw new ArgumentNullException("request");
+                result.page = ComparePage(
+                    request.beforePath,
+                    request.afterPath,
+                    request.outputDirectory,
+                    request.pageNumber,
+                    request.kind,
+                    threshold,
+                    minimumRegionPixels,
+                    padding);
+            }
+            catch (Exception ex)
+            {
+                result.error = ex.Message;
+            }
+            results[index] = result;
+        });
+        return results;
     }
 }

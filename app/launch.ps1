@@ -585,7 +585,7 @@ try {
     Add-LaunchLog "ServerProcessId=$($proc.Id)"
 
     # コンソールウィンドウの描画が先に完了してからブラウザを前面に出す。
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 100
 
     $readyImageUrl = Get-ReportBinderApiUrl $url '/api/ready.gif'
     Write-StartupWaitPage $waitPageFile $url $readyImageUrl $edgeCmdFile $latest
