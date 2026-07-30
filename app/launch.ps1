@@ -46,6 +46,8 @@ $serverPidFile = Join-Path $logDir ("server-$Mode-latest.pid")
 $launchPidFile = Join-Path $logDir ("launch-$Mode-latest.pid")
 $waitPageFile = Join-Path $localLaunchDir ("startup-wait-$Mode-latest.html")
 $edgeCmdFile = Join-Path $logDir ("ReportBinder-$Mode-Edge.cmd")
+$launchMutex = $null
+$launchMutexOwned = $false
 
 function Sync-LatestLog {
     try { Copy-Item -LiteralPath $log -Destination $latest -Force } catch {}
@@ -526,6 +528,22 @@ function Open-ExistingIfRunning([string]$Mode, [string]$UrlFile, [string]$RootUr
 }
 
 try {
+    # Windows can deliver two launcher invocations for one double-click, especially
+    # when the shortcut lives on a shared folder. Only one launcher may decide
+    # whether to start/open the UI for this app root and language.
+    $mutexName = "Local\ReportBinder.Launch.$appRootKey.$Mode"
+    $createdNew = $false
+    $launchMutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+    try {
+        $launchMutexOwned = $launchMutex.WaitOne(0, $false)
+    } catch [System.Threading.AbandonedMutexException] {
+        $launchMutexOwned = $true
+    }
+    if (-not $launchMutexOwned) {
+        Add-LaunchLog "Another launcher is already handling startup. This duplicate invocation will exit without opening a tab."
+        exit 0
+    }
+
     Set-Content -LiteralPath $launchPidFile -Value ([string]$PID) -Encoding ASCII
     Add-LaunchLog "ReportBinder launcher start. Mode=$Mode"
     Add-LaunchLog "AppRoot=$script:AppRoot"
@@ -613,14 +631,10 @@ try {
     }
 
     Add-LaunchLog "Server is ready. Startup wait page should redirect to ReportBinder shortly. ReadyWaitMs=$readyWaitMs URL=$url"
-    # If readiness took a while, the local startup page may still be waiting because of browser-side restrictions.
-    # Open the real app URL once as a rescue path. In the normal fast path this is skipped to avoid duplicate tabs.
-    if ((-not $waitPageOpened) -or $readyWaitMs -ge 12000) {
-        if (-not $waitPageOpened) {
-            Add-LaunchLog "Startup wait page was not opened; opening ReportBinder URL directly now that the server is ready."
-        } else {
-            Add-LaunchLog "Readiness was delayed; opening ReportBinder URL directly as a fallback."
-        }
+    # The wait page owns the redirect once Edge accepted it. Opening the real URL
+    # as a delayed rescue as well races with that redirect and creates two tabs.
+    if (-not $waitPageOpened) {
+        Add-LaunchLog "Startup wait page was not opened; opening ReportBinder URL directly now that the server is ready."
         [void](Open-EdgeBrowser $url)
     }
     Sync-LatestLog
@@ -654,4 +668,10 @@ try {
     exit 1
 } finally {
     try { Remove-Item -LiteralPath $launchPidFile -Force -ErrorAction SilentlyContinue } catch {}
+    if ($launchMutexOwned -and $null -ne $launchMutex) {
+        try { $launchMutex.ReleaseMutex() } catch {}
+    }
+    if ($null -ne $launchMutex) {
+        try { $launchMutex.Dispose() } catch {}
+    }
 }

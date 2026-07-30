@@ -420,17 +420,37 @@ public static class ReportBinderDiffEngine
         changedRatio = pixels == 0 ? 0 : (double)rawCount / pixels;
         averageDifference = rawCount == 0 ? 0 : (double)rawDiff / rawCount;
 
+        // Count changed neighbours with a summed-area table. The previous nested
+        // 5x5 scan performed up to 25 lookups for every changed pixel and dominated
+        // pages with widespread anti-aliasing differences.
+        int integralStride = width + 1;
+        int[] changedIntegral = new int[(height + 1) * integralStride];
+        for (int y = 0; y < height; y++)
+        {
+            int rowTotal = 0;
+            for (int x = 0; x < width; x++)
+            {
+                if (raw[y * width + x]) rowTotal++;
+                changedIntegral[(y + 1) * integralStride + x + 1] =
+                    changedIntegral[y * integralStride + x + 1] + rowTotal;
+            }
+        }
         bool[] candidate = new bool[pixels];
         for (int y = 0; y < height; y++)
         {
+            int top = Math.Max(0, y - 2);
+            int bottom = Math.Min(height - 1, y + 2) + 1;
             for (int x = 0; x < width; x++)
             {
                 int index = y * width + x;
                 if (!raw[index]) continue;
-                int neighbors = 0;
-                for (int yy = Math.Max(0, y - 2); yy <= Math.Min(height - 1, y + 2) && neighbors < 3; yy++)
-                    for (int xx = Math.Max(0, x - 2); xx <= Math.Min(width - 1, x + 2) && neighbors < 3; xx++)
-                        if (raw[yy * width + xx]) neighbors++;
+                int left = Math.Max(0, x - 2);
+                int right = Math.Min(width - 1, x + 2) + 1;
+                int neighbors =
+                    changedIntegral[bottom * integralStride + right] -
+                    changedIntegral[top * integralStride + right] -
+                    changedIntegral[bottom * integralStride + left] +
+                    changedIntegral[top * integralStride + left];
                 candidate[index] = neighbors >= 3;
             }
         }

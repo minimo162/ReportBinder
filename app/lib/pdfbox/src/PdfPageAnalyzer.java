@@ -3,6 +3,7 @@ import org.apache.pdfbox.rendering.ImageType;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 
+import javax.imageio.ImageIO;
 import javax.imageio.stream.MemoryCacheImageOutputStream;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
@@ -28,7 +29,8 @@ import java.util.Map;
  *    画像タイプや alpha premultiplication の違いで環境間・バージョン間に不安定さが出る。
  *      [幅(4byte BE)][高さ(4byte BE)][各画素を行優先で R,G,B の3バイト連結]  ← alpha は含めない
  *  - ファイル/ピクセルのハッシュは 64文字・大文字・prefix なし(server.ps1 の New-Sha256 と同形式)。
- *  - PNG は保存しない。ハッシュ計算後に画像を破棄する。
+ *  - rasterDirectory が指定された場合は、比較詳細で同じPDFを再画像化しないよう
+ *    解析に使ったPNGをレンダリング世代のキャッシュへ保存する。
  *  - 解析の失敗は 1 シートの失敗にとどめ、プロセス全体を失敗させない。
  */
 public final class PdfPageAnalyzer {
@@ -64,7 +66,7 @@ public final class PdfPageAnalyzer {
             for (String[] sheet : sheets) {
                 if (!first) { sb.append(','); }
                 first = false;
-                sb.append(analyseOne(sheet[0], sheet[1], dpi));
+                sb.append(analyseOne(sheet[0], sheet[1], sheet[2], dpi));
             }
             sb.append("]}");
             try (Writer w = new OutputStreamWriter(Files.newOutputStream(Paths.get(outputPath)), StandardCharsets.UTF_8)) {
@@ -77,11 +79,12 @@ public final class PdfPageAnalyzer {
         }
     }
 
-    /** request.json は {"sheets":[{"sheetName":"1","pdf":"..."}]} だけを読む簡易パーサ。 */
+    /** request.json は sheetName/pdf/rasterDirectory だけを読む簡易パーサ。 */
     private static List<String[]> parseRequest(String json) {
         List<String[]> out = new ArrayList<String[]>();
         String key1 = "\"sheetName\"";
         String key2 = "\"pdf\"";
+        String key3 = "\"rasterDirectory\"";
         int idx = 0;
         while (true) {
             int a = json.indexOf(key1, idx);
@@ -90,7 +93,13 @@ public final class PdfPageAnalyzer {
             int b = json.indexOf(key2, a);
             if (b < 0) { break; }
             String pdf = readStringValue(json, b + key2.length());
-            out.add(new String[] { name, pdf });
+            int next = json.indexOf(key1, b + key2.length());
+            int c = json.indexOf(key3, b + key2.length());
+            String rasterDirectory = "";
+            if (c >= 0 && (next < 0 || c < next)) {
+                rasterDirectory = readStringValue(json, c + key3.length());
+            }
+            out.add(new String[] { name, pdf, rasterDirectory });
             idx = b + key2.length();
         }
         return out;
@@ -123,7 +132,7 @@ public final class PdfPageAnalyzer {
         return sb.toString();
     }
 
-    private static String analyseOne(String sheetName, String pdfPath, int dpi) {
+    private static String analyseOne(String sheetName, String pdfPath, String rasterDirectory, int dpi) {
         PDDocument doc = null;
         try {
             File f = new File(pdfPath);
@@ -138,10 +147,23 @@ public final class PdfPageAnalyzer {
             List<String> pagePerceptualHashes = new ArrayList<String>();
             MessageDigest sheetDigest = MessageDigest.getInstance("SHA-256");
             sheetDigest.update(intBytes(pageCount));
+            File rasterDir = null;
+            if (rasterDirectory != null && !rasterDirectory.trim().isEmpty()) {
+                rasterDir = new File(rasterDirectory);
+                if (!rasterDir.isDirectory() && !rasterDir.mkdirs()) {
+                    throw new IllegalStateException("比較画像キャッシュを作成できません: " + rasterDir);
+                }
+            }
             for (int i = 0; i < pageCount; i++) {
                 BufferedImage img = renderer.renderImage(i, scale, ImageType.RGB);
                 String hex = normalizedPixelHash(img);
                 pagePerceptualHashes.add(perceptualHash(img));
+                if (rasterDir != null) {
+                    File rasterFile = new File(rasterDir, String.format(java.util.Locale.ROOT, "page-%04d.png", i + 1));
+                    if (!ImageIO.write(img, "png", rasterFile)) {
+                        throw new IllegalStateException("PNG writer unavailable");
+                    }
+                }
                 img.flush();
                 pageHashes.add(hex);
                 sheetDigest.update(hex.getBytes(StandardCharsets.US_ASCII));

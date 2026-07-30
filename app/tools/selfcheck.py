@@ -36,8 +36,11 @@ diff_skeleton_block=server.split('function New-DiffDetailSkeleton',1)[1].split('
 if 'if ([bool]$Context.available)' not in diff_skeleton_block:
     raise SystemExit('unavailable diff detail must not resolve empty history ids')
 compare_block=server.split('function Compare-SnapshotVisual',1)[1].split('function Invoke-PostRenderAnalysis',1)[0]
-for needle in ["previousSnapshotId", "Get-RenderVersionIds $Language $WorkbookId $previousSnapshotId", "Sort-Object -Descending"]:
-    if needle not in compare_block: raise SystemExit(f'comparison baseline recovery missing: {needle}')
+if 'previousSnapshotId' in '\n'.join(
+        line for line in compare_block.splitlines() if not line.strip().startswith('#')):
+    raise SystemExit('automatic comparison must not fall back to an arbitrarily old previous snapshot')
+if '$baseSnap -eq $CurrentSnapshotId' not in compare_block:
+    raise SystemExit('current version must become the baseline without self-comparison')
 for needle in ['$comparisonKey = (Get-Sha256Text', '"cmp-{0}.json"']:
     if needle not in compare_block: raise SystemExit(f'comparison path shortening missing: {needle}')
 post_analysis_block=server.split('function Invoke-PostRenderAnalysis',1)[1].split('function Get-LatestComparison',1)[0]
@@ -601,6 +604,21 @@ for needed in ['$TargetMode', '-autoschedulerpath', '-renderjobpath', '-diffjobp
         raise SystemExit(f'stale-server cleanup must be scoped ({needed})')
 if 'Stop-StaleUiServerProcesses $server $Mode' not in launch:
     raise SystemExit('stale-server cleanup must be called with the current mode')
+for needed in ['System.Threading.Mutex', '$launchMutexOwned', 'duplicate invocation will exit without opening a tab']:
+    if needed not in launch:
+        raise SystemExit(f'launcher single-instance guard missing: {needed}')
+if '$readyWaitMs -ge 12000' in launch:
+    raise SystemExit('delayed direct browser fallback can race the wait-page redirect and open a duplicate tab')
+
+# Existing structure.json must never be converted to an empty workspace after a
+# transient shared-folder read or parse failure.
+for needed in ['function Test-StructureDocument', 'structure.json.last-good',
+               'structure.json は上書きしていません', '不完全な登録情報の保存を拒否しました']:
+    if needed not in server:
+        raise SystemExit(f'structure fail-closed protection missing: {needed}')
+_read_structure = server.split('function Read-StructureUnlocked', 1)[1].split('\nfunction ', 1)[0]
+if 'Read-JsonFile $path (New-EmptyStructure' in _read_structure:
+    raise SystemExit('existing structure read failures must not fall back to New-EmptyStructure')
 
 # 2026-07-30 review fixes ------------------------------------------------------
 # A lazily generated single sheet must not mark the whole diff detail as ready,
@@ -640,8 +658,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 8' not in server:
-    raise SystemExit('batched comparison changes must bump DiffDetailAlgorithmVersion to 8')
+if '$Script:DiffDetailAlgorithmVersion = 9' not in server:
+    raise SystemExit('cached-raster comparison changes must bump DiffDetailAlgorithmVersion to 9')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -692,7 +710,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 8',
+    '$Script:DiffDetailAlgorithmVersion = 9',
     '$Script:DiffDetailDpi = 120',
     '$Script:DiffDetailThreshold = 24',
     '$Script:DiffDetailMinimumRegionPixels = 24',
@@ -706,6 +724,7 @@ for needed in [
     'MergeNearbyRegions',
     'SaveBaseImage',
     'sparseFullPage',
+    'changedIntegral',
 ]:
     if needed not in diff_engine:
         raise SystemExit(f'diff-region noise control missing: {needed}')
@@ -720,6 +739,9 @@ batch_script = (root/'app/tools/diff-image-batch.ps1').read_text(encoding='utf-8
 for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine', 'items = @($results)', 'rasterMs', 'analysisMs']:
     if needed not in batch_script:
         raise SystemExit(f'batched diff rasterization missing: {needed}')
+for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster']:
+    if needed not in batch_script:
+        raise SystemExit(f'persistent render-raster reuse missing: {needed}')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
 for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
     if needed not in batch_java:
@@ -728,6 +750,9 @@ for needed in ['function Invoke-DiffImageBatchGeneration', '$batchRequest', '$ba
                '新旧PDFをまとめて画像化・解析しています']:
     if needed not in server:
         raise SystemExit(f'diff job does not use the batch path: {needed}')
+for needed in ['function Get-RenderRasterSheetDir', 'rasterDirectory', 'beforeRasterDirectory', 'afterRasterDirectory']:
+    if needed not in server:
+        raise SystemExit(f'render-time raster cache wiring missing: {needed}')
 for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260730_v52']:
     if needed not in html:
         raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')

@@ -1,7880 +1,2684 @@
-ï»¿param(
-    [ValidateSet('ja','en')]
-    [string]$Mode = 'ja',
-    [int]$Port = 0,
-    [string]$Token = '',
-    [switch]$NoOpen,
-    [string]$RenderJobPath = '',
-    [string]$DiffJobPath = '',
-    [string]$AutoSchedulerPath = '',
-    [int]$ParentProcessId = 0
-)
-
-$ErrorActionPreference = 'Stop'
-
-$Script:AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Script:WebRoot = Join-Path $Script:AppRoot 'web'
-$Script:DefaultConfigPath = Join-Path $Script:AppRoot 'default-config.json'
-$localConfigOverride = ([string]$env:REPORTBINDER_LOCAL_CONFIG_ROOT).Trim()
-if ([string]::IsNullOrWhiteSpace($localConfigOverride)) {
-    $Script:LocalConfigRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder'
-} else {
-    $Script:LocalConfigRoot = [IO.Path]::GetFullPath($localConfigOverride)
-}
-$Script:ConfigPath = Join-Path $Script:LocalConfigRoot 'config.json'
-if (-not (Test-Path -LiteralPath $Script:LocalConfigRoot)) { New-Item -ItemType Directory -Path $Script:LocalConfigRoot -Force | Out-Null }
-if ([string]::IsNullOrWhiteSpace($Token)) {
-    $tokenBytes = New-Object byte[] 32
-    $tokenRng = [Security.Cryptography.RandomNumberGenerator]::Create()
-    try {
-        $tokenRng.GetBytes($tokenBytes)
-    } finally {
-        $tokenRng.Dispose()
-    }
-    $Script:Token = [Convert]::ToBase64String($tokenBytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-} else {
-    $Script:Token = $Token
-}
-
-$Script:ClientAttached = $false
-$Script:LastHeartbeatUtc = [DateTime]::UtcNow
-$Script:ClientCloseNotifiedUtc = [DateTime]::MinValue
-$Script:ShutdownRequested = $false
-$Script:CachedJavaExe = ''
-# æœ€å°åŒ–ã‚³ãƒ³ã‚½ãƒ¼ãƒ«ã§èµ·å‹•ã•ã‚ŒãŸã¨ãã€ä½•ã®ã‚¦ã‚£ãƒ³ãƒ‰ã‚¦ã‹åˆ†ã‹ã‚‹ã‚ˆã†ã«ã‚¿ã‚¤ãƒˆãƒ«ã‚’ä»˜ã‘ã‚‹ã€‚
-try { $host.UI.RawUI.WindowTitle = "ReportBinder ã‚µãƒ¼ãƒãƒ¼ ($Mode) - ã“ã®ã‚¦ã‚£ãƒ³ãƒ‰ã‚¦ã‚’é–‰ã˜ã‚‹ã¨çµ‚äº†ã—ã¾ã™" } catch { }
-$Script:AutoRenderInProgress = $false
-$Script:ServerStartedUtc = [DateTime]::UtcNow
-$Script:IdleTimeoutSeconds = 1800
-$Script:NoClientStartupTimeoutSeconds = 600
-$Script:ReadyGifBytes = [Convert]::FromBase64String('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==')
-$Script:ExcelPrintProfileVersion = 2026072201
-$Script:FinalPdfComposerProfileVersion = 20260604
-$Script:RenderEnvironmentCache = $null
-$Script:RenderEnvironmentCompared = $false
-$Script:CurrentRenderEnvFingerprint = ''
-$Script:CurrentRenderEnvInfo = $null
-$Script:LastRenderAttempt = $null
-$Script:PdfPageAnalyzerVersion = 1
-$Script:JavaRuntimeSignature = ''
-$Script:PendingAnalysis = $null
-$Script:PdfPageAnalyzerAvailable = $null
-$Script:AutoSchedulerProcessId = 0
-$Script:AutoSchedulerProcess = $null
-$Script:AutoSchedulerControlPath = ''
-# V5-P2: è¨­å®šãƒ»ãƒ‘ã‚¹ãƒ»æ‰¿èªãƒãƒªã‚·ãƒ¼ã¯ Get-WorkspacePath çµŒç”±ã§ã»ã¼å…¨é–¢æ•°ã‹ã‚‰å‘¼ã°ã‚Œã‚‹ã€‚
-# æ¯Žå›žãƒ‡ã‚£ã‚¹ã‚¯ã‚’èª­ã‚€(ã•ã‚‰ã« config ã¯æ›¸ã)ã¨ã€å…±æœ‰ãƒ‰ãƒ©ã‚¤ãƒ–ä¸Šã§è‡´å‘½çš„ã«é…ããªã‚‹ã€‚çŸ­æ™‚é–“ã ã‘ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã™ã‚‹ã€‚
-$Script:AppConfigCache = $null
-$Script:AppConfigCacheAtUtc = [DateTime]::MinValue
-$Script:PathsCache = $null
-$Script:PathsCacheAtUtc = [DateTime]::MinValue
-$Script:WorkspacePolicyCache = $null
-$Script:WorkspacePolicyCacheAtUtc = [DateTime]::MinValue
-$Script:HistorySizeCache = $null
-$Script:HistorySizeCacheKey = ''
-$Script:HistorySizeCacheAtUtc = [DateTime]::MinValue
-$Script:ConfigCacheSeconds = 2
-$Script:PolicyCacheSeconds = 5
-$Script:HistorySizeCacheSeconds = 60
-$Script:ConfigMergeChanged = $false
-
-function New-NowIso {
-    return (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
-}
-
-function Get-ErrorDetail($ErrorRecord) {
-    if ($null -eq $ErrorRecord) { return '' }
-    $parts = @()
-    # V5-P3: ä»¥å‰ã¯ Exception.ToString() ãŒå–ã‚Œãªã„ã¨ã€ãƒ¡ãƒƒã‚»ãƒ¼ã‚¸1è¡Œã ã‘ã«ãªã‚ŠåŽŸå› è¿½è·¡ãŒã§ããªã‹ã£ãŸã€‚
-    # åž‹ãƒ»HResultãƒ».NETã‚¹ã‚¿ãƒƒã‚¯ãƒ»å†…éƒ¨ä¾‹å¤–ãƒ»ç™ºç”Ÿè¡Œã‚’ã€å–ã‚ŒãŸã‚‚ã®ã‹ã‚‰å¿…ãšç©ã‚€ã€‚
-    try {
-        $ex = $ErrorRecord.Exception
-        $depth = 0
-        while ($null -ne $ex -and $depth -lt 5) {
-            $line = ('[{0}] {1}' -f $ex.GetType().FullName, [string]$ex.Message)
-            try { $line += (' (HResult=0x{0:X8})' -f [int]$ex.HResult) } catch { }
-            $parts += $line
-            try { if (-not [string]::IsNullOrWhiteSpace([string]$ex.StackTrace)) { $parts += [string]$ex.StackTrace } } catch { }
-            try { $ex = $ex.InnerException } catch { $ex = $null }
-            $depth++
-        }
-    } catch { }
-    try {
-        $ii = $ErrorRecord.InvocationInfo
-        if ($null -ne $ii) {
-            $parts += ('at line {0}, char {1}: {2}' -f [int]$ii.ScriptLineNumber, [int]$ii.OffsetInLine, [string]$ii.Line).Trim()
-        }
-    } catch { }
-    try { if ($ErrorRecord.FullyQualifiedErrorId) { $parts += ('errorId: ' + [string]$ErrorRecord.FullyQualifiedErrorId) } } catch { }
-    try {
-        if (-not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.ScriptStackTrace)) {
-            $parts += "PowerShell stack:`n$([string]$ErrorRecord.ScriptStackTrace)"
-        }
-    } catch { }
-    try {
-        if (-not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.InvocationInfo.PositionMessage)) {
-            $parts += [string]$ErrorRecord.InvocationInfo.PositionMessage
-        }
-    } catch { }
-    if ($parts.Count -eq 0) { return [string]$ErrorRecord }
-    return ($parts -join "`n")
-}
-
-
-
-function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList) {
-    # V5-P3: Windows PowerShell 5.1 ã§ã¯ã€ãƒã‚¤ãƒ†ã‚£ãƒ–ã‚³ãƒžãƒ³ãƒ‰ã® stderr ã‚’ 2>&1 ã§å–ã‚Šè¾¼ã‚€ã¨
-    # ErrorRecord ã¨ã—ã¦ãƒ‘ã‚¤ãƒ—ãƒ©ã‚¤ãƒ³ã«æµã‚Œã€$ErrorActionPreference='Stop' ã®ä¸‹ã§ã¯
-    # NativeCommandError ã®ä¾‹å¤–ã«ãªã‚‹ã€‚
-    # PDFBox ã¯æ—¥æœ¬èªžãƒ•ã‚©ãƒ³ãƒˆã‚’å«ã‚€PDFã§è­¦å‘Š(Format 14 cmap table ...)ã‚’ stderr ã«å‡ºã™ãŸã‚ã€
-    # è§£æžã‚„çµ„ç‰ˆãŒæˆåŠŸã—ã¦ã„ã¦ã‚‚å‘¼ã³å‡ºã—å´ãŒã€Œå¤±æ•—ã€ã¨èª¤èªã—ã¦ã„ãŸã€‚
-    # ã“ã“ã ã‘ Continue ã«è½ã¨ã—ã¦å‡ºåŠ›ã‚’æ–‡å­—åˆ—ã¨ã—ã¦å›žåŽã™ã‚‹ã€‚
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $lines = @()
-    $exit = -1
-    try {
-        $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })
-        $exit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    return [ordered]@{ exitCode = $exit; output = $lines; text = ($lines -join "`n") }
-}
-
-# Read a file timestamp from an open Windows file handle. On SMB shares this is
-# more reliable than directory-enumeration metadata and matches Explorer's
-# "æ›´æ–°æ—¥æ™‚" value. Fall back to System.IO on non-Windows or if the handle call fails.
-if ($env:OS -eq 'Windows_NT' -and -not ('ReportBinderNative.FileTimes' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-
-namespace ReportBinderNative {
-    public static class FileTimes {
-        private const uint FILE_READ_ATTRIBUTES = 0x00000080;
-        private const uint FILE_SHARE_READ = 0x00000001;
-        private const uint FILE_SHARE_WRITE = 0x00000002;
-        private const uint FILE_SHARE_DELETE = 0x00000004;
-        private const uint OPEN_EXISTING = 3;
-        private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern SafeFileHandle CreateFile(
-            string fileName,
-            uint desiredAccess,
-            uint shareMode,
-            IntPtr securityAttributes,
-            uint creationDisposition,
-            uint flagsAndAttributes,
-            IntPtr templateFile);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool GetFileTime(
-            SafeFileHandle fileHandle,
-            out long creationTime,
-            out long lastAccessTime,
-            out long lastWriteTime);
-
-        public static long GetLastWriteFileTimeUtc(string path) {
-            using (SafeFileHandle handle = CreateFile(
-                path,
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                IntPtr.Zero,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                IntPtr.Zero)) {
-                if (handle.IsInvalid) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
-                }
-                long creation, access, write;
-                if (!GetFileTime(handle, out creation, out access, out write)) {
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
-                }
-                return write;
-            }
-        }
-    }
-}
-'@
-}
-
-function Get-FileLastWriteSnapshot([string]$Path) {
-    $utc = $null
-    if ($env:OS -eq 'Windows_NT' -and ('ReportBinderNative.FileTimes' -as [type])) {
-        try {
-            $fileTimeUtc = [ReportBinderNative.FileTimes]::GetLastWriteFileTimeUtc($Path)
-            $utc = [DateTime]::FromFileTimeUtc($fileTimeUtc)
-        } catch { }
-    }
-    if ($null -eq $utc) {
-        $utc = [IO.File]::GetLastWriteTimeUtc($Path)
-    }
-    $local = $utc.ToLocalTime()
-    return [ordered]@{
-        utc = $utc
-        local = $local
-        display = $local.ToString('yyyy/MM/dd HH:mm')
-        unixMs = [int64]([DateTimeOffset]::new($utc).ToUnixTimeMilliseconds())
-    }
-}
-
-function Read-TextFileShared([string]$Path) {
-    $share = [IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete)
-    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-    try {
-        $reader = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8, $true)
-        try { return $reader.ReadToEnd() }
-        finally { $reader.Dispose() }
-    } finally {
-        $fs.Dispose()
-    }
-}
-
-function Read-JsonFile([string]$Path, $DefaultValue) {
-    for ($attempt = 0; $attempt -lt 10; $attempt++) {
-        try {
-            if (-not (Test-Path -LiteralPath $Path)) { return $DefaultValue }
-            $text = Read-TextFileShared $Path
-            if ([string]::IsNullOrWhiteSpace($text)) { return $DefaultValue }
-            return $text | ConvertFrom-Json
-        } catch [System.IO.FileNotFoundException] {
-            return $DefaultValue
-        } catch [System.IO.IOException] {
-            if ($attempt -ge 9) { throw }
-            Start-Sleep -Milliseconds (60 + (45 * $attempt))
-        } catch [System.UnauthorizedAccessException] {
-            if ($attempt -ge 9) { throw }
-            Start-Sleep -Milliseconds (60 + (45 * $attempt))
-        } catch {
-            # A progress JSON file can be read exactly while it is being rewritten.
-            # Retry parse failures instead of treating a temporary partial file as a fatal job error.
-            if ($attempt -ge 9) {
-                if ($null -ne $DefaultValue) { return $DefaultValue }
-                throw
-            }
-            Start-Sleep -Milliseconds (70 + (50 * $attempt))
-        }
-    }
-    return $DefaultValue
-}
-
-function Write-Utf8NoBomFile([string]$Path, [string]$Text) {
-    # Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes a BOM.
-    # ReportPdfComposer's compact JSON reader expects plain UTF-8, so write JSON files without BOM.
-    $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
-    [IO.File]::WriteAllText($Path, $Text, $encoding)
-}
-
-function Write-Utf8NoBomFileShared([string]$Path, [string]$Text) {
-    # Fallback for protected / synced folders where File.Replace can intermittently
-    # raise Access Denied. Readers use ReadWrite/Delete sharing and Read-JsonFile
-    # retries partial reads, so progress keeps moving instead of staying at 0%.
-    $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
-    $bytes = $encoding.GetBytes($Text)
-    $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    for ($attempt = 0; $attempt -lt 12; $attempt++) {
-        $fs = $null
-        try {
-            $share = [IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete)
-            $fs = [IO.File]::Open($Path, [IO.FileMode]::Create, [IO.FileAccess]::Write, $share)
-            $fs.Write($bytes, 0, $bytes.Length)
-            try { $fs.Flush($true) } catch { $fs.Flush() }
-            return
-        } catch [System.IO.IOException] {
-            if ($attempt -ge 11) { throw }
-        } catch [System.UnauthorizedAccessException] {
-            if ($attempt -ge 11) { throw }
-        } finally {
-            if ($fs) { try { $fs.Dispose() } catch { } }
-        }
-        Start-Sleep -Milliseconds (50 + (35 * $attempt))
-    }
-}
-
-function Move-FileAtomicCompat([string]$SourcePath, [string]$DestinationPath) {
-    for ($attempt = 0; $attempt -lt 12; $attempt++) {
-        try {
-            if (Test-Path -LiteralPath $DestinationPath) {
-                [IO.File]::Replace($SourcePath, $DestinationPath, $null, $true)
-            } else {
-                [IO.File]::Move($SourcePath, $DestinationPath)
-            }
-            return
-        } catch [System.IO.FileNotFoundException] {
-            try { [IO.File]::Move($SourcePath, $DestinationPath); return } catch { if ($attempt -ge 11) { throw } }
-        } catch [System.IO.IOException] {
-            if ($attempt -ge 11) { throw }
-        } catch [System.UnauthorizedAccessException] {
-            if ($attempt -ge 11) { throw }
-        }
-        Start-Sleep -Milliseconds (50 + (30 * $attempt))
-    }
-}
-
-function Write-JsonFile([string]$Path, $Value) {
-    $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $tmp = "$Path.tmp.$([Guid]::NewGuid().ToString('N'))"
-    $json = ConvertTo-Json -InputObject $Value -Depth 50
-    $atomicError = ''
-    try {
-        # æ·±ã„å…±æœ‰ãƒ•ã‚©ãƒ«ãƒ€ã§ã¯ã€æœ€çµ‚ãƒ‘ã‚¹ã¯æ‰±ãˆã¦ã‚‚GUIDä»˜ãä¸€æ™‚åã ã‘ãŒ
-        # MAX_PATHã‚’è¶…ãˆã‚‹ã“ã¨ãŒã‚ã‚‹ã€‚ä½œæˆã‚‚tryå†…ã«ç½®ãã€ç›´æŽ¥æ›¸è¾¼ã¸ç¸®é€€ã™ã‚‹ã€‚
-        Write-Utf8NoBomFile $tmp $json
-        Move-FileAtomicCompat $tmp $Path
-        return
-    } catch {
-        $atomicError = $_.Exception.Message
-        # Some Windows/OneDrive/antivirus combinations deny File.Replace on JSON files
-        # that are being watched or previewed. Use a shared direct write as a fallback.
-        try {
-            Write-Utf8NoBomFileShared $Path $json
-            return
-        } catch {
-            throw "JSONä¿å­˜ã«å¤±æ•—ã—ã¾ã—ãŸ: $Path / atomic=$atomicError / shared=$($_.Exception.Message)"
-        }
-    } finally {
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-function Read-TextFileTailSafe([string]$Path, [int]$MaxChars = 4000) {
-    try {
-        if (-not (Test-Path -LiteralPath $Path)) { return '' }
-        $text = Read-TextFileShared $Path
-        if ([string]::IsNullOrWhiteSpace($text)) { return '' }
-        if ($text.Length -le $MaxChars) { return $text }
-        return $text.Substring($text.Length - $MaxChars)
-    } catch { return '' }
-}
-
-function Set-RenderJobFailedFromStartupProblem([string]$StatusPath, $Job, [string]$Message) {
-    if ($null -eq $Job) { return $Job }
-    Set-NoteProperty $Job 'status' 'failed'
-    Set-NoteProperty $Job 'percent' 100
-    Set-NoteProperty $Job 'message' $Message
-    $stdoutPath = [string](Get-DataProperty $Job 'stdoutPath' '')
-    $stderrPath = [string](Get-DataProperty $Job 'stderrPath' '')
-    $stdoutTail = Read-TextFileTailSafe $stdoutPath 3000
-    $stderrTail = Read-TextFileTailSafe $stderrPath 3000
-    $detail = @()
-    if (-not [string]::IsNullOrWhiteSpace($stderrTail)) { $detail += "stderr:`n$stderrTail" }
-    if (-not [string]::IsNullOrWhiteSpace($stdoutTail)) { $detail += "stdout:`n$stdoutTail" }
-    if ($detail.Count -gt 0) { Set-NoteProperty $Job 'startupLog' ($detail -join "`n`n") }
-    $err = [ordered]@{ error = $Message; userError = 'PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã‚’èµ·å‹•ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚ReportBinderã‚’ä¸€åº¦çµ‚äº†ã—ã¦ã‹ã‚‰å†å®Ÿè¡Œã—ã¦ãã ã•ã„ã€‚'; detail = ([string](Get-DataProperty $Job 'startupLog' '')) }
-    Set-NoteProperty $Job 'errors' @($err)
-    Write-RenderJobStatus $StatusPath $Job
-    return $Job
-}
-
-function Get-Array($Value) {
-    if ($null -eq $Value) { return @() }
-    if ($Value -is [System.Array]) { return @($Value) }
-    return @($Value)
-}
-
-
-function Set-ArrayProperty($Object, [string]$Name) {
-    if ($null -eq $Object) { return }
-    $arr = @(Get-Array $Object.$Name)
-    if ($Object.PSObject.Properties[$Name]) {
-        $Object.$Name = $arr
-    } else {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $arr
-    }
-}
-
-function Normalize-StructureCollections($Structure) {
-    if ($null -eq $Structure) { return $Structure }
-    Set-ArrayProperty $Structure 'workbooks'
-    Set-ArrayProperty $Structure 'pages'
-    if ($null -eq $Structure.volumes) {
-        $Structure | Add-Member -NotePropertyName 'volumes' -NotePropertyValue ([ordered]@{}) -Force
-    }
-    return $Structure
-}
-
-function Test-DirectExcelRelativePath([string]$RelativePath) {
-    Test-RelativePath $RelativePath | Out-Null
-    if ($RelativePath -match '[\\/]') { throw 'æå‡ºãƒ•ã‚©ãƒ«ãƒ€ç›´ä¸‹ã®Excelã ã‘ç™»éŒ²ã§ãã¾ã™ã€‚å­ãƒ•ã‚©ãƒ«ãƒ€å†…ã®ãƒ•ã‚¡ã‚¤ãƒ«ã¯å¯¾è±¡å¤–ã§ã™ã€‚' }
-    $ext = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
-    if ($ext -ne '.xlsx') { throw 'æ‹¡å¼µå­ãŒ .xlsx ã®Excelã ã‘ç™»éŒ²ã§ãã¾ã™ã€‚' }
-    if ([IO.Path]::GetFileName($RelativePath) -like '~$*') { throw 'Excelã®ä¸€æ™‚ãƒ•ã‚¡ã‚¤ãƒ«ã¯ç™»éŒ²ã§ãã¾ã›ã‚“ã€‚' }
-    return $true
-}
-
-function Get-ConfigKeyNames($Object) {
-    if ($null -eq $Object) { return @() }
-    if ($Object -is [System.Collections.IDictionary]) { return @($Object.Keys | ForEach-Object { [string]$_ }) }
-    return @($Object.PSObject.Properties | ForEach-Object { [string]$_.Name })
-}
-
-function Test-ConfigHasKey($Object, [string]$Name) {
-    if ($null -eq $Object) { return $false }
-    if ($Object -is [System.Collections.IDictionary]) { return $Object.Contains($Name) }
-    return ($null -ne $Object.PSObject.Properties[$Name])
-}
-
-function Merge-ConfigDefaults($Target, $Defaults) {
-    # æ—¢å®šå€¤ã‚’ã‚­ãƒ¼å˜ä½ã§å†å¸°çš„ã«è£œå®Œã™ã‚‹ã€‚æ—¢ã«ã‚ã‚‹å€¤ã¯å¿…ãšå„ªå…ˆã™ã‚‹(åˆ©ç”¨è€…ã®è¨­å®šã‚’å£Šã•ãªã„)ã€‚
-    # Target/Defaults ã¯ PSCustomObject ã§ã‚‚ ordered hashtable ã§ã‚‚ã‚ˆã„ã€‚
-    if ($null -eq $Defaults) { return $Target }
-    if ($null -eq $Target) { return $Defaults }
-    foreach ($name in (Get-ConfigKeyNames $Defaults)) {
-        $defValue = Get-DataProperty $Defaults $name $null
-        if (-not (Test-ConfigHasKey $Target $name)) {
-            Set-NoteProperty $Target $name $defValue
-            # V5-P2: æ—¢å®šå€¤ã‚’å®Ÿéš›ã«è£œå®Œã—ãŸã¨ãã ã‘ config.json ã‚’æ›¸ãæˆ»ã™ã€‚
-            $Script:ConfigMergeChanged = $true
-            continue
-        }
-        $cur = Get-DataProperty $Target $name $null
-        $defIsObj = ($defValue -is [pscustomobject]) -or ($defValue -is [System.Collections.IDictionary])
-        $curIsObj = ($cur -is [pscustomobject]) -or ($cur -is [System.Collections.IDictionary])
-        if ($defIsObj -and $curIsObj) { [void](Merge-ConfigDefaults $cur $defValue) }
-    }
-    return $Target
-}
-
-function Reset-ConfigCaches {
-    # è¨­å®šãƒ»ãƒ‘ã‚¹ãƒ»ãƒãƒªã‚·ãƒ¼ã‚’å¤‰æ›´ã—ãŸã‚‰å¿…ãšå‘¼ã¶ã€‚
-    $Script:AppConfigCache = $null
-    $Script:AppConfigCacheAtUtc = [DateTime]::MinValue
-    $Script:PathsCache = $null
-    $Script:PathsCacheAtUtc = [DateTime]::MinValue
-    $Script:WorkspacePolicyCache = $null
-    $Script:WorkspacePolicyCacheAtUtc = [DateTime]::MinValue
-    # dataDir ã®åˆ‡æ›¿æ™‚ã«æ—§ãƒ¯ãƒ¼ã‚¯ã‚¹ãƒšãƒ¼ã‚¹ã®å®¹é‡ã‚’è¿”ã•ãªã„ã€‚
-    $Script:HistorySizeCache = $null
-    $Script:HistorySizeCacheKey = ''
-    $Script:HistorySizeCacheAtUtc = [DateTime]::MinValue
-}
-
-function Get-AppConfig {
-    # V5: ãƒ­ãƒ¼ã‚«ãƒ«configã‚’ãã®ã¾ã¾è¿”ã™ã¨ã€æ—¢å­˜åˆ©ç”¨è€…ã«æ–°ã—ã„ã‚­ãƒ¼(autoRender ãªã©)ãŒåæ˜ ã•ã‚Œãªã„ã€‚
-    # æ—¢å®šå€¤ã‚’èª­ã¿ã€ãƒ­ãƒ¼ã‚«ãƒ«å„ªå…ˆã§ã‚­ãƒ¼å˜ä½ã«ãƒžãƒ¼ã‚¸ã—ã¦ã‹ã‚‰è¿”ã™ã€‚
-    # V5-P2: ä»¥å‰ã¯ã“ã®é–¢æ•°ãŒå‘¼ã°ã‚Œã‚‹ãŸã³ã« config.json ã‚’æ›¸ãæˆ»ã—ã¦ã„ãŸã€‚
-    # Get-Paths -> Get-WorkspacePath çµŒç”±ã§ã»ã¼å…¨é–¢æ•°ã‹ã‚‰å‘¼ã°ã‚Œã‚‹ãŸã‚ã€
-    # æ¤œçŸ¥ç‰ˆã®ä¸€è¦§å–å¾—ãªã©ã§1ä»¶ã”ã¨ã«ãƒ•ã‚¡ã‚¤ãƒ«æ›¸ãè¾¼ã¿ãŒç™ºç”Ÿã—ã¦ã„ãŸã€‚
-    # å®Ÿéš›ã«æ—¢å®šå€¤ã‚’è£œå®Œã—ãŸã¨ãã ã‘æ›¸ãã€çµæžœã¯çŸ­æ™‚é–“ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã™ã‚‹ã€‚
-    if ($null -ne $Script:AppConfigCache -and (([DateTime]::UtcNow - $Script:AppConfigCacheAtUtc).TotalSeconds -lt $Script:ConfigCacheSeconds)) {
-        return $Script:AppConfigCache
-    }
-    $default = [ordered]@{ schemaVersion = 1; lastSubmissionDir = ''; lastDataDir = ''; lastOutputDir = ''; lastMode = $Mode }
-    $seed = Read-JsonFile $Script:DefaultConfigPath $default
-    if (-not (Test-Path -LiteralPath $Script:ConfigPath)) {
-        try { Write-JsonFile $Script:ConfigPath $seed } catch { }
-        $Script:AppConfigCache = $seed
-        $Script:AppConfigCacheAtUtc = [DateTime]::UtcNow
-        return $seed
-    }
-    $local = Read-JsonFile $Script:ConfigPath $default
-    $Script:ConfigMergeChanged = $false
-    $merged = Merge-ConfigDefaults $local $seed
-    if ([string](Get-DataProperty $merged 'schemaVersion' '') -ne '2') {
-        Set-NoteProperty $merged 'schemaVersion' 2
-        $Script:ConfigMergeChanged = $true
-    }
-    if ($Script:ConfigMergeChanged) { try { Write-JsonFile $Script:ConfigPath $merged } catch { } }
-    $Script:AppConfigCache = $merged
-    $Script:AppConfigCacheAtUtc = [DateTime]::UtcNow
-    return $merged
-}
-
-function Get-WorkspacePolicy {
-    # V5: æ¥­å‹™æ‰¿èªã¯ãƒ¯ãƒ¼ã‚¯ã‚¹ãƒšãƒ¼ã‚¹å˜ä½ã€‚å€‹äººè¨­å®šã‹ã‚‰ã¯ä¸Šæ›¸ãã§ããªã„ã€‚
-    # æ³¨æ„: ã“ã‚Œã¯æŠ€è¡“çš„ãªã‚¢ã‚¯ã‚»ã‚¹åˆ¶å¾¡ã§ã¯ãªãé‹ç”¨ãƒ•ãƒ©ã‚°ã§ã‚ã‚‹ã€‚
-    #       å…±æœ‰dataDirã¸æ›¸ãè¾¼ã‚ã‚‹åˆ©ç”¨è€…ã¯ policy.json ã‚‚ç·¨é›†ã§ãã‚‹ã€‚
-    # V5-P2: Test-InputHistoryEnabled ã¯ Write-HistoryEvent ãªã©ã‹ã‚‰å¤šæ•°å›žå‘¼ã°ã‚Œã‚‹ã€‚
-    # å…±æœ‰ãƒ‰ãƒ©ã‚¤ãƒ–ä¸Šã® policy.json ã‚’æ¯Žå›žèª­ã¾ãªã„ã‚ˆã†çŸ­æ™‚é–“ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã™ã‚‹ã€‚
-    if ($null -ne $Script:WorkspacePolicyCache -and (([DateTime]::UtcNow - $Script:WorkspacePolicyCacheAtUtc).TotalSeconds -lt $Script:PolicyCacheSeconds)) {
-        return $Script:WorkspacePolicyCache
-    }
-    $default = [ordered]@{ schemaVersion = 1; inputHistoryApproved = $false; sourceRetentionApproved = $false; approvedBy = ''; approvedAt = ''; minimumAppVersion = '' }
-    $result = $default
-    try {
-        $paths = Get-Paths
-        if (-not [string]::IsNullOrWhiteSpace([string]$paths.dataDir)) {
-            $path = Join-Path ([string]$paths.dataDir) 'common\policy.json'
-            if (Test-Path -LiteralPath $path) { $result = Read-JsonFile $path $default }
-        }
-    } catch { $result = $default }
-    $Script:WorkspacePolicyCache = $result
-    $Script:WorkspacePolicyCacheAtUtc = [DateTime]::UtcNow
-    return $result
-}
-
-function Test-InputHistoryEnabled {
-    return [bool](Get-DataProperty (Get-WorkspacePolicy) 'inputHistoryApproved' $false)
-}
-
-function Test-SourceRetentionEnabled {
-    $policy = Get-WorkspacePolicy
-    if (-not [bool](Get-DataProperty $policy 'inputHistoryApproved' $false)) { return $false }
-    if (-not [bool](Get-DataProperty $policy 'sourceRetentionApproved' $false)) { return $false }
-    # æ‰¿èªæ¡ä»¶ã€ŒåŒä¸€ã®é™å®šãƒ•ã‚©ãƒ«ãƒ€é…ä¸‹ã®ã¿ã€ã‚’ã‚³ãƒ¼ãƒ‰ã§ç¢ºèªã™ã‚‹ã€‚
-    # dataDir ãŒæå‡ºãƒ•ã‚©ãƒ«ãƒ€ã®å¤–ã«ã‚ã‚‹å ´åˆã¯ç¾ç‰©ã‚’ä¿å­˜ã—ãªã„ã€‚
-    try {
-        $paths = Get-Paths
-        $sub = [IO.Path]::GetFullPath([string]$paths.submissionDir)
-        if (-not $sub.EndsWith([IO.Path]::DirectorySeparatorChar)) { $sub += [IO.Path]::DirectorySeparatorChar }
-        $data = [IO.Path]::GetFullPath([string]$paths.dataDir)
-        if (-not $data.StartsWith($sub, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    } catch { return $false }
-    return $true
-}
-
-function Get-AutoRenderSettings {
-    $config = Get-AppConfig
-    $auto = Get-DataProperty $config 'autoRender' $null
-    $enabled = [bool](Get-DataProperty $auto 'enabled' $false)
-    # çŸ›ç›¾è¨­å®šã¯æ‹’å¦ã™ã‚‹: å±¥æ­´ãŒæœªæ‰¿èªãªã‚‰è‡ªå‹•å‡¦ç†ã¯å‹•ã‹ã•ãªã„ã€‚
-    if ($enabled -and -not (Test-InputHistoryEnabled)) {
-        $enabled = $false
-        Write-Warning 'autoRender.enabled ãŒæœ‰åŠ¹ã§ã™ãŒã€ãƒ¯ãƒ¼ã‚¯ã‚¹ãƒšãƒ¼ã‚¹ã§å…¥åŠ›å±¥æ­´ãŒæ‰¿èªã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚è‡ªå‹•å‡¦ç†ã‚’ç„¡åŠ¹ã«ã—ã¾ã™ã€‚'
-    }
-    return [ordered]@{
-        enabled = $enabled
-        quietPeriodSeconds = [int](Get-DataProperty $auto 'quietPeriodSeconds' 180)
-        requireStableHashCount = [int](Get-DataProperty $auto 'requireStableHashCount' 2)
-        deferWhileExcelInUse = [bool](Get-DataProperty $auto 'deferWhileExcelInUse' $true)
-    }
-}
-
-function Get-InputHistorySettings {
-    $config = Get-AppConfig
-    $ih = Get-DataProperty $config 'inputHistory' $null
-    return [ordered]@{
-        retainSourceVersions = [int](Get-DataProperty $ih 'retainSourceVersions' 2)
-        retainContentPdfVersions = [int](Get-DataProperty $ih 'retainContentPdfVersions' 3)
-        sourceRetentionDaysAfterBuild = (Get-DataProperty $ih 'sourceRetentionDaysAfterBuild' $null)
-        softCapMegabytes = [int](Get-DataProperty $ih 'softCapMegabytes' 5120)
-        warnAtPercent = [int](Get-DataProperty $ih 'warnAtPercent' 80)
-        ephemeralCopyMaxAgeMinutes = [int](Get-DataProperty $ih 'ephemeralCopyMaxAgeMinutes' 30)
-    }
-}
-
-function Save-AppConfig($Config) {
-    # Current values are always per-user. The shared default-config.json is read-only at runtime.
-    Write-JsonFile $Script:ConfigPath $Config
-    Reset-ConfigCaches
-}
-
-function Convert-CmToPt([double]$Cm) { return $Cm * 28.3464567 }
-
-
-function Get-RelativePathCompat([string]$BasePath, [string]$FullPath) {
-    $base = [IO.Path]::GetFullPath($BasePath)
-    if (-not $base.EndsWith([IO.Path]::DirectorySeparatorChar)) { $base += [IO.Path]::DirectorySeparatorChar }
-    $full = [IO.Path]::GetFullPath($FullPath)
-    # ãƒ•ã‚©ãƒ«ãƒ€åã« % ã‚„ # ã‚’å«ã‚€ã¨ Uri.MakeRelativeUri / UnescapeDataString ãŒ
-    # ãƒ‘ã‚¹ã‚’å£Šã™ï¼ˆ%20â†’ç©ºç™½åŒ–ã€#ä»¥é™æ¬ è½ï¼‰ã€‚é…ä¸‹ã®å ´åˆã¯å˜ç´”ãªåˆ‡ã‚Šå‡ºã—ã§æ±‚ã‚ã‚‹ã€‚
-    if ($full.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) {
-        return $full.Substring($base.Length)
-    }
-    $baseUri = New-Object System.Uri($base)
-    $fullUri = New-Object System.Uri($full)
-    $rel = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($fullUri).ToString())
-    return ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)
-}
-
-function Normalize-FileHash([string]$Value) {
-    # V5: ãƒ•ã‚¡ã‚¤ãƒ«ãƒãƒƒã‚·ãƒ¥ã¯ New-Sha256 ã®å½¢å¼(64æ–‡å­—ãƒ»å¤§æ–‡å­—ãƒ»prefixãªã—)ã«çµ±ä¸€ã™ã‚‹ã€‚
-    # éŽåŽ»ãƒ‡ãƒ¼ã‚¿ã‚„æ‰‹æ›¸ãè¨­å®šã« 'sha256:' ä»˜ãå°æ–‡å­—ãŒæ··ã–ã£ã¦ã„ã¦ã‚‚æ¯”è¼ƒãŒå£Šã‚Œãªã„ã‚ˆã†å¸åŽã™ã‚‹ã€‚
-    # æ–‡å­—åˆ— fingerprint (Get-Sha256Text) ã® 'sha256:'+å°æ–‡å­— ã¨ã¯åˆ¥ç‰©ãªã®ã§æ··ãœãªã„ã“ã¨ã€‚
-    $v = [string]$Value
-    if ([string]::IsNullOrWhiteSpace($v)) { return '' }
-    if ($v -match '^(?i)sha256:') { $v = $v.Substring(7) }
-    return $v.Trim().ToUpperInvariant()
-}
-
-function New-RbId {
-    # V5: ID = ã‚¿ã‚¤ãƒ ã‚¹ã‚¿ãƒ³ãƒ—(ãƒŸãƒªç§’) + '_' + GUID8ã€‚
-    # ãƒãƒƒã‚·ãƒ¥ã‚„ fingerprint ã¯ ID ã«åŸ‹ã‚è¾¼ã¾ãªã„(manifest ã®æ­£å¼ãƒ•ã‚£ãƒ¼ãƒ«ãƒ‰ã¨ã—ã¦æŒã¤)ã€‚
-    return ((Get-Date).ToString('yyyyMMddTHHmmss.fff') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8)))
-}
-
-function New-RbVersionId {
-    return ('v' + (New-RbId))
-}
-
-function New-UniqueDirectory([string]$Parent, [scriptblock]$IdFactory) {
-    # ç”Ÿæˆå¾Œã«æ—¢å­˜ãƒ‡ã‚£ãƒ¬ã‚¯ãƒˆãƒªãŒã‚ã‚Œã°å†ç”Ÿæˆã™ã‚‹(æœ€å¤§3å›ž)ã€‚immutable ãªä¸–ä»£ãƒ•ã‚©ãƒ«ãƒ€ãŒæ··ã–ã‚‹ã®ã‚’é˜²ãã€‚
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $id = [string](& $IdFactory)
-        $full = Join-Path $Parent $id
-        if (-not (Test-Path -LiteralPath $full)) {
-            New-Item -ItemType Directory -Path $full -Force | Out-Null
-            return [ordered]@{ id = $id; path = $full }
-        }
-        Start-Sleep -Milliseconds 5
-    }
-    throw "ä¸€æ„ãªãƒ•ã‚©ãƒ«ãƒ€åã‚’ç”Ÿæˆã§ãã¾ã›ã‚“ã§ã—ãŸ: $Parent"
-}
-
-function New-Sha256([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return '' }
-    # Get-FileHash ã¯ FileShare.Read ã§é–‹ããŸã‚ã€èª°ã‹ãŒExcelã§(æ›¸ãè¾¼ã¿ã‚¢ã‚¯ã‚»ã‚¹ä»˜ãã§)é–‹ã„ã¦ã„ã‚‹ã¨
-    # ã€Œåˆ¥ã®ãƒ—ãƒ­ã‚»ã‚¹ã§ä½¿ç”¨ã•ã‚Œã¦ã„ã¾ã™ã€ã§å¤±æ•—ã™ã‚‹ã€‚FileShare.ReadWrite ã‚’æ˜Žç¤ºã—ã¦é–‹ã‘ã°èª­ã‚ã‚‹ã€‚
-    $fs = $null
-    $sha = $null
-    try {
-        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        $sha = [Security.Cryptography.SHA256]::Create()
-        $hashBytes = $sha.ComputeHash($fs)
-        $hex = (-join ($hashBytes | ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
-        if ([string]::IsNullOrWhiteSpace($hex)) { throw "ãƒãƒƒã‚·ãƒ¥ã‚’è¨ˆç®—ã§ãã¾ã›ã‚“ã§ã—ãŸ: $Path" }
-        return $hex
-    } finally {
-        if ($sha) { try { $sha.Dispose() } catch { } }
-        if ($fs) { try { $fs.Dispose() } catch { } }
-    }
-}
-
-function Copy-FileSharedRead([string]$Source, [string]$Destination) {
-    # Excelã§é–‹ã‹ã‚Œã¦ã„ã‚‹(æ›¸ãè¾¼ã¿ã‚¢ã‚¯ã‚»ã‚¹ä¿æŒä¸­ã®)ãƒ•ã‚¡ã‚¤ãƒ«ã‚‚ã‚³ãƒ”ãƒ¼ã§ãã‚‹ã‚ˆã†ã€
-    # èª­ã¿å–ã‚Šå´ã‚’ FileShare.ReadWrite ã§é–‹ãã€‚Copy-Item ã§ã¯åŒã˜ç†ç”±ã§å¤±æ•—ã™ã‚‹ã€‚
-    $inStream = $null
-    $outStream = $null
-    try {
-        $inStream = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        $outStream = [IO.File]::Open($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $inStream.CopyTo($outStream)
-    } finally {
-        if ($outStream) { try { $outStream.Dispose() } catch { } }
-        if ($inStream) { try { $inStream.Dispose() } catch { } }
-    }
-}
-
-function New-StableHash([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return '' }
-    # Old implementation always waited at least 500ms per workbook. That becomes very visible
-    # when PDFä½œæˆ processes many Excel files. If the file has not been touched for a few seconds,
-    # hash it immediately; only recently modified files get a short stability check.
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-    $ageMs = ([DateTime]::UtcNow - $item.LastWriteTimeUtc).TotalMilliseconds
-    if ($ageMs -ge 3000) { return New-Sha256 $Path }
-
-    $lastSize = $item.Length
-    $lastWrite = $item.LastWriteTimeUtc
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 100
-        $next = Get-Item -LiteralPath $Path -ErrorAction Stop
-        if ($next.Length -eq $lastSize -and $next.LastWriteTimeUtc -eq $lastWrite) { break }
-        $lastSize = $next.Length
-        $lastWrite = $next.LastWriteTimeUtc
-    }
-    return New-Sha256 $Path
-}
-
-function New-Slug([string]$Text) {
-    $base = [IO.Path]::GetFileNameWithoutExtension($Text).ToLowerInvariant()
-    $base = [regex]::Replace($base, '[^a-z0-9]+', '-')
-    $base = $base.Trim('-')
-    if ([string]::IsNullOrWhiteSpace($base)) { $base = 'item' }
-    $sha1 = [System.Security.Cryptography.SHA1]::Create()
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
-    $hash = ([BitConverter]::ToString($sha1.ComputeHash($bytes))).Replace('-', '').Substring(0, 8).ToLowerInvariant()
-    return "$base-$hash"
-}
-
-function Test-RelativePath([string]$RelativePath) {
-    if ([string]::IsNullOrWhiteSpace($RelativePath)) { throw 'relativePath ãŒç©ºã§ã™ã€‚' }
-    if ([IO.Path]::IsPathRooted($RelativePath)) { throw 'çµ¶å¯¾ãƒ‘ã‚¹ã¯å—ã‘ä»˜ã‘ã¾ã›ã‚“ã€‚' }
-    if ($RelativePath -match '(^|[\\/])\.\.($|[\\/])') { throw '.. ã‚’å«ã‚€ãƒ‘ã‚¹ã¯å—ã‘ä»˜ã‘ã¾ã›ã‚“ã€‚' }
-    if ($RelativePath -match '[\x00-\x1F]') { throw 'åˆ¶å¾¡æ–‡å­—ã‚’å«ã‚€ãƒ‘ã‚¹ã¯å—ã‘ä»˜ã‘ã¾ã›ã‚“ã€‚' }
-    return $true
-}
-
-function Assert-SafeStorageSegment([string]$Value, [string]$Name = 'è­˜åˆ¥å­') {
-    # workbookId / snapshotId / versionId are used as single directory or file-name
-    # segments. Never let API input introduce separators, drive prefixes, or dot
-    # traversal into the history/archive trees.
-    $segment = ([string]$Value).Trim()
-    if ([string]::IsNullOrWhiteSpace($segment) -or
-        $segment.Length -gt 200 -or
-        $segment -in @('.', '..') -or
-        $segment -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
-        throw [System.ArgumentException]::new("$Name ãŒä¸æ­£ã§ã™ã€‚")
-    }
-    return $segment
-}
-
-function Join-Safe([string]$Root, [string]$RelativePath) {
-    Test-RelativePath $RelativePath | Out-Null
-    $full = [IO.Path]::GetFullPath((Join-Path $Root $RelativePath))
-    $rootFull = [IO.Path]::GetFullPath($Root)
-    if (-not $rootFull.EndsWith([IO.Path]::DirectorySeparatorChar)) { $rootFull += [IO.Path]::DirectorySeparatorChar }
-    if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'ç™»éŒ²æ¸ˆã¿ãƒ•ã‚©ãƒ«ãƒ€å¤–ã®ãƒ‘ã‚¹ã§ã™ã€‚' }
-    return $full
-}
-
-function Get-Paths {
-    # V5-P2: Get-WorkspacePath çµŒç”±ã§ã»ã¼å…¨é–¢æ•°ã‹ã‚‰å‘¼ã°ã‚Œã‚‹ã€‚å…±æœ‰ãƒ‰ãƒ©ã‚¤ãƒ–ä¸Šã®
-    # common\paths.json ã‚’1å›žã®æ“ä½œã§ä½•ç™¾å›žã‚‚èª­ã¿ç›´ã•ãªã„ã‚ˆã†çŸ­æ™‚é–“ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã™ã‚‹ã€‚
-    if ($null -ne $Script:PathsCache -and (([DateTime]::UtcNow - $Script:PathsCacheAtUtc).TotalSeconds -lt $Script:ConfigCacheSeconds)) {
-        return $Script:PathsCache
-    }
-    $config = Get-AppConfig
-    $paths = [ordered]@{
-        submissionDir = [string]$config.lastSubmissionDir
-        dataDir       = [string]$config.lastDataDir
-        outputDir     = [string]$config.lastOutputDir
-    }
-    $result = $paths
-    if ($paths.dataDir -and (Test-Path -LiteralPath (Join-Path $paths.dataDir 'common\paths.json'))) {
-        $stored = Read-JsonFile (Join-Path $paths.dataDir 'common\paths.json') $null
-        if ($stored) { $result = $stored }
-    }
-    $Script:PathsCache = $result
-    $Script:PathsCacheAtUtc = [DateTime]::UtcNow
-    return $result
-}
-
-
-function Get-DefaultChildPaths([string]$SubmissionDir) {
-    if ([string]::IsNullOrWhiteSpace($SubmissionDir)) {
-        return [ordered]@{ submissionDir = ''; dataDir = ''; outputDir = '' }
-    }
-    $trimmed = $SubmissionDir.TrimEnd([char[]]@([char]92, [char]47))
-    return [ordered]@{
-        submissionDir = $trimmed
-        dataDir = (Join-Path $trimmed '_reportbinder')
-        outputDir = (Join-Path $trimmed 'å‡ºåŠ›')
-    }
-}
-
-
-function ConvertTo-EnvBase64([string]$Text) {
-    if ($null -eq $Text) { $Text = '' }
-    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
-}
-
-function Select-FolderDialog([string]$Title, [string]$InitialDir) {
-    if ([string]::IsNullOrWhiteSpace($Title)) { $Title = 'ãƒ•ã‚©ãƒ«ãƒ€ã‚’é¸æŠžã—ã¦ãã ã•ã„' }
-    if ([string]::IsNullOrWhiteSpace($InitialDir) -or -not (Test-Path -LiteralPath $InitialDir)) { $InitialDir = [Environment]::GetFolderPath('MyDocuments') }
-
-    $helper = Join-Path $Script:AppRoot 'tools\select-folder.ps1'
-    if (-not (Test-Path -LiteralPath $helper)) { throw 'ãƒ•ã‚©ãƒ«ãƒ€é¸æŠžç”¨ã®è£œåŠ©ã‚¹ã‚¯ãƒªãƒ—ãƒˆãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("reportbinder-folder-{0}.txt" -f ([Guid]::NewGuid().ToString('N')))
-    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
-
-    $oldTitle = [Environment]::GetEnvironmentVariable('REPORTBINDER_PICKER_TITLE_B64', 'Process')
-    $oldInitial = [Environment]::GetEnvironmentVariable('REPORTBINDER_PICKER_INITIAL_B64', 'Process')
-    $oldOutput = [Environment]::GetEnvironmentVariable('REPORTBINDER_PICKER_OUTPUT_B64', 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable('REPORTBINDER_PICKER_TITLE_B64', (ConvertTo-EnvBase64 $Title), 'Process')
-        [Environment]::SetEnvironmentVariable('REPORTBINDER_PICKER_INITIAL_B64', (ConvertTo-EnvBase64 $InitialDir), 'Process')
-        [Environment]::SetEnvironmentVariable('REPORTBINDER_PICKER_OUTPUT_B64', (ConvertTo-EnvBase64 $tmp), 'Process')
-
-        $escapedHelper = $helper -replace "'", "''"
-        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$escapedHelper'"))
-        $args = "-NoProfile -STA -ExecutionPolicy Bypass -EncodedCommand $encoded"
-        $proc = Start-Process -FilePath $psExe -ArgumentList $args -WindowStyle Hidden -PassThru -Wait
-        if ($proc.ExitCode -ne 0) { throw "ãƒ•ã‚©ãƒ«ãƒ€é¸æŠžãƒ€ã‚¤ã‚¢ãƒ­ã‚°ã‚’é–‹ã‘ã¾ã›ã‚“ã§ã—ãŸã€‚ExitCode=$($proc.ExitCode)" }
-        if (Test-Path -LiteralPath $tmp) {
-            $selected = (Get-Content -LiteralPath $tmp -Raw -Encoding UTF8).Trim()
-            if ($selected -and (Test-Path -LiteralPath $selected)) { return $selected }
-            return ''
-        }
-        return ''
-    } finally {
-        [Environment]::SetEnvironmentVariable('REPORTBINDER_PICKER_TITLE_B64', $oldTitle, 'Process')
-        [Environment]::SetEnvironmentVariable('REPORTBINDER_PICKER_INITIAL_B64', $oldInitial, 'Process')
-        [Environment]::SetEnvironmentVariable('REPORTBINDER_PICKER_OUTPUT_B64', $oldOutput, 'Process')
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-function Get-WorkspacePath([string]$Language, [string]$DataDir = '') {
-    # First-run folder setup must be able to initialize the selected workspace before
-    # the per-user config is committed. Prefer the explicit dataDir when supplied;
-    # normal API operations continue to resolve it from Get-Paths.
-    $resolvedDataDir = ([string]$DataDir).Trim()
-    if ([string]::IsNullOrWhiteSpace($resolvedDataDir)) {
-        $paths = Get-Paths
-        $resolvedDataDir = ([string]$paths.dataDir).Trim()
-    }
-    if ([string]::IsNullOrWhiteSpace($resolvedDataDir)) { throw 'ç®¡ç†ãƒ‡ãƒ¼ã‚¿ãƒ•ã‚©ãƒ«ãƒ€ãŒæœªè¨­å®šã§ã™ã€‚æå‡ºãƒ•ã‚©ãƒ«ãƒ€ã‚’é¸ã‚“ã§ãã ã•ã„ã€‚' }
-    return Join-Path $resolvedDataDir $Language
-}
-
-function New-EmptyVolumeState {
-    return [ordered]@{
-        status = 'not-built'
-        lastBuiltAt = $null
-        outputPdf = $null
-        builtFingerprint = ''
-        staleReasons = @()
-        message = ''
-    }
-}
-
-function Get-VolumeStateKey([string]$Volume, [string]$Category) {
-    $cat = Normalize-WorkbookCategory $Category ''
-    if ([string]::IsNullOrWhiteSpace($cat)) { return "$Volume|_" }
-    return "$Volume|$cat"
-}
-
-function New-EmptyStructure([string]$Language) {
-    $volumes = [ordered]@{}
-    foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
-        foreach ($category in @('ecm','bod','dmm')) {
-            $volumes[(Get-VolumeStateKey $volume $category)] = New-EmptyVolumeState
-        }
-    }
-    return [ordered]@{
-        schemaVersion = 2
-        language = $Language
-        workbooks = @()
-        pages = @()
-        volumes = $volumes
-        updatedAt = New-NowIso
-    }
-}
-
-function Ensure-Package($Paths) {
-    foreach ($key in @('submissionDir','dataDir','outputDir')) {
-        if ([string]::IsNullOrWhiteSpace([string]$Paths.$key)) { throw "$key ãŒæœªè¨­å®šã§ã™ã€‚" }
-    }
-    foreach ($dir in @([string]$Paths.submissionDir, [string]$Paths.dataDir, [string]$Paths.outputDir)) {
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    }
-    $dataDir = [string]$Paths.dataDir
-    foreach ($dir in @('common','common\audit','common\tmp','common\locks')) {
-        New-Item -ItemType Directory -Path (Join-Path $dataDir $dir) -Force | Out-Null
-    }
-    $pkgPath = Join-Path $dataDir 'package.json'
-    if (-not (Test-Path -LiteralPath $pkgPath)) {
-        Write-JsonFile $pkgPath ([ordered]@{ schemaVersion = 2; app = 'ReportBinder'; createdAt = New-NowIso })
-    }
-    Write-JsonFile (Join-Path $dataDir 'common\paths.json') ([ordered]@{
-        submissionDir = [string]$Paths.submissionDir
-        dataDir = [string]$Paths.dataDir
-        outputDir = [string]$Paths.outputDir
-        updatedAt = New-NowIso
-    })
-    # V5-P2: åˆå›žã‚»ãƒƒãƒˆã‚¢ãƒƒãƒ—ç›´å¾Œã«å¤ã„ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã‚’è¿”ã•ãªã„ã€‚
-    Reset-ConfigCaches
-    foreach ($lang in @('ja','en')) {
-        foreach ($dir in @('', 'workbooks', 'pages', 'content-pdf', 'exports', 'state', 'locks', 'logs')) {
-            New-Item -ItemType Directory -Path (Join-Path (Join-Path $dataDir $lang) $dir) -Force | Out-Null
-        }
-        # Use the selected dataDir directly. On first run the local config is intentionally
-        # saved only after package initialization succeeds, so Get-Paths is still empty here.
-        Initialize-Or-MigrateStructure $lang ([string]$Paths.dataDir) | Out-Null
-    }
-}
-
-
-function Resolve-PageId($Page) {
-    if ($null -eq $Page) { return '' }
-    $existing = [string]$Page.pageId
-    if (-not [string]::IsNullOrWhiteSpace($existing)) { return $existing }
-    $legacy = [string]$Page.id
-    if (-not [string]::IsNullOrWhiteSpace($legacy)) { return $legacy }
-    $wb = [string]$Page.workbookId
-    $sheetName = [string]$Page.sheetName
-    if ([string]::IsNullOrWhiteSpace($wb) -or [string]::IsNullOrWhiteSpace($sheetName)) { return '' }
-    $sheetKey = [regex]::Replace($sheetName, '[^0-9A-Za-z]+', '-')
-    if ([string]::IsNullOrWhiteSpace($sheetKey)) { $sheetKey = 'sheet' }
-    return "$wb-$sheetKey"
-}
-
-function Set-NoteProperty($Object, [string]$Name, $Value) {
-    if ($null -eq $Object) { return }
-    if ($Object -is [System.Collections.IDictionary]) {
-        $Object[$Name] = $Value
-        return
-    }
-    if ($null -eq $Object.PSObject.Properties[$Name]) {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
-    } else {
-        $Object.$Name = $Value
-    }
-}
-
-function Get-DataProperty($Object, [string]$Name, $DefaultValue = $null) {
-    if ($null -eq $Object) { return $DefaultValue }
-    if ($Object -is [System.Collections.IDictionary]) {
-        if ($Object.Contains($Name)) { return $Object[$Name] }
-        return $DefaultValue
-    }
-    $prop = $Object.PSObject.Properties[$Name]
-    if ($null -eq $prop) { return $DefaultValue }
-    return $prop.Value
-}
-
-
-function Get-IntDataProperty($Object, [string]$Name, [int]$DefaultValue = 0) {
-    try { return [int](Get-DataProperty $Object $Name $DefaultValue) } catch { return $DefaultValue }
-}
-
-function Test-WorkbookRenderIsCurrent($Workbook) {
-    if ($null -eq $Workbook) { return $false }
-    $status = [string](Get-DataProperty $Workbook 'status' '')
-    if ($status -in @('new','excel-updated','missing','render-error','rendering','stale','not-rendered')) { return $false }
-    $lastRenderedHash = [string](Get-DataProperty $Workbook 'lastRenderedExcelHash' '')
-    if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { return $false }
-    $currentHash = [string](Get-DataProperty $Workbook 'currentExcelHash' '')
-    if ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and $currentHash -ne $lastRenderedHash) { return $false }
-    $profileVersion = Get-IntDataProperty $Workbook 'renderProfileVersion' 0
-    if ($profileVersion -lt $Script:ExcelPrintProfileVersion) { return $false }
-    return $true
-}
-
-function Mark-WorkbookContentStaleForProfile($Structure, $Workbook) {
-    $changed = $false
-    if ($null -eq $Workbook) { return $changed }
-    $lastRenderedHash = [string](Get-DataProperty $Workbook 'lastRenderedExcelHash' '')
-    if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { return $changed }
-    $profileVersion = Get-IntDataProperty $Workbook 'renderProfileVersion' 0
-    if ($profileVersion -ge $Script:ExcelPrintProfileVersion) { return $changed }
-    if ([string](Get-DataProperty $Workbook 'status' '') -ne 'excel-updated') {
-        Set-NoteProperty $Workbook 'status' 'excel-updated'
-        $changed = $true
-    }
-    foreach ($p in @(Get-Array $Structure.pages | Where-Object { [string]$_.workbookId -eq [string]$Workbook.workbookId })) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$p.contentPdf) -and [string]$p.status -ne 'stale') {
-            Set-NoteProperty $p 'status' 'stale'
-            Set-NoteProperty $p 'updatedAt' (New-NowIso)
-            $changed = $true
-        }
-    }
-    return $changed
-}
-
-
-function Repair-StructurePages($Structure) {
-    $changed = $false
-    if ($null -eq $Structure.workbooks) { Set-NoteProperty $Structure 'workbooks' @(); $changed = $true }
-    if ($null -eq $Structure.pages) { Set-NoteProperty $Structure 'pages' @(); $changed = $true }
-    foreach ($wb in @(Get-Array $Structure.workbooks)) {
-        # structure.json created by older builds may not have these properties.
-        # Add them explicitly instead of assigning to a missing PSCustomObject property.
-        $cat = ''
-        try { $cat = Normalize-WorkbookCategory ([string]$wb.category) ([string]$wb.fileName) } catch { $cat = '' }
-        if ([string]::IsNullOrWhiteSpace($cat)) {
-            $name = [string]$wb.fileName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$wb.displayName }
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$wb.relativePath }
-            $cat = Normalize-WorkbookCategory '' $name
-        }
-        if ($null -eq $wb.PSObject.Properties['category'] -or [string]$wb.category -ne $cat) { Set-NoteProperty $wb 'category' $cat; $changed = $true }
-        foreach ($pair in @(
-            @{Name='lastError'; Value=''},
-            @{Name='lastErrorUser'; Value=''},
-            @{Name='lastErrorAt'; Value=$null},
-            @{Name='lastRenderAttemptHash'; Value=''},
-            @{Name='lastRenderLog'; Value=''},
-            @{Name='renderProfileVersion'; Value=0},
-            @{Name='lastRenderedSheets'; Value=@()},
-            @{Name='lastRenderedSheetFingerprint'; Value=''},
-            @{Name='currentExcelLastWriteUtcTicks'; Value=''},
-            @{Name='warnings'; Value=@()}
-        )) {
-            if ($null -eq $wb.PSObject.Properties[$pair.Name]) { Set-NoteProperty $wb $pair.Name $pair.Value; $changed = $true }
-        }
-        if (Mark-WorkbookContentStaleForProfile $Structure $wb) { $changed = $true }
-    }
-    $used = @{}
-    foreach ($p in @(Get-Array $Structure.pages)) {
-        $pageKey = Resolve-PageId $p
-        if (-not [string]::IsNullOrWhiteSpace($pageKey)) {
-            $base = $pageKey
-            $n = 2
-            while ($used.ContainsKey($pageKey)) {
-                $pageKey = "$base-$n"
-                $n++
-            }
-            $used[$pageKey] = $true
-            if ([string]::IsNullOrWhiteSpace([string]$p.pageId) -or [string]$p.pageId -ne $pageKey) {
-                Set-NoteProperty $p 'pageId' $pageKey
-                $changed = $true
-            }
-        }
-        if ($null -eq $p.PSObject.Properties['numberingManual']) { Set-NoteProperty $p 'numberingManual' $false; $changed = $true }
-        if ($null -eq $p.PSObject.Properties['numberingDefault']) { Set-NoteProperty $p 'numberingDefault' 'first-page-none'; $changed = $true }
-        if ($null -eq $p.PSObject.Properties['enabled']) { Set-NoteProperty $p 'enabled' $true; $changed = $true }
-    }
-    return $changed
-}
-
-function Read-StructureUnlocked([string]$Language, [string]$DataDir = '') {
-    $workspace = Get-WorkspacePath $Language $DataDir
-    $path = Join-Path $workspace 'structure.json'
-    if (-not (Test-Path -LiteralPath $path)) { return New-EmptyStructure $Language }
-    $structure = Read-JsonFile $path (New-EmptyStructure $Language)
-    return Normalize-StructureCollections $structure
-}
-
-function Write-StructureUnlocked([string]$Language, $Structure, [string]$DataDir = '') {
-    $Structure = Normalize-StructureCollections $Structure
-    Set-NoteProperty $Structure 'updatedAt' (New-NowIso)
-    $workspace = Get-WorkspacePath $Language $DataDir
-    Write-JsonFile (Join-Path $workspace 'structure.json') $Structure
-}
-
-function Get-Structure([string]$Language) {
-    # Read-only API path. Repair and schema migration are performed only by Initialize-Or-MigrateStructure.
-    return Read-StructureUnlocked $Language
-}
-
-function Update-StructureLocked([string]$Language, [scriptblock]$Mutation) {
-    $workspace = Get-WorkspacePath $Language
-    $structureLock = Join-Path $workspace 'locks\structure.lock'
-    return Invoke-WithLock $structureLock {
-        $structure = Read-StructureUnlocked $Language
-        $result = & $Mutation $structure
-        Write-StructureUnlocked $Language $structure
-        return $result
-    }
-}
-
-function Save-Structure([string]$Language, $Structure) {
-    throw 'Save-Structureã®ç›´æŽ¥å‘¼å‡ºã—ã¯ç¦æ­¢ã•ã‚Œã¦ã„ã¾ã™ã€‚Update-StructureLockedã‚’ä½¿ç”¨ã—ã¦ãã ã•ã„ã€‚'
-}
-
-function Get-EffectiveLanguage {
-    if ($Mode -eq 'en') { return 'en' }
-    return 'ja'
-}
-
-function Get-VolumeList([string]$Language) {
-    if ($Language -eq 'ja') { return @('ja-main','ja-appendix','none') }
-    return @('en-main','en-appendix','none')
-}
-
-function Get-DefaultVolume([string]$Language) {
-    if ($Language -eq 'ja') { return 'ja-main' }
-    return 'en-main'
-}
-
-function Get-LanguageFromFileName([string]$FileName) {
-    $name = [string]$FileName
-    if ($name -match '(^|[_-])(J|JA|JPN)([_-]|$)') { return 'ja' }
-    if ($name -match '(^|[_-])(E|EN|ENG)([_-]|$)') { return 'en' }
-    return $null
-}
-
-function Normalize-WorkbookCategory([string]$Category, [string]$FileName = '') {
-    $cat = ([string]$Category).Trim().ToLowerInvariant()
-    if (@('ecm','bod','dmm') -contains $cat) { return $cat }
-    $upper = ([string]$FileName).ToUpperInvariant()
-    if ($upper -match '(^|[_-])ECM([_-]|$)' -or $upper.Contains('ECM')) { return 'ecm' }
-    if ($upper -match '(^|[_-])BOD([_-]|$)' -or $upper.Contains('BOD')) { return 'bod' }
-    if ($upper -match '(^|[_-])DMM([_-]|$)' -or $upper.Contains('DMM')) { return 'dmm' }
-    return ''
-}
-
-function Require-WorkbookCategory([string]$Category) {
-    $cat = Normalize-WorkbookCategory $Category ''
-    if (@('ecm','bod','dmm') -notcontains $cat) {
-        throw [System.ArgumentException]::new('categoryã«ã¯ ecm / bod / dmm ã®ã„ãšã‚Œã‹ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚')
-    }
-    return $cat
-}
-
-function Get-PageCategory($Structure, $Page) {
-    if ($null -eq $Page) { return '' }
-    $wb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$Page.workbookId } | Select-Object -First 1)
-    if ($wb.Count -eq 0) { return '' }
-    return Normalize-WorkbookCategory ([string]$wb[0].category) ([string]$wb[0].fileName)
-}
-
-function Test-WorkbookCategory($Workbook, [string]$Category) {
-    $cat = Normalize-WorkbookCategory $Category ''
-    if ([string]::IsNullOrWhiteSpace($cat)) { return $true }
-    $stored = Normalize-WorkbookCategory ([string]$Workbook.category) ''
-    if (-not [string]::IsNullOrWhiteSpace($stored)) { return $stored -eq $cat }
-    $name = ([string]$Workbook.fileName)
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$Workbook.displayName }
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$Workbook.relativePath }
-    return ((Normalize-WorkbookCategory '' $name) -eq $cat)
-}
-
-function Get-ProjectIdFromWorkbooks($Workbooks) {
-    foreach ($wb in (Get-Array $Workbooks)) {
-        $name = [string]$wb.fileName
-        if ($name -match '^(?<p>.+)_(J|E)_') { return $matches['p'] }
-    }
-    return 'ReportBinder'
-}
-
-function Get-CategoryProjectId([string]$ProjectId, [string]$Category) {
-    $cat = Require-WorkbookCategory $Category
-    $categoryLabel = $cat.ToUpperInvariant()
-    $base = ([string]$ProjectId).Trim()
-    if ([string]::IsNullOrWhiteSpace($base)) { $base = 'ReportBinder' }
-    if ($base -match '^(?<prefix>.*?)(?:[_-](?:ECM|BOD|DMM))$') {
-        $prefix = (([string]$matches['prefix']) -replace '[_-]+$','')
-        if ([string]::IsNullOrWhiteSpace($prefix)) { return $categoryLabel }
-        return "${prefix}_${categoryLabel}"
-    }
-    return "${base}_${categoryLabel}"
-}
-
-function Get-OutputFileName([string]$Volume, [string]$ProjectId, [string]$Category) {
-    $namedProjectId = Get-CategoryProjectId $ProjectId $Category
-    switch ($Volume) {
-        'ja-main' { return "${namedProjectId}_J_æœ¬ä½“.pdf" }
-        'ja-appendix' { return "${namedProjectId}_J_è£œè¶³.pdf" }
-        'en-main' { return "${namedProjectId}_E_Main.pdf" }
-        'en-appendix' { return "${namedProjectId}_E_Appendix.pdf" }
-        default { throw "æœªçŸ¥ã®æˆæžœç‰©: $Volume" }
-    }
-}
-
-function Get-SheetOrderNumber([string]$SheetName) {
-    $sheetNum = 0
-    if ([int]::TryParse($SheetName, [ref]$sheetNum)) { return $sheetNum }
-    return 999999
-}
-
-function Get-FileOrderNumber([string]$FileName) {
-    if ($FileName -match '_(?<num>\d{1,4})_') { return [int]$matches['num'] }
-    return 999999
-}
-
-function Get-OrderHint([string]$FileName, [string]$SheetName) {
-    # Default page insertion order is primarily the numeric worksheet name.
-    # File order is only a tie breaker when several workbooks have the same sheet number.
-    return ((Get-SheetOrderNumber $SheetName) * 100000) + (Get-FileOrderNumber $FileName)
-}
-
-function Get-ExcelFilesInSubmission {
-    $paths = Get-Paths
-    if ([string]::IsNullOrWhiteSpace([string]$paths.submissionDir) -or -not (Test-Path -LiteralPath ([string]$paths.submissionDir))) { return @() }
-
-    # Only show Excel files directly under the submission folder.
-    # The default data/output child folders are intentionally ignored.
-    $excelExts = @('.xlsx')
-    $files = Get-ChildItem -LiteralPath ([string]$paths.submissionDir) -File -ErrorAction SilentlyContinue |
-        Where-Object { $excelExts -contains $_.Extension.ToLowerInvariant() -and $_.Name -notlike '~$*' } |
-        Sort-Object Name
-
-    $result = @()
-    foreach ($entry in $files) {
-        # Network shares may briefly retain directory-enumeration metadata. Re-read and refresh
-        # each FileInfo so the UI shows the newest save time available from the file server.
-        try {
-            $f = Get-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop
-            $f.Refresh()
-        } catch {
-            $f = $entry
-        }
-        $rel = Get-RelativePathCompat ([string]$paths.submissionDir) $f.FullName
-        # Safety: direct children only. Do not accept any relative path containing a separator.
-        if ($rel -match '[\\/]') { continue }
-        # Explorer and the app must show the same minute. Read the timestamp from an
-        # open file handle (which bypasses stale SMB directory metadata), convert it on the
-        # server PC, and return the final display string without browser timezone conversion.
-        $modifiedSnapshot = Get-FileLastWriteSnapshot $f.FullName
-        $result += [ordered]@{
-            fileName = $f.Name
-            relativePath = $rel
-            size = $f.Length
-            modifiedAtDisplay = [string]$modifiedSnapshot.display
-            modifiedAt = ([DateTime]$modifiedSnapshot.local).ToString('yyyy-MM-ddTHH:mm:sszzz')
-            modifiedAtUtc = ([DateTime]$modifiedSnapshot.utc).ToString('o')
-            modifiedAtUnixMs = [int64]$modifiedSnapshot.unixMs
-            modifiedAtUtcTicks = [string]([DateTime]$modifiedSnapshot.utc).Ticks
-            detectedLanguage = (Get-LanguageFromFileName $f.Name)
-        }
-    }
-    return $result
-}
-
-function New-WorkbookObject([string]$RelativePath, [string]$Language, [string]$Category = '') {
-    $paths = Get-Paths
-    $full = Join-Safe ([string]$paths.submissionDir) $RelativePath
-    if (-not (Test-Path -LiteralPath $full)) { throw "æå‡ºãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $RelativePath" }
-    $item = Get-Item -LiteralPath $full
-    $hash = New-StableHash $full
-    $categoryNormalized = Normalize-WorkbookCategory $Category $item.Name
-    $baseId = New-Slug $item.Name
-    # ECM / BOD / DMM are independent work sets. A single Excel file may be registered
-    # in more than one category, so new workbook IDs include the category prefix.
-    $id = $(if (-not [string]::IsNullOrWhiteSpace($categoryNormalized)) { "$categoryNormalized-$baseId" } else { $baseId })
-    return [ordered]@{
-        workbookId = $id
-        language = $Language
-        fileName = $item.Name
-        relativePath = $RelativePath
-        displayName = $item.Name
-        category = $categoryNormalized
-        currentExcelModifiedAt = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz')
-        currentExcelLastWriteUtcTicks = [string]$item.LastWriteTimeUtc.Ticks
-        currentExcelSize = $item.Length
-        currentExcelHash = $hash
-        lastRenderedVersionId = $null
-        lastRenderedExcelHash = $null
-        lastRenderedAt = $null
-        lastRenderedSheets = @()
-        lastRenderedSheetFingerprint = ''
-        status = 'new'
-        warnings = @()
-        lastError = ''
-        lastErrorUser = ''
-        lastErrorAt = $null
-        lastRenderAttemptHash = ''
-        lastRenderLog = ''
-        renderProfileVersion = 0
-        registeredAt = New-NowIso
-    }
-}
-
-function Invoke-ComRelease($Obj) {
-    if ($null -ne $Obj) {
-        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Obj) | Out-Null } catch { }
-    }
-}
-
-
-function Open-ExcelWorkbookSafe($Excel, [string]$FullPath, [bool]$ReadOnly) {
-    $missing = [Type]::Missing
-
-    # Mark of the Web (Zone.Identifier) ãŒä»˜ã„ãŸãƒ•ã‚¡ã‚¤ãƒ«ã¯ä¿è­·ãƒ“ãƒ¥ãƒ¼å¯¾è±¡ã¨ãªã‚Šã€
-    # COMã® Workbooks.Open ãŒã€ŒWorkbooks ã‚¯ãƒ©ã‚¹ã® Open ãƒ—ãƒ­ãƒ‘ãƒ†ã‚£ã‚’å–å¾—ã§ãã¾ã›ã‚“ã€ã§å¤±æ•—ã™ã‚‹ã€‚
-    # äº‹å‰ã«Zone.Identifierã‚’é™¤åŽ»ã™ã‚‹ï¼ˆå†…å®¹ãƒ»æ›´æ–°æ—¥æ™‚ã¯å¤‰ã‚ã‚‰ãªã„ï¼‰ã€‚
-    try { Unblock-File -LiteralPath $FullPath -ErrorAction SilentlyContinue } catch { }
-
-    $openError = $null
-    try {
-        # Use explicit optional arguments. This avoids Excel interpreting a short Open() call differently
-        # on some Office builds, and prevents link / read-only prompts.
-        return $Excel.Workbooks.Open($FullPath, 0, $ReadOnly, $missing, $missing, $missing, $true, $missing, $missing, $false, $false, $missing, $false, $true, $missing)
-    } catch {
-        $openError = $_
-    }
-    try {
-        # Compatibility fallback for older COM dispatchers.
-        return $Excel.Workbooks.Open($FullPath, 0, $ReadOnly)
-    } catch {
-        $openError = $_
-    }
-    # æœ€çµ‚ãƒ•ã‚©ãƒ¼ãƒ«ãƒãƒƒã‚¯: ä¿è­·ãƒ“ãƒ¥ãƒ¼çµŒç”±ã§é–‹ã„ã¦ç·¨é›†ãƒ¢ãƒ¼ãƒ‰ã¸æ˜‡æ ¼ã•ã›ã‚‹ã€‚
-    # Unblock-FileãŒåŠ¹ã‹ãªã„ç’°å¢ƒï¼ˆã‚°ãƒ«ãƒ¼ãƒ—ãƒãƒªã‚·ãƒ¼ã§ä¿è­·ãƒ“ãƒ¥ãƒ¼å¼·åˆ¶ç­‰ï¼‰å‘ã‘ã€‚
-    try {
-        $pvw = $Excel.ProtectedViewWindows.Open($FullPath)
-        if ($null -ne $pvw) {
-            $book = $pvw.Edit()
-            if ($null -ne $book) { return $book }
-        }
-    } catch { }
-    throw $openError
-}
-
-function Inspect-ExcelWorkbook([string]$FullPath) {
-    $excel = $null
-    $book = $null
-    $sheets = @()
-    try {
-        $excel = New-Object -ComObject Excel.Application
-        $excel.Visible = $false
-        $excel.DisplayAlerts = $false
-        $excel.EnableEvents = $false
-        $excel.ScreenUpdating = $false
-        try { $excel.AskToUpdateLinks = $false } catch { }
-        try { $excel.AutomationSecurity = 3 } catch { }
-        $book = Open-ExcelWorkbookSafe $excel $FullPath $true
-        $sheetCount = 0
-        try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
-        for ($i = 1; $i -le $sheetCount; $i++) {
-            $ws = $null
-            try {
-                $ws = $book.Worksheets.Item($i)
-                $sheetName = [string]$ws.Name
-                $visible = ([int]$ws.Visible -eq -1)
-                if ($visible -and $sheetName -match '^[0-9]+$') {
-                    $a1 = ''
-                    try { $a1 = [string]$ws.Range('A1').Text } catch { $a1 = '' }
-                    if ([string]::IsNullOrWhiteSpace($a1)) { $a1 = '' }
-                    $zoom = $null
-                    try { $zoom = $ws.PageSetup.Zoom } catch { }
-                    $printArea = ''
-                    try { $printArea = [string]$ws.PageSetup.PrintArea } catch { }
-                    $sheets += [ordered]@{
-                        sheetName = $sheetName
-                        titleSource = 'A1'
-                        detectedTitle = $a1
-                        zoom = $zoom
-                        printArea = $printArea
-                    }
-                }
-            } finally {
-                Invoke-ComRelease $ws
-            }
-        }
-    } finally {
-        if ($book) { try { $book.Close($false) } catch { } ; Invoke-ComRelease $book }
-        if ($excel) { try { $excel.Quit() } catch { } ; Invoke-ComRelease $excel }
-        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-    }
-    return $sheets
-}
-
-function Add-NotePropertyIfMissing($Object, [string]$Name, $Value) {
-    if ($null -eq $Object) { return }
-    if ($Object -is [System.Collections.IDictionary]) {
-        if (-not $Object.Contains($Name)) { $Object[$Name] = $Value }
-        return
-    }
-    if ($null -eq $Object.PSObject.Properties[$Name]) {
-        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
-    }
-}
-
-
-function Renumber-VolumeOrder($Structure, [string]$Volume, [string]$Category) {
-    $cat = Require-WorkbookCategory $Category
-    $wbIds = @{}
-    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookCategory $_ $cat })) { $wbIds[[string]$wb.workbookId] = $true }
-    $pages = @(Get-Array $Structure.pages | Where-Object {
-        $wbIds.ContainsKey([string]$_.workbookId) -and (
-            ($Volume -eq 'none' -and ([string]$_.volume -eq 'none' -or $_.enabled -eq $false)) -or
-            ($Volume -ne 'none' -and [string]$_.volume -eq $Volume -and $_.enabled -ne $false)
-        )
-    } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {[string](Resolve-PageId $_)})
-    for ($i=0; $i -lt $pages.Count; $i++) { Set-NoteProperty $pages[$i] 'order' (($i+1)*10) }
-    return $pages
-}
-
-function Insert-PageInSheetOrder($Structure, $NewPage, [string]$Volume, [string]$Category) {
-    $cat = Require-WorkbookCategory $Category
-    $existing = @(Renumber-VolumeOrder $Structure $Volume $cat)
-    $manual = @($existing | Where-Object { [bool](Get-DataProperty $_ 'orderManual' $false) }).Count -gt 0
-    $ordered = New-Object System.Collections.Generic.List[object]
-    foreach ($p in $existing) { [void]$ordered.Add($p) }
-    $insertedAtEnd = $manual
-    if ($manual -or $existing.Count -eq 0) {
-        [void]$ordered.Add($NewPage)
-    } else {
-        $newWb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$NewPage.workbookId } | Select-Object -First 1)
-        $newFile = if ($newWb.Count) { [string]$newWb[0].fileName } else { '' }
-        $newSheet = Get-SheetOrderNumber ([string]$NewPage.sheetName)
-        $newFileOrder = Get-FileOrderNumber $newFile
-        $at = $existing.Count
-        for ($i=0; $i -lt $existing.Count; $i++) {
-            $p = $existing[$i]
-            $wb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$p.workbookId } | Select-Object -First 1)
-            $file = if ($wb.Count) { [string]$wb[0].fileName } else { '' }
-            $sheet = Get-SheetOrderNumber ([string]$p.sheetName)
-            $fileOrder = Get-FileOrderNumber $file
-            if ($sheet -gt $newSheet -or ($sheet -eq $newSheet -and $fileOrder -gt $newFileOrder) -or ($sheet -eq $newSheet -and $fileOrder -eq $newFileOrder -and [StringComparer]::OrdinalIgnoreCase.Compare($file,$newFile) -gt 0)) { $at=$i; break }
-        }
-        $ordered.Insert($at,$NewPage)
-    }
-    for ($i=0; $i -lt $ordered.Count; $i++) { Set-NoteProperty $ordered[$i] 'order' (($i+1)*10) }
-    # Windows PowerShell 5.1 can throw "Argument types do not match" when
-    # @() directly converts List[object] through PSToObjectArrayBinder.
-    return [ordered]@{ insertedAtEnd=$insertedAtEnd; pages=$ordered.ToArray() }
-}
-
-function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = '') {
-    $workspace = Get-WorkspacePath $Language $DataDir
-    $lockPath = Join-Path $workspace 'locks\structure.lock'
-    return Invoke-WithLock $lockPath {
-        $path = Join-Path $workspace 'structure.json'
-        if (-not (Test-Path -LiteralPath $path)) { Write-StructureUnlocked $Language (New-EmptyStructure $Language) $DataDir; return [ordered]@{ created=$true; migrated=$false } }
-        $structure = Read-JsonFile $path (New-EmptyStructure $Language)
-        $version = 1
-        try { $version=[int](Get-DataProperty $structure 'schemaVersion' 1) } catch { $version=1 }
-        if ($version -gt 2) { throw "ã“ã®ç®¡ç†ãƒ‡ãƒ¼ã‚¿ã¯æ–°ã—ã„schemaVersion=$versionã§ã™ã€‚å¯¾å¿œã™ã‚‹ReportBinderã‚’ä½¿ç”¨ã—ã¦ãã ã•ã„ã€‚" }
-        if ($version -eq 2) { return [ordered]@{ created=$false; migrated=$false } }
-        $backup = Join-Path $workspace 'structure.json.v1.bak'
-        if (-not (Test-Path -LiteralPath $backup)) {
-            Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
-            if ((Get-Item $backup).Length -ne (Get-Item $path).Length -or (New-StableHash $backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakã®æ¤œè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸã€‚' }
-        }
-        $structure = Normalize-StructureCollections $structure
-        [void](Repair-StructurePages $structure)
-        $oldVolumes = Get-DataProperty $structure 'volumes' $null
-        $newVolumes = [ordered]@{}
-        foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
-            foreach ($cat in @('ecm','bod','dmm')) {
-                $fresh = New-EmptyVolumeState
-                if ($cat -eq 'ecm' -and $null -ne $oldVolumes) {
-                    $old = Get-DataProperty $oldVolumes $volume $null
-                    if ($null -eq $old) { $old = Get-DataProperty $oldVolumes (Get-VolumeStateKey $volume $cat) $null }
-                    if ($null -ne $old) {
-                        foreach ($name in @('status','lastBuiltAt','outputPdf','message','builtFingerprint','staleReasons')) {
-                            $value=Get-DataProperty $old $name $null
-                            if ($null -ne $value) { Set-NoteProperty $fresh $name $value }
-                        }
-                    }
-                }
-                $newVolumes[(Get-VolumeStateKey $volume $cat)] = $fresh
-            }
-        }
-        Set-NoteProperty $structure 'volumes' $newVolumes
-        Set-NoteProperty $structure 'schemaVersion' 2
-        foreach ($cat in @('ecm','bod','dmm')) { foreach ($volume in @(Get-VolumeList $Language)) { [void](Renumber-VolumeOrder $structure $volume $cat) } }
-        Write-StructureUnlocked $Language $structure $DataDir
-        Write-JsonFile (Join-Path $workspace 'schema-version.json') ([ordered]@{ schemaVersion=2; migratedAt=(New-NowIso); backup=$backup })
-        return [ordered]@{ created=$false; migrated=$true; backup=$backup }
-    }
-}
-
-function Apply-DefaultNumberingPerVolume([string]$Language, $Structure, [string]$Category) {
-    $cat = Require-WorkbookCategory $Category
-    $wbIds = @{}
-    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookCategory $_ $cat })) { $wbIds[[string]$wb.workbookId] = $true }
-    foreach ($vol in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
-        $setPages = @(Get-Array $Structure.pages | Where-Object { $wbIds.ContainsKey([string]$_.workbookId) -and $_.enabled -eq $true -and [string]$_.volume -eq $vol } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {[string](Resolve-PageId $_)})
-        for ($i=0; $i -lt $setPages.Count; $i++) {
-            $p=$setPages[$i]
-            Add-NotePropertyIfMissing $p 'numberingManual' $false
-            Add-NotePropertyIfMissing $p 'numberingDefault' 'first-page-none'
-            if (-not [bool]$p.numberingManual) {
-                Set-NoteProperty $p 'numberingMode' $(if ($i -eq 0) { 'none' } else { 'visible' })
-                Set-NoteProperty $p 'numberingDefault' 'first-page-none'
-            }
-        }
-    }
-}
-
-function ConvertTo-UserRenderError([string]$Message) {
-    $text = [string]$Message
-    $rawTail = if ($text.Length -gt 250) { ' (å…ƒã®ã‚¨ãƒ©ãƒ¼: ' + $text.Substring(0, 250) + 'â€¦)' } else { ' (å…ƒã®ã‚¨ãƒ©ãƒ¼: ' + $text + ')' }
-    if ($text -match 'Open ãƒ—ãƒ­ãƒ‘ãƒ†ã‚£ã‚’å–å¾—ã§ãã¾ã›ã‚“|Unable to get the Open property') { return 'ExcelãŒã“ã®ãƒ•ã‚¡ã‚¤ãƒ«ã‚’é–‹ã‘ã¾ã›ã‚“ã§ã—ãŸã€‚ãƒ•ã‚¡ã‚¤ãƒ«ãŒä¿è­·ãƒ“ãƒ¥ãƒ¼å¯¾è±¡ï¼ˆã‚¤ãƒ³ã‚¿ãƒ¼ãƒãƒƒãƒˆç”±æ¥ï¼‰ãƒ»æš—å·åŒ–ï¼ˆç§˜å¯†åº¦ãƒ©ãƒ™ãƒ«/IRMï¼‰ãƒ»ç ´æã®ã„ãšã‚Œã‹ã®å¯èƒ½æ€§ãŒã‚ã‚Šã¾ã™ã€‚ãƒ•ã‚¡ã‚¤ãƒ«ã‚’å³ã‚¯ãƒªãƒƒã‚¯â†’ãƒ—ãƒ­ãƒ‘ãƒ†ã‚£â†’ã€Œè¨±å¯ã™ã‚‹ã€ã«ãƒã‚§ãƒƒã‚¯å¾Œã€ã‚‚ã†ä¸€åº¦PDFä½œæˆã—ã¦ãã ã•ã„ã€‚' }
-    if ($text -match 'ã“ã®ã‚ªãƒ–ã‚¸ã‚§ã‚¯ãƒˆã«ãƒ—ãƒ­ãƒ‘ãƒ†ã‚£|stateSavedAt|ãƒ—ãƒ­ãƒ‘ãƒ†ã‚£.*è¦‹ã¤ã‹ã‚Šã¾ã›ã‚“|property.*not found|does not contain a property') { return 'PDFä½œæˆã®é€²æ—çŠ¶æ…‹ã‚’æ›´æ–°ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚ReportBinderã‚’æ›´æ–°ã—ã¦ã‹ã‚‰ã€ã‚‚ã†ä¸€åº¦PDFä½œæˆã—ã¦ãã ã•ã„ã€‚' }
-    if ($text -match 'PDFåŒ–å¯¾è±¡ã®ã‚·ãƒ¼ãƒˆ|åŠè§’æ•°å­—') { return 'PDFåŒ–å¯¾è±¡ã®ã‚·ãƒ¼ãƒˆãŒã‚ã‚Šã¾ã›ã‚“ã€‚ã‚·ãƒ¼ãƒˆåã‚’åŠè§’æ•°å­—ã ã‘ã«ã—ã¦ãã ã•ã„ã€‚ä¾‹: 1, 2, 3' }
-    if ($text -match 'æå‡ºãƒ•ã‚¡ã‚¤ãƒ«|ãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“|ãƒ–ãƒƒã‚¯ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“|not found|missing') { return 'æå‡ºãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚å‰Šé™¤ãƒ»ç§»å‹•ãƒ»åå‰å¤‰æ›´ã•ã‚Œã¦ã„ãªã„ã‹ç¢ºèªã—ã¦ãã ã•ã„ã€‚' }
-    if ($text -match 'ã‚³ãƒ”ãƒ¼å‰å¾Œ|æå‡ºä¸­|ä½¿ç”¨ä¸­|locked|lock|ãƒ­ãƒƒã‚¯') { return ('ExcelãŒä¿å­˜ä¸­ã¾ãŸã¯ä»–ã®å‡¦ç†ä¸­ã§ã™ã€‚ä¿å­˜ãŒçµ‚ã‚ã£ã¦ã‹ã‚‰å†åº¦ç¢ºèªã—ã¾ã™ã€‚' + $rawTail) }
-    if ($text -match 'Excel|COM|HRESULT|ExportAsFixedFormat|RPC') { return ('Excelã§PDFåŒ–ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' + $rawTail) }
-    if ($text -match 'PDFã‚’ä½œæˆã§ãã¾ã›ã‚“|PDFãŒä½œæˆã•ã‚Œã¾ã›ã‚“|ç©ºã®PDF|0 bytes') { return ('Excelã‹ã‚‰PDFãŒå‡ºåŠ›ã•ã‚Œã¾ã›ã‚“ã§ã—ãŸã€‚å°åˆ·ç¯„å›²ã¨ã‚·ãƒ¼ãƒˆè¨­å®šã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚' + $rawTail) }
-    if ($text.Length -gt 120) { return $text.Substring(0, 120) + 'â€¦' }
-    return $text
-}
-
-function Get-SheetNameListFromInspection($Sheets) {
-    $names = @()
-    foreach ($s in @(Get-Array $Sheets)) {
-        $name = [string](Get-DataProperty $s 'sheetName' '')
-        if (-not [string]::IsNullOrWhiteSpace($name)) { $names += $name }
-    }
-    return @($names)
-}
-
-function Get-SheetFingerprintFromNames($SheetNames) {
-    $names = @($SheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($names.Count -eq 0) { return '' }
-    return ([string]::Join('|', @($names | Sort-Object { Get-SheetOrderNumber $_ }, { [string]$_ })))
-}
-
-function Set-WorkbookRenderedSheetSnapshot($Workbook, $SheetNames) {
-    $names = @($SheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    Set-NoteProperty $Workbook 'lastRenderedSheets' @($names)
-    Set-NoteProperty $Workbook 'lastRenderedSheetFingerprint' (Get-SheetFingerprintFromNames $names)
-}
-
-function Test-WorkbookRenderedSheetContains($Workbook, [string]$SheetName) {
-    if ($null -eq $Workbook) { return $false }
-    $lastSheets = @(Get-Array (Get-DataProperty $Workbook 'lastRenderedSheets' @()) | ForEach-Object { [string]$_ })
-    if ($lastSheets.Count -eq 0) { return $true } # Compatibility with workbooks rendered by older builds.
-    return (@($lastSheets | Where-Object { $_ -eq [string]$SheetName }).Count -gt 0)
-}
-
-function Test-PageContentMatchesWorkbookVersion($Page, $Workbook) {
-    if ($null -eq $Page -or $null -eq $Workbook) { return $false }
-    $versionId = [string](Get-DataProperty $Workbook 'lastRenderedVersionId' '')
-    if ([string]::IsNullOrWhiteSpace($versionId)) { return $true } # Older data: fall back to file existence and hash checks.
-    $workbookId = [string](Get-DataProperty $Workbook 'workbookId' '')
-    if ([string]::IsNullOrWhiteSpace($workbookId)) { return $false }
-    $rel = Normalize-RelativeForCompare ([string](Get-DataProperty $Page 'contentPdf' ''))
-    $expectedPrefix = Normalize-RelativeForCompare ("content-pdf\$workbookId\$versionId\")
-    return ($rel.StartsWith($expectedPrefix))
-}
-
-function Add-StaleReason($VolumeState, [string]$Type, [string]$Detail) {
-    if ($null -eq $VolumeState) { return }
-    $reasons = @(Get-Array (Get-DataProperty $VolumeState 'staleReasons' @()))
-    $existing = @($reasons | Where-Object { [string]$_.type -eq $Type } | Select-Object -First 1)
-    $others = @($reasons | Where-Object { [string]$_.type -ne $Type })
-    $count = 1
-    $detailText = [string]$Detail
-    if ($detailText -match '(?<n>\d+)ä»¶') { $count = [int]$matches['n'] }
-    if ($existing.Count -gt 0) {
-        $oldCount = Get-IntDataProperty $existing[0] 'count' 0
-        if ($oldCount -le 0) {
-            $oldDetail = [string](Get-DataProperty $existing[0] 'detail' '')
-            if ($oldDetail -match '(?<n>\d+)ä»¶') { $oldCount = [int]$matches['n'] } else { $oldCount = 1 }
-        }
-        $count += $oldCount
-        if ($detailText -match '\d+ä»¶') { $detailText = [regex]::Replace($detailText, '\d+ä»¶', "$count`ä»¶", 1) }
-    }
-    $reason = [ordered]@{ type=$Type; at=(New-NowIso); detail=$detailText; count=$count }
-    $nextReasons = @($reason) + @($others)
-    Set-NoteProperty $VolumeState 'staleReasons' @($nextReasons | Select-Object -First 10)
-}
-
-function Mark-VolumeNeedsRebuild($Structure, [string]$Language, [string]$Category, [string[]]$Volumes, [string]$Type, [string]$Detail) {
-    $cat=Require-WorkbookCategory $Category
-    foreach ($volume in @($Volumes | Select-Object -Unique)) {
-        if ([string]::IsNullOrWhiteSpace($volume) -or $volume -eq 'none') { continue }
-        $key=Get-VolumeStateKey $volume $cat
-        $v=Get-DataProperty $Structure.volumes $key $null
-        if ($null -eq $v) { continue }
-        $built=[string](Get-DataProperty $v 'builtFingerprint' '')
-        if (-not [string]::IsNullOrWhiteSpace($built)) {
-            Set-NoteProperty $v 'status' 'needs-rebuild'
-            Add-StaleReason $v $Type $Detail
-        }
-    }
-}
-
-function Mark-StructureVolumesNeedRebuild($Structure) {
-    # Legacy compatibility only. New code must call Mark-VolumeNeedsRebuild with explicit category and volumes.
-}
-
-function Remove-ContentPdfFileSafe([string]$Workspace, [string]$RelativePdf) {
-    if ([string]::IsNullOrWhiteSpace($RelativePdf)) { return }
-    try {
-        $workspaceFull = [IO.Path]::GetFullPath($Workspace)
-        if (-not $workspaceFull.EndsWith([IO.Path]::DirectorySeparatorChar)) { $workspaceFull += [IO.Path]::DirectorySeparatorChar }
-        $contentRoot = [IO.Path]::GetFullPath((Join-Path $Workspace 'content-pdf'))
-        if (-not $contentRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $contentRoot += [IO.Path]::DirectorySeparatorChar }
-        $full = [IO.Path]::GetFullPath((Join-Path $Workspace $RelativePdf))
-        if (-not $full.StartsWith($workspaceFull, [StringComparison]::OrdinalIgnoreCase)) { return }
-        if (-not $full.StartsWith($contentRoot, [StringComparison]::OrdinalIgnoreCase)) { return }
-        if (Test-Path -LiteralPath $full) { Remove-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue }
-        $dir = Split-Path -Parent $full
-        while (-not [string]::IsNullOrWhiteSpace($dir)) {
-            $dirFull = [IO.Path]::GetFullPath($dir)
-            if (-not $dirFull.StartsWith($contentRoot, [StringComparison]::OrdinalIgnoreCase)) { break }
-            $children = @(Get-ChildItem -LiteralPath $dirFull -Force -ErrorAction SilentlyContinue)
-            if ($children.Count -gt 0) { break }
-            Remove-Item -LiteralPath $dirFull -Force -ErrorAction SilentlyContinue
-            $dir = Split-Path -Parent $dirFull
-        }
-    } catch { }
-}
-
-function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets) {
-    $workbookId=[string](Get-DataProperty $Workbook 'workbookId' '')
-    $cat=Require-WorkbookCategory ([string](Get-DataProperty $Workbook 'category' ''))
-    $pages=@(Get-Array $Structure.pages)
-    $sortedSheets=@(Get-Array $Sheets | Sort-Object @{Expression={Get-SheetOrderNumber ([string](Get-DataProperty $_ 'sheetName' ''))};Ascending=$true}, @{Expression={[string](Get-DataProperty $_ 'sheetName' '')};Ascending=$true})
-    $current=@{}; foreach($s in $sortedSheets){$n=[string](Get-DataProperty $s 'sheetName' '');if($n){$current[$n]=$true}}
-    $removed=@(); $kept=@()
-    foreach($p in $pages){ if([string]$p.workbookId -eq $workbookId -and (-not $current.ContainsKey([string]$p.sheetName))){$removed+= $p}else{$kept+=$p} }
-    $pages=@($kept); $Structure.pages=$pages
-    $known=@{}; foreach($p in $pages){$known[(Resolve-PageId $p)]=$p}
-    $added=@();$updated=@();$atEnd=@();$inOrder=0
-    foreach($s in $sortedSheets){
-        $sheet=[string](Get-DataProperty $s 'sheetName' ''); if(-not $sheet){continue}
-        $pageId="$workbookId-$([regex]::Replace($sheet,'[^0-9A-Za-z]+','-'))"
-        $title=[string](Get-DataProperty $s 'detectedTitle' '');if(-not $title){$title="$([string]$Workbook.fileName) / $sheet"}
-        if($known.ContainsKey($pageId)){
-            $p=$known[$pageId];Set-NoteProperty $p 'sheetName' $sheet;Set-NoteProperty $p 'detectedTitle' $title;if(-not [string]$p.title){Set-NoteProperty $p 'title' $title};$updated+=$pageId
-        }else{
-            # V5-P3: pages ã¯ JSON ç”±æ¥ã® PSCustomObject ã§æ§‹æˆã•ã‚Œã‚‹ã€‚æ–°è¦ãƒšãƒ¼ã‚¸ã ã‘ OrderedDictionary ã«ã™ã‚‹ã¨
-            #        Windows PowerShell 5.1 ãŒ Sort-Object ç­‰ã®åž‹æ¯”è¼ƒã§ã€Œå¼•æ•°ã®åž‹ãŒä¸€è‡´ã—ã¾ã›ã‚“ã€ã‚’æŠ•ã’ã‚‹ã“ã¨ãŒã‚ã‚‹ã€‚
-            #        ã‚³ãƒ¬ã‚¯ã‚·ãƒ§ãƒ³ã®è¦ç´ åž‹ã‚’å¿…ãšæƒãˆã‚‹ã€‚
-            $p=[pscustomobject][ordered]@{pageId=$pageId;workbookId=$workbookId;sheetName=$sheet;titleSource='A1';detectedTitle=$title;title=$title;volume=(Get-DefaultVolume $Language);order=0;orderManual=$false;numberingMode='visible';numberingManual=$false;numberingDefault='first-page-none';enabled=$true;contentPdf=$null;status='not-rendered';warnings=@();updatedAt=New-NowIso}
-            $ins=Insert-PageInSheetOrder $Structure $p ([string]$p.volume) $cat
-            $Structure.pages=@(Get-Array $Structure.pages)+@($p)
-            if($ins.insertedAtEnd){$atEnd+=$pageId}else{$inOrder++}
-            $added+=$pageId;$known[$pageId]=$p
-        }
-    }
-    foreach($vol in @(Get-VolumeList $Language)){[void](Renumber-VolumeOrder $Structure $vol $cat)}
-    if($removed.Count -gt 0 -or $added.Count -gt 0){
-        $affected=@($removed|ForEach-Object{[string]$_.volume})
-        if($added.Count -gt 0){$affected+=@((Get-DefaultVolume $Language))}
-        Mark-VolumeNeedsRebuild $Structure $Language $cat @($affected|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique) 'render' 'Excelã®ã‚·ãƒ¼ãƒˆæ§‹æˆãŒå¤‰æ›´ã•ã‚Œã¾ã—ãŸ'
-    }
-    Apply-DefaultNumberingPerVolume $Language $Structure $cat
-    $names=@($sortedSheets|ForEach-Object{[string]$_.sheetName})
-    return [ordered]@{addedPageIds=@($added);updatedPageIds=@($updated);removedPages=@($removed);sheetNames=$names;sheetFingerprint=(Get-SheetFingerprintFromNames $names);addedCount=$added.Count;insertedInOrderCount=$inOrder;insertedAtEndCount=$atEnd.Count;insertedAtEndPageIds=@($atEnd)}
-}
-
-function Clear-ExcelHeaderFooterParts($Target) {
-    if ($null -eq $Target) { return }
-    foreach ($part in @('LeftHeader','CenterHeader','RightHeader','LeftFooter','CenterFooter','RightFooter')) {
-        try { $Target.$part = '' } catch { }
-        try { $Target.$part.Text = '' } catch { }
-    }
-}
-
-function Clear-ExcelHeaderFooterPictures($PageSetup) {
-    if ($null -eq $PageSetup) { return }
-    foreach ($part in @(
-        'LeftHeaderPicture','CenterHeaderPicture','RightHeaderPicture',
-        'LeftFooterPicture','CenterFooterPicture','RightFooterPicture'
-    )) {
-        try { $PageSetup.$part.FileName = '' } catch { }
-        try { $PageSetup.$part.Filename = '' } catch { }
-    }
-}
-
-function Remove-XlsxHeaderFooterXml([string]$XlsxPath) {
-    # Remove Excel header/footer definitions from the temporary XLSX package before Excel opens it.
-    # This avoids relying on slow/fragile COM FirstPage/EvenPage PageSetup calls and prevents
-    # footer page numbers such as &P from being exported into the content PDF.
-    if ([string]::IsNullOrWhiteSpace($XlsxPath)) { return [ordered]@{ ok = $true; changed = 0; skipped = $true } }
-    $ext = [IO.Path]::GetExtension($XlsxPath).ToLowerInvariant()
-    if (@('.xlsx','.xlsm','.xltx','.xltm') -notcontains $ext) { return [ordered]@{ ok = $true; changed = 0; skipped = $true } }
-    if (-not (Test-Path -LiteralPath $XlsxPath)) { return [ordered]@{ ok = $true; changed = 0; skipped = $true } }
-
-    try {
-        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue | Out-Null
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue | Out-Null
-    } catch { }
-
-    $zip = $null
-    $changed = 0
-    try {
-        $zip = [System.IO.Compression.ZipFile]::Open($XlsxPath, [System.IO.Compression.ZipArchiveMode]::Update)
-        $targets = @($zip.Entries | Where-Object { [string]$_.FullName -match '^xl/(worksheets|chartsheets)/[^/]+\.xml$' })
-        $utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false
-        foreach ($entry in $targets) {
-            $name = [string]$entry.FullName
-            $xml = ''
-            $reader = $null
-            try {
-                $reader = New-Object IO.StreamReader($entry.Open(), [Text.Encoding]::UTF8, $true)
-                $xml = $reader.ReadToEnd()
-            } finally {
-                if ($reader) { $reader.Dispose() }
-            }
-            if ([string]::IsNullOrWhiteSpace($xml)) { continue }
-
-            $hasHeaderFooter = ([regex]::IsMatch($xml, '(?is)<(?:\w+:)?headerFooter\b'))
-            if (-not $hasHeaderFooter) { continue }
-
-            $newXml = [regex]::Replace($xml, '(?is)<(?:\w+:)?headerFooter\b[^>]*(?:/>|>.*?</(?:\w+:)?headerFooter>)', '')
-            # Only touch pageMargins when the sheet actually had header/footer content. Rewriting every
-            # sheet XML just to change blank header/footer margins is slow and does not affect page numbers.
-            $newXml = [regex]::Replace($newXml, '(?is)<(?:\w+:)?pageMargins\b[^>]*>', [System.Text.RegularExpressions.MatchEvaluator]{
-                param($m)
-                $tag = [string]$m.Value
-                if ($tag -notmatch '\sheader=') { $tag = $tag -replace '/?>$', ' header="0"$0' }
-                else { $tag = [regex]::Replace($tag, 'header="[^"]*"', 'header="0"') }
-                if ($tag -notmatch '\sfooter=') { $tag = $tag -replace '/?>$', ' footer="0"$0' }
-                else { $tag = [regex]::Replace($tag, 'footer="[^"]*"', 'footer="0"') }
-                return $tag
-            })
-
-            if ($newXml -ne $xml) {
-                $entry.Delete()
-                $newEntry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
-                $writer = $null
-                try {
-                    $writer = New-Object IO.StreamWriter($newEntry.Open(), $utf8)
-                    $writer.Write($newXml)
-                } finally {
-                    if ($writer) { $writer.Dispose() }
-                }
-                $changed++
-            }
-        }
-        return [ordered]@{ ok = $true; changed = $changed; skipped = $false }
-    } finally {
-        if ($zip) { $zip.Dispose() }
-    }
-}
-
-function Clear-ExcelPageSetupHeadersAndFooters($PageSetup) {
-    if ($null -eq $PageSetup) { return }
-
-    # Keep COM calls minimal. First-page/even-page header/footer XML is stripped from the
-    # temporary XLSX package before opening, so normal PageSetup cleanup is enough here.
-    # Toggling DifferentFirstPageHeaderFooter/OddAndEvenPagesHeaderFooter on some Excel builds
-    # can be very slow or hang on the first sheet.
-    Clear-ExcelHeaderFooterParts $PageSetup
-    Clear-ExcelHeaderFooterPictures $PageSetup
-    try { $PageSetup.DifferentFirstPageHeaderFooter = $false } catch { }
-    try { $PageSetup.OddAndEvenPagesHeaderFooter = $false } catch { }
-    try { $PageSetup.ScaleWithDocHeaderFooter = $false } catch { }
-    try { $PageSetup.AlignMarginsHeaderFooter = $false } catch { }
-    try { $PageSetup.HeaderMargin = 0 } catch { }
-    try { $PageSetup.FooterMargin = 0 } catch { }
-}
-
-function Clear-ExcelWorksheetHeadersAndFooters($Worksheet, $Excel = $null) {
-    if ($null -eq $Worksheet) { return }
-    # Flush queued PageSetup changes first. Some Excel versions keep header/footer changes queued
-    # while PrintCommunication is false, which can make ExportAsFixedFormat see old footer text.
-    try { if ($null -ne $Excel) { $Excel.PrintCommunication = $true } } catch { }
-    try { Clear-ExcelPageSetupHeadersAndFooters $Worksheet.PageSetup } catch { }
-    try { if ($null -ne $Excel) { $Excel.PrintCommunication = $true } } catch { }
-}
-
-function Set-ExcelPrintCommunicationSafe($Excel, [bool]$Enabled) {
-    if ($null -eq $Excel) { return $false }
-    try {
-        $Excel.PrintCommunication = $Enabled
-        return $true
-    } catch { return $false }
-}
-
-function Apply-StandardPrintSettings($Worksheet, $Excel = $null, [bool]$DeferPrintCommunication = $false) {
-    $printCommunicationChanged = $false
-    $ps = $null
-    try {
-        # PageSetup ã¯Excel COMã®ä¸­ã§ã‚‚ç‰¹ã«é‡ã„ã€‚è¤‡æ•°ã‚·ãƒ¼ãƒˆã®PDFä½œæˆæ™‚ã¯ã€å‘¼ã³å‡ºã—å…ƒã§
-        # PrintCommunication ã‚’ä¸€æ™‚åœæ­¢ã—ã¦ã‹ã‚‰ã¾ã¨ã‚ã¦åæ˜ ã™ã‚‹ã“ã¨ã§ã€ã‚·ãƒ¼ãƒˆã”ã¨ã®å¾…ã¡æ™‚é–“ã‚’æ¸›ã‚‰ã™ã€‚
-        if (-not $DeferPrintCommunication) {
-            $printCommunicationChanged = Set-ExcelPrintCommunicationSafe $Excel $false
-        }
-
-        try { $Worksheet.DisplayPageBreaks = $false } catch { }
-        $ps = $Worksheet.PageSetup
-        # æš«å®šPDFã¯å·¦å³1.2cmã‚’åŸºæº–ã«ã™ã‚‹ã€‚æœ€çµ‚PDFã§ã¯å¥‡æ•°/å¶æ•°ãƒšãƒ¼ã‚¸ã‚’0.2cmã ã‘å†…å´ã¸å¯„ã›ã‚‹(ãƒ‘ãƒ³ãƒå´1.4cm/å¤–å´1.0cm)ã€‚
-        $ps.TopMargin = Convert-CmToPt 0.8
-        $ps.BottomMargin = Convert-CmToPt 0.8
-        $ps.LeftMargin = Convert-CmToPt 1.2
-        $ps.RightMargin = Convert-CmToPt 1.2
-        # å°åˆ·ç¯„å›²ãŒ1ãƒšãƒ¼ã‚¸å¹…ã«æº€ãŸãªã„ã‚·ãƒ¼ãƒˆãŒå·¦å¯„ã‚Šã«è¦‹ãˆãªã„ã‚ˆã†ã€æ°´å¹³æ–¹å‘ã®ã¿ä¸­å¤®æƒãˆã«ã™ã‚‹ã€‚
-        # å¹…ã„ã£ã±ã„ã®ã‚·ãƒ¼ãƒˆã¯ä½™ç™½ã«æŽ¥ã™ã‚‹ãŸã‚ã€ã‚»ãƒ³ã‚¿ãƒªãƒ³ã‚°ã—ã¦ã‚‚ä½ç½®ã¯å¤‰ã‚ã‚‰ãªã„ã€‚
-        $ps.CenterHorizontally = $true
-        $ps.CenterVertically = $false
-        # å°åˆ·ç¯„å›²ã¯å°Šé‡ã—ã¤ã¤ã€å€çŽ‡ã¯Excelè¨­å®šã‚’ç„¡è¦–ã—ã¦1ãƒšãƒ¼ã‚¸ã«åŽã‚ã‚‹ã€‚
-        $ps.Zoom = $false
-        $ps.FitToPagesWide = 1
-        $ps.FitToPagesTall = 1
-        Clear-ExcelPageSetupHeadersAndFooters $ps
-    } finally {
-        if ($printCommunicationChanged -and $null -ne $Excel) {
-            [void](Set-ExcelPrintCommunicationSafe $Excel $true)
-        }
-    }
-
-    if ($null -eq $ps) {
-        try { Clear-ExcelWorksheetHeadersAndFooters $Worksheet $Excel } catch { }
-    }
-}
-
-function Get-PdfBatchToolInfo {
-    $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
-    $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-    if (-not (Test-Path -LiteralPath $composerJar)) { return $null }
-    if (-not (Test-Path -LiteralPath $pdfboxJar)) { return $null }
-    try { $javaExe = Resolve-JavaExe } catch { return $null }
-    return [ordered]@{ javaExe = $javaExe; classPath = "$composerJar;$pdfboxJar" }
-}
-
-function Split-BatchPdfToSheets([string]$BatchPdf, $SheetInfos, [string]$TmpDir) {
-    $tool = Get-PdfBatchToolInfo
-    if ($null -eq $tool) { return [ordered]@{ ok = $false; reason = 'pdfbox-unavailable'; message = 'PDFBox/JavaãŒãªã„ãŸã‚ä¸€æ‹¬PDFåˆ†å‰²ã‚’ä½¿ã„ã¾ã›ã‚“ã€‚' } }
-    $mapPath = Join-Path $TmpDir 'batch-split-map.tsv'
-    $lines = New-Object System.Collections.Generic.List[string]
-    $pageNo = 1
-    foreach ($info in @($SheetInfos)) {
-        $out = [string]$info.outPdf
-        $outParent = Split-Path -Parent $out
-        if (-not (Test-Path -LiteralPath $outParent)) { New-Item -ItemType Directory -Path $outParent -Force | Out-Null }
-        $lines.Add(("{0}`t{1}`t1" -f $out, $pageNo))
-        $pageNo++
-    }
-    Write-Utf8NoBomFile $mapPath ([string]::Join("`n", $lines))
-    $run = Invoke-NativeCapture ([string]$tool.javaExe) @('-cp', [string]$tool.classPath, 'BatchPdfSplitter', '--source', $BatchPdf, '--map', $mapPath)
-    $output = @($run.output)
-    $global:LASTEXITCODE = [int]$run.exitCode
-    $exit = $LASTEXITCODE
-    $outputText = ($output -join "`n")
-    if ($exit -ne 0) { return [ordered]@{ ok = $false; reason = 'split-failed'; message = $outputText } }
-    foreach ($info in @($SheetInfos)) {
-        if (-not (Test-Path -LiteralPath ([string]$info.outPdf))) { return [ordered]@{ ok = $false; reason = 'split-missing-output'; message = "åˆ†å‰²å¾ŒPDFãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $($info.outPdf)" } }
-        try {
-            if ((Get-Item -LiteralPath ([string]$info.outPdf)).Length -le 0) { return [ordered]@{ ok = $false; reason = 'split-empty-output'; message = "åˆ†å‰²å¾ŒPDFãŒç©ºã§ã™: $($info.outPdf)" } }
-        } catch { return [ordered]@{ ok = $false; reason = 'split-check-failed'; message = $_.Exception.Message } }
-    }
-    return [ordered]@{ ok = $true; message = $outputText }
-}
-
-function Export-WorkbookSheetsToPdfBatch($Excel, $Workbook, $SheetInfos, [string]$TmpDir) {
-    $infos = @($SheetInfos)
-    if ($infos.Count -le 1) { return [ordered]@{ ok = $false; reason = 'single-sheet'; message = '1ã‚·ãƒ¼ãƒˆã®ãŸã‚ä¸€æ‹¬PDFåŒ–ã—ã¾ã›ã‚“ã€‚' } }
-    if ($null -eq (Get-PdfBatchToolInfo)) { return [ordered]@{ ok = $false; reason = 'pdfbox-unavailable'; message = 'PDFBox/JavaãŒãªã„ãŸã‚å¾“æ¥æ–¹å¼ã§PDFåŒ–ã—ã¾ã™ã€‚' } }
-
-    $batchPdf = Join-Path $TmpDir 'batch-workbook.pdf'
-    if (Test-Path -LiteralPath $batchPdf) { Remove-Item -LiteralPath $batchPdf -Force -ErrorAction SilentlyContinue }
-    $missing = [Type]::Missing
-    $selected = $false
-    try {
-        $first = $true
-        foreach ($info in $infos) {
-            $ws = $null
-            try {
-                $ws = $Workbook.Worksheets.Item([string]$info.sheetName)
-                if ($first) { $ws.Select($true) | Out-Null; $first = $false }
-                else { $ws.Select($false) | Out-Null }
-            } finally {
-                Invoke-ComRelease $ws
-            }
-        }
-        $selected = $true
-        $active = $Workbook.ActiveSheet
-        try {
-            # é¸æŠžã—ãŸè¤‡æ•°ã‚·ãƒ¼ãƒˆã‚’1å›žã§PDFåŒ–ã™ã‚‹ã€‚ã‚·ãƒ¼ãƒˆã”ã¨ã®ExportAsFixedFormatå›žæ•°ã‚’æ¸›ã‚‰ã™ã®ãŒç‹™ã„ã€‚
-            $active.ExportAsFixedFormat(0, $batchPdf, 0, $true, $false, $missing, $missing, $false, $missing)
-        } finally {
-            Invoke-ComRelease $active
-        }
-        [void](Wait-ForPdfOutput $batchPdf 'ä¸€æ‹¬PDF')
-        $pageCount = Get-PdfPageCount $batchPdf
-        if ($pageCount -ne $infos.Count) {
-            return [ordered]@{ ok = $false; reason = 'page-count-mismatch'; message = "ä¸€æ‹¬PDFã®ãƒšãƒ¼ã‚¸æ•°ãŒæƒ³å®šã¨ç•°ãªã‚Šã¾ã™ã€‚æƒ³å®š=$($infos.Count) å®Ÿéš›=$pageCount" }
-        }
-        return (Split-BatchPdfToSheets $batchPdf $infos $TmpDir)
-    } catch {
-        return [ordered]@{ ok = $false; reason = 'batch-export-failed'; message = $_.Exception.Message }
-    } finally {
-        if ($selected -and $infos.Count -gt 0) {
-            try { $Workbook.Worksheets.Item([string]$infos[0].sheetName).Select($true) | Out-Null } catch { }
-        }
-    }
-}
-
-
-function Wait-ForPdfOutput([string]$PdfPath, [string]$SheetName) {
-    for ($i = 0; $i -lt 80; $i++) {
-        if (Test-Path -LiteralPath $PdfPath) {
-            try {
-                $item = Get-Item -LiteralPath $PdfPath
-                if ($item.Length -gt 0) { return $item }
-            } catch { }
-        }
-        Start-Sleep -Milliseconds 250
-    }
-    if (-not (Test-Path -LiteralPath $PdfPath)) { throw "Excelã‹ã‚‰PDFãŒå‡ºåŠ›ã•ã‚Œã¾ã›ã‚“ã§ã—ãŸ: ã‚·ãƒ¼ãƒˆ $SheetName" }
-    $item2 = Get-Item -LiteralPath $PdfPath
-    if ($item2.Length -le 0) { throw "Excelã‹ã‚‰ç©ºã®PDFãŒå‡ºåŠ›ã•ã‚Œã¾ã—ãŸ: ã‚·ãƒ¼ãƒˆ $SheetName" }
-    return $item2
-}
-
-function Export-WorksheetToPdfSafe($Excel, $Workbook, $Worksheet, [string]$OutPdf, [string]$SheetName, [bool]$AlreadyPrepared = $false) {
-    $missing = [Type]::Missing
-    $parent = Split-Path -Parent $OutPdf
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    if (Test-Path -LiteralPath $OutPdf) { Remove-Item -LiteralPath $OutPdf -Force -ErrorAction SilentlyContinue }
-
-    # Export the cleaned worksheet directly. The previous one-sheet-copy method can hang on
-    # cover workbooks with shapes or embedded objects. Header/footer definitions are already
-    # removed from the temporary XLSX package, so a direct ExportAsFixedFormat is safer and faster.
-    try {
-        if (-not $AlreadyPrepared) { Apply-StandardPrintSettings $Worksheet $Excel }
-        try { $Workbook.Activate() | Out-Null } catch { }
-        try { $Worksheet.Activate() | Out-Null } catch { }
-        try { $Worksheet.Select($true) | Out-Null } catch { }
-        # Type=0 xlTypePDF, Quality=0 xlQualityStandard, IgnorePrintAreas=false.
-        $Worksheet.ExportAsFixedFormat(0, $OutPdf, 0, $true, $false, $missing, $missing, $false, $missing)
-        return (Wait-ForPdfOutput $OutPdf $SheetName)
-    } catch {
-        $directError = $_.Exception.Message
-        throw "Excelã§PDFåŒ–ã§ãã¾ã›ã‚“ã§ã—ãŸ: ã‚·ãƒ¼ãƒˆ $SheetName / ç›´æŽ¥å‡ºåŠ›=[$directError]"
-    } finally {
-        try { $Workbook.Activate() | Out-Null } catch { }
-    }
-}
-
-function Get-PdfPageCount([string]$PdfPath) {
-    try {
-        $bytes = [IO.File]::ReadAllBytes($PdfPath)
-        $text = [Text.Encoding]::ASCII.GetString($bytes)
-        $count = ([regex]::Matches($text, '/Type\s*/Page(?!s)\b')).Count
-        if ($count -lt 1) { return 1 }
-        return $count
-    } catch { return 1 }
-}
-
-
-function New-ExcelApplicationForRender {
-    $excel = New-Object -ComObject Excel.Application
-    $excel.Visible = $false
-    $excel.DisplayAlerts = $false
-    $excel.EnableEvents = $false
-    $excel.ScreenUpdating = $false
-    try { $excel.AskToUpdateLinks = $false } catch { }
-    try { $excel.AutomationSecurity = 3 } catch { }
-    try { $excel.CalculateBeforeSave = $false } catch { }
-    # Speed-oriented settings. Submitted workbooks are expected to be saved with calculated values.
-    # PDF rendering does not need UI animation, status bar updates, or automatic recalculation.
-    try { $excel.DisplayStatusBar = $false } catch { }
-    try { $excel.EnableAnimations = $false } catch { }
-    try { $excel.UserControl = $false } catch { }
-    try { $excel.Calculation = -4135 } catch { } # xlCalculationManual
-    return $excel
-}
-
-function Close-ExcelApplicationForRender($Excel) {
-    if ($Excel) {
-        try { $Excel.Quit() } catch { }
-        Invoke-ComRelease $Excel
-    }
-}
-
-function Get-RenderEnvironment($Excel) {
-    $fontArial = Test-Path -LiteralPath 'C:\Windows\Fonts\arial.ttf'
-    $fontMsgothic = (Test-Path -LiteralPath 'C:\Windows\Fonts\msgothic.ttc') -or (Test-Path -LiteralPath 'C:\Windows\Fonts\msgothic.ttf')
-    $activePrinter = ''
-    try { $activePrinter = [string]$Excel.ActivePrinter } catch { }
-    return [ordered]@{
-        pcName = $env:COMPUTERNAME
-        userName = "$env:USERDOMAIN\$env:USERNAME"
-        excelVersion = [string]$Excel.Version
-        osVersion = [Environment]::OSVersion.VersionString
-        activePrinter = $activePrinter
-        hasArial = $fontArial
-        hasMsgothic = $fontMsgothic
-        capturedAt = New-NowIso
-    }
-}
-
-function Get-CachedRenderEnvironment($Excel) {
-    if ($null -eq $Script:RenderEnvironmentCache) {
-        $Script:RenderEnvironmentCache = Get-RenderEnvironment $Excel
-    }
-    return $Script:RenderEnvironmentCache
-}
-
-function Get-RenderEnvironmentFingerprint($EnvInfo) {
-    # V5-Â§6.4: ç”»åƒãƒãƒƒã‚·ãƒ¥ã®æ¯”è¼ƒå¯å¦ã‚’å·¦å³ã™ã‚‹è¦ç´ ã ã‘ã‚’æŒ‡ç´‹ã«ã™ã‚‹ã€‚
-    # pcName / userName ã¯è¨ºæ–­æƒ…å ±ã§ã‚ã‚Šã€æ¯”è¼ƒã®ä¸»åˆ¤å®šã«ã¯å«ã‚ãªã„
-    # (åˆ¥PCã§ã‚‚ç’°å¢ƒãŒåŒç­‰ãªã‚‰åŒã˜PDFã«ãªã‚Šã†ã‚‹ãŸã‚)ã€‚
-    if ($null -eq $EnvInfo) { return '' }
-    $parts = @(
-        'excelVersion=' + [string](Get-DataProperty $EnvInfo 'excelVersion' '')
-        'osVersion='    + [string](Get-DataProperty $EnvInfo 'osVersion' '')
-        'printer='      + [string](Get-DataProperty $EnvInfo 'activePrinter' '')
-        'arial='        + [string](Get-DataProperty $EnvInfo 'hasArial' $false)
-        'msgothic='     + [string](Get-DataProperty $EnvInfo 'hasMsgothic' $false)
-        'printProfile=' + [string]$Script:ExcelPrintProfileVersion
-    )
-    # V5-P1: ç”»åƒãƒãƒƒã‚·ãƒ¥ã¯ PDFBox / Java / è§£æžæ–¹å¼ / DPI / è‰²ã«ã‚‚ä¾å­˜ã™ã‚‹ã€‚
-    # ã“ã‚Œã‚‰ã‚’å«ã‚ãªã„ã¨ã€æ–¹å¼ã‚’å¤‰ãˆã¦ã‚‚æŒ‡ç´‹ãŒä¸€è‡´ã—ã¦äº’æ›æ€§ã®ãªã„ãƒãƒƒã‚·ãƒ¥ã‚’ç›´æŽ¥æ¯”è¼ƒã—ã¦ã—ã¾ã†ã€‚
-    try {
-        $vp = Get-VisualHashProfile
-        $parts += ('pdfBox=' + [string](Get-DataProperty $vp 'pdfBoxVersion' ''))
-        $parts += ('dpi=' + [string](Get-DataProperty $vp 'dpi' ''))
-        $parts += ('color=' + [string](Get-DataProperty $vp 'colorMode' ''))
-        $parts += ('profile=' + [string](Get-DataProperty $vp 'profileVersion' ''))
-        $parts += ('analyzer=' + [string]$Script:PdfPageAnalyzerVersion)
-        # V5-P1(#11): Java ã®ç‰ˆã‚’å®Ÿéš›ã«æŽ¡å–ã—ã¦æŒ‡ç´‹ã¸å«ã‚ã‚‹(ç©ºã®ã¾ã¾ã ã¨ Java æ›´æ–°å¾Œã‚‚æŒ‡ç´‹ãŒå¤‰ã‚ã‚‰ãšã€
-        # äº’æ›æ€§ã®ãªã„ç”»åƒãƒãƒƒã‚·ãƒ¥ã‚’ç›´æŽ¥æ¯”è¼ƒã—ã¦ã—ã¾ã†)ã€‚
-        $parts += ('java=' + [string](Get-JavaRuntimeSignature))
-    } catch { }
-    return (Get-Sha256Text ($parts -join '|'))
-}
-
-function Reset-RenderEnvironmentForJob {
-    # V5-Â§6.4: ç’°å¢ƒã¯ã‚µãƒ¼ãƒãƒ¼ç¨¼åƒä¸­ã«å¤‰ã‚ã‚Šã†ã‚‹(é€šå¸¸ä½¿ã†ãƒ—ãƒªãƒ³ã‚¿ã®å¤‰æ›´ãªã©)ã€‚
-    # ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã‚¸ãƒ§ãƒ–ã®é–‹å§‹ã”ã¨ã«å–ã‚Šç›´ã™ã€‚ãƒ­ã‚°å‡ºåŠ›ã®1å›žåˆ¶é™ã¨ã¯åˆ†ã‘ã‚‹ã€‚
-    $Script:RenderEnvironmentCache = $null
-    $Script:RenderEnvironmentCompared = $false
-    $Script:CurrentRenderEnvFingerprint = ''
-}
-
-function Compare-And-SaveEnvironment([string]$Language, $EnvInfo) {
-    $workspace = Get-WorkspacePath $Language
-    $path = Join-Path $workspace 'state\render-env.json'
-    $warnings = @()
-    if (Test-Path -LiteralPath $path) {
-        $old = Read-JsonFile $path $null
-        foreach ($key in @('pcName','excelVersion','osVersion','activePrinter','hasArial','hasMsgothic')) {
-            if ([string]$old.$key -ne [string]$EnvInfo.$key) {
-                $warnings += "PDFåŒ–ç’°å¢ƒãŒå‰å›žã¨ç•°ãªã‚Šã¾ã™: $key å‰å›ž=[$($old.$key)] ä»Šå›ž=[$($EnvInfo.$key)]"
-            }
-        }
-    }
-    Write-JsonFile $path $EnvInfo
-    return $warnings
-}
-
-
-function Touch-ClientActivity([string]$ClientId) {
-    $Script:ClientAttached = $true
-    $Script:LastHeartbeatUtc = [DateTime]::UtcNow
-    $Script:ClientCloseNotifiedUtc = [DateTime]::MinValue
-    return [ordered]@{ ok = $true; clientId = $ClientId; at = New-NowIso }
-}
-
-function Notify-ClientClosing([string]$ClientId) {
-    $Script:ClientAttached = $true
-    $Script:ClientCloseNotifiedUtc = [DateTime]::UtcNow
-    return [ordered]@{ ok = $true; clientId = $ClientId; closing = $true; at = New-NowIso }
-}
-
-function Request-ServerShutdown([string]$Reason) {
-    $Script:ShutdownRequested = $true
-    return [ordered]@{ ok = $true; shutdown = $true; reason = $Reason; at = New-NowIso }
-}
-
-function Test-ActiveRenderJobs([string]$Language) {
-    try {
-        $dir = Get-RenderJobDir $Language
-        if (-not (Test-Path -LiteralPath $dir)) { return $false }
-        $cutoff = [DateTime]::UtcNow.AddHours(-12)
-        $terminal = @('completed','completed-with-errors','failed','missing','cancelled')
-        $now = [DateTime]::UtcNow
-        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.status.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 30)) {
-            if ($file.LastWriteTimeUtc -lt $cutoff) { continue }
-            $job = Read-JsonFile $file.FullName $null
-            if ($null -eq $job) { continue }
-            $status = ([string]$job.status).ToLowerInvariant()
-            if ([string]::IsNullOrWhiteSpace($status)) { continue }
-            if ($terminal -contains $status) { continue }
-            $processId = Get-IntDataProperty $job 'processId' 0
-            if ($processId -gt 0) {
-                try { if ($null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { return $true } } catch { }
-                continue
-            }
-            if (($now - $file.LastWriteTimeUtc).TotalSeconds -lt 20) { return $true }
-        }
-    } catch {
-        return $false
-    }
-    return $false
-}
-
-function Try-AcquireLockHandle([string]$LockPath) {
-    # V5: Invoke-WithLock ã¯ body çµ‚äº†ã§ãƒãƒ³ãƒ‰ãƒ«ã‚’é–‰ã˜ã‚‹ãŸã‚ã€tick ã‚’ã¾ãŸã„ã§ãƒ­ãƒƒã‚¯ã‚’ä¿æŒã§ããªã„ã€‚
-    # è‡ªå‹•ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼ãŒè¤‡æ•°ãƒ–ãƒƒã‚¯ã®æ‰€æœ‰æ¨©ã‚’æŒã¡ç¶šã‘ã‚‹ãŸã‚ã®å–å¾—å°‚ç”¨ãƒ˜ãƒ«ãƒ‘ã€‚
-    # å–å¾—ã§ããªã„å ´åˆã¯ $null ã‚’è¿”ã™(ã‚¨ãƒ©ãƒ¼ã«ã—ãªã„ã€‚ä»–ã‚µãƒ¼ãƒãƒ¼ãŒæ‹…å½“ã—ã¦ã„ã‚‹ã ã‘)ã€‚
-    try {
-        $parent = Split-Path -Parent $LockPath
-        if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        $fs = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-        try {
-            $fs.SetLength(0)
-            $bytes = [Text.Encoding]::UTF8.GetBytes("$env:COMPUTERNAME\$env:USERNAME $(New-NowIso)")
-            $fs.Write($bytes, 0, $bytes.Length)
-            $fs.Flush()
-        } catch { }
-        return [pscustomobject]@{ Path = $LockPath; Stream = $fs }
-    } catch {
-        return $null
-    }
-}
-
-function Release-LockHandle($Handle) {
-    if ($null -eq $Handle) { return }
-    try { if ($Handle.Stream) { $Handle.Stream.Close(); $Handle.Stream.Dispose() } } catch { }
-    try { if ($Handle.Path -and (Test-Path -LiteralPath $Handle.Path)) { Remove-Item -LiteralPath $Handle.Path -Force -ErrorAction SilentlyContinue } } catch { }
-}
-
-function Get-RenderEngineLockPath([string]$Language) {
-    return (Join-Path (Get-WorkspacePath $Language) 'locks\render-engine.lock')
-}
-
-function Get-WorkbookRenderLockPath([string]$Language, [string]$WorkbookId) {
-    return (Join-Path (Get-WorkspacePath $Language) ("locks\render_{0}.lock" -f $WorkbookId))
-}
-
-function Invoke-WithRenderLock([string]$Language, [string]$WorkbookId, [scriptblock]$Body) {
-    # V5-D1: Excel COM ã¯è¨€èªžã”ã¨ã«1ã‚¸ãƒ§ãƒ–ã¸åˆ¶é™ã™ã‚‹ã€‚
-    # ãƒ‡ãƒƒãƒ‰ãƒ­ãƒƒã‚¯ã‚’é¿ã‘ã‚‹ãŸã‚ã€å–å¾—é †åºã‚’å…¨çµŒè·¯ã§ render-engine -> render_<workbookId> ã«çµ±ä¸€ã™ã‚‹ã€‚
-    $enginePath = Get-RenderEngineLockPath $Language
-    $bookPath = Get-WorkbookRenderLockPath $Language $WorkbookId
-    # Invoke-WithLock deliberately names its scriptblock parameter $Action.
-    # If both functions use $Body, PowerShell's dynamic scope makes this wrapper
-    # see itself and recursively reacquire the workbook lock.
-    return Invoke-WithLock $enginePath {
-        Invoke-WithLock $bookPath $Body
-    }
-}
-
-function Invoke-WithLock([string]$LockPath, [scriptblock]$Action) {
-    $parent = Split-Path -Parent $LockPath
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $fs = $null
-    # OpenOrCreate + FileShare.None: æŽ’ä»–ã¯ã€Œé–‹ã„ã¦ã„ã‚‹ãƒãƒ³ãƒ‰ãƒ«ã€ã§æ‹…ä¿ã™ã‚‹ã€‚
-    # ä»¥å‰ã® CreateNew æ–¹å¼ã¯ã€ãƒ—ãƒ­ã‚»ã‚¹å¼·åˆ¶çµ‚äº†ã‚„é›»æºæ–­ã§ãƒ­ãƒƒã‚¯ãƒ•ã‚¡ã‚¤ãƒ«ãŒæ®‹ã‚‹ã¨
-    # æ‰‹å‹•å‰Šé™¤ã™ã‚‹ã¾ã§æ°¸ä¹…ã«ã€Œä»–ã®å‡¦ç†ãŒãƒ­ãƒƒã‚¯ä¸­ã€ã«ãªã£ã¦ã„ãŸã€‚
-    # å¼·åˆ¶çµ‚äº†ç›´å¾Œã¯SMBå´ã§ãƒãƒ³ãƒ‰ãƒ«è§£æ”¾ãŒé…ã‚Œã‚‹ã“ã¨ãŒã‚ã‚‹ãŸã‚ã€çŸ­ã„ãƒªãƒˆãƒ©ã‚¤ã‚’å…¥ã‚Œã‚‹ã€‚
-    for ($lockAttempt = 1; $lockAttempt -le 3; $lockAttempt++) {
-        try {
-            $fs = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-            break
-        } catch {
-            $fs = $null
-            if ($lockAttempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-    }
-    if ($null -eq $fs) {
-        throw "ä»–ã®å‡¦ç†ãŒãƒ­ãƒƒã‚¯ä¸­ã§ã™ã€‚èª°ã‹ãŒåŒã˜å‡¦ç†ã‚’å®Ÿè¡Œä¸­ã‹ã€å¼·åˆ¶çµ‚äº†ã—ãŸãƒ—ãƒ­ã‚»ã‚¹ã®ãƒãƒ³ãƒ‰ãƒ«ãŒæ®‹ã£ã¦ã„ã¾ã™ã€‚æ™‚é–“ã‚’ãŠã„ã¦å†å®Ÿè¡Œã—ã¦ãã ã•ã„ã€‚è§£æ”¾å¾Œã«ä¿æŒè€…ã‚’ç¢ºèªã™ã‚‹ã«ã¯æ¬¡ã®ãƒ•ã‚¡ã‚¤ãƒ«ã‚’é–‹ã„ã¦ãã ã•ã„: $LockPath"
-    }
-    try {
-        $fs.SetLength(0)
-        $bytes = [Text.Encoding]::UTF8.GetBytes("$env:COMPUTERNAME\$env:USERNAME $(New-NowIso)")
-        $fs.Write($bytes, 0, $bytes.Length)
-        return & $Action
-    } finally {
-        if ($fs) { $fs.Close(); $fs.Dispose() }
-        if (Test-Path -LiteralPath $LockPath) { Remove-Item -LiteralPath $LockPath -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-function Register-Workbook([string]$Language, [string]$RelativePath, [string]$Category = '') {
-    Test-DirectExcelRelativePath $RelativePath | Out-Null
-    $cat=Require-WorkbookCategory $Category
-    $paths=Get-Paths
-    $full=Join-Safe ([string]$paths.submissionDir) $RelativePath
-    if (-not (Test-Path -LiteralPath $full)) { throw "æå‡ºãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $RelativePath" }
-    $candidate=New-WorkbookObject $RelativePath $Language $cat
-    return Update-StructureLocked $Language {
-        param($structure)
-        $normalized=([string]$RelativePath -replace '\\','/').ToLowerInvariant()
-        $existing=@(Get-Array $structure.workbooks | Where-Object {
-            ([string]$_.workbookId -eq [string]$candidate.workbookId) -or ((([string]$_.relativePath -replace '\\','/').ToLowerInvariant() -eq $normalized) -and (Test-WorkbookCategory $_ $cat))
-        } | Select-Object -First 1)
-        if ($existing.Count -gt 0) {
-            $old=$existing[0]
-            Set-NoteProperty $candidate 'workbookId' ([string]$old.workbookId)
-            foreach ($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','lastRenderedSheets','lastRenderedSheetFingerprint','lastRenderLog','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash')) {
-                Set-NoteProperty $candidate $name (Get-DataProperty $old $name $null)
-            }
-            if (-not [string]::IsNullOrWhiteSpace([string]$candidate.lastRenderedExcelHash)) { Set-NoteProperty $candidate 'status' $(if ($candidate.currentExcelHash -ne $candidate.lastRenderedExcelHash) {'excel-updated'} else {[string]$old.status}) }
-        }
-        $structure.workbooks=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -ne [string]$candidate.workbookId }) + @($candidate)
-        Mark-VolumeNeedsRebuild $structure $Language $cat @((Get-DefaultVolume $Language)) 'register' 'Excelã‚’1ä»¶ç™»éŒ²ã—ã¾ã—ãŸ'
-        return [ordered]@{ workbook=$candidate; sheets=@(); registered=$true; inspected=$false }
-    }
-}
-
-function Register-WorkbooksBatch([string]$Language, $RelativePaths, [string]$Category = '') {
-    $registered = @()
-    $errors = @()
-    $seen = @{}
-    foreach ($raw in (Get-Array $RelativePaths)) {
-        $rel = [string]$raw
-        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
-        $key = ($rel -replace '\\', '/').ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
-        try {
-            $r = Register-Workbook $Language $rel $Category
-            $wb = $r.workbook
-            $registered += [ordered]@{
-                relativePath = $rel
-                workbookId = [string]$wb.workbookId
-                fileName = [string]$wb.fileName
-                displayName = [string]$wb.displayName
-                status = [string]$wb.status
-                category = [string]$wb.category
-            }
-        } catch {
-            $errors += [ordered]@{ relativePath = $rel; error = $_.Exception.Message; detail = [string]$_ }
-        }
-    }
-    return [ordered]@{
-        requestedCount = @(Get-Array $RelativePaths).Count
-        registered = @($registered)
-        errors = @($errors)
-        registeredCount = @($registered).Count
-        errorCount = @($errors).Count
-    }
-}
-
-
-function Get-LastRenderAttemptFor([string]$WorkbookId) {
-    $a = $Script:LastRenderAttempt
-    if ($null -eq $a) { return [ordered]@{ snapshotId = ''; hash = '' } }
-    if ([string](Get-DataProperty $a 'workbookId' '') -ne [string]$WorkbookId) { return [ordered]@{ snapshotId = ''; hash = '' } }
-    return [ordered]@{ snapshotId = [string](Get-DataProperty $a 'snapshotId' ''); hash = [string](Get-DataProperty $a 'hash' '') }
-}
-
-function Set-WorkbookRenderError([string]$Language, [string]$WorkbookId, [string]$Message, [string]$Detail = '',
-                                 [string]$AttemptedSnapshotId = '', [string]$AttemptedHash = '') {
-    try {
-        $userMessage=ConvertTo-UserRenderError $Message
-        Update-StructureLocked $Language {
-            param($structure)
-            $wb=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-            if ($wb.Count -gt 0) {
-                # V5-Â§6.3a: å¤±æ•—ã—ãŸã®ã¯ã€Œè©¦è¡Œã—ãŸç‰ˆã€ã§ã‚ã£ã¦ã€ç¾åœ¨ã®ç‰ˆã¨ã¯é™ã‚‰ãªã„ã€‚
-                # æ—¢ã«æ–°ã—ã„ç‰ˆãŒæ¤œçŸ¥ã•ã‚Œã¦ã„ã‚‹ãªã‚‰ render-error ã«ã›ãš excel-updated ã®ã¾ã¾ã«ã™ã‚‹ã€‚
-                $attempted = Normalize-FileHash $AttemptedHash
-                $latest = Normalize-FileHash ([string](Get-DataProperty $wb[0] 'currentExcelHash' ''))
-                $sameVersion = ([string]::IsNullOrWhiteSpace($attempted)) -or ([string]::IsNullOrWhiteSpace($latest)) -or ($attempted -eq $latest)
-                if ($sameVersion) {
-                    Set-NoteProperty $wb[0] 'status' 'render-error'
-                    foreach ($p in @(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.status -ne 'confirmed' })) { Set-NoteProperty $p 'status' 'render-error'; Set-NoteProperty $p 'warnings' @($userMessage); Set-NoteProperty $p 'updatedAt' (New-NowIso) }
-                } else {
-                    Set-NoteProperty $wb[0] 'status' 'excel-updated'
-                    # ãƒšãƒ¼ã‚¸ã® status ã¯ä¸Šæ›¸ãã—ãªã„(æ–°ã—ã„ç‰ˆã®çŠ¶æ…‹ã‚’å£Šã•ãªã„ãŸã‚)
-                }
-                # å¤±æ•—æƒ…å ±ã¯çŠ¶æ…‹ã¨åˆ‡ã‚Šé›¢ã—ã¦å¿…ãšæ®‹ã™
-                Add-NotePropertyIfMissing $wb[0] 'lastRenderErrorSnapshotId' ''
-                Add-NotePropertyIfMissing $wb[0] 'lastRenderErrorHash' ''
-                Set-NoteProperty $wb[0] 'lastRenderErrorSnapshotId' ([string]$AttemptedSnapshotId)
-                Set-NoteProperty $wb[0] 'lastRenderErrorHash' ([string]$AttemptedHash)
-                Set-NoteProperty $wb[0] 'lastError' $Message; Set-NoteProperty $wb[0] 'lastErrorUser' $userMessage; Set-NoteProperty $wb[0] 'lastErrorAt' (New-NowIso)
-            }
-        } | Out-Null
-        $workspace=Get-WorkspacePath $Language
-        $safeId=[regex]::Replace($WorkbookId,'[^A-Za-z0-9_.-]+','_')
-        $logRel=Join-Path 'logs' ("render-error_{0}_{1}.json" -f $safeId,(New-RbId))
-        Write-JsonFile (Join-Path $workspace $logRel) ([ordered]@{workbookId=$WorkbookId;message=$Message;userMessage=$userMessage;detail=$Detail;at=New-NowIso})
-        Update-StructureLocked $Language { param($structure) $wb=@(Get-Array $structure.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1); if($wb.Count){Set-NoteProperty $wb[0] 'lastRenderLog' $logRel} } | Out-Null
-    } catch { }
-}
-
-function Get-ContentPdfMaintenanceLockPath([string]$Workspace, [string]$WorkbookId) {
-    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-    return (Join-Path $Workspace ("locks\content-pdf_{0}.lock" -f $safeWorkbookId))
-}
-
-function Remove-WorkbookContentPdfs([string]$Workspace, [string]$WorkbookId, [string]$KeepVersionId) {
-    $lockPath = Get-ContentPdfMaintenanceLockPath $Workspace $WorkbookId
-    try {
-        Invoke-WithLock $lockPath { Remove-WorkbookContentPdfsCore $Workspace $WorkbookId $KeepVersionId } | Out-Null
-    } catch {
-        # ä¿æŒæ•´ç†ã®ç«¶åˆãƒ»å¤±æ•—ã§ã€å®Œæˆæ¸ˆã¿PDFä½œæˆãã®ã‚‚ã®ã‚’å¤±æ•—æ‰±ã„ã«ã—ãªã„ã€‚
-        Write-Warning ('content PDFã®ä¸–ä»£æ•´ç†ã‚’è¦‹é€ã‚Šã¾ã—ãŸ: ' + $_.Exception.Message)
-    }
-}
-
-function Remove-WorkbookContentPdfsCore([string]$Workspace, [string]$WorkbookId, [string]$KeepVersionId) {
-    # V5-Â§3.7: ä¿æŒä¸–ä»£æ•°ã¨ pins/leases ã«ã‚ˆã‚‹ä¿è­·ã‚’å°Šé‡ã™ã‚‹ã€‚
-    # å˜ç´”ã« KeepVersionId ä»¥å¤–ã‚’å…¨å‰Šé™¤ã™ã‚‹ã¨ã€å·®åˆ†æ¯”è¼ƒã®åŸºæº–ã‚„æ­£å¼PDFãŒå‚ç…§ã™ã‚‹ä¸–ä»£ã¾ã§æ¶ˆãˆã‚‹ã€‚
-    try {
-        # V5-P0: æ‰¿èªå‰ã¯ãƒ‡ã‚£ã‚¹ã‚¯ä½¿ç”¨é‡ã‚’å¢—ã‚„ã•ãªã„ã€‚V4.1 ã¨åŒã˜ã€Œæœ€æ–°ä»¥å¤–ã‚’å‰Šé™¤ã€ã«æˆ»ã™ã€‚
-        if (-not (Test-InputHistoryEnabled)) { Remove-WorkbookContentPdfsAll $Workspace $WorkbookId $KeepVersionId; return }
-        $keepCount = 3
-        try { $keepCount = [int](Get-InputHistorySettings).retainContentPdfVersions } catch { }
-        if ($keepCount -lt 1) { $keepCount = 1 }
-        $bookDir0 = Join-Path $Workspace (Join-Path 'content-pdf' $WorkbookId)
-        if (Test-Path -LiteralPath $bookDir0) {
-            $dirs = @(Get-ChildItem -LiteralPath $bookDir0 -Directory -ErrorAction SilentlyContinue | Sort-Object Name)
-            $keep = @()
-            if (-not [string]::IsNullOrWhiteSpace($KeepVersionId)) { $keep += $KeepVersionId }
-            $keep += @($dirs | Select-Object -Last $keepCount | ForEach-Object { [string]$_.Name })
-            foreach ($d in $dirs) {
-                $name = [string]$d.Name
-                if ($keep -contains $name) { continue }
-                if (Test-ContentPdfProtected $Workspace $WorkbookId $name) { continue }
-                Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-        return
-    } catch { }
-}
-
-function Remove-WorkbookContentPdfsAll([string]$Workspace, [string]$WorkbookId, [string]$KeepVersionId) {
-    try {
-        $bookDir = Join-Path $Workspace (Join-Path 'content-pdf' $WorkbookId)
-        if (-not (Test-Path -LiteralPath $bookDir)) { return }
-        foreach ($dir in @(Get-ChildItem -LiteralPath $bookDir -Directory -ErrorAction SilentlyContinue)) {
-            if ([string]::IsNullOrWhiteSpace($KeepVersionId) -or [string]$dir.Name -ne $KeepVersionId) {
-                Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-    } catch { }
-}
-
-function Unregister-Workbook([string]$Language, [string]$WorkbookId) {
-    if ([string]::IsNullOrWhiteSpace($WorkbookId)) { throw 'workbookId ãŒå¿…è¦ã§ã™ã€‚' }
-    $result=Update-StructureLocked $Language {
-        param($structure)
-        $found=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-        if ($found.Count -eq 0) { throw "ç™»éŒ²æ¸ˆã¿ExcelãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $WorkbookId" }
-        $cat=Require-WorkbookCategory ([string]$found[0].category)
-        $removedPages=@(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId })
-        $affected=@($removedPages | ForEach-Object {[string]$_.volume} | Where-Object {$_ -and $_ -ne 'none'} | Select-Object -Unique)
-        $structure.workbooks=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -ne $WorkbookId })
-        $structure.pages=@(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -ne $WorkbookId })
-        Mark-VolumeNeedsRebuild $structure $Language $cat $affected 'unregister' 'Excelã‚’1ä»¶ç™»éŒ²è§£é™¤ã—ã¾ã—ãŸ'
-        return [ordered]@{workbookId=$WorkbookId;fileName=[string]$found[0].fileName;removedPages=$removedPages}
-    }
-    # V5-Â§3.8: ç™»éŒ²è§£é™¤ã¨å±¥æ­´å‰Šé™¤ã¯åˆ¥æ“ä½œã€‚å±¥æ­´ãŒæœ‰åŠ¹ãªã‚‰ content-pdf ã‚‚æ®‹ã™
-    # (æ­£å¼PDFã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ãŒéŽåŽ»ã®ä¸–ä»£ã‚’å‚ç…§ã—ã¦ã„ã‚‹å¯èƒ½æ€§ãŒã‚ã‚‹ãŸã‚)ã€‚
-    try {
-        if (-not (Test-InputHistoryEnabled)) { Remove-WorkbookContentPdfsAll (Get-WorkspacePath $Language) $WorkbookId '' }
-    } catch { }
-    return $result
-}
-
-function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = $null, [bool]$KeepExcelOpen = $false, [scriptblock]$ProgressCallback = $null,
-                         [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '') {
-    $paths = Get-Paths
-    $workspace = Get-WorkspacePath $Language
-    $structure = Get-Structure $Language
-    $workbook = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-    if ($workbook.Count -eq 0) { throw "WorkbookãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $WorkbookId" }
-    $wb = $workbook[0]
-    $sourcePath = Join-Safe ([string]$paths.submissionDir) ([string]$wb.relativePath)
-    # V5: ä¿å­˜æ¸ˆã¿æ¤œçŸ¥ç‰ˆã‹ã‚‰ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã™ã‚‹å ´åˆã¯ã€æå‡ºãƒ•ã‚©ãƒ«ãƒ€ã®ç¾ç‰©ãŒæ¶ˆãˆã¦ã„ã¦ã‚‚ç¶šè¡Œã§ãã‚‹ã€‚
-    if ([string]::IsNullOrWhiteSpace($SourceOverridePath) -and -not (Test-Path -LiteralPath $sourcePath)) {
-        $hasSnapshotInput = $false
-        try { $probe = Capture-RenderInput $Language $WorkbookId $SourceSnapshotId ''; $hasSnapshotInput = (-not [string]::IsNullOrWhiteSpace([string]$probe.path)) } catch { }
-        if (-not $hasSnapshotInput) {
-            Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){Set-NoteProperty $x[0] 'status' 'missing'} } | Out-Null
-            throw "æå‡ºãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $($wb.relativePath)"
-        }
-    }
-    # V5-D1: render-engine -> render_<workbookId> ã®é †ã§å–å¾—ã™ã‚‹ã€‚
-    $Script:PendingAnalysis = $null
-    $renderResult = Invoke-WithRenderLock $Language $WorkbookId {
-        Add-NotePropertyIfMissing $wb 'lastError' ''
-        Add-NotePropertyIfMissing $wb 'lastErrorUser' ''
-        Add-NotePropertyIfMissing $wb 'lastErrorAt' $null
-        Add-NotePropertyIfMissing $wb 'lastRenderAttemptHash' ''
-        Add-NotePropertyIfMissing $wb 'lastRenderLog' ''
-        Set-NoteProperty $wb 'status' 'rendering'
-        Set-NoteProperty $wb 'lastError' ''
-        Set-NoteProperty $wb 'lastErrorUser' ''
-        Set-NoteProperty $wb 'lastErrorAt' $null
-        Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){Set-NoteProperty $x[0] 'status' 'rendering';Set-NoteProperty $x[0] 'lastError' '';Set-NoteProperty $x[0] 'lastErrorUser' '';Set-NoteProperty $x[0] 'lastErrorAt' $null} } | Out-Null
-
-        # èª°ã‹ãŒä¿å­˜ã—ãŸç›´å¾Œã‚„ã‚¦ã‚¤ãƒ«ã‚¹ã‚¹ã‚­ãƒ£ãƒ³ä¸­ã¯èª­ã¿å–ã‚ŠãŒä¸€æ™‚çš„ã«å¤±æ•—ã™ã‚‹ãŸã‚ã€å°‘ã—å¾…ã£ã¦ãƒªãƒˆãƒ©ã‚¤ã™ã‚‹ã€‚
-        # V5-Â§6.1/Â§C: å…ˆã«ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°å…¥åŠ›ã‚’ç¢ºå®šã•ã›ã‚‹ã€‚
-        # ãƒãƒƒã‚·ãƒ¥ã¯ã€Œå®Ÿéš›ã«é–‹ããƒ•ã‚¡ã‚¤ãƒ«ã€ã«å¯¾ã—ã¦è¨ˆç®—ã—ãªã‘ã‚Œã°ãªã‚‰ãªã„ã€‚
-        # ç¾è¡ŒExcelã®ãƒãƒƒã‚·ãƒ¥ã‚’ä½¿ã†ã¨ã€æ¤œçŸ¥ç‰ˆã‹ã‚‰ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã—ãŸã®ã«æœ€æ–°æ‰±ã„ã«ãªã‚ŠCASãŒå£Šã‚Œã‚‹ã€‚
-        $inputInfo = $null
-        $ephemeralCaptureId = ''
-        if ([string]::IsNullOrWhiteSpace($SourceOverridePath)) {
-            try { $inputInfo = Capture-RenderInput $Language $WorkbookId $SourceSnapshotId '' } catch { $inputInfo = $null }
-            if ($null -ne $inputInfo -and -not [string]::IsNullOrWhiteSpace([string]$inputInfo.path)) {
-                $SourceOverridePath = [string]$inputInfo.path
-                $SourceSnapshotId = [string]$inputInfo.snapshotId
-                $ExpectedSourceHash = [string]$inputInfo.hash
-                if ([bool]$inputInfo.ephemeral) { $ephemeralCaptureId = [string]$inputInfo.captureId }
-            }
-        }
-        if (-not [string]::IsNullOrWhiteSpace($SourceOverridePath)) {
-            if (-not (Test-Path -LiteralPath $SourceOverridePath)) { throw "ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°å…¥åŠ›ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $SourceOverridePath" }
-            $sourcePath = $SourceOverridePath
-            $item = Get-Item -LiteralPath $sourcePath -ErrorAction Stop
-        }
-        $sourceHash = ''
-        $lastReadError = ''
-        for ($readAttempt = 1; $readAttempt -le 3; $readAttempt++) {
-            try {
-                $sourceHash = New-StableHash $sourcePath
-                if (-not [string]::IsNullOrWhiteSpace($sourceHash)) { break }
-            } catch { $lastReadError = $_.Exception.Message }
-            if ($readAttempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-        # V5-Â§6.3a: catch çµŒè·¯ãŒã€Œã©ã®ç‰ˆã‚’è©¦è¡Œã—ãŸã‹ã€ã‚’çŸ¥ã‚‹ãŸã‚ã«è¨˜éŒ²ã™ã‚‹ã€‚
-        # åŒä¸€ãƒ—ãƒ­ã‚»ã‚¹å†…ã®ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã¯ render-engine ãƒ­ãƒƒã‚¯ã§ç›´åˆ—åŒ–ã•ã‚Œã¦ã„ã‚‹ãŸã‚å®‰å…¨ã€‚
-        # V5-P0(#3): å›ºå®šç‰ˆ(pin)ã®æŒ‡å®šãŒã‚ã‚‹å ´åˆã€è©¦è¡Œã—ãŸç‰ˆã¯ã€Œæ„å›³ã—ãŸ ExpectedSourceHashã€ã§ã‚ã£ã¦
-        # ç¾ç‰©ãƒ•ã‚¡ã‚¤ãƒ«($sourceHash=ç¾åœ¨ç‰ˆ)ã§ã¯ãªã„ã€‚ç¾ç‰©ã®ãƒãƒƒã‚·ãƒ¥ã‚’è¨˜éŒ²ã™ã‚‹ã¨ã€ç‰ˆãšã‚Œå¤±æ•—æ™‚ã«
-        # Set-WorkbookRenderError ã® sameVersion åˆ¤å®šãŒèª¤ã£ã¦ç¾åœ¨ç‰ˆã‚’ render-error åŒ–ã—ã¦ã—ã¾ã†ã€‚
-        $attemptHashForRecord = if (-not [string]::IsNullOrWhiteSpace($ExpectedSourceHash)) { [string]$ExpectedSourceHash } else { [string]$sourceHash }
-        $Script:LastRenderAttempt = [ordered]@{ workbookId = $WorkbookId; snapshotId = [string]$SourceSnapshotId; hash = [string]$attemptHashForRecord }
-        if (-not [string]::IsNullOrWhiteSpace($ExpectedSourceHash) -and -not [string]::IsNullOrWhiteSpace($sourceHash)) {
-            if ((Normalize-FileHash $sourceHash) -ne (Normalize-FileHash $ExpectedSourceHash)) {
-                throw 'ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°å…¥åŠ›ãŒæƒ³å®šã—ãŸç‰ˆã¨ä¸€è‡´ã—ã¾ã›ã‚“ã€‚ã‚‚ã†ä¸€åº¦PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($sourceHash)) {
-            throw "æå‡ºExcelã‚’èª­ã¿å–ã‚Œã¾ã›ã‚“ã§ã—ãŸ(3å›žè©¦è¡Œ)ã€‚èª°ã‹ãŒä¿å­˜ä¸­ã‹ã€æŽ’ä»–ãƒ¢ãƒ¼ãƒ‰ã§é–‹ã‹ã‚Œã¦ã„ã‚‹å¯èƒ½æ€§ãŒã‚ã‚Šã¾ã™ã€‚å°‘ã—å¾…ã£ã¦ã‹ã‚‰ã‚‚ã†ä¸€åº¦PDFä½œæˆã—ã¦ãã ã•ã„ã€‚ $lastReadError"
-        }
-        $item = Get-Item -LiteralPath $sourcePath
-        # V5: ç§’å˜ä½ã ã¨åŒä¸€ç§’ã®2å›žå‡¦ç†ã§åŒã˜ä¸–ä»£ãƒ•ã‚©ãƒ«ãƒ€ã‚’å…±æœ‰ã—ã¦ã—ã¾ã†ã€‚ãƒŸãƒªç§’+GUID8ã«ã™ã‚‹ã€‚
-        $versionId = New-RbVersionId
-        $contentDir = Join-Path $workspace (Join-Path 'content-pdf' (Join-Path $WorkbookId $versionId))
-        New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
-        $tmpDir = Join-Path ([string]$paths.dataDir) (Join-Path 'common\tmp' ([Guid]::NewGuid().ToString('N')))
-        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-        $tmpPath = Join-Path $tmpDir ([IO.Path]::GetFileName($sourcePath))
-        $lastCopyError = ''
-        $copied = $false
-        for ($copyAttempt = 1; $copyAttempt -le 3; $copyAttempt++) {
-            try {
-                Copy-FileSharedRead $sourcePath $tmpPath
-                $copied = $true
-                break
-            } catch { $lastCopyError = $_.Exception.Message }
-            if ($copyAttempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-        if (-not $copied) {
-            throw "æå‡ºExcelã‚’ã‚³ãƒ”ãƒ¼ã§ãã¾ã›ã‚“ã§ã—ãŸ(3å›žè©¦è¡Œ)ã€‚èª°ã‹ãŒä¿å­˜ä¸­ã®å¯èƒ½æ€§ãŒã‚ã‚Šã¾ã™ã€‚å°‘ã—å¾…ã£ã¦ã‹ã‚‰ã‚‚ã†ä¸€åº¦PDFä½œæˆã—ã¦ãã ã•ã„ã€‚ $lastCopyError"
-        }
-        # Copy-Itemã¯Zone.Identifierï¼ˆMark of the Webï¼‰ã‚’ä¸€æ™‚ã‚³ãƒ”ãƒ¼ã¸å¼•ãç¶™ããŸã‚ã€
-        # ä¿è­·ãƒ“ãƒ¥ãƒ¼ã«ã‚ˆã‚‹Workbooks.Openå¤±æ•—ã‚’é˜²ãç›®çš„ã§æ˜Žç¤ºçš„ã«é™¤åŽ»ã™ã‚‹ã€‚
-        try { Unblock-File -LiteralPath $tmpPath -ErrorAction SilentlyContinue } catch { }
-        # Full SHA-256 twice per workbook was expensive. The source has already been hashed;
-        # after copying, confirm size and source timestamp/size stability instead of hashing the copy again.
-        $copyItem = Get-Item -LiteralPath $tmpPath -ErrorAction Stop
-        $sourceAfterCopy = Get-Item -LiteralPath $sourcePath -ErrorAction Stop
-        if ($copyItem.Length -ne $item.Length -or $sourceAfterCopy.Length -ne $item.Length -or $sourceAfterCopy.LastWriteTimeUtc -ne $item.LastWriteTimeUtc) {
-            throw 'ã‚³ãƒ”ãƒ¼ä¸­ã«æå‡ºExcelãŒæ›´æ–°ã•ã‚Œã¾ã—ãŸã€‚ä¿å­˜ãŒçµ‚ã‚ã£ã¦ã‹ã‚‰ã‚‚ã†ä¸€åº¦PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'
-        }
-        # V5-Â§3.1/Â§6.2: æå‡ºãƒ•ã‚©ãƒ«ãƒ€ã®ç¾ç‰©ã‹ã‚‰ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã™ã‚‹å ´åˆã¯ã€
-        # ãƒ˜ãƒƒãƒ€ãƒ¼/ãƒ•ãƒƒã‚¿ãƒ¼XMLã‚’åŠ å·¥ã™ã‚‹å‰(Lç›´å¾Œ)ã«æœªåŠ å·¥ã®æ¤œçŸ¥ç‰ˆã‚’ä¿å­˜ã™ã‚‹ã€‚
-        if ([string]::IsNullOrWhiteSpace($SourceSnapshotId) -and (Test-InputHistoryEnabled)) {
-            try {
-                $capMeta = Ensure-SnapshotMetadata $Language $WorkbookId ([string]$wb.relativePath) ([string]$wb.category) $sourcePath $sourceHash 'render'
-                if ([bool]$capMeta.ok) {
-                    $capId = [string]$capMeta.snapshotId
-                    $capOk = $true
-                    if ([bool](Get-DataProperty $capMeta 'pending' $false)) {
-                        if (Test-SourceRetentionEnabled) {
-                            $saved = Save-SnapshotSourceFile $Language $WorkbookId $capId $sourcePath $sourceHash
-                            if (-not [bool]$saved.ok) { $capOk = $false }
-                        }
-                        if ($capOk) { $capOk = Complete-Snapshot $Language $WorkbookId $capId }
-                    }
-                    if ($capOk) {
-                        $SourceSnapshotId = $capId
-                        $Script:LastRenderAttempt = [ordered]@{ workbookId = $WorkbookId; snapshotId = $SourceSnapshotId; hash = [string]$sourceHash }
-                    }
-                }
-            } catch { }
-        }
-
-        $excelPackageScrub = $null
-        try { $excelPackageScrub = Remove-XlsxHeaderFooterXml $tmpPath } catch { $excelPackageScrub = [ordered]@{ ok = $false; error = $_.Exception.Message } }
-
-        $excel = $SharedExcel
-        $ownsExcel = $false
-        $book = $null
-        $rendered = @()
-        $warnings = @()
-        $steps = @()
-        try {
-            if ($ProgressCallback) { & $ProgressCallback 'prepare' $WorkbookId '' }
-            if ($null -eq $excel) {
-                $steps += 'Excel COMã‚’èµ·å‹•'
-                $excel = New-ExcelApplicationForRender
-                $ownsExcel = $true
-            } else {
-                $steps += 'æ—¢å­˜ã®Excel COMã‚’ä½¿ç”¨'
-                try { $excel.DisplayAlerts = $false; $excel.EnableEvents = $false; $excel.ScreenUpdating = $false } catch { }
-            }
-            $envInfo = Get-CachedRenderEnvironment $excel
-            $Script:CurrentRenderEnvFingerprint = Get-RenderEnvironmentFingerprint $envInfo
-            $Script:CurrentRenderEnvInfo = $envInfo
-            if (-not $Script:RenderEnvironmentCompared) {
-                $warnings += Compare-And-SaveEnvironment $Language $envInfo
-                Write-JsonFile (Join-Path $workspace "logs\render-env_$versionId.json") $envInfo
-                $Script:RenderEnvironmentCompared = $true
-            }
-
-            if ($excelPackageScrub -and $excelPackageScrub.ok -eq $true -and [int](Get-DataProperty $excelPackageScrub 'changed' 0) -gt 0) {
-                $steps += "Excelå†…éƒ¨ã®ãƒ˜ãƒƒãƒ€ãƒ¼/ãƒ•ãƒƒã‚¿ãƒ¼XMLã‚’å‰Šé™¤: $([int](Get-DataProperty $excelPackageScrub 'changed' 0)) ä»¶"
-            } elseif ($excelPackageScrub -and $excelPackageScrub.ok -eq $false) {
-                $warnings += "Excelå†…éƒ¨ãƒ˜ãƒƒãƒ€ãƒ¼/ãƒ•ãƒƒã‚¿ãƒ¼XMLã®äº‹å‰å‰Šé™¤ã«å¤±æ•—ã—ã¾ã—ãŸã€‚COMè¨­å®šã§å‰Šé™¤ã‚’ç¶šè¡Œã—ã¾ã™: $([string](Get-DataProperty $excelPackageScrub 'error' ''))"
-            }
-            $steps += 'ä¸€æ™‚ã‚³ãƒ”ãƒ¼ã‚’é–‹ã'
-            if ($ProgressCallback) { & $ProgressCallback 'open' $WorkbookId '' }
-            $book = Open-ExcelWorkbookSafe $excel $tmpPath $true
-            try { $book.CheckCompatibility = $false } catch { }
-
-            $inspected = @()
-            $targetSheetNames = @()
-            $sheetRenderInfos = @()
-            $sheetCount = 0
-            try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
-            $deferredPrintCommunication = Set-ExcelPrintCommunicationSafe $excel $false
-            try {
-                for ($i = 1; $i -le $sheetCount; $i++) {
-                    $ws = $null
-                    try {
-                        $ws = $book.Worksheets.Item($i)
-                        $sheetName = [string]$ws.Name
-                        $visible = ([int]$ws.Visible -eq -1)
-                        if ($visible -and $sheetName -match '^[0-9]+$') {
-                            $targetSheetNames += $sheetName
-                            $a1 = ''
-                            try { $a1 = [string]$ws.Range('A1').Text } catch { }
-                            if ([string]::IsNullOrWhiteSpace($a1)) { $a1 = "$($wb.fileName) / $sheetName" }
-                            # Reading PageSetup.PrintArea is another slow COM call and is only diagnostic.
-                            # Keep it blank in render logs to avoid delaying PDFä½œæˆ.
-                            $printArea = ''
-                            $inspected += [ordered]@{ sheetName = $sheetName; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
-
-                            $steps += "ã‚·ãƒ¼ãƒˆ $sheetName ã®å°åˆ·è¨­å®šã‚’èª¿æ•´"
-                            if ($ProgressCallback) { & $ProgressCallback 'sheet-setup' $WorkbookId $sheetName }
-                            Apply-StandardPrintSettings $ws $excel $deferredPrintCommunication
-                            $outPdf = Join-Path $contentDir "$sheetName.pdf"
-                            $sheetRenderInfos += [ordered]@{ sheetName = $sheetName; outPdf = $outPdf; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
-                        }
-                    } finally {
-                        Invoke-ComRelease $ws
-                    }
-                }
-            } finally {
-                if ($deferredPrintCommunication) { [void](Set-ExcelPrintCommunicationSafe $excel $true) }
-            }
-            if ($targetSheetNames.Count -eq 0) {
-                $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @()
-                # V5-Â§3.7: æ—§ä¸–ä»£ã®å€‹åˆ¥å‰Šé™¤ã¯å»ƒæ­¢ã€‚ä¸–ä»£å˜ä½ã®æŽƒé™¤(Remove-WorkbookContentPdfs)ã«ä¸€æœ¬åŒ–ã™ã‚‹ã€‚
-                # å€‹åˆ¥ã«æ¶ˆã™ã¨ã€ä¿æŒã—ã¦ã„ã‚‹ã¯ãšã®ä¸–ä»£ãƒ•ã‚©ãƒ«ãƒ€ã®ä¸­èº«ãŒæ¬ æã™ã‚‹ã€‚
-                Set-WorkbookRenderedSheetSnapshot $wb @()
-                Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @());Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
-                throw 'PDFåŒ–å¯¾è±¡ã®ã‚·ãƒ¼ãƒˆãŒã‚ã‚Šã¾ã›ã‚“ã€‚ã‚·ãƒ¼ãƒˆåãŒåŠè§’æ•°å­—ã®ã¿ï¼ˆä¾‹: 1, 2, 003ï¼‰ã®ã‚·ãƒ¼ãƒˆã‚’ç”¨æ„ã—ã¦ãã ã•ã„ã€‚'
-            }
-
-            $batchResult = $null
-            if (@($sheetRenderInfos).Count -gt 1) {
-                if ($ProgressCallback) { & $ProgressCallback 'batch' $WorkbookId '' }
-                $steps += "è¤‡æ•°ã‚·ãƒ¼ãƒˆã‚’ä¸€æ‹¬PDFåŒ–: $(@($sheetRenderInfos).Count) ã‚·ãƒ¼ãƒˆ"
-                $batchResult = Export-WorkbookSheetsToPdfBatch $excel $book $sheetRenderInfos $tmpDir
-                if ($batchResult -and $batchResult.ok -eq $true) {
-                    $steps += 'ä¸€æ‹¬PDFã‚’ã‚·ãƒ¼ãƒˆåˆ¥PDFã¸åˆ†å‰²'
-                    if ($ProgressCallback) { & $ProgressCallback 'split' $WorkbookId '' }
-                } else {
-                    $reason = [string](Get-DataProperty $batchResult 'reason' '')
-                    $msg = [string](Get-DataProperty $batchResult 'message' '')
-                    if ($reason -ne 'single-sheet' -and $reason -ne 'pdfbox-unavailable') {
-                        $warnings += "ä¸€æ‹¬PDFåŒ–ã‚’ä½¿ãˆãªã‹ã£ãŸãŸã‚å¾“æ¥æ–¹å¼ã§ç¶šè¡Œã—ã¾ã™: $msg"
-                    }
-                }
-            }
-
-            if (-not ($batchResult -and $batchResult.ok -eq $true)) {
-                foreach ($info in @($sheetRenderInfos)) {
-                    $ws = $null
-                    try {
-                        $sheetName = [string]$info.sheetName
-                        $steps += "ã‚·ãƒ¼ãƒˆ $sheetName ã‚’PDFåŒ–"
-                        if ($ProgressCallback) { & $ProgressCallback 'sheet' $WorkbookId $sheetName }
-                        $ws = $book.Worksheets.Item($sheetName)
-                        [void](Export-WorksheetToPdfSafe $excel $book $ws ([string]$info.outPdf) $sheetName $true)
-                    } finally {
-                        Invoke-ComRelease $ws
-                    }
-                }
-            }
-
-            $usedBatchOutput = ($batchResult -and $batchResult.ok -eq $true)
-            foreach ($info in @($sheetRenderInfos)) {
-                $sheetName = [string]$info.sheetName
-                $outPdf = [string]$info.outPdf
-                # Batch export is accepted only when total pages equals target sheet count, and the splitter
-                # writes one page per target. Avoid rereading every split PDF just to count pages.
-                $pageCount = if ($usedBatchOutput) { 1 } else { Get-PdfPageCount $outPdf }
-                $pageWarnings = @()
-                if ($pageCount -gt 1) { $pageWarnings += "ã“ã®ã‚·ãƒ¼ãƒˆã®PDFã¯ $pageCount ãƒšãƒ¼ã‚¸ã§ã™ã€‚Excelã®å°åˆ·ç¯„å›²ãƒ»æ”¹ãƒšãƒ¼ã‚¸ãƒ»å€çŽ‡ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚" }
-                $rendered += [ordered]@{ sheetName = $sheetName; pdf = $outPdf; pageCount = $pageCount; warnings = $pageWarnings }
-            }
-            if ($rendered.Count -eq 0) {
-                throw 'PDFã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚Excelã®å°åˆ·è¨­å®šã¾ãŸã¯å¯¾è±¡ã‚·ãƒ¼ãƒˆã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚'
-            }
-
-            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $inspected
-            $removedPages = @(Get-Array (Get-DataProperty $pageSync 'removedPages' @()))
-            if ($removedPages.Count -gt 0) {
-                $removedNames = @($removedPages | ForEach-Object { [string](Get-DataProperty $_ 'sheetName' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-                $removedLabel = [string]::Join('ã€', $removedNames)
-                if ([string]::IsNullOrWhiteSpace($removedLabel)) { $removedLabel = "$($removedPages.Count) ãƒšãƒ¼ã‚¸" }
-                $warnings += "ç¾åœ¨ã®Excelã«å­˜åœ¨ã—ãªã„ã‚·ãƒ¼ãƒˆã‚’ãƒšãƒ¼ã‚¸æ§‹æˆã‹ã‚‰å¤–ã—ã¾ã—ãŸ: $removedLabel"
-                $steps += "å­˜åœ¨ã—ãªã„ã‚·ãƒ¼ãƒˆã®å¤ã„ãƒšãƒ¼ã‚¸ã‚’å‰Šé™¤: $removedLabel"
-                # V5-Â§3.7: æ—§ä¸–ä»£ã®å€‹åˆ¥å‰Šé™¤ã¯å»ƒæ­¢(ä¸Šè¨˜ã¨åŒã˜ç†ç”±)ã€‚
-            }
-            Set-WorkbookRenderedSheetSnapshot $wb (Get-DataProperty $pageSync 'sheetNames' @())
-            $pages = @(Get-Array $structure.pages)
-            foreach ($r in $rendered) {
-                $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
-                $p = @($pages | Where-Object { (Resolve-PageId $_) -eq $pageId -or ([string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq [string]$r.sheetName) } | Select-Object -First 1)
-                if ($p.Count -gt 0) {
-                    $rel = Get-RelativePathCompat $workspace ([string]$r.pdf)
-                    Set-NoteProperty ($p[0]) 'contentPdf' $rel
-                    Set-NoteProperty ($p[0]) 'status' 'rendered'
-                    Set-NoteProperty ($p[0]) 'warnings' @($r.warnings)
-                    Set-NoteProperty ($p[0]) 'updatedAt' (New-NowIso)
-                }
-            }
-            foreach ($p in @($pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.contentPdf -and [string]$_.status -eq 'confirmed' })) {
-                if ($sourceHash -ne [string]$wb.lastRenderedExcelHash) { Set-NoteProperty $p 'status' 'stale' }
-            }
-            # V5-Â§2.4: currentExcel* ã¯ Scan-Updates ã®å°‚æœ‰ã€‚ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã¯æ›¸ã‹ãªã„ã€‚
-            # ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ä¸­ã«åˆ¥ãƒ—ãƒ­ã‚»ã‚¹ãŒæ¤œçŸ¥ã—ãŸæ–°ã—ã„ç‰ˆã‚’ã€å¤ã„ç‰ˆã®ãƒãƒƒã‚·ãƒ¥ã§ä¸Šæ›¸ãã—ãªã„ãŸã‚ã€‚
-            Set-NoteProperty $wb 'lastRenderedVersionId' $versionId
-            Set-NoteProperty $wb 'lastRenderedExcelHash' $sourceHash
-            Set-NoteProperty $wb 'lastRenderedAt' (New-NowIso)
-            Set-WorkbookRenderedSheetSnapshot $wb (Get-DataProperty $pageSync 'sheetNames' @())
-            Set-NoteProperty $wb 'renderProfileVersion' $Script:ExcelPrintProfileVersion
-            Add-NotePropertyIfMissing $wb 'lastError' ''
-            Add-NotePropertyIfMissing $wb 'lastErrorUser' ''
-            Add-NotePropertyIfMissing $wb 'lastErrorAt' $null
-            Add-NotePropertyIfMissing $wb 'lastRenderAttemptHash' ''
-            Add-NotePropertyIfMissing $wb 'lastRenderLog' ''
-            Set-NoteProperty $wb 'status' 'rendered-unchecked'
-            Set-NoteProperty $wb 'lastError' ''
-            Set-NoteProperty $wb 'lastErrorUser' ''
-            Set-NoteProperty $wb 'lastErrorAt' $null
-            Set-NoteProperty $wb 'lastRenderAttemptHash' $sourceHash
-            Set-NoteProperty $wb 'warnings' @($warnings)
-            $logRel = "logs\render_$WorkbookId`_$versionId.json"
-            Set-NoteProperty $wb 'lastRenderLog' $logRel
-            $pageSync = Update-StructureLocked $Language {
-                param($st)
-                $latest=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1)
-                if(-not $latest.Count){throw "WorkbookãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $WorkbookId"}
-                $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected
-                foreach($r in $rendered){$pageId="$WorkbookId-$([regex]::Replace([string]$r.sheetName,'[^0-9A-Za-z]+','-'))";$pg=@(Get-Array $st.pages|Where-Object{(Resolve-PageId $_)-eq $pageId}|Select-Object -First 1);if($pg.Count){Set-NoteProperty $pg[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf));Set-NoteProperty $pg[0] 'status' 'rendered';Set-NoteProperty $pg[0] 'warnings' @($r.warnings);Set-NoteProperty $pg[0] 'updatedAt' (New-NowIso)}}
-                # V5-Â§2.4: currentExcel* ã¯ã‚³ãƒ”ãƒ¼ã—ãªã„(Scan-Updates ã®å°‚æœ‰)ã€‚
-                foreach($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash','warnings','lastRenderLog')){Set-NoteProperty $lw $name (Get-DataProperty $wb $name $null)}
-                Set-NoteProperty $lw 'lastRenderedSnapshotId' ([string]$SourceSnapshotId)
-                Set-NoteProperty $lw 'renderEnvironmentFingerprint' ([string]$Script:CurrentRenderEnvFingerprint)
-                # V5-Â§6.3: ãƒ­ãƒƒã‚¯å†…ã§æœ€æ–°ã® currentExcelHash ã¨çªãåˆã‚ã›ã¦ status ã‚’æ±ºã‚ã‚‹ã€‚
-                # ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ä¸­ã«å…ƒExcelãŒæ›´æ–°ã•ã‚Œã¦ã„ã‚Œã°ã€PDFã¯ä¿å­˜ã—ã¤ã¤ excel-updated ã«æˆ»ã™ã€‚
-                $latestCurrentHash = Normalize-FileHash ([string](Get-DataProperty $lw 'currentExcelHash' ''))
-                $renderedHash = Normalize-FileHash $sourceHash
-                if ([string]::IsNullOrWhiteSpace($latestCurrentHash) -or $latestCurrentHash -eq $renderedHash) {
-                    Set-NoteProperty $lw 'status' 'rendered-unchecked'
-                } else {
-                    Set-NoteProperty $lw 'status' 'excel-updated'
-                    foreach($pg2 in @(Get-Array $st.pages|Where-Object{[string]$_.workbookId -eq $WorkbookId -and [string]$_.status -eq 'rendered'})){ Set-NoteProperty $pg2 'status' 'stale' }
-                }
-                Set-WorkbookRenderedSheetSnapshot $lw (Get-DataProperty $sync 'sheetNames' @())
-                $cat=Require-WorkbookCategory ([string]$lw.category);$vols=@(Get-Array $st.pages|Where-Object{[string]$_.workbookId -eq $WorkbookId}|ForEach-Object{[string]$_.volume}|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique);Mark-VolumeNeedsRebuild $st $Language $cat $vols 'render' 'Excelã‚’1ä»¶PDFä½œæˆã—ã¾ã—ãŸ'
-                return $sync
-            }
-            Write-JsonFile (Join-Path $workspace $logRel) ([ordered]@{ workbookId = $WorkbookId; rendered = $rendered; warnings = $warnings; steps = $steps; sheetSync = $pageSync; at = New-NowIso })
-            # V5-P1: è§£æžã¯ã“ã“ã§ã¯å®Ÿè¡Œã—ãªã„ã€‚
-            # ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ç”¨Excelã‚’é–‹ã„ãŸã¾ã¾ã€ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãƒ­ãƒƒã‚¯ã‚’ä¿æŒã—ãŸã¾ã¾è§£æžã™ã‚‹ã¨ã€
-            # æ¯”è¼ƒç”¨ã®å†ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãŒ2ã¤ç›®ã®Excel COMã‚’èµ·å‹•ã—ã¦ã—ã¾ã†(1ã‚¸ãƒ§ãƒ–åˆ¶é™ã«åã™ã‚‹)ã€‚
-            # ãƒ­ãƒƒã‚¯è§£æ”¾å¾Œã«å®Ÿè¡Œã™ã‚‹ãŸã‚ã€å¯¾è±¡ã ã‘ã‚’è¨˜éŒ²ã—ã¦ãŠãã€‚
-            $Script:PendingAnalysis = [ordered]@{ language = $Language; workbookId = $WorkbookId; snapshotId = [string]$SourceSnapshotId; versionId = $versionId; rendered = $rendered }
-            Remove-WorkbookContentPdfs $workspace $WorkbookId $versionId
-        } finally {
-            if ($book) { try { $book.Close($false) } catch { } ; Invoke-ComRelease $book }
-            if ($ownsExcel -and $excel) { Close-ExcelApplicationForRender $excel }
-            if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
-            if (-not [string]::IsNullOrWhiteSpace($ephemeralCaptureId)) { Remove-EphemeralCopy $Language $ephemeralCaptureId }
-            if ($ownsExcel -or -not $KeepExcelOpen) { [GC]::Collect(); [GC]::WaitForPendingFinalizers() }
-        }
-        return [ordered]@{ workbookId = $WorkbookId; versionId = $versionId; rendered = $rendered; warnings = $warnings; steps = $steps; sheetSync = $pageSync }
-    }
-
-    # V5-P1: ã“ã“ã§ã¯ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãƒ­ãƒƒã‚¯ã‚‚Excelã‚‚è§£æ”¾æ¸ˆã¿ã€‚
-    # æ¯”è¼ƒç”¨ã®å†ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãŒå¿…è¦ã«ãªã£ã¦ã‚‚ã€æ”¹ã‚ã¦å…±é€šãƒ­ãƒƒã‚¯ã‚’å–ã‚Šç›´ã›ã‚‹ã€‚
-    # è§£æžã®å¤±æ•—ã¯PDFä½œæˆã®å¤±æ•—ã«ã—ãªã„(åˆ¤å®šã¯ unknown ã«ãªã‚‹)ã€‚
-    # V5-P3: KeepExcelOpen ã®ã¨ã($Script:PendingAnalysis ã‚’å‘¼å‡ºå…ƒãŒå›žåŽã™ã‚‹ä¸€æ‹¬ã‚¸ãƒ§ãƒ–)ã¯
-    # ã“ã“ã§æ¶ˆã—ã¦ã¯ãªã‚‰ãªã„ã€‚ä»¥å‰ã¯ç„¡æ¡ä»¶ã« $null ã‚’ä»£å…¥ã—ã¦ã„ãŸãŸã‚ã€
-    # Invoke-RenderJobFromFile ã® $deferredAnalyses ãŒå¸¸ã«ç©ºã«ãªã‚Šã€
-    # ç”»åƒãƒãƒƒã‚·ãƒ¥ã®è§£æžãŒä¸€åº¦ã‚‚å®Ÿè¡Œã•ã‚Œã¦ã„ãªã‹ã£ãŸ(renders ãƒ•ã‚©ãƒ«ãƒ€ãŒä½œã‚‰ã‚Œãªã„)ã€‚
-    if ($KeepExcelOpen) { return $renderResult }
-    $pending = $Script:PendingAnalysis
-    $Script:PendingAnalysis = $null
-    if ($null -ne $pending) {
-        try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
-        catch { Write-Warning ('ç”»åƒãƒãƒƒã‚·ãƒ¥ã®è§£æžã«å¤±æ•—ã—ã¾ã—ãŸ: ' + $_.Exception.Message) }
-    }
-    return $renderResult
-}
-
-function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null, [bool]$ForceHash = $false) {
-    $paths = Get-Paths
-    $snapshot = Get-Structure $Language
-    $changed = @()
-    $scanned = 0; $hashed = 0; $metadataOnly = 0
-    $list = @(Get-Array $snapshot.workbooks)
-    $index = 0
-    foreach ($snap in $list) {
-        $index++
-        if ($ProgressCallback) { & $ProgressCallback $index $list.Count ([string]$snap.workbookId) ([string]$snap.displayName) }
-        $id = [string]$snap.workbookId
-        try { $full = Join-Safe ([string]$paths.submissionDir) ([string]$snap.relativePath) } catch { continue }
-        if (-not (Test-Path -LiteralPath $full)) {
-            $didMissing = Update-StructureLocked $Language {
-                param($st)
-                $found = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $id } | Select-Object -First 1)
-                if ($found.Count -eq 0) { return $false }
-                $w = $found[0]
-                $wasMissing = ([string]$w.status -eq 'missing')
-                Set-NoteProperty $w 'status' 'missing'
-                if (-not $wasMissing) {
-                    $cat = Require-WorkbookCategory ([string]$w.category)
-                    $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
-                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'excel-updated' 'å…ƒExcelãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“'
-                }
-                return (-not $wasMissing)
-            }
-            if ($didMissing) { $changed += $id }
-            continue
-        }
-        $item = Get-Item -LiteralPath $full
-        $scanned++
-        $ticks = [string]$item.LastWriteTimeUtc.Ticks
-        $size = [int64]$item.Length
-        $modified = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz')
-        $knownTicks = [string](Get-DataProperty $snap 'currentExcelLastWriteUtcTicks' '')
-        $knownSize = [int64](Get-DataProperty $snap 'currentExcelSize' -1)
-        $hash = [string](Get-DataProperty $snap 'currentExcelHash' '')
-        $mustHash = $ForceHash -or $knownTicks -ne $ticks -or $knownSize -ne $size -or [string]::IsNullOrWhiteSpace($hash)
-        if ($mustHash) { try { $hash = New-StableHash $full; $hashed++ } catch { $hash = '' } } else { $metadataOnly++ }
-        $did = Update-StructureLocked $Language {
-            param($st)
-            $found = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $id } | Select-Object -First 1)
-            if ($found.Count -eq 0) { return $false }
-            $w = $found[0]
-            $previousHash = [string](Get-DataProperty $w 'currentExcelHash' '')
-            $previousStatus = [string](Get-DataProperty $w 'status' '')
-            $lastRendered = [string](Get-DataProperty $w 'lastRenderedExcelHash' '')
-            Set-NoteProperty $w 'currentExcelModifiedAt' $modified
-            Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
-            Set-NoteProperty $w 'currentExcelSize' $size
-            if (-not [string]::IsNullOrWhiteSpace($hash)) { Set-NoteProperty $w 'currentExcelHash' $hash }
-            $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt $Script:ExcelPrintProfileVersion)
-            $stale = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and (([string]::IsNullOrWhiteSpace($hash)) -or $hash -ne $lastRendered -or $profileOld)
-            if ($stale) {
-                Set-NoteProperty $w 'status' 'excel-updated'
-                foreach ($page in @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id -and -not [string]::IsNullOrWhiteSpace([string]$_.contentPdf) })) { Set-NoteProperty $page 'status' 'stale' }
-                $newlyDetected = ($previousStatus -ne 'excel-updated') -or ($previousHash -ne $hash)
-                if ($newlyDetected) {
-                    $cat = Require-WorkbookCategory ([string]$w.category)
-                    $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
-                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'excel-updated' 'å…ƒExcelãŒ1ä»¶æ›´æ–°ã•ã‚Œã¾ã—ãŸ'
-                }
-                return $newlyDetected
-            }
-            if ([string]::IsNullOrWhiteSpace($lastRendered)) {
-                if ([string]$w.status -ne 'render-error') { Set-NoteProperty $w 'status' 'new' }
-            } else { Set-NoteProperty $w 'status' 'rendered-unchecked' }
-            return $false
-        }
-        if ($did) { $changed += $id }
-    }
-    return [ordered]@{ changedWorkbookIds=@($changed | Select-Object -Unique); scanned=$scanned; hashed=$hashed; metadataOnly=$metadataOnly; forceHash=[bool]$ForceHash }
-}
-
-function Get-AutoRenderWorkbookIds([string]$Language, [string[]]$PreferredIds, [string]$Category = '') {
-    $structure = Get-Structure $Language
-    $preferred = @($PreferredIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $usePreferred = ($preferred.Count -gt 0)
-    $categoryNormalized = Normalize-WorkbookCategory $Category ''
-    $ids = @()
-    foreach ($wb in @(Get-Array $structure.workbooks)) {
-        $id = [string]$wb.workbookId
-        if (-not [string]::IsNullOrWhiteSpace($categoryNormalized) -and -not (Test-WorkbookCategory $wb $categoryNormalized)) { continue }
-        if ($usePreferred -and (@($preferred | Where-Object { $_ -eq $id }).Count -eq 0)) { continue }
-        if ([string]$wb.status -eq 'missing') { continue }
-        $needs = $false
-        $status = [string]$wb.status
-        $currentHash = [string]$wb.currentExcelHash
-        $lastRenderedHash = [string]$wb.lastRenderedExcelHash
-        $lastAttemptHash = [string]$wb.lastRenderAttemptHash
-        $renderProfileOutdated = ((-not [string]::IsNullOrWhiteSpace($lastRenderedHash)) -and ((Get-IntDataProperty $wb 'renderProfileVersion' 0) -lt $Script:ExcelPrintProfileVersion))
-        if ($status -eq 'render-error') {
-            # The PDF button is an explicit retry. A previous render-error must not make
-            # the button look idle just because the same file hash already failed once.
-            $needs = $true
-        } else {
-            if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { $needs = $true }
-            if ($status -in @('new','excel-updated')) { $needs = $true }
-            if ($renderProfileOutdated) { $needs = $true }
-            if ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and ($currentHash -ne $lastRenderedHash)) { $needs = $true }
-            if ($usePreferred) { $needs = $true }
-        }
-        if ($needs) { $ids += $id }
-    }
-    return @($ids | Select-Object -Unique)
-}
-
-function Invoke-AutoRender([string]$Language, [string[]]$WorkbookIds) {
-    if ($Script:AutoRenderInProgress) {
-        return [ordered]@{ skipped = $true; reason = 'auto-render-busy'; results = @(); at = New-NowIso }
-    }
-    $Script:AutoRenderInProgress = $true
-    try {
-        Reset-RenderEnvironmentForJob   # V5-Â§6.4: ã‚¸ãƒ§ãƒ–é–‹å§‹ã”ã¨ã«ç’°å¢ƒã‚’å–ã‚Šç›´ã™
-        $scan = Scan-Updates $Language $null $false
-        $ids = Get-AutoRenderWorkbookIds $Language $WorkbookIds ''
-        $results = @()
-        foreach ($id in $ids) {
-            try {
-                $r = Render-Workbook $Language $id
-                $r['ok'] = $true
-                $results += $r
-            } catch {
-                $msg = $_.Exception.Message
-                $userMsg = ConvertTo-UserRenderError $msg
-                $att = Get-LastRenderAttemptFor $id
-                $errorDetail = Get-ErrorDetail $_
-                Set-WorkbookRenderError $Language $id $msg $errorDetail ([string]$att.snapshotId) ([string]$att.hash)
-                $results += [ordered]@{ ok = $false; workbookId = $id; error = $msg; userError = $userMsg; detail = $errorDetail }
-            }
-        }
-        $hasErrors = $false
-        foreach ($rr in $results) { try { if ($rr.Contains('ok') -and $rr['ok'] -eq $false) { $hasErrors = $true } } catch { } }
-        return [ordered]@{ skipped = $false; scanned = $scan; workbookIds = $ids; results = $results; hasErrors = $hasErrors; at = New-NowIso }
-    } finally {
-        $Script:LastHeartbeatUtc = [DateTime]::UtcNow
-        $Script:AutoRenderInProgress = $false
-    }
-}
-
-
-function Get-RenderJobDir([string]$Language) {
-    $workspace = Get-WorkspacePath $Language
-    $dir = Join-Path $workspace 'state\jobs'
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    return $dir
-}
-
-function Write-RenderJobStatus([string]$StatusPath, $Status) {
-    if ([string]::IsNullOrWhiteSpace($StatusPath)) { return }
-    try {
-        Set-NoteProperty $Status 'updatedAt' (New-NowIso)
-        $json = ConvertTo-Json -InputObject $Status -Depth 50
-        Write-Utf8NoBomFileShared $StatusPath $json
-    } catch {
-        # Progress JSON is read frequently by the browser while a background PowerShell job writes it.
-        # If shared write fails, fall back to the generic writer and log the failure, but do not stop Excel.
-        try { Write-JsonFile $StatusPath $Status } catch { }
-        try {
-            $errPath = "$StatusPath.write-error.log"
-            Add-Content -LiteralPath $errPath -Encoding UTF8 -Value ("{0} {1}" -f (New-NowIso), $_.Exception.Message)
-        } catch { }
-    }
-}
-
-function Normalize-RenderJobId([string]$JobId) {
-    $value = ([string]$JobId).Trim()
-    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
-    try { $value = [Uri]::UnescapeDataString($value).Trim() } catch { }
-
-    # Browser / fetch / proxy differences should not be able to break progress polling.
-    # Accept the exact job id, and also recover it if it was accidentally stringified
-    # together with another query string or a small wrapper object.
-    if ($value -match '(?i)(job_[0-9]{8}_[0-9]{6}_[0-9a-f]{8})') {
-        return $matches[1].ToLowerInvariant()
-    }
-    return ''
-}
-
-function Read-RenderJobStatus([string]$Language, [string]$JobId) {
-    $normalizedJobId = Normalize-RenderJobId $JobId
-    if ([string]::IsNullOrWhiteSpace($normalizedJobId)) {
-        throw 'PDFä½œæˆã‚¸ãƒ§ãƒ–ã®æƒ…å ±ã‚’å—ã‘å–ã‚Œã¾ã›ã‚“ã§ã—ãŸã€‚ã‚‚ã†ä¸€åº¦ã€ŒPDFä½œæˆã€ã‚’æŠ¼ã—ã¦ãã ã•ã„ã€‚'
-    }
-    $jobDir = Get-RenderJobDir $Language
-    $path = Join-Path $jobDir "$normalizedJobId.status.json"
-    for ($attempt = 0; $attempt -lt 8; $attempt++) {
-        if (Test-Path -LiteralPath $path) {
-            try {
-                $job = Read-JsonFile $path $null
-                if ($null -ne $job) {
-                    try {
-                        $statusText = ([string]$job.status).ToLowerInvariant()
-                        $terminal = @('completed','completed-with-errors','failed','missing','cancelled')
-                        if ($terminal -notcontains $statusText) {
-                            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
-                            $ageSeconds = if ($item) { ([DateTime]::UtcNow - $item.LastWriteTimeUtc).TotalSeconds } else { 0 }
-                            $processId = Get-IntDataProperty $job 'processId' 0
-                            if ($processId -gt 0) {
-                                $alive = $false
-                                try { $alive = $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue) } catch { $alive = $false }
-                                if ((-not $alive) -and $ageSeconds -gt 10) {
-                                    $job = Set-RenderJobFailedFromStartupProblem $path $job 'PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ãŒçµ‚äº†ã—ã¦ã„ãŸãŸã‚åœæ­¢ã—ã¾ã—ãŸã€‚ã‚‚ã†ä¸€åº¦PDFä½œæˆã‚’æŠ¼ã—ã¦ãã ã•ã„ã€‚'
-                                } elseif ($alive -and ($statusText -eq 'queued' -or $statusText -eq 'launching') -and $ageSeconds -gt 90) {
-                                    # A healthy child process rewrites queued/launching -> running. Give PowerShell/Excel startup
-                                    # enough room, but do not leave the UI at the initial percent forever.
-                                    $job = Set-RenderJobFailedFromStartupProblem $path $job 'PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã¯èµ·å‹•ã—ã¾ã—ãŸãŒã€ã‚¸ãƒ§ãƒ–å‡¦ç†ã«å…¥ã‚Œã¾ã›ã‚“ã§ã—ãŸã€‚Excelã‚’é–‰ã˜ã¦ã‹ã‚‰ã€ã‚‚ã†ä¸€åº¦PDFä½œæˆã‚’æŠ¼ã—ã¦ãã ã•ã„ã€‚'
-                                }
-                            } elseif ($ageSeconds -gt 10) {
-                                $job = Set-RenderJobFailedFromStartupProblem $path $job 'PDFä½œæˆã‚¸ãƒ§ãƒ–ãŒä¸­æ–­ã•ã‚Œã¦ã„ã¾ã—ãŸã€‚ã‚‚ã†ä¸€åº¦PDFä½œæˆã‚’æŠ¼ã—ã¦ãã ã•ã„ã€‚'
-                            }
-                        }
-                    } catch { }
-                    return $job
-                }
-            } catch [System.IO.IOException] {
-                Start-Sleep -Milliseconds (70 + (35 * $attempt))
-            } catch [System.UnauthorizedAccessException] {
-                Start-Sleep -Milliseconds (70 + (35 * $attempt))
-            }
-        } else {
-            Start-Sleep -Milliseconds (70 + (35 * $attempt))
-        }
-    }
-
-    $inputPath = Join-Path $jobDir "$normalizedJobId.input.json"
-    $total = 0
-    try {
-        $input = Read-JsonFile $inputPath $null
-        if ($input -and $input.workbookIds) { $total = @(Get-Array $input.workbookIds).Count }
-    } catch { }
-    return [ordered]@{
-        ok = $true
-        jobId = $normalizedJobId
-        status = 'queued'
-        total = $total
-        completed = 0
-        failed = 0
-        percent = 0
-        message = 'PDFä½œæˆã‚¸ãƒ§ãƒ–ã‚’æº–å‚™ã—ã¦ã„ã¾ã™ã€‚'
-        currentWorkbookId = ''
-        currentWorkbookName = ''
-        currentSheet = ''
-        results = @()
-        errors = @()
-        updatedAt = 'waiting-for-status-file'
-        stateSavedAt = ''
-        transientMissing = $true
-    }
-}
-
-function Get-WorkbookDisplayForStatus([string]$Language, [string]$WorkbookId) {
-    try {
-        $s = Get-Structure $Language
-        $w = @(Get-Array $s.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-        if ($w.Count -gt 0) {
-            $name = [string]$w[0].displayName
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = [string]$w[0].fileName }
-            if (-not [string]::IsNullOrWhiteSpace($name)) { return $name }
-        }
-    } catch { }
-    return $WorkbookId
-}
-
-
-function Get-ActiveRenderJobStatus([string]$Language) {
-    try {
-        $dir = Get-RenderJobDir $Language
-        if (-not (Test-Path -LiteralPath $dir)) { return $null }
-        $terminal = @('completed','completed-with-errors','failed','missing','cancelled')
-        $cutoff = [DateTime]::UtcNow.AddHours(-4)
-        $now = [DateTime]::UtcNow
-        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.status.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 20)) {
-            if ($file.LastWriteTimeUtc -lt $cutoff) { continue }
-            $job = Read-JsonFile $file.FullName $null
-            if ($null -eq $job) { continue }
-            $status = ([string]$job.status).ToLowerInvariant()
-            if ([string]::IsNullOrWhiteSpace($status)) { continue }
-            if ($terminal -contains $status) { continue }
-
-            $ageSeconds = ($now - $file.LastWriteTimeUtc).TotalSeconds
-            $processId = Get-IntDataProperty $job 'processId' 0
-            if ($processId -gt 0) {
-                $alive = $false
-                try { $alive = $null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue) } catch { $alive = $false }
-                if ($alive) {
-                    if (($status -eq 'queued' -or $status -eq 'launching') -and $ageSeconds -gt 90) {
-                        [void](Set-RenderJobFailedFromStartupProblem $file.FullName $job 'å‰å›žã®PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ãŒã‚¸ãƒ§ãƒ–å‡¦ç†ã«å…¥ã‚‰ãšåœæ­¢æ‰±ã„ã«ãªã‚Šã¾ã—ãŸã€‚æ–°ã—ãPDFä½œæˆã§ãã¾ã™ã€‚')
-                        continue
-                    }
-                    return $job
-                }
-                # Immediately after Start-Process there can be a short race before the child process is visible.
-                if ($ageSeconds -lt 10) { return $job }
-                [void](Set-RenderJobFailedFromStartupProblem $file.FullName $job 'å‰å›žã®PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ãŒçµ‚äº†ã—ã¦ã„ãŸãŸã‚ã€æ–°ã—ã„PDFä½œæˆã‚’é–‹å§‹ã§ãã¾ã™ã€‚')
-                continue
-            }
-
-            # Older builds did not write processId. Do not let those stale queued/running files block the PDF button.
-            if ($ageSeconds -lt 5) { return $job }
-            [void](Set-RenderJobFailedFromStartupProblem $file.FullName $job 'å¤ã„PDFä½œæˆã‚¸ãƒ§ãƒ–ã‚’çµ‚äº†æ‰±ã„ã«ã—ã¾ã—ãŸã€‚ã‚‚ã†ä¸€åº¦PDFä½œæˆã§ãã¾ã™ã€‚')
-        }
-    } catch { }
-    return $null
-}
-
-function Start-HiddenPowerShellChild([string]$PowerShellExe, [string]$Command, [string]$StdoutPath, [string]$StderrPath) {
-    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
-    $args = @('-NoProfile','-STA','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$encodedCommand) -join ' '
-    try {
-        return (Start-Process -FilePath $PowerShellExe -ArgumentList $args -WindowStyle Hidden -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -PassThru)
-    } catch {
-        # Some managed launch environments expose both Path and PATH. Windows
-        # PowerShell's Start-Process tries to copy them into a case-insensitive
-        # dictionary and fails before the child starts. ShellExecute avoids that
-        # enumeration; redirect inside the encoded child command instead.
-        $outEscaped = ([IO.Path]::GetFullPath($StdoutPath)).Replace("'", "''")
-        $errEscaped = ([IO.Path]::GetFullPath($StderrPath)).Replace("'", "''")
-        $redirected = "& { $Command } 1>> '$outEscaped' 2>> '$errEscaped'"
-        $encodedFallback = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($redirected))
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $PowerShellExe
-        $psi.Arguments = @('-NoProfile','-STA','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$encodedFallback) -join ' '
-        $psi.WorkingDirectory = $Script:AppRoot
-        $psi.UseShellExecute = $true
-        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-        return [System.Diagnostics.Process]::Start($psi)
-    }
-}
-
-function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyUpdated, [string]$Category = '', $SnapshotPins = $null) {
-    # Return a job immediately. Expensive update scanning runs inside the background job,
-    # so the PDF button does not appear to do nothing on large folders.
-    $activeJob = Get-ActiveRenderJobStatus $Language
-    if ($null -ne $activeJob) {
-        $activeMsg = [string]$activeJob.message
-        if ([string]::IsNullOrWhiteSpace($activeMsg)) { $activeMsg = 'PDFä½œæˆä¸­ã§ã™ã€‚' }
-        else { $activeMsg = "PDFä½œæˆä¸­ã§ã™ã€‚ $activeMsg" }
-        Set-NoteProperty $activeJob 'message' $activeMsg
-        if ($null -eq $activeJob.PSObject.Properties['ok']) { Set-NoteProperty $activeJob 'ok' $true }
-        return ([pscustomobject]$activeJob)
-    }
-    $structure = Get-Structure $Language
-    $categoryNormalized = Normalize-WorkbookCategory $Category ''
-    $explicitIds = @($WorkbookIds | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    $ids = @()
-    if ($explicitIds.Count -gt 0) {
-        $known = @(Get-Array $structure.workbooks | Where-Object {
-            $id = [string]$_.workbookId
-            ($explicitIds -contains $id) -and ([string]$_.status -ne 'missing') -and ([string]::IsNullOrWhiteSpace($categoryNormalized) -or (Test-WorkbookCategory $_ $categoryNormalized))
-        } | ForEach-Object { [string]$_.workbookId })
-        $ids = @($known | Select-Object -Unique)
-    } elseif (-not $OnlyUpdated) {
-        $ids = @(Get-Array $structure.workbooks | Where-Object {
-            ([string]$_.status -ne 'missing') -and ([string]::IsNullOrWhiteSpace($categoryNormalized) -or (Test-WorkbookCategory $_ $categoryNormalized))
-        } | ForEach-Object { [string]$_.workbookId })
-    }
-
-    $registeredCount = @(Get-Array $structure.workbooks | Where-Object { ([string]$_.status -ne 'missing') -and ([string]::IsNullOrWhiteSpace($categoryNormalized) -or (Test-WorkbookCategory $_ $categoryNormalized)) }).Count
-    if ($registeredCount -eq 0) { $OnlyUpdated = $false }
-
-    $jobId = 'job_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
-    $jobDir = Get-RenderJobDir $Language
-    $inputPath = Join-Path $jobDir "$jobId.input.json"
-    $statusPath = Join-Path $jobDir "$jobId.status.json"
-    $stdoutPath = Join-Path $jobDir "$jobId.out.log"
-    $stderrPath = Join-Path $jobDir "$jobId.err.log"
-    $initialTotal = if ($OnlyUpdated -and $ids.Count -eq 0) { $registeredCount } else { $ids.Count }
-    $initialMessage = 'PDFä½œæˆãŒå¿…è¦ãªExcelã¯ã‚ã‚Šã¾ã›ã‚“ã€‚'
-    if ($registeredCount -eq 0) { $initialMessage = 'ç™»éŒ²æ¸ˆã¿ExcelãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-    elseif ($OnlyUpdated -and $ids.Count -eq 0) { $initialMessage = 'PDFä½œæˆå¯¾è±¡ã‚’ç¢ºèªã—ã¦ã„ã¾ã™ã€‚' }
-    elseif ($ids.Count -gt 0) { $initialMessage = 'PDFä½œæˆã‚’é–‹å§‹ã—ã¾ã™ã€‚' }
-    $initial = [pscustomobject][ordered]@{
-        ok = $true; jobId = $jobId; status = 'queued'; total = $initialTotal; completed = 0; failed = 0; percent = 1;
-        message = $initialMessage;
-        currentWorkbookId = ''; currentWorkbookName = ''; currentSheet = ''; processId = 0; stdoutPath = $stdoutPath; stderrPath = $stderrPath; results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = ''
-    }
-    Write-JsonFile $statusPath $initial
-    $pinsOut = [ordered]@{}
-    if ($null -ne $SnapshotPins) { foreach ($k in @($SnapshotPins.Keys)) { $pinsOut[[string]$k] = $SnapshotPins[$k] } }
-    Write-JsonFile $inputPath ([ordered]@{ jobId = $jobId; mode = $Language; workbookIds = @($ids); onlyUpdated = $OnlyUpdated; category = $categoryNormalized; snapshotPins = $pinsOut; statusPath = $statusPath; stdoutPath = $stdoutPath; stderrPath = $stderrPath })
-    if ($registeredCount -eq 0 -or ($ids.Count -eq 0 -and -not $OnlyUpdated)) {
-        $initial.status = 'completed'; $initial.percent = 100
-        if ($registeredCount -eq 0) { $initial.message = 'ç™»éŒ²æ¸ˆã¿ExcelãŒã‚ã‚Šã¾ã›ã‚“ã€‚' } else { $initial.message = 'PDFä½œæˆãŒå¿…è¦ãªExcelã¯ã‚ã‚Šã¾ã›ã‚“ã€‚' }
-        Write-RenderJobStatus $statusPath $initial
-        return ([pscustomobject]$initial)
-    }
-
-    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
-    $script = Join-Path $Script:AppRoot 'server.ps1'
-    # Use -EncodedCommand instead of a quoted -File command line. This avoids Windows quoting edge cases
-    # where the child PowerShell can start without binding -RenderJobPath, leaving the UI stuck at 0%.
-    $jobCommand = "& '$($script.Replace("'", "''"))' -Mode '$($Language.Replace("'", "''"))' -RenderJobPath '$($inputPath.Replace("'", "''"))'"
-    Set-NoteProperty $initial 'launchCommandKind' 'EncodedCommand-STA'
-    Set-NoteProperty $initial 'status' 'launching'
-    Set-NoteProperty $initial 'message' 'PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã‚’èµ·å‹•ã—ã¦ã„ã¾ã™ã€‚'
-    Write-RenderJobStatus $statusPath $initial
-    try {
-        $proc = Start-HiddenPowerShellChild $psExe $jobCommand $stdoutPath $stderrPath
-        if ($proc -and $proc.Id) {
-            $initial.processId = [int]$proc.Id
-            $statusToUpdate = $initial
-            try {
-                $existingStatus = Read-JsonFile $statusPath $null
-                if ($null -ne $existingStatus) { $statusToUpdate = $existingStatus }
-            } catch { }
-            Set-NoteProperty $statusToUpdate 'processId' ([int]$proc.Id)
-            Set-NoteProperty $statusToUpdate 'status' 'launching'
-            Set-NoteProperty $statusToUpdate 'percent' ([Math]::Max(2, (Get-IntDataProperty $statusToUpdate 'percent' 0)))
-            Set-NoteProperty $statusToUpdate 'message' 'PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã‚’èµ·å‹•ã—ã¾ã—ãŸã€‚Excelã‚’æº–å‚™ã—ã¦ã„ã¾ã™ã€‚'
-            Write-RenderJobStatus $statusPath $statusToUpdate
-        }
-    } catch {
-        $initial.status = 'failed'
-        $initial.percent = 100
-        $initial.message = "PDFä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã‚’èµ·å‹•ã§ãã¾ã›ã‚“ã§ã—ãŸ: $($_.Exception.Message)"
-        $initial.errors = @([ordered]@{ error = $_.Exception.Message; userError = (ConvertTo-UserRenderError $_.Exception.Message); detail = [string]$_ })
-        Write-RenderJobStatus $statusPath $initial
-        throw
-    }
-    return ([pscustomobject]$initial)
-}
-
-function Invoke-RenderJobFromFile([string]$JobPath) {
-    $job = Read-JsonFile $JobPath $null
-    if ($null -eq $job) { throw "Render job file is not readable: $JobPath" }
-    $language = [string]$job.mode
-    if ([string]::IsNullOrWhiteSpace($language)) { $language = $Mode }
-    $ids = @(Get-Array $job.workbookIds | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $explicitIds = ($ids.Count -gt 0)
-    $onlyUpdated = [bool](Get-DataProperty $job 'onlyUpdated' $false)
-    $category = Normalize-WorkbookCategory ([string](Get-DataProperty $job 'category' '')) ''
-    $statusPath = [string]$job.statusPath
-    $stdoutPath = [string](Get-DataProperty $job 'stdoutPath' '')
-    $stderrPath = [string](Get-DataProperty $job 'stderrPath' '')
-    $jobId = [string]$job.jobId
-    $processId = 0
-    try {
-        $existingStatus = Read-JsonFile $statusPath $null
-        if ($null -ne $existingStatus) { $processId = Get-IntDataProperty $existingStatus 'processId' 0 }
-    } catch { }
-    if ($processId -le 0) { try { $processId = [System.Diagnostics.Process]::GetCurrentProcess().Id } catch { $processId = 0 } }
-    $total = $ids.Count
-    $statusMessage = 'Excelã‚’æº–å‚™ã—ã¦ã„ã¾ã™ã€‚'
-    if ($onlyUpdated -and -not $explicitIds) { $statusMessage = 'PDFä½œæˆå¯¾è±¡ã‚’ç¢ºèªã—ã¦ã„ã¾ã™ã€‚' }
-    $status = [pscustomobject][ordered]@{ ok = $true; jobId = $jobId; status = 'running'; total = $total; completed = 0; failed = 0; percent = 3; message = $statusMessage; currentWorkbookId = ''; currentWorkbookName = ''; currentSheet = ''; processId = $processId; stdoutPath = $stdoutPath; stderrPath = $stderrPath; results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = '' }
-    Write-RenderJobStatus $statusPath $status
-    $excel = $null
-    try {
-        if ($onlyUpdated -and -not $explicitIds) {
-            $status.status = 'scanning'
-            $status.message = 'PDFä½œæˆãŒå¿…è¦ãªExcelã‚’ç¢ºèªã—ã¦ã„ã¾ã™ã€‚'
-            $status.percent = 5
-            Write-RenderJobStatus $statusPath $status
-            [void](Scan-Updates $language {
-                param($scanIndex, $scanTotal, $scanWorkbookId, $scanName)
-                $status.status = 'scanning'
-                $status.currentWorkbookId = [string]$scanWorkbookId
-                $status.currentWorkbookName = [string]$scanName
-                $status.currentSheet = ''
-                $status.total = [Math]::Max([int]$scanTotal, 1)
-                $status.completed = [Math]::Max([int]$scanIndex - 1, 0)
-                $status.failed = 0
-                $status.percent = [int][Math]::Max(5, [Math]::Min(15, [Math]::Floor(([double]$scanIndex / [Math]::Max(1, [int]$scanTotal)) * 15)))
-                $status.message = "PDFä½œæˆå¯¾è±¡ã‚’ç¢ºèªã—ã¦ã„ã¾ã™: $scanIndex / $scanTotal ä»¶ç›® $scanName"
-                Write-RenderJobStatus $statusPath $status
-            })
-            $ids = @(Get-AutoRenderWorkbookIds $language @() $category)
-            $total = $ids.Count
-            $status.total = $total
-            $status.completed = 0
-            $status.failed = 0
-            $status.percent = if ($total -gt 0) { [Math]::Max([int]$status.percent, 15) } else { 100 }
-            if ($total -eq 0) {
-                $status.status = 'completed'
-                $status.message = 'PDFä½œæˆãŒå¿…è¦ãªExcelã¯ã‚ã‚Šã¾ã›ã‚“ã€‚'
-                Write-RenderJobStatus $statusPath $status
-                return
-            }
-            $status.message = "$total ä»¶ã®PDFä½œæˆã‚’é–‹å§‹ã—ã¾ã™ã€‚"
-            Write-RenderJobStatus $statusPath $status
-        } elseif ($total -eq 0) {
-            $status.status = 'completed'
-            $status.percent = 100
-            $status.message = 'PDFä½œæˆãŒå¿…è¦ãªExcelã¯ã‚ã‚Šã¾ã›ã‚“ã€‚'
-            Write-RenderJobStatus $statusPath $status
-            return
-        }
-        if ($total -gt 0) {
-            Reset-RenderEnvironmentForJob   # V5-Â§6.4: ã‚¸ãƒ§ãƒ–é–‹å§‹ã”ã¨ã«ç’°å¢ƒã‚’å–ã‚Šç›´ã™
-            $status.message = 'Excelã‚’èµ·å‹•ã—ã¦ã„ã¾ã™ã€‚'
-            $status.percent = [Math]::Max([int]$status.percent, 8)
-            Write-RenderJobStatus $statusPath $status
-            $excel = New-ExcelApplicationForRender
-            $status.message = 'Excelã®èµ·å‹•ãŒå®Œäº†ã—ã¾ã—ãŸã€‚PDFåŒ–ã‚’é–‹å§‹ã—ã¾ã™ã€‚'
-            $status.percent = [Math]::Max([int]$status.percent, 10)
-            Write-RenderJobStatus $statusPath $status
-        }
-        $index = 0
-        $deferredAnalyses = @()
-        foreach ($id in $ids) {
-            $index++
-            $name = Get-WorkbookDisplayForStatus $language $id
-            $status.currentWorkbookId = $id
-            $status.currentWorkbookName = $name
-            $status.currentSheet = ''
-            $status.message = "$index / $total ä»¶ç›®: $name ã‚’PDFåŒ–ã—ã¦ã„ã¾ã™ã€‚"
-            $status.percent = [int][Math]::Max(10, [Math]::Floor((($index - 1) / [Math]::Max(1, $total)) * 100))
-            Write-RenderJobStatus $statusPath $status
-            $callback = {
-                param($stage, $workbookId, $sheetName)
-                $status.currentWorkbookId = [string]$workbookId
-                $status.currentWorkbookName = $name
-                $status.currentSheet = [string]$sheetName
-                if ($stage -eq 'open') { $status.message = "$index / $total ä»¶ç›®: $name ã‚’é–‹ã„ã¦ã„ã¾ã™ã€‚" }
-                elseif ($stage -eq 'sheet-setup') { $status.message = "$index / $total ä»¶ç›®: $name / ã‚·ãƒ¼ãƒˆ $sheetName ã®å°åˆ·è¨­å®šã‚’èª¿æ•´ã—ã¦ã„ã¾ã™ã€‚" }
-                elseif ($stage -eq 'batch') { $status.message = "$index / $total ä»¶ç›®: $name ã®è¤‡æ•°ã‚·ãƒ¼ãƒˆã‚’ã¾ã¨ã‚ã¦PDFåŒ–ã—ã¦ã„ã¾ã™ã€‚" }
-                elseif ($stage -eq 'split') { $status.message = "$index / $total ä»¶ç›®: $name ã®PDFã‚’ã‚·ãƒ¼ãƒˆåˆ¥ã«åˆ†ã‘ã¦ã„ã¾ã™ã€‚" }
-                elseif ($stage -eq 'sheet') { $status.message = "$index / $total ä»¶ç›®: $name / ã‚·ãƒ¼ãƒˆ $sheetName ã‚’PDFåŒ–ã—ã¦ã„ã¾ã™ã€‚" }
-                else { $status.message = "$index / $total ä»¶ç›®: $name ã‚’æº–å‚™ã—ã¦ã„ã¾ã™ã€‚" }
-                $status.percent = [int][Math]::Floor((($index - 1 + 0.35) / [Math]::Max(1, $total)) * 100)
-                Write-RenderJobStatus $statusPath $status
-            }
-            try {
-                # V5-P0: è‡ªå‹•å‡¦ç†ãŒå›ºå®šã—ãŸæ¤œçŸ¥ç‰ˆãŒã‚ã‚Œã°ã€ãã®ç‰ˆã§ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã™ã‚‹ã€‚
-                $pin = Get-DataProperty (Get-DataProperty $job 'snapshotPins' $null) $id $null
-                $pinSnapshot = [string](Get-DataProperty $pin 'snapshotId' '')
-                $pinHash = [string](Get-DataProperty $pin 'expectedHash' '')
-                $r = Render-Workbook $language $id $excel $true $callback '' $pinSnapshot $pinHash
-                $deferredAnalyses += $Script:PendingAnalysis
-                $Script:PendingAnalysis = $null
-                $r['ok'] = $true
-                $status.results = @($status.results) + @($r)
-                $status.completed = [int]$status.completed + 1
-            } catch {
-                $msg = $_.Exception.Message
-                $userMsg = ConvertTo-UserRenderError $msg
-                $att = Get-LastRenderAttemptFor $id
-                $errorDetail = Get-ErrorDetail $_
-                Set-WorkbookRenderError $language $id $msg $errorDetail ([string]$att.snapshotId) ([string]$att.hash)
-                $err = [ordered]@{ ok = $false; workbookId = $id; workbookName = $name; error = $msg; userError = $userMsg; detail = $errorDetail }
-                $status.errors = @($status.errors) + @($err)
-                $status.results = @($status.results) + @($err)
-                $status.failed = [int]$status.failed + 1
-            }
-            $status.currentSheet = ''
-            $status.percent = [int][Math]::Floor((([int]$status.completed + [int]$status.failed) / [Math]::Max(1, $total)) * 100)
-            Write-RenderJobStatus $statusPath $status
-        }
-        if ([int]$status.failed -gt 0) {
-            $status.status = 'completed-with-errors'
-            $status.message = "$($status.failed) ä»¶ã§ã‚¨ãƒ©ãƒ¼ãŒç™ºç”Ÿã—ã¾ã—ãŸã€‚èµ¤ã„ã‚¨ãƒ©ãƒ¼è¡¨ç¤ºã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚"
-        } else {
-            $status.status = 'completed'
-            $status.message = "$($status.completed) ä»¶ã®PDFä½œæˆãŒå®Œäº†ã—ã¾ã—ãŸã€‚"
-        }
-        $status.percent = 100
-        Set-NoteProperty $status 'stateSavedAt' (New-NowIso)
-        Write-RenderJobStatus $statusPath $status
-    } catch {
-        $status.status = 'failed'
-        $status.message = $_.Exception.Message
-        $status.errors = @($status.errors) + @([ordered]@{ error = $_.Exception.Message; userError = (ConvertTo-UserRenderError $_.Exception.Message); detail = [string]$_ })
-        Write-RenderJobStatus $statusPath $status
-        throw
-    } finally {
-        Close-ExcelApplicationForRender $excel
-        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-        # V5-P1: Excel ã‚’é–‰ã˜ã€ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãƒ­ãƒƒã‚¯ã‚‚è§£æ”¾ã—ã¦ã‹ã‚‰è§£æžã™ã‚‹ã€‚
-        # æ¯”è¼ƒç”¨ã®å†ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãŒå¿…è¦ã«ãªã£ã¦ã‚‚ã€æ”¹ã‚ã¦å…±é€šãƒ­ãƒƒã‚¯ã‚’å–ã‚Šç›´ã›ã‚‹ã€‚
-        foreach ($pending in @($deferredAnalyses | Where-Object { $null -ne $_ })) {
-            try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
-            catch { Write-Warning ('ç”»åƒãƒãƒƒã‚·ãƒ¥ã®è§£æžã«å¤±æ•—ã—ã¾ã—ãŸ: ' + $_.Exception.Message) }
-        }
-    }
-}
-
-
-function Reorder-Pages([string]$Language, $Body) {
-    $cat = Require-WorkbookCategory ([string]$Body.category)
-    return Update-StructureLocked $Language {
-        param($structure)
-        $allowed = @(Get-VolumeList $Language)
-        $volumeObject = $Body.volumes
-        if ($null -eq $volumeObject) { throw [System.ArgumentException]::new('volumes ãŒå¿…è¦ã§ã™ã€‚') }
-        $workbookIds = @{}
-        foreach ($wb in @(Get-Array $structure.workbooks | Where-Object { Test-WorkbookCategory $_ $cat })) { $workbookIds[[string]$wb.workbookId] = $true }
-        $pageMap = @{}
-        foreach ($page in @(Get-Array $structure.pages | Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) })) { $pageMap[(Resolve-PageId $page)] = $page }
-        $affected = New-Object System.Collections.Generic.HashSet[string]
-        foreach ($property in $volumeObject.PSObject.Properties) {
-            $volume = [string]$property.Name
-            if ($allowed -notcontains $volume) { throw [System.ArgumentException]::new("ä¸æ­£ãªvolumeã§ã™: $volume") }
-            $desiredIds = @(Get-Array $property.Value | ForEach-Object { [string]$_ })
-            $currentIds = @(Get-Array $structure.pages | Where-Object {
-                $workbookIds.ContainsKey([string]$_.workbookId) -and (
-                    ($volume -eq 'none' -and ([string]$_.volume -eq 'none' -or $_.enabled -eq $false)) -or
-                    ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
-                )
-            } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_} | ForEach-Object { Resolve-PageId $_ })
-            $sameSequence = (($currentIds -join "`n") -eq ($desiredIds -join "`n"))
-            if ($sameSequence) { continue }
-            if ($volume -ne 'none') { [void]$affected.Add($volume) }
-            for ($i=0; $i -lt $desiredIds.Count; $i++) {
-                $id = $desiredIds[$i]
-                if (-not $pageMap.ContainsKey($id)) { continue }
-                $page = $pageMap[$id]
-                $oldVolume = [string](Get-DataProperty $page 'volume' 'none')
-                if ($oldVolume -ne 'none') { [void]$affected.Add($oldVolume) }
-                Set-NoteProperty $page 'volume' $volume
-                Set-NoteProperty $page 'enabled' ($volume -ne 'none')
-                Set-NoteProperty $page 'order' (($i+1)*10)
-                Set-NoteProperty $page 'orderManual' $true
-                Set-NoteProperty $page 'updatedAt' (New-NowIso)
-            }
-        }
-        foreach ($volume in $allowed) { [void](Renumber-VolumeOrder $structure $volume $cat) }
-        Apply-DefaultNumberingPerVolume $Language $structure $cat
-        if ($affected.Count -gt 0) { Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ãƒšãƒ¼ã‚¸æ§‹æˆã‚’å¤‰æ›´ã—ã¾ã—ãŸ' }
-        return [ordered]@{ pages=$structure.pages; affectedVolumes=@($affected); updatedAt=(New-NowIso) }
-    }
-}
-
-function Update-Page([string]$Language, $Body) {
-    $cat=Require-WorkbookCategory ([string]$Body.category)
-    return Update-StructureLocked $Language {
-        param($structure)
-        $page=@(Get-Array $structure.pages|Where-Object{(Resolve-PageId $_)-eq [string]$Body.pageId}|Select-Object -First 1);if($page.Count -eq 0){throw "PageãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $($Body.pageId)"};$p=$page[0]
-        if((Get-PageCategory $structure $p) -ne $cat){throw [ArgumentException]::new('æŒ‡å®šã‚«ãƒ†ã‚´ãƒªã®ãƒšãƒ¼ã‚¸ã§ã¯ã‚ã‚Šã¾ã›ã‚“ã€‚')}
-        $beforeVol=[string]$p.volume;$beforeEnabled=[bool](Get-DataProperty $p 'enabled' $true);$beforeNum=[string]$p.numberingMode;$structural=$false
-        if($null -ne $Body.title){Set-NoteProperty $p 'title' ([string]$Body.title)}
-        if($null -ne $Body.volume){if((Get-VolumeList $Language)-notcontains [string]$Body.volume){throw [ArgumentException]::new('ä¸æ­£ãªvolumeã§ã™ã€‚')};Set-NoteProperty $p 'volume' ([string]$Body.volume);$structural=$true}
-        if($null -ne $Body.numberingMode){if(@('none','visible')-notcontains [string]$Body.numberingMode){throw [ArgumentException]::new('ä¸æ­£ãªnumberingModeã§ã™ã€‚')};Set-NoteProperty $p 'numberingMode' ([string]$Body.numberingMode);Set-NoteProperty $p 'numberingManual' $true;$structural=$true}
-        if($null -ne $Body.numberingManual){Set-NoteProperty $p 'numberingManual' ([bool]$Body.numberingManual);$structural=$true}
-        if($null -ne $Body.resetNumbering -and [bool]$Body.resetNumbering){Set-NoteProperty $p 'numberingManual' $false;$structural=$true}
-        if($null -ne $Body.enabled){Set-NoteProperty $p 'enabled' ([bool]$Body.enabled);$structural=$true}
-        Set-NoteProperty $p 'updatedAt' (New-NowIso);foreach($vol in @(Get-VolumeList $Language)){[void](Renumber-VolumeOrder $structure $vol $cat)};Apply-DefaultNumberingPerVolume $Language $structure $cat
-        if($structural){$affected=@($beforeVol,[string]$p.volume)|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique;Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ãƒšãƒ¼ã‚¸æ§‹æˆã‚’å¤‰æ›´ã—ã¾ã—ãŸ'}
-        return $p
-    }
-}
-
-function Confirm-Page([string]$Language, $Body) {
-    $cat=Require-WorkbookCategory ([string]$Body.category)
-    return Update-StructureLocked $Language { param($structure) $page=@(Get-Array $structure.pages|Where-Object{(Resolve-PageId $_)-eq [string]$Body.pageId}|Select-Object -First 1);if($page.Count -eq 0){throw "PageãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $($Body.pageId)"};if((Get-PageCategory $structure $page[0]) -ne $cat){throw [ArgumentException]::new('æŒ‡å®šã‚«ãƒ†ã‚´ãƒªã®ãƒšãƒ¼ã‚¸ã§ã¯ã‚ã‚Šã¾ã›ã‚“ã€‚')};switch([string]$Body.action){'confirm'{Set-NoteProperty $page[0] 'status' 'confirmed'}'reject'{Set-NoteProperty $page[0] 'status' 'rejected'}default{throw [ArgumentException]::new('action ã¯ confirm ã¾ãŸã¯ reject ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚')}};Set-NoteProperty $page[0] 'updatedAt' (New-NowIso);return $page[0] }
-}
-
-function Sort-PagesBySheet([string]$Language, $Body) {
-    $cat = Require-WorkbookCategory ([string]$Body.category)
-    return Update-StructureLocked $Language {
-        param($structure)
-        $volumes = @()
-        if ($Body.volumes) {
-            $volumes = @(Get-Array $Body.volumes | ForEach-Object { [string]$_ })
-        } else {
-            $volumes = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
-        }
-        $wbMap = @{}
-        foreach ($wb in @(Get-Array $structure.workbooks | Where-Object { Test-WorkbookCategory $_ $cat })) {
-            $wbMap[[string]$wb.workbookId] = $wb
-        }
-        $affected = New-Object System.Collections.Generic.HashSet[string]
-        foreach ($volume in @($volumes | Select-Object -Unique)) {
-            if ((Get-VolumeList $Language) -notcontains $volume) { throw [ArgumentException]::new("ä¸æ­£ãªvolumeã§ã™: $volume") }
-            $current = @(Get-Array $structure.pages | Where-Object {
-                $wbMap.ContainsKey([string]$_.workbookId) -and (
-                    ($volume -eq 'none' -and ([string]$_.volume -eq 'none' -or $_.enabled -eq $false)) -or
-                    ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
-                )
-            } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_})
-            $sorted = @($current | Sort-Object `
-                @{Expression={Get-SheetOrderNumber ([string]$_.sheetName)};Ascending=$true}, `
-                @{Expression={Get-FileOrderNumber ([string]$wbMap[[string]$_.workbookId].fileName)};Ascending=$true}, `
-                @{Expression={[string]$wbMap[[string]$_.workbookId].fileName};Ascending=$true}, `
-                @{Expression={Resolve-PageId $_};Ascending=$true})
-            $beforeIds = @($current | ForEach-Object { Resolve-PageId $_ })
-            $afterIds = @($sorted | ForEach-Object { Resolve-PageId $_ })
-            $inputChanged = (($beforeIds -join "`n") -ne ($afterIds -join "`n"))
-            for ($i=0; $i -lt $sorted.Count; $i++) {
-                $expected = ($i + 1) * 10
-                if ([double](Get-DataProperty $sorted[$i] 'order' 0) -ne $expected) { $inputChanged = $true }
-                Set-NoteProperty $sorted[$i] 'order' $expected
-                Set-NoteProperty $sorted[$i] 'orderManual' $false
-                Set-NoteProperty $sorted[$i] 'updatedAt' (New-NowIso)
-            }
-            if ($inputChanged -and $volume -ne 'none') { [void]$affected.Add($volume) }
-        }
-        Apply-DefaultNumberingPerVolume $Language $structure $cat
-        if ($affected.Count -gt 0) {
-            Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ãƒšãƒ¼ã‚¸ã‚’ã‚·ãƒ¼ãƒˆåé †ã«ä¸¦ã¹æ›¿ãˆã¾ã—ãŸ'
-        }
-        return [ordered]@{ pages=$structure.pages; category=$cat; affectedVolumes=@($affected) }
-    }
-}
-
-function Resolve-JavaExe {
-    # ä¸€åº¦è¦‹ã¤ã‹ã£ãŸãƒ‘ã‚¹ã¯ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã™ã‚‹(å…±æœ‰ãƒ•ã‚©ãƒ«ãƒ€ä¸Šã®Test-Pathã®çž¬æ–­å¯¾ç­–ã‚‚å…¼ã­ã‚‹)ã€‚
-    if (-not [string]::IsNullOrWhiteSpace($Script:CachedJavaExe)) { return $Script:CachedJavaExe }
-    # Prefer a local portable runtime installed by app\tools\install-thirdparty.cmd.
-    $direct = Join-Path $Script:AppRoot 'lib\java\bin\java.exe'
-    # ãƒãƒƒãƒˆãƒ¯ãƒ¼ã‚¯å…±æœ‰ã§ã¯ Test-Path ãŒã‚¦ã‚¤ãƒ«ã‚¹ã‚¹ã‚­ãƒ£ãƒ³ç­‰ã§ä¸€æ™‚çš„ã« false ã«ãªã‚‹ã“ã¨ãŒã‚ã‚‹ãŸã‚ãƒªãƒˆãƒ©ã‚¤ã™ã‚‹ã€‚
-    for ($javaAttempt = 1; $javaAttempt -le 3; $javaAttempt++) {
-        if (Test-Path -LiteralPath $direct) { $Script:CachedJavaExe = $direct; return $direct }
-        if ($javaAttempt -lt 3) { Start-Sleep -Seconds 2 }
-    }
-    $javaRoot = Join-Path $Script:AppRoot 'lib\java'
-    if (Test-Path -LiteralPath $javaRoot) {
-        $found = @(Get-ChildItem -LiteralPath $javaRoot -Filter java.exe -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '[\\/]bin[\\/]java\.exe$' } |
-            Sort-Object FullName |
-            Select-Object -First 1)
-        if ($found.Count -gt 0) { return [string]$found[0].FullName }
-    }
-    $cmd = Get-Command java.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return [string]$cmd.Source }
-    $cmd2 = Get-Command java -ErrorAction SilentlyContinue
-    if ($cmd2) { return [string]$cmd2.Source }
-    throw ("æœ€çµ‚PDFã®ä½œæˆã«å¿…è¦ãªJava RuntimeãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“(æŽ¢ã—ãŸå ´æ‰€: {0})ã€‚ã“ã®å ´æ‰€ã«java.exeãŒã‚ã‚‹ã®ã«ã“ã®ã‚¨ãƒ©ãƒ¼ãŒå‡ºã‚‹å ´åˆã¯ã€server.ps1ã®ç½®ãå ´æ‰€(AppRoot)ãŒãšã‚Œã¦ã„ã¾ã™ã€‚app\logs\startup-*-latest.log ã® AppRoot è¡Œã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚java.exeè‡ªä½“ãŒãªã„å ´åˆã¯ app\tools\install-thirdparty.cmd ã‚’å®Ÿè¡Œã—ã¦ã‹ã‚‰ã€ã‚‚ã†ä¸€åº¦PDFã‚’å‡ºåŠ›ã—ã¦ãã ã•ã„ã€‚" -f $direct)
-}
-
-function Get-JavaRuntimeSignature {
-    # V5-P1(#11): ç”»åƒãƒãƒƒã‚·ãƒ¥ã®ç’°å¢ƒæŒ‡ç´‹ã«å«ã‚ã‚‹ Java ç‰ˆã®ç½²åã€‚
-    # `java -version` ã®å‡ºåŠ›(ãƒãƒ¼ã‚¸ãƒ§ãƒ³+ãƒ“ãƒ«ãƒ‰)ã‚’æŽ¡å–ã—ã¦ãƒãƒƒã‚·ãƒ¥åŒ–ã—ã€Java æ›´æ–°ã§å¿…ãšå€¤ãŒå¤‰ã‚ã‚‹ã‚ˆã†ã«ã™ã‚‹ã€‚
-    if (-not [string]::IsNullOrWhiteSpace($Script:JavaRuntimeSignature)) { return $Script:JavaRuntimeSignature }
-    $sig = 'unknown'
-    try {
-        $java = Resolve-JavaExe
-        # `java -version` ã¯ãƒãƒ¼ã‚¸ãƒ§ãƒ³æƒ…å ±ã‚’ stderr ã«å‡ºã™ãŸã‚ 2>&1 ã§å–ã‚Šè¾¼ã‚€ã€‚
-        $out = [string](Invoke-NativeCapture $java @('-version')).text
-        $norm = ($out -replace '\s+', ' ').Trim()
-        if (-not [string]::IsNullOrWhiteSpace($norm)) { $sig = (Get-Sha256Text $norm).Substring(0, 16) }
-    } catch { $sig = 'unknown' }
-    $Script:JavaRuntimeSignature = $sig
-    return $sig
-}
-
-function Get-Sha256Text([string]$Text) {
-    $sha=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($Text);return 'sha256:'+([BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant())}finally{$sha.Dispose()}
-}
-
-function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volume,[string]$Category) {
-    $cat=Require-WorkbookCategory $Category
-    if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $Volume){throw [ArgumentException]::new("ä¸æ­£ãªæˆæžœç‰©ã§ã™: $Volume")}
-    $workspace=Get-WorkspacePath $Language;$wbMap=@{};$targets=@(Get-Array $Structure.workbooks|Where-Object{Test-WorkbookCategory $_ $cat});foreach($wb in $targets){$wbMap[[string]$wb.workbookId]=$wb}
-    $pages=@(Get-Array $Structure.pages|Where-Object{$_.enabled -eq $true -and [string]$_.volume -eq $Volume -and $wbMap.ContainsKey([string]$_.workbookId)}|Sort-Object {[double]$_.order},{Resolve-PageId $_})
-    $blockers=@();$manifest=@();$fpPages=@()
-    if($pages.Count -eq 0){$blockers+= [ordered]@{code='no-pages';pageTitle='';workbookName='';message='å¯¾è±¡ãƒšãƒ¼ã‚¸ãŒã‚ã‚Šã¾ã›ã‚“ã€‚ãƒšãƒ¼ã‚¸æ§‹æˆã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚'}}
-    foreach($p in $pages){$wb=$wbMap[[string]$p.workbookId];$title=[string]$p.title;$wbName=[string]$wb.fileName;$rel=[string]$p.contentPdf;$full='';$size=0L;$ticks=0L
-        if(-not $rel){$blockers+=[ordered]@{code='content-missing';pageTitle=$title;workbookName=$wbName;message='PDFæœªä½œæˆã®ãƒšãƒ¼ã‚¸ãŒã‚ã‚Šã¾ã™ã€‚å…ˆã«PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'}}
-        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path $full)){throw 'missing'};$it=Get-Item $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°æ¸ˆã¿PDFãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚å…ˆã«PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'}}}
-        if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers+=[ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='å…ƒExcelãŒæ›´æ–°ã•ã‚Œã¦ã„ã¾ã™ã€‚å…ˆã«PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'}}
-        elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers+=[ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='Excelã®ã‚·ãƒ¼ãƒˆæ§‹æˆãŒå¤‰ã‚ã£ã¦ã„ã¾ã™ã€‚å…ˆã«PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'}}
-        elseif(-not(Test-PageContentMatchesWorkbookVersion $p $wb)){$blockers+=[ordered]@{code='old-content';pageTitle=$title;workbookName=$wbName;message='å¤ã„PDFå‚ç…§ãŒæ®‹ã£ã¦ã„ã¾ã™ã€‚å…ˆã«PDFä½œæˆã—ã¦ãã ã•ã„ã€‚'}}
-        $normalized=($rel -replace '\\','/').ToLowerInvariant();$fpPages+=[ordered]@{pageId=(Resolve-PageId $p);order=[double]$p.order;enabled=[bool]$p.enabled;volume=[string]$p.volume;numberingMode=[string]$p.numberingMode;contentPdf=$normalized;contentPdfSize=$size;contentPdfLastWriteUtcTicks=$ticks;lastRenderedVersionId=[string]$wb.lastRenderedVersionId}
-        if($full){$manifest+=[ordered]@{pageId=(Resolve-PageId $p);title=$title;sourcePdf=$full;numberingMode=[string]$p.numberingMode;punchShiftPt=(Convert-CmToPt 0.2)}}
-    }
-    $input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;category=$cat;volume=$Volume;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
-    return [ordered]@{language=$Language;category=$cat;volume=$Volume;pages=$pages;manifestPages=$manifest;blockers=@($blockers);pageCount=$pages.Count;projectId=(Get-ProjectIdFromWorkbooks $targets);fingerprint=$fingerprint;fingerprintInput=$input}
-}
-
-function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty $Snapshot 'fingerprint' '') }
-
-function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[string]$Category) {
-    $cat=Require-WorkbookCategory $Category;$snap=Get-FinalBuildInputSnapshot $Structure $Language $Volume $cat;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $Structure.volumes $key (New-EmptyVolumeState);$built=[string](Get-DataProperty $v 'builtFingerprint' '');$current=[string]$snap.fingerprint;$out=[string](Get-DataProperty $v 'outputPdf' '');$exists=(-not [string]::IsNullOrWhiteSpace($out))-and(Test-Path -LiteralPath $out);$status='not-built';if($built){if($built -ne $current -or $snap.blockers.Count -gt 0){$status='needs-rebuild'}else{$status='built'}};$display=if($snap.blockers.Count -gt 0){'blocked'}elseif(-not $built){'not-built'}elseif($built -ne $current){'needs-rebuild'}elseif(-not $exists){'output-missing'}else{'built'}
-    Set-NoteProperty $v 'status' $status
-    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='æœ€çµ‚PDFã®å…¥åŠ›ãŒå¤‰æ›´ã•ã‚Œã¾ã—ãŸ'})}
-    return [ordered]@{canBuild=($snap.blockers.Count -eq 0 -and $snap.pageCount -gt 0);pageCount=$snap.pageCount;status=$status;displayState=$display;builtFingerprint=$built;currentFingerprint=$current;outputPdf=$out;outputPdfExists=[bool]$exists;lastBuiltAt=(Get-DataProperty $v 'lastBuiltAt' $null);blockers=@($snap.blockers);staleReasons=@($reasons);snapshot=$snap}
-}
-
-function Get-AllFinalReadiness($Structure,[string]$Language) {
-    $result=[ordered]@{};foreach($cat in @('ecm','bod','dmm')){$vols=[ordered]@{};foreach($volume in @(Get-VolumeList $Language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $Structure $Language $volume $cat};$result[$cat]=[ordered]@{volumes=$vols}};return $result
-}
-
-function Build-FinalPdf([string]$Language,[string]$Volume,[string]$Category='') {
-    # category ã¯ fail closedã€‚ã“ã“ã§ã‚‚æ˜Žç¤ºçš„ã«æ¤œè¨¼ã™ã‚‹ã€‚
-    $cat = Require-WorkbookCategory $Category
-    # V5-P0: æ‰¿èªå‰ã¯æ–°ã—ã„å‡ºåŠ›çµŒè·¯ã‚’ä¸€åˆ‡é€šã•ãªã„ã€‚V4.1 ã¨åŒã˜æŒ™å‹•ã«ã™ã‚‹ã€‚
-    if (-not (Test-InputHistoryEnabled)) { return Build-FinalPdfLegacy $Language $Volume $cat }
-    # V5-Â§E: æ‰¿èªæ¸ˆã¿ãªã‚‰å˜ä½“å‡ºåŠ›ã‚‚ã¾ã¨ã‚ã¦å‡ºåŠ›ã‚‚åŒã˜ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³ã‚¨ãƒ³ã‚¸ãƒ³ã‚’é€šã™ã€‚
-    $r = Invoke-FinalBuildTransaction $Language $cat @($Volume)
-    $built = @(Get-Array $r.built)
-    if ($built.Count -eq 0) { throw [InvalidOperationException]::new('å¯¾è±¡ãƒšãƒ¼ã‚¸ãŒã‚ã‚Šã¾ã›ã‚“ã€‚ãƒšãƒ¼ã‚¸æ§‹æˆã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚') }
-    return $built[0]
-}
-
-function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Category='') {
-    if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeã«ã¯æœ¬ä½“ã¾ãŸã¯è£œè¶³ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚') }
-    $cat=Require-WorkbookCategory $Category;$paths=Get-Paths;$workspace=Get-WorkspacePath $Language;try{[void](Scan-Updates $Language $null $false)}catch{}
-    $lockPath=Join-Path $workspace "locks\volume_${Volume}_${cat}.lock"
-    return Invoke-WithLock $lockPath {
-        $composerJar=Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar';$pdfboxJar=Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar';if(-not(Test-Path $composerJar)){throw 'ReportPdfComposer.jar ãŒã‚ã‚Šã¾ã›ã‚“ã€‚'};if(-not(Test-Path $pdfboxJar)){throw 'pdfbox-app.jar ãŒã‚ã‚Šã¾ã›ã‚“ã€‚'}
-        $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
-        if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
-        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=Get-OutputFileName $Volume $projectId $cat;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
-        if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "å‡ºåŠ›å…ˆã®æœ€çµ‚PDFãŒé–‹ã‹ã‚Œã¦ã„ã‚‹ãŸã‚ä¸Šæ›¸ãã§ãã¾ã›ã‚“: $outName"}finally{if($f){$f.Dispose()}}}
-        $manifest=[ordered]@{schemaVersion=2;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
-        $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath);$exit=[int]$run.exitCode;$text=[string]$run.text;if($exit -ne 0){throw "PDFBoxçµ„ç‰ˆã«å¤±æ•—ã—ã¾ã—ãŸã€‚exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'æœ€çµ‚PDFã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'}
-        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'excel-updated' 'å…ƒExcelãŒæ›´æ–°ã•ã‚ŒãŸãŸã‚ã€PDFã‚’å†ä½œæˆå¾Œã«æœ€çµ‚PDFã‚’å†å‡ºåŠ›ã—ã¦ãã ã•ã„'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
-        if($commit.changed){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'PDFä½œæˆä¸­ã«ãƒšãƒ¼ã‚¸æ§‹æˆã¾ãŸã¯PDFå…¥åŠ›ãŒå¤‰æ›´ã•ã‚Œã¾ã—ãŸã€‚æœ€æ–°ã®çŠ¶æ…‹ã§å†åº¦å‡ºåŠ›ã—ã¦ãã ã•ã„ã€‚'}
-        return [ordered]@{volume=$Volume;category=$cat;outputPdf=$outPath;inputFingerprint=$fpBefore;message=$text;readiness=$commit.readiness}
-    }
-}
-
-function Invoke-FinalBuildAllLegacy([string]$Language, [string]$Category, [string[]]$Volumes) {
-    # V5-P0(#2): æ‰¿èªå‰ã®ã€Œã¾ã¨ã‚ã¦å‡ºåŠ›ã€ã€‚æ–°ã—ã„ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³/ã‚¹ãƒŠãƒƒãƒ—ã‚·ãƒ§ãƒƒãƒˆæ©Ÿæ§‹ã‚’ä¸€åˆ‡é€šã•ãšã€
-    # å˜ä½“å‡ºåŠ›ã¨åŒã˜ V4.1 çµŒè·¯(Build-FinalPdfLegacy)ã‚’å·»ã”ã¨ã«å›žã™ã€‚
-    # ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³ç‰ˆã¨åŒæ§˜ã€ãƒšãƒ¼ã‚¸ãŒç„¡ã„å·»ã¯ã‚¹ã‚­ãƒƒãƒ—ã—ã€æœ¬å½“ã®ãƒ–ãƒ­ãƒƒã‚«ãƒ¼ã¯ Build-FinalPdfLegacy å´ã§é€å‡ºã™ã‚‹ã€‚
-    $cat = Require-WorkbookCategory $Category
-    $allowed = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
-    $requested = @($Volumes | Where-Object { $allowed -contains $_ })
-    if ($requested.Count -eq 0) { throw [System.ArgumentException]::new('volumeã«ã¯æœ¬ä½“ã¾ãŸã¯è£œè¶³ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚') }
-    $built = @()
-    $skipped = @()
-    foreach ($v in $requested) {
-        $structure = Get-Structure $Language
-        $rd = Get-FinalBuildReadiness $structure $Language $v $cat
-        if ([int]$rd.pageCount -le 0) { $skipped += $v; continue }
-        $built += @(Build-FinalPdfLegacy $Language $v $cat)
-    }
-    return [ordered]@{ built = @($built); skipped = @($skipped); message = (if ($built.Count -eq 0) { 'å‡ºåŠ›å¯¾è±¡ãŒã‚ã‚Šã¾ã›ã‚“ã€‚' } else { '' }) }
-}
-
-function Get-StatePayload([string]$Language) {
-    $paths = Get-Paths
-    $configured = $false
-    if ($paths -and [string]$paths.submissionDir -and [string]$paths.dataDir -and [string]$paths.outputDir) { $configured = $true }
-    $structure = $null
-    $structureLoadError = ''
-    if ($configured -and (Test-Path -LiteralPath ([string]$paths.dataDir))) {
-        try {
-            $structure = Get-Structure $Language
-        } catch {
-            $structureLoadError = $_.Exception.Message
-            $structure = New-EmptyStructure $Language
-        }
-    } else {
-        $structure = New-EmptyStructure $Language
-    }
-    $workbooks = @(Get-Array $structure.workbooks)
-    $pages = @(Get-Array $structure.pages)
-    $summary = [ordered]@{
-        excelUpdated = @($workbooks | Where-Object { [string]$_.status -eq 'excel-updated' }).Count
-        uncheckedPages = @($pages | Where-Object { [string]$_.status -in @('rendered','stale','not-rendered') }).Count
-        confirmedPages = @($pages | Where-Object { [string]$_.status -eq 'confirmed' }).Count
-        renderErrors = @($workbooks | Where-Object { [string]$_.status -eq 'render-error' }).Count
-        pdfReadyWorkbooks = @($workbooks | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.lastRenderedExcelHash) -and [string]$_.status -ne 'render-error' }).Count
-        pdfPendingWorkbooks = @($workbooks | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.lastRenderedExcelHash) -or [string]$_.status -in @('new','excel-updated','render-error') }).Count
-        pdfReadyPages = @($pages | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.contentPdf) }).Count
-        totalWorkbooks = $workbooks.Count
-        totalPages = $pages.Count
-    }
-    if ($configured -and -not $structureLoadError) {
-        foreach ($cat in @('ecm','bod','dmm')) {
-            foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
-                $key=Get-VolumeStateKey $volume $cat; $v=Get-DataProperty $structure.volumes $key $null
-                if ($null -ne $v) { $out=[string](Get-DataProperty $v 'outputPdf' ''); Set-NoteProperty $v 'outputPdfExists' ((-not [string]::IsNullOrWhiteSpace($out)) -and (Test-Path -LiteralPath $out)) }
-            }
-        }
-    }
-    # V5: ã‚·ãƒ¼ãƒˆå˜ä½ã®å¤‰æ›´åˆ¤å®šã‚’ state ã«è¼‰ã›ã‚‹(å±¥æ­´ãŒæ‰¿èªã•ã‚Œã¦ã„ã‚‹å ´åˆã®ã¿)ã€‚
-    $changeSummaries = [ordered]@{}
-    $inputHistoryOn = $false
-    try { $inputHistoryOn = (Test-InputHistoryEnabled) } catch { }
-    if ($configured -and -not $structureLoadError -and $inputHistoryOn) {
-        foreach ($w in $workbooks) {
-            try {
-                $cs = Get-WorkbookChangeSummary $Language ([string]$w.workbookId) $w
-                if ($null -ne $cs) { $changeSummaries[[string]$w.workbookId] = $cs }
-            } catch { }
-        }
-    }
-    $autoSummary = $null
-    try { if ($configured) { $autoSummary = Get-AutoStateSummary $Language } } catch { }
-
-    $pdfjsDir = Join-Path $Script:WebRoot 'pdfjs'
-    $pdfjsClassic = ((Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.min.js')) -and (Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.worker.min.js')))
-    $pdfjsModule = ((Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.min.mjs')) -and (Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.worker.min.mjs')))
-    $pdfjsMode = 'none'
-    if ($pdfjsModule) { $pdfjsMode = 'module' } elseif ($pdfjsClassic) { $pdfjsMode = 'classic' }
-    return [ordered]@{
-        ok = $true
-        mode = $Mode
-        language = $Language
-        token = $Script:Token
-        configured = $configured
-        paths = $paths
-        structure = $structure
-        structureLoadError = $structureLoadError
-        finalReadiness = $(if ($configured -and -not $structureLoadError) { Get-AllFinalReadiness $structure $Language } else { [ordered]@{} })
-        summary = $summary
-        recentErrors = @(Get-Array $workbooks | Where-Object { [string]$_.status -eq 'render-error' -or -not [string]::IsNullOrWhiteSpace([string]$_.lastError) } | ForEach-Object { [ordered]@{ workbookId = [string]$_.workbookId; fileName = [string]$_.fileName; displayName = [string]$_.displayName; message = [string]$_.lastErrorUser; detail = [string]$_.lastError; at = [string]$_.lastErrorAt } })
-        pdfjsPresent = ($pdfjsClassic -or $pdfjsModule)
-        pdfjsMode = $pdfjsMode
-        excelPrintProfileVersion = $Script:ExcelPrintProfileVersion
-        inputHistoryEnabled = $inputHistoryOn
-        changeSummaries = $changeSummaries
-        auto = $autoSummary
-        autoRenderInProgress = $Script:AutoRenderInProgress
-        shutdownOnTabClose = $false
-    }
-}
-
-function Read-BodyJson($Request) {
-    $reader = New-Object IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
-    $text = $reader.ReadToEnd()
-    if ([string]::IsNullOrWhiteSpace($text)) { return [pscustomobject]@{} }
-    return $text | ConvertFrom-Json
-}
-
-function Touch-ResponseActivity {
-    if ($Script:ClientAttached -and $Script:ClientCloseNotifiedUtc -eq [DateTime]::MinValue) { $Script:LastHeartbeatUtc = [DateTime]::UtcNow }
-}
-
-function Write-TextResponse($Context, [int]$Status, [string]$Body, [string]$ContentType, [bool]$AllowCors = $false) {
-    Touch-ResponseActivity
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
-    if (Test-TcpContext $Context) { Write-TcpResponse $Context $Status $bytes $ContentType $AllowCors; return }
-    $Context.Response.StatusCode = $Status
-    $Context.Response.ContentType = $ContentType
-    $Context.Response.Headers['Cache-Control'] = 'no-store'
-    if ($AllowCors) { $Context.Response.Headers['Access-Control-Allow-Origin'] = '*' }
-    $Context.Response.ContentLength64 = $bytes.Length
-    $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    $Context.Response.OutputStream.Close()
-}
-
-function Write-JsonResponse($Context, [int]$Status, $Object, [bool]$AllowCors = $false) {
-    $json = ConvertTo-Json -InputObject $Object -Depth 50
-    Write-TextResponse $Context $Status $json 'application/json; charset=utf-8' $AllowCors
-}
-
-function Write-BytesResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$ContentType, [bool]$AllowCors = $false) {
-    Touch-ResponseActivity
-    if (Test-TcpContext $Context) { Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors; return }
-    $Context.Response.StatusCode = $Status
-    $Context.Response.ContentType = $ContentType
-    $Context.Response.Headers['Cache-Control'] = 'no-store'
-    if ($AllowCors) { $Context.Response.Headers['Access-Control-Allow-Origin'] = '*' }
-    $Context.Response.ContentLength64 = $Bytes.Length
-    $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
-    $Context.Response.OutputStream.Close()
-}
-
-function Get-Mime([string]$Path) {
-    switch ([IO.Path]::GetExtension($Path).ToLowerInvariant()) {
-        '.html' { return 'text/html; charset=utf-8' }
-        '.css' { return 'text/css; charset=utf-8' }
-        '.js' { return 'application/javascript; charset=utf-8' }
-        '.mjs' { return 'application/javascript; charset=utf-8' }
-        '.json' { return 'application/json; charset=utf-8' }
-        '.pdf' { return 'application/pdf' }
-        '.png' { return 'image/png' }
-        '.svg' { return 'image/svg+xml' }
-        default { return 'application/octet-stream' }
-    }
-}
-
-function Get-RequestCookieValue($Request, [string]$Name) {
-    try {
-        $cookieHeader = [string]$Request.Headers['Cookie']
-        if ([string]::IsNullOrWhiteSpace($cookieHeader)) { return '' }
-        foreach ($part in ($cookieHeader -split ';')) {
-            $item = $part.Trim()
-            $eq = $item.IndexOf('=')
-            if ($eq -le 0) { continue }
-            $n = $item.Substring(0, $eq).Trim()
-            if ($n -ne $Name) { continue }
-            return [Uri]::UnescapeDataString($item.Substring($eq + 1))
-        }
-    } catch {}
-    return ''
-}
-
-function Test-FixedTimeTokenEquals([string]$Candidate, [string]$Expected) {
-    if ($null -eq $Candidate) { $Candidate = '' }
-    if ($null -eq $Expected) { $Expected = '' }
-    $utf8 = [Text.Encoding]::UTF8
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try {
-        $candidateHash = $sha.ComputeHash($utf8.GetBytes($Candidate))
-        $expectedHash = $sha.ComputeHash($utf8.GetBytes($Expected))
-    } finally {
-        $sha.Dispose()
-    }
-    $difference = 0
-    for ($i = 0; $i -lt $candidateHash.Length; $i++) {
-        $difference = $difference -bor ($candidateHash[$i] -bxor $expectedHash[$i])
-    }
-    return ($difference -eq 0 -and $Candidate.Length -eq $Expected.Length)
-}
-
-function Test-Token($Request) {
-    $q = [string]$Request.QueryString['token']
-    $t = [string]$Request.QueryString['t']
-    $h = [string]$Request.Headers['X-ReportBinder-Token']
-    $c = Get-RequestCookieValue $Request 'ReportBinderToken'
-    return ((Test-FixedTimeTokenEquals $q $Script:Token) -or
-        (Test-FixedTimeTokenEquals $t $Script:Token) -or
-        (Test-FixedTimeTokenEquals $h $Script:Token) -or
-        (Test-FixedTimeTokenEquals $c $Script:Token))
-}
-
-function Serve-Static($Context, [string]$Path) {
-    if ($Path -eq '/') { $Path = '/index.html' }
-    $rel = $Path.TrimStart('/') -replace '/', [IO.Path]::DirectorySeparatorChar
-    if ($rel -match '(^|[\\/])\.\.($|[\\/])') { Write-JsonResponse $Context 400 ([ordered]@{ ok = $false; error = '.. is not allowed' }); return }
-    $file = [IO.Path]::GetFullPath((Join-Path $Script:WebRoot $rel))
-    $root = [IO.Path]::GetFullPath($Script:WebRoot)
-    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
-    if (-not $file.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $file)) {
-        Write-JsonResponse $Context 404 ([ordered]@{ ok = $false; error = 'not found' }); return
-    }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($file)) (Get-Mime $file)
-}
-
-
-function Normalize-WorkspaceRelativePath([string]$RelativePath) {
-    if ([string]::IsNullOrWhiteSpace($RelativePath)) { return '' }
-    $rel = $RelativePath.Trim()
-    if ($rel -eq 'undefined' -or $rel -eq 'null') { return '' }
-    if ([IO.Path]::IsPathRooted($rel)) { throw 'PDFãƒ‘ã‚¹ãŒä¸æ­£ã§ã™ã€‚' }
-    if ($rel -match '(^|[\\/])\.\.($|[\\/])') { throw 'PDFãƒ‘ã‚¹ãŒä¸æ­£ã§ã™ã€‚' }
-    if ($rel -match '[\x00-\x1F]') { throw 'PDFãƒ‘ã‚¹ãŒä¸æ­£ã§ã™ã€‚' }
-    if ([IO.Path]::GetExtension($rel).ToLowerInvariant() -ne '.pdf') { throw 'PDFãƒ•ã‚¡ã‚¤ãƒ«ã ã‘è¡¨ç¤ºã§ãã¾ã™ã€‚' }
-    return $rel
-}
-
-
-function Normalize-RelativeForCompare([string]$RelativePath) {
-    return (([string]$RelativePath) -replace '\\','/').Trim().ToLowerInvariant()
-}
-
-function Serve-ContentPdfByValues($Context, [string]$Language, [string]$PageId, [string]$WorkbookId, [string]$SheetName, [string]$ContentPdf) {
-    $workspace = Get-WorkspacePath $Language
-    $structure = Get-Structure $Language
-    $pageId = ([string]$PageId).Trim()
-    if ($pageId -eq 'undefined' -or $pageId -eq 'null') { $pageId = '' }
-    $workbookId = ([string]$WorkbookId).Trim()
-    if ($workbookId -eq 'undefined' -or $workbookId -eq 'null') { $workbookId = '' }
-    $sheetName = ([string]$SheetName).Trim()
-    if ($sheetName -eq 'undefined' -or $sheetName -eq 'null') { $sheetName = '' }
-    $contentRel = Normalize-WorkspaceRelativePath $ContentPdf
-    $page = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($pageId)) {
-        $page = @(Get-Array $structure.pages | Where-Object {
-            (Resolve-PageId $_) -eq $pageId -or [string]$_.pageId -eq $pageId -or [string]$_.id -eq $pageId
-        } | Select-Object -First 1)
-    }
-    if ($page.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($workbookId) -and -not [string]::IsNullOrWhiteSpace($sheetName)) {
-        $page = @(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $workbookId -and [string]$_.sheetName -eq $sheetName } | Select-Object -First 1)
-    }
-    if ($page.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($contentRel)) {
-        $cmp = Normalize-RelativeForCompare $contentRel
-        $page = @(Get-Array $structure.pages | Where-Object { (Normalize-RelativeForCompare ([string]$_.contentPdf)) -eq $cmp } | Select-Object -First 1)
-    }
-
-    $rel = ''
-    if ($page.Count -gt 0) { $rel = [string]$page[0].contentPdf }
-    if ([string]::IsNullOrWhiteSpace($rel) -and -not [string]::IsNullOrWhiteSpace($contentRel)) { $rel = $contentRel }
-    $rel = Normalize-WorkspaceRelativePath $rel
-    if ([string]::IsNullOrWhiteSpace($rel)) { throw 'PDFæƒ…å ±ãŒä¸è¶³ã—ã¦ã„ã¾ã™ã€‚ãƒšãƒ¼ã‚¸æ§‹æˆã‚’æ›´æ–°ã—ã¦ã‹ã‚‰PDFã‚’é–‹ã„ã¦ãã ã•ã„ã€‚' }
-
-    $full = [IO.Path]::GetFullPath((Join-Path $workspace $rel))
-    $workspaceFull = [IO.Path]::GetFullPath($workspace)
-    if (-not $workspaceFull.EndsWith([IO.Path]::DirectorySeparatorChar)) { $workspaceFull += [IO.Path]::DirectorySeparatorChar }
-    if (-not $full.StartsWith($workspaceFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'ãƒ¯ãƒ¼ã‚¯ã‚¹ãƒšãƒ¼ã‚¹å¤–ã®ãƒ•ã‚¡ã‚¤ãƒ«ã¯è¡¨ç¤ºã§ãã¾ã›ã‚“ã€‚' }
-    if (-not (Test-Path -LiteralPath $full)) { throw 'PDFãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚PDFä½œæˆã‚’ã‚„ã‚Šç›´ã—ã¦ãã ã•ã„ã€‚' }
-    if ((Get-Item -LiteralPath $full).Length -le 0) { throw 'PDFãƒ•ã‚¡ã‚¤ãƒ«ãŒç©ºã§ã™ã€‚PDFä½œæˆã‚’ã‚„ã‚Šç›´ã—ã¦ãã ã•ã„ã€‚' }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
-}
-
-function Resolve-ContentPdfFullPath([string]$Workspace, [string]$RelativePdf) {
-    if ([string]::IsNullOrWhiteSpace($RelativePdf)) { throw 'content-pdf ãŒæœªä½œæˆã§ã™ã€‚' }
-    Test-RelativePath $RelativePdf | Out-Null
-    if ([IO.Path]::GetExtension($RelativePdf).ToLowerInvariant() -ne '.pdf') { throw 'PDFãƒ•ã‚¡ã‚¤ãƒ«ã ã‘è¡¨ç¤ºã§ãã¾ã™ã€‚' }
-    $full = [IO.Path]::GetFullPath((Join-Path $Workspace $RelativePdf))
-    $workspaceFull = [IO.Path]::GetFullPath($Workspace)
-    if (-not $workspaceFull.EndsWith([IO.Path]::DirectorySeparatorChar)) { $workspaceFull += [IO.Path]::DirectorySeparatorChar }
-    if (-not $full.StartsWith($workspaceFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'ãƒ¯ãƒ¼ã‚¯ã‚¹ãƒšãƒ¼ã‚¹å¤–ã®ãƒ•ã‚¡ã‚¤ãƒ«ã¯è¡¨ç¤ºã§ãã¾ã›ã‚“ã€‚' }
-    if (-not (Test-Path -LiteralPath $full)) { throw 'PDFãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚PDFä½œæˆã‚’ã‚„ã‚Šç›´ã—ã¦ãã ã•ã„ã€‚' }
-    return $full
-}
-
-function Serve-ContentPdf($Context, [string]$Language) {
-    $pageId = [string]$Context.Request.QueryString['pageId']
-    if ([string]::IsNullOrWhiteSpace($pageId)) { $pageId = [string]$Context.Request.QueryString['id'] }
-    $contentPdf = [string]$Context.Request.QueryString['contentPdf']
-    if ([string]::IsNullOrWhiteSpace($contentPdf)) { $contentPdf = [string]$Context.Request.QueryString['pdf'] }
-    if ([string]::IsNullOrWhiteSpace($contentPdf)) { $contentPdf = [string]$Context.Request.QueryString['path'] }
-    Serve-ContentPdfByValues $Context $Language $pageId ([string]$Context.Request.QueryString['workbookId']) ([string]$Context.Request.QueryString['sheetName']) $contentPdf
-}
-
-function Serve-ContentPdfFromBody($Context, [string]$Language, $Body) {
-    $pageId = [string]$Body.pageId
-    if ([string]::IsNullOrWhiteSpace($pageId)) { $pageId = [string]$Body.id }
-    $contentPdf = [string]$Body.contentPdf
-    if ([string]::IsNullOrWhiteSpace($contentPdf)) { $contentPdf = [string]$Body.pdf }
-    if ([string]::IsNullOrWhiteSpace($contentPdf)) { $contentPdf = [string]$Body.path }
-    Serve-ContentPdfByValues $Context $Language $pageId ([string]$Body.workbookId) ([string]$Body.sheetName) $contentPdf
-}
-
-function Serve-FinalPdfByVolume($Context,[string]$Language,[string]$Volume,[string]$Category) {
-    if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeã«ã¯æœ¬ä½“ã¾ãŸã¯è£œè¶³ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚') }
-    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('ä¸æ­£ãªæˆæžœç‰©ã§ã™ã€‚')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw 'æœ€çµ‚PDFã¯ã¾ã ä½œæˆã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'å‡ºåŠ›ãƒ•ã‚©ãƒ«ãƒ€å¤–ã®PDFã¯è¡¨ç¤ºã§ãã¾ã›ã‚“ã€‚'};if(-not(Test-Path $full)){throw 'æœ€çµ‚PDFãƒ•ã‚¡ã‚¤ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
-}
-
-function Serve-FinalPdf($Context,[string]$Language) {
-    Serve-FinalPdfByVolume $Context $Language ([string]$Context.Request.QueryString['volume']) ([string]$Context.Request.QueryString['category'])
-}
-
-function Handle-Api($Context) {
-    $language = Get-EffectiveLanguage
-    $path = $Context.Request.Url.AbsolutePath
-    $method = $Context.Request.HttpMethod.ToUpperInvariant()
-    try {
-        # These lightweight endpoints are only for startup readiness checks.
-        # They intentionally do not require a session token so the local wait page
-        # can detect readiness even if the browser strips or delays query handling.
-        if ($method -eq 'OPTIONS') {
-            Write-TextResponse $Context 204 '' 'text/plain; charset=utf-8'; return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/ready.gif') {
-            Write-BytesResponse $Context 200 $Script:ReadyGifBytes 'image/gif' $true; return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/ping') {
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; mode = $Mode; at = New-NowIso }) $true; return
-        }
-        if (-not (Test-Token $Context.Request)) { Write-JsonResponse $Context 403 ([ordered]@{ ok = $false; error = 'invalid token' }); return }
-        Touch-ClientActivity '' | Out-Null
-        if ($method -eq 'POST' -and $path -eq '/api/heartbeat') {
-            $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 (Touch-ClientActivity ([string]$body.clientId)); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/client/close') {
-            $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 (Notify-ClientClosing ([string]$body.clientId)); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/shutdown') {
-            $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 (Request-ServerShutdown ([string]$body.reason)); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/auto/render') {
-            $body = Read-BodyJson $Context.Request
-            $ids = @()
-            if ($body.workbookIds) { $ids = @(Get-Array $body.workbookIds | ForEach-Object { [string]$_ }) }
-            $result = Invoke-AutoRender $language $ids
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/state') {
-            Write-JsonResponse $Context 200 (Get-StatePayload $language); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/final/readiness') {
-            $cat=Require-WorkbookCategory ([string]$Context.Request.QueryString['category'])
-            $structure=Get-Structure $language;$vols=[ordered]@{}
-            foreach($volume in @(Get-VolumeList $language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $structure $language $volume $cat}
-            Write-JsonResponse $Context 200 ([ordered]@{ok=$true;category=$cat;volumes=$vols});return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/submission-files') {
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; scannedAt = (New-NowIso); files = (Get-ExcelFilesInSubmission) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/submission/select-and-start') {
-            $body = Read-BodyJson $Context.Request
-            $initial = [string]$body.initialDir
-            if ([string]::IsNullOrWhiteSpace($initial)) { $initial = [string](Get-Paths).submissionDir }
-            $selected = Select-FolderDialog 'æå‡ºãƒ•ã‚©ãƒ«ãƒ€ã‚’é¸æŠž' $initial
-            if ([string]::IsNullOrWhiteSpace($selected)) {
-                Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; cancelled = $true; state = (Get-StatePayload $language) }); return
-            }
-            $newPaths = Get-DefaultChildPaths $selected
-            Ensure-Package $newPaths
-            $config = Get-AppConfig
-            $config.lastSubmissionDir = [string]$newPaths.submissionDir
-            $config.lastDataDir = [string]$newPaths.dataDir
-            $config.lastOutputDir = [string]$newPaths.outputDir
-            $config.lastMode = $Mode
-            Save-AppConfig $config
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = (Get-ExcelFilesInSubmission) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/dialog/folder') {
-            $body = Read-BodyJson $Context.Request
-            $selected = Select-FolderDialog ([string]$body.title) ([string]$body.initialDir)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; path = $selected }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/paths/defaults') {
-            $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = (Get-DefaultChildPaths ([string]$body.submissionDir)) }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/file') {
-            Serve-ContentPdf $Context $language; return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/file') {
-            $body = Read-BodyJson $Context.Request
-            Serve-ContentPdfFromBody $Context $language $body; return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/final/file') {
-            Serve-FinalPdf $Context $language; return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/final/file') {
-            $body = Read-BodyJson $Context.Request
-            Serve-FinalPdfByVolume $Context $language ([string]$body.volume) ([string]$body.category); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/paths') {
-            $body = Read-BodyJson $Context.Request
-            $newPaths = [ordered]@{ submissionDir = [string]$body.submissionDir; dataDir = [string]$body.dataDir; outputDir = [string]$body.outputDir }
-            if ([string]::IsNullOrWhiteSpace([string]$newPaths.dataDir) -or [string]::IsNullOrWhiteSpace([string]$newPaths.outputDir)) {
-                $defaults = Get-DefaultChildPaths ([string]$newPaths.submissionDir)
-                if ([string]::IsNullOrWhiteSpace([string]$newPaths.dataDir)) { $newPaths.dataDir = [string]$defaults.dataDir }
-                if ([string]::IsNullOrWhiteSpace([string]$newPaths.outputDir)) { $newPaths.outputDir = [string]$defaults.outputDir }
-            }
-            Ensure-Package $newPaths
-            $config = Get-AppConfig
-            $config.lastSubmissionDir = [string]$newPaths.submissionDir
-            $config.lastDataDir = [string]$newPaths.dataDir
-            $config.lastOutputDir = [string]$newPaths.outputDir
-            $config.lastMode = $Mode
-            Save-AppConfig $config
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/workbooks/register-batch') {
-            $body = Read-BodyJson $Context.Request
-            $rels = @()
-            if ($body.relativePaths) { $rels = @(Get-Array $body.relativePaths | ForEach-Object { [string]$_ }) }
-            elseif ($body.relativePath) { $rels = @([string]$body.relativePath) }
-            if ($rels.Count -eq 0) { throw 'ç™»éŒ²ã™ã‚‹ExcelãŒé¸æŠžã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' }
-            $result = Register-WorkbooksBatch $language $rels ([string]$body.category)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result; state = (Get-StatePayload $language) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/workbooks/register') {
-            $body = Read-BodyJson $Context.Request
-            $result = Register-Workbook $language ([string]$body.relativePath) ([string]$body.category)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result; state = (Get-StatePayload $language) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/workbooks/unregister') {
-            $body = Read-BodyJson $Context.Request
-            $result = Unregister-Workbook $language ([string]$body.workbookId)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
-        }
-        if (($method -eq 'GET' -or $method -eq 'POST') -and $path -eq '/api/jobs/status') {
-            $jobId = ''
-            if ($method -eq 'POST') {
-                $body = Read-BodyJson $Context.Request
-                $jobId = [string](Get-DataProperty $body 'jobId' '')
-                if ([string]::IsNullOrWhiteSpace($jobId)) { $jobId = [string](Get-DataProperty $body 'JobId' '') }
-                if ([string]::IsNullOrWhiteSpace($jobId)) { $jobId = [string](Get-DataProperty $body 'id' '') }
-            }
-            if ([string]::IsNullOrWhiteSpace($jobId)) { $jobId = [string]$Context.Request.QueryString['jobId'] }
-            if ([string]::IsNullOrWhiteSpace($jobId)) { $jobId = [string]$Context.Request.QueryString['JobId'] }
-            if ([string]::IsNullOrWhiteSpace($jobId)) { $jobId = [string]$Context.Request.QueryString['id'] }
-            Write-JsonResponse $Context 200 (Read-RenderJobStatus $language $jobId); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/workbooks/render/start') {
-            $body = Read-BodyJson $Context.Request
-            $ids = @()
-            if ($body.workbookIds) { $ids = @(Get-Array $body.workbookIds | ForEach-Object { [string]$_ }) }
-            $result = Start-RenderJob $language $ids ([bool]$body.onlyUpdated) ([string]$body.category)
-            $jobIdForResponse = Normalize-RenderJobId ([string](Get-DataProperty $result 'jobId' ''))
-            if ([string]::IsNullOrWhiteSpace($jobIdForResponse)) { try { $jobIdForResponse = Normalize-RenderJobId ([string]$result.jobId) } catch { } }
-            if ([string]::IsNullOrWhiteSpace($jobIdForResponse)) { $jobIdForResponse = Normalize-RenderJobId ([string]$result) }
-            if ([string]::IsNullOrWhiteSpace($jobIdForResponse)) { throw 'PDFä½œæˆã‚¸ãƒ§ãƒ–ã®æƒ…å ±ã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚ã‚‚ã†ä¸€åº¦ã€ŒPDFä½œæˆã€ã‚’æŠ¼ã—ã¦ãã ã•ã„ã€‚' }
-            Set-NoteProperty $result 'jobId' $jobIdForResponse
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; jobId = $jobIdForResponse; job = $result; state = (Get-StatePayload $language) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/workbooks/render') {
-            $body = Read-BodyJson $Context.Request
-            $structure = Get-Structure $language
-            $ids = @()
-            if ($body.workbookIds) { $ids = @(Get-Array $body.workbookIds | ForEach-Object { [string]$_ }) }
-            elseif ($body.onlyUpdated -eq $true) { $ids = @(Get-Array $structure.workbooks | Where-Object { [string]$_.status -in @('new','excel-updated','render-error') -or [string]$_.currentExcelHash -ne [string]$_.lastRenderedExcelHash } | ForEach-Object { [string]$_.workbookId }) }
-            else { $ids = @(Get-Array $structure.workbooks | ForEach-Object { [string]$_.workbookId }) }
-            $results = @()
-            foreach ($id in $ids) {
-                try {
-                    $r = Render-Workbook $language $id
-                    $r['ok'] = $true
-                    $results += $r
-                } catch {
-                    $msg = $_.Exception.Message
-                    $userMsg = ConvertTo-UserRenderError $msg
-                    $att = Get-LastRenderAttemptFor $id
-                    $errorDetail = Get-ErrorDetail $_
-                    Set-WorkbookRenderError $language $id $msg $errorDetail ([string]$att.snapshotId) ([string]$att.hash)
-                    $results += [ordered]@{ ok = $false; workbookId = $id; error = $msg; userError = $userMsg; detail = $errorDetail }
-                }
-            }
-            $hasErrors = $false
-            foreach ($rr in $results) { try { if ($rr.Contains('ok') -and $rr['ok'] -eq $false) { $hasErrors = $true } } catch { } }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; results = $results; hasErrors = $hasErrors; state = (Get-StatePayload $language) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/pages/reorder') {
-            $body = Read-BodyJson $Context.Request
-            [void](Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'reorder')
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Reorder-Pages $language $body) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/pages/sort-by-sheet') {
-            $body=Read-BodyJson $Context.Request
-            [void](Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'sort-by-sheet')
-            Write-JsonResponse $Context 200 ([ordered]@{ok=$true;result=(Sort-PagesBySheet $language $body)});return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/pages/update') {
-            $body = Read-BodyJson $Context.Request
-            # V5: å‡ºåŠ›å…ˆãƒ»ãƒšãƒ¼ã‚¸ç•ªå·ãƒ»å‡ºåŠ›å¯¾è±¡ãƒ»ã‚¿ã‚¤ãƒˆãƒ«ã®å¤‰æ›´ã‚‚ãƒ¬ã‚¤ã‚¢ã‚¦ãƒˆå±¥æ­´ã«æ®‹ã™ã€‚
-            [void](Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'page-update')
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; page = (Update-Page $language $body) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/pages/confirm') {
-            $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; page = (Confirm-Page $language $body) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/scan-updates') {
-            $body = Read-BodyJson $Context.Request
-            $forceHash = $false
-            try { $forceHash = [bool]$body.forceHash -or [bool]$body.force } catch { $forceHash = $false }
-            $scanResult = Scan-Updates $language $null $forceHash
-            # V5-Â§3.1/Â§3.3: æ¤œçŸ¥ã¨åŒæ™‚ã«ä¿å­˜ã™ã‚‹ã€‚é™æ­¢å¾…ã¡ã‚ˆã‚Šå‰ã€‚
-            $captured = Update-InputHistoryAfterScan $language
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $scanResult; capturedSnapshots = @($captured) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/final/build') {
-            $body = Read-BodyJson $Context.Request
-            $result = Build-FinalPdf $language ([string]$body.volume) ([string]$body.category)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/final/build-all') {
-            $body = Read-BodyJson $Context.Request
-            $cat = Require-WorkbookCategory ([string]$body.category)
-            $vols = @(Get-VolumeList $language | Where-Object { $_ -ne 'none' })
-            # V5-P0(#2): æ‰¿èªå‰ã¯ã€Œã¾ã¨ã‚ã¦å‡ºåŠ›ã€ã‚‚æ–°ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³çµŒè·¯ã¸å…¥ã‚Œãªã„ã€‚
-            # å˜ä½“å‡ºåŠ›(Build-FinalPdf)ã¨åŒã˜ã V4.1(legacy)ã§å‡¦ç†ã™ã‚‹ã€‚
-            $result = if (Test-InputHistoryEnabled) { Invoke-FinalBuildTransaction $language $cat $vols } else { Invoke-FinalBuildAllLegacy $language $cat $vols }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
-        }
-
-        # ---- V5: å±¥æ­´ãƒ»å·®åˆ†ãƒ»è‡ªå‹•å‡¦ç† ----
-        if ($method -eq 'GET' -and $path -eq '/api/history/timeline') {
-            $limit = 100
-            try { $limit = [int]$Context.Request.QueryString['limit'] } catch { }
-            if ($limit -le 0 -or $limit -gt 500) { $limit = 100 }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; events = (Get-HistoryTimeline $language $limit) }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/history/snapshots') {
-            $wbId = [string]$Context.Request.QueryString['workbookId']
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; snapshots = (Get-SnapshotSummaries $language $wbId) }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/history/diff') {
-            $wbId = [string]$Context.Request.QueryString['workbookId']
-            $fromId = [string]$Context.Request.QueryString['fromSnapshotId']
-            $toId = [string]$Context.Request.QueryString['toSnapshotId']
-            $diff = $null
-            if ([string]::IsNullOrWhiteSpace($fromId) -and [string]::IsNullOrWhiteSpace($toId)) {
-                $diff = Get-LatestComparison $language $wbId
-            } else {
-                $fromVer = Get-PreferredHistoryRenderVersion $language $wbId $fromId
-                $toVer = Get-PreferredHistoryRenderVersion $language $wbId $toId
-                $diff = if ($fromVer -and $toVer) { Get-StoredComparison $language $wbId $fromId $toId $fromVer $toVer 'history' } else { $null }
-            }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; diff = $diff }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/history/diff-detail') {
-            $wbId = [string]$Context.Request.QueryString['workbookId']
-            $fromId = [string]$Context.Request.QueryString['fromSnapshotId']
-            $toId = [string]$Context.Request.QueryString['toSnapshotId']
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; detail = (Get-DiffDetail $language $wbId $fromId $toId) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/history/diff/prepare') {
-            $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; job = (Start-DiffDetailJob $language ([string]$body.workbookId) ([string]$body.fromSnapshotId) ([string]$body.toSnapshotId) ([string]$body.sheetKey)) }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/history/diff-page') {
-            Serve-DiffPage $Context $language `
-                ([string]$Context.Request.QueryString['workbookId']) `
-                ([string]$Context.Request.QueryString['currentSnapshotId']) `
-                ([string]$Context.Request.QueryString['baselineSnapshotId']) `
-                ([string]$Context.Request.QueryString['sheetKey']) `
-                ([string]$Context.Request.QueryString['pageNumber']) `
-                ([string]$Context.Request.QueryString['asset']) `
-                ([string]$Context.Request.QueryString['scope'])
-            return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/history/content-pdf') {
-            Serve-HistoryContentPdf $Context $language ([string]$Context.Request.QueryString['workbookId']) ([string]$Context.Request.QueryString['versionId']) ([string]$Context.Request.QueryString['sheetName']) ([string]$Context.Request.QueryString['snapshotId']); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/history/pin') {
-            $body = Read-BodyJson $Context.Request
-            $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
-            $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
-            if (-not (New-SnapshotPin $language $wbId $snapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
-                throw 'å±¥æ­´ã®ä¿è­·æƒ…å ±ã‚’ä¿å­˜ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-            }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/history/unpin') {
-            $body = Read-BodyJson $Context.Request
-            $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
-            $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
-            Remove-SnapshotPin $language $wbId $snapshotId 'manual'
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/layout/snapshots') {
-            $cat = Require-WorkbookCategory ([string]$Context.Request.QueryString['category'])
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; snapshots = (Get-LayoutSnapshots $language $cat) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/layout/restore/preview') {
-            $body = Read-BodyJson $Context.Request
-            $cat = Require-WorkbookCategory ([string]$body.category)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; preview = (Get-LayoutRestorePreview $language $cat ([string]$body.snapshotId)) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/layout/restore') {
-            $body = Read-BodyJson $Context.Request
-            $cat = Require-WorkbookCategory ([string]$body.category)
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Restore-LayoutSnapshot $language $cat ([string]$body.snapshotId)) }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/final/archives') {
-            $cat = Require-WorkbookCategory ([string]$Context.Request.QueryString['category'])
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; archives = (Get-FinalArchives $language $cat) }); return
-        }
-        if ($method -eq 'GET' -and $path -eq '/api/auto/state') {
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; auto = (Get-AutoStateSummary $language) }); return
-        }
-        if ($method -eq 'POST' -and $path -eq '/api/auto/run-now') {
-            $body = Read-BodyJson $Context.Request
-            $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Request-AutoRunNow $language $wbId) }); return
-        }
-        Write-JsonResponse $Context 404 ([ordered]@{ ok = $false; error = 'unknown api route' })
-    } catch [System.ArgumentException] {
-        Write-JsonResponse $Context 400 ([ordered]@{ ok = $false; error = $_.Exception.Message })
-    } catch {
-        Write-JsonResponse $Context 500 ([ordered]@{ ok = $false; error = $_.Exception.Message; detail = (Get-ErrorDetail $_) })
-    }
-}
-
-
-function Test-TcpContext($Context) {
-    return ($null -ne $Context -and $null -ne $Context.PSObject.Properties['IsTcp'] -and $Context.IsTcp -eq $true)
-}
-
-function Get-HttpStatusText([int]$Status) {
-    switch ($Status) {
-        200 { return 'OK' }
-        204 { return 'No Content' }
-        400 { return 'Bad Request' }
-        403 { return 'Forbidden' }
-        404 { return 'Not Found' }
-        500 { return 'Internal Server Error' }
-        default { return 'OK' }
-    }
-}
-
-function Write-TcpResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$ContentType, [bool]$AllowCors = $false) {
-    try {
-        $statusText = Get-HttpStatusText $Status
-        # CORSãƒ˜ãƒƒãƒ€ãƒ¼ã¯èµ·å‹•å¾…ã¡ãƒšãƒ¼ã‚¸(file://)ãŒèª­ã‚€å¿…è¦ã®ã‚ã‚‹è»½é‡ã‚¨ãƒ³ãƒ‰ãƒã‚¤ãƒ³ãƒˆã ã‘ã«ä»˜ã‘ã‚‹ã€‚
-        # ãƒˆãƒ¼ã‚¯ãƒ³ä¿è­·APIã« Access-Control-Allow-Origin: * ã‚’ä»˜ã‘ã‚‹ã¨ã€ãƒˆãƒ¼ã‚¯ãƒ³æ¼ãˆã„æ™‚ã«
-        # ä»»æ„ã®Webãƒšãƒ¼ã‚¸ã‹ã‚‰å¿œç­”ã‚’èª­ã‚ã¦ã—ã¾ã†ãŸã‚ã€æ—¢å®šã§ã¯ä»˜ã‘ãªã„ï¼ˆåŒä¸€ã‚ªãƒªã‚¸ãƒ³ã«ã¯ä¸è¦ï¼‰ã€‚
-        $corsHeader = ''
-        if ($AllowCors) { $corsHeader = "Access-Control-Allow-Origin: *`r`n" }
-        $header = "HTTP/1.1 $Status $statusText`r`nContent-Type: $ContentType`r`nContent-Length: $($Bytes.Length)`r`nCache-Control: no-store`r`n${corsHeader}Connection: close`r`n`r`n"
-        $headerBytes = [Text.Encoding]::ASCII.GetBytes($header)
-        $stream = $Context.TcpStream
-        $stream.Write($headerBytes, 0, $headerBytes.Length)
-        if ($Bytes.Length -gt 0) { $stream.Write($Bytes, 0, $Bytes.Length) }
-        $stream.Flush()
-    } finally {
-        try { if ($Context.TcpStream) { $Context.TcpStream.Close() } } catch {}
-        try { if ($Context.TcpClient) { $Context.TcpClient.Close() } } catch {}
-    }
-}
-
-function Find-HttpHeaderEnd([byte[]]$Bytes) {
-    if ($Bytes.Length -lt 4) { return -1 }
-    for ($i = 3; $i -lt $Bytes.Length; $i++) {
-        if ($Bytes[$i - 3] -eq 13 -and $Bytes[$i - 2] -eq 10 -and $Bytes[$i - 1] -eq 13 -and $Bytes[$i] -eq 10) {
-            return ($i - 3)
-        }
-    }
-    return -1
-}
-
-function New-NameValueCollectionCompat {
-    try { return New-Object System.Collections.Specialized.NameValueCollection ([StringComparer]::OrdinalIgnoreCase) }
-    catch { return New-Object System.Collections.Specialized.NameValueCollection }
-}
-
-function Decode-UrlPart([string]$Value) {
-    if ($null -eq $Value) { return '' }
-    return [Uri]::UnescapeDataString(($Value -replace '\+', ' '))
-}
-
-function New-QueryStringCollection([string]$Query) {
-    $nvc = New-NameValueCollectionCompat
-    # NameValueCollection is enumerable. Returning it normally makes PowerShell
-    # unwrap its values into Object[] (or a scalar for a single query item), so
-    # Request.QueryString['token'] can never retrieve the token. Keep the
-    # collection as one pipeline object on every return path.
-    if ([string]::IsNullOrEmpty($Query)) { return ,$nvc }
-    $q = $Query
-    if ($q.StartsWith('?')) { $q = $q.Substring(1) }
-    if ([string]::IsNullOrEmpty($q)) { return ,$nvc }
-    foreach ($pair in ($q -split '&')) {
-        if ([string]::IsNullOrEmpty($pair)) { continue }
-        $eq = $pair.IndexOf('=')
-        if ($eq -ge 0) {
-            $name = Decode-UrlPart $pair.Substring(0, $eq)
-            $value = Decode-UrlPart $pair.Substring($eq + 1)
-        } else {
-            $name = Decode-UrlPart $pair
-            $value = ''
-        }
-        $nvc.Add($name, $value)
-    }
-    return ,$nvc
-}
-
-function Read-TcpHttpContext($TcpClient, [int]$Port) {
-    $stream = $TcpClient.GetStream()
-    # Browsers can open speculative/idle local connections before sending a request.
-    # The server handles requests sequentially, so a long header timeout can freeze startup.
-    $stream.ReadTimeout = 2000
-    $buffer = New-Object byte[] 8192
-    $ms = New-Object IO.MemoryStream
-    $headerEnd = -1
-    while ($headerEnd -lt 0) {
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-        if ($read -le 0) { throw 'Empty HTTP request.' }
-        $ms.Write($buffer, 0, $read)
-        $data = $ms.ToArray()
-        $headerEnd = Find-HttpHeaderEnd $data
-        if ($ms.Length -gt 65536 -and $headerEnd -lt 0) { throw 'HTTP header is too large.' }
-    }
-
-    $data = $ms.ToArray()
-    $headerText = [Text.Encoding]::ASCII.GetString($data, 0, $headerEnd)
-    $lines = $headerText -split "`r?`n"
-    if ($lines.Count -lt 1) { throw 'Invalid HTTP request.' }
-    $requestLine = $lines[0] -split ' '
-    if ($requestLine.Count -lt 2) { throw 'Invalid HTTP request line.' }
-    $method = $requestLine[0]
-    $target = $requestLine[1]
-
-    $headers = New-NameValueCollectionCompat
-    for ($i = 1; $i -lt $lines.Count; $i++) {
-        $line = $lines[$i]
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $colon = $line.IndexOf(':')
-        if ($colon -gt 0) {
-            $headers.Add($line.Substring(0, $colon).Trim(), $line.Substring($colon + 1).Trim())
-        }
-    }
-
-    $contentLength = 0
-    $contentLengthText = [string]$headers['Content-Length']
-    if (-not [string]::IsNullOrWhiteSpace($contentLengthText)) {
-        if (-not [int]::TryParse($contentLengthText, [ref]$contentLength) -or $contentLength -lt 0) {
-            throw [System.ArgumentException]::new('Invalid Content-Length header.')
-        }
-        # ReportBinder only accepts small JSON commands. A limit keeps a malformed
-        # or hostile local request from blocking the single-threaded listener.
-        if ($contentLength -gt 1048576) {
-            throw [System.ArgumentException]::new('Request body is too large.')
-        }
-    }
-    if ($contentLength -gt 0) { $stream.ReadTimeout = 10000 }
-    $bodyMs = New-Object IO.MemoryStream
-    $bodyStart = $headerEnd + 4
-    if ($data.Length -gt $bodyStart -and $contentLength -gt 0) {
-        $available = [Math]::Min($data.Length - $bodyStart, $contentLength)
-        if ($available -gt 0) { $bodyMs.Write($data, $bodyStart, $available) }
-    }
-    while ($bodyMs.Length -lt $contentLength) {
-        $needed = [Math]::Min($buffer.Length, $contentLength - [int]$bodyMs.Length)
-        $read = $stream.Read($buffer, 0, $needed)
-        if ($read -le 0) { break }
-        $bodyMs.Write($buffer, 0, $read)
-    }
-    if ($bodyMs.Length -ne $contentLength) {
-        throw [System.ArgumentException]::new('Incomplete HTTP request body.')
-    }
-    $bodyMs.Position = 0
-
-    $pathOnly = $target
-    $query = ''
-    $qmark = $target.IndexOf('?')
-    if ($qmark -ge 0) {
-        $pathOnly = $target.Substring(0, $qmark)
-        $query = $target.Substring($qmark + 1)
-    }
-    if ([string]::IsNullOrWhiteSpace($pathOnly)) { $pathOnly = '/' }
-    $uri = New-Object System.Uri("http://127.0.0.1:$Port$target")
-
-    $request = [pscustomobject]@{
-        Url = $uri
-        HttpMethod = $method
-        Headers = $headers
-        QueryString = (New-QueryStringCollection $query)
-        InputStream = $bodyMs
-        ContentEncoding = [Text.Encoding]::UTF8
-    }
-    return [pscustomobject]@{
-        IsTcp = $true
-        TcpClient = $TcpClient
-        TcpStream = $stream
-        Request = $request
-        Response = [pscustomobject]@{}
-    }
-}
-
-
-
-function Resolve-EdgeExecutableFromCommandText([string]$CommandText) {
-    if ([string]::IsNullOrWhiteSpace($CommandText)) { return '' }
-    $expanded = [Environment]::ExpandEnvironmentVariables($CommandText.Trim())
-    $candidate = ''
-    if ($expanded -match '^\s*"([^"]*msedge\.exe)"') { $candidate = $matches[1] }
-    elseif ($expanded -match '^\s*([^\s"]*msedge\.exe)') { $candidate = $matches[1] }
-    elseif ($expanded -match '"([^"]*msedge\.exe)"') { $candidate = $matches[1] }
-    elseif ($expanded -match '([^\s"]*msedge\.exe)') { $candidate = $matches[1] }
-    if ([string]::IsNullOrWhiteSpace($candidate)) { return '' }
-    $candidate = $candidate.Trim('"')
-    try {
-        if (Test-Path -LiteralPath $candidate) { return ([IO.Path]::GetFullPath($candidate)) }
-    } catch {}
-    return ''
-}
-
-function Add-EdgeExecutableCandidate($Candidates, [string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return }
-    $expanded = [Environment]::ExpandEnvironmentVariables($Value.Trim())
-    $parsed = Resolve-EdgeExecutableFromCommandText $expanded
-    if (-not [string]::IsNullOrWhiteSpace($parsed)) {
-        [void]$Candidates.Add($parsed)
-        return
-    }
-    $raw = $expanded.Trim('"')
-    if (-not [string]::IsNullOrWhiteSpace($raw)) { [void]$Candidates.Add($raw) }
-}
-
-function Get-RegistryDefaultValueText([string]$Path) {
-    try {
-        $key = Get-Item -LiteralPath $Path -ErrorAction Stop
-        return [string]$key.GetValue('')
-    } catch {
-        return ''
-    }
-}
-
-function Get-EdgeExecutablePath {
-    $candidates = New-Object System.Collections.Generic.List[string]
-    try {
-        $cmd = Get-Command msedge.exe -ErrorAction SilentlyContinue
-        if ($cmd -and -not [string]::IsNullOrWhiteSpace([string]$cmd.Source)) {
-            Add-EdgeExecutableCandidate $candidates ([string]$cmd.Source)
-        }
-    } catch {}
-
-    foreach ($regPath in @(
-        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
-        'HKCU:\SOFTWARE\Classes\MSEdgeHTM\shell\open\command',
-        'HKLM:\SOFTWARE\Classes\MSEdgeHTM\shell\open\command',
-        'HKCU:\SOFTWARE\Classes\microsoft-edge\shell\open\command',
-        'HKLM:\SOFTWARE\Classes\microsoft-edge\shell\open\command'
-    )) {
-        Add-EdgeExecutableCandidate $candidates (Get-RegistryDefaultValueText $regPath)
-    }
-
-    foreach ($base in @(
-        [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'),
-        [Environment]::GetEnvironmentVariable('ProgramFiles'),
-        [Environment]::GetEnvironmentVariable('LocalAppData')
-    )) {
-        if (-not [string]::IsNullOrWhiteSpace($base)) {
-            Add-EdgeExecutableCandidate $candidates (Join-Path $base 'Microsoft\Edge\Application\msedge.exe')
-        }
-    }
-
-    foreach ($candidate in @($candidates | Select-Object -Unique)) {
-        try {
-            if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
-                return ([IO.Path]::GetFullPath($candidate))
-            }
-        } catch {}
-    }
-    return ''
-}
-
-function ConvertTo-EdgeOpenTarget([string]$Target) {
-    if ([string]::IsNullOrWhiteSpace($Target)) { return '' }
-    $trimmed = $Target.Trim()
-    try {
-        # A Windows drive path such as C:\... must not be mistaken for a URI scheme.
-        if ($trimmed -match '^[A-Za-z]:[\\/]' -or $trimmed -match '^\\\\') {
-            return ([Uri]([IO.Path]::GetFullPath($trimmed))).AbsoluteUri
-        }
-        if ($trimmed -match '^file:') { return $trimmed }
-        if ($trimmed -match '^[A-Za-z][A-Za-z0-9+.-]*:') { return $trimmed }
-        if (Test-Path -LiteralPath $trimmed) {
-            return ([Uri]([IO.Path]::GetFullPath($trimmed))).AbsoluteUri
-        }
-        return $trimmed
-    } catch {
-        return $trimmed
-    }
-}
-
-
-function Open-ReportBinderBrowser([string]$Url) {
-    Write-Host "ReportBinder URL: $Url"
-    $target = ConvertTo-EdgeOpenTarget $Url
-    $edge = Get-EdgeExecutablePath
-    if (-not [string]::IsNullOrWhiteSpace($edge)) {
-        try { Start-Process -FilePath $edge -ArgumentList @($target) -ErrorAction Stop | Out-Null; return $true }
-        catch { Write-Warning ("Could not open Microsoft Edge: " + $_.Exception.Message) }
-    } else {
-        Write-Warning "Microsoft Edge executable path was not resolved. Trying protocol/command fallbacks."
-    }
-    if ($target -match '^https?://') {
-        try { Start-Process -FilePath ("microsoft-edge:" + $target) -ErrorAction Stop | Out-Null; return $true }
-        catch { Write-Warning ("Could not open Microsoft Edge via protocol fallback: " + $_.Exception.Message) }
-    }
-    try {
-        $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
-        if (-not (Test-Path -LiteralPath $cmdExe)) { $cmdExe = 'cmd.exe' }
-        $escapedTarget = $target -replace '"','""'
-        $cmdArgs = '/c start "" msedge.exe "' + $escapedTarget + '"'
-        Start-Process -FilePath $cmdExe -ArgumentList $cmdArgs -WindowStyle Hidden -ErrorAction Stop | Out-Null
-        return $true
-    } catch { Write-Warning ("Could not open Microsoft Edge via command fallback: " + $_.Exception.Message) }
-    return $false
-}
-
-function Start-LocalTcpServer([int]$ListenPort, [string]$OpenUrl, [bool]$SkipOpen) {
-    # ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼ã¯ã“ã®é–¢æ•°ã‚ˆã‚Šå…ˆã«èµ·å‹•ã™ã‚‹ãŸã‚ã€listener ã®ç”Ÿæˆãƒ»Start ãŒå¤±æ•—ã—ãŸå ´åˆã‚‚
-    # finally ã«å…¥ã£ã¦å¿…ãšå­ãƒ—ãƒ­ã‚»ã‚¹ã‚’åœæ­¢ã§ãã‚‹ã‚ˆã†ã€åˆæœŸåŒ–å…¨ä½“ã‚’ try å†…ã«ç½®ãã€‚
-    $tcp = $null
-    try {
-        $tcp = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'), $ListenPort)
-        $tcp.Start()
-        Write-Host "ReportBinder local server started on 127.0.0.1:$ListenPort"
-        Write-Host "ReportBinder URL: $OpenUrl"
-        Write-Host "ReportBinder will stop after 30 minutes without browser activity. PDF creation jobs continue even if the tab is closed."
-        if (-not $SkipOpen) { Open-ReportBinderBrowser $OpenUrl }
-        while ($true) {
-            $now = [DateTime]::UtcNow
-            if ($Script:ShutdownRequested) {
-                Write-Host "ReportBinder shutdown requested."
-                break
-            }
-            if (-not $Script:ClientAttached -and (($now - $Script:ServerStartedUtc).TotalSeconds -ge $Script:NoClientStartupTimeoutSeconds)) {
-                if (-not (Test-ActiveRenderJobs $Mode)) {
-                    Write-Host "ReportBinder browser was not opened or attached. Stopping local server."
-                    break
-                }
-            }
-            if ($Script:ClientAttached -and (($now - $Script:LastHeartbeatUtc).TotalSeconds -ge $Script:IdleTimeoutSeconds)) {
-                if (Test-ActiveRenderJobs $Mode) {
-                    Write-Host "ReportBinder is idle, but a PDF creation job is still running. Keeping local server alive."
-                    $Script:LastHeartbeatUtc = $now
-                } else {
-                    Write-Host "ReportBinder idle timeout reached. Stopping local server."
-                    break
-                }
-            }
-
-            if (-not $tcp.Pending()) {
-                Start-Sleep -Milliseconds 250
-                continue
-            }
-
-            $client = $tcp.AcceptTcpClient()
-            try {
-                $context = Read-TcpHttpContext $client $ListenPort
-                $path = $context.Request.Url.AbsolutePath
-                if ($path.StartsWith('/api/')) { Handle-Api $context } else { Serve-Static $context $path }
-            } catch {
-                try {
-                    $ctx = [pscustomobject]@{ IsTcp = $true; TcpClient = $client; TcpStream = $client.GetStream(); Request = $null; Response = [pscustomobject]@{} }
-                    $err = [ordered]@{ ok = $false; error = $_.Exception.Message }
-                    $status = $(if ($_.Exception -is [System.ArgumentException]) { 400 } else { 500 })
-                    Write-JsonResponse $ctx $status $err
-                } catch {
-                    try { $client.Close() } catch {}
-                }
-            }
-        }
-    } finally {
-        # è¦ªPIDç›£è¦–ã ã‘ã«é ¼ã‚‰ãšã€é€šå¸¸çµ‚äº†ãƒ»listenerèµ·å‹•å¤±æ•—ã®ã©ã¡ã‚‰ã§ã‚‚æ˜Žç¤ºåœæ­¢ã™ã‚‹ã€‚
-        try { Stop-AutoSchedulerProcess } catch { }
-        if ($tcp) { try { $tcp.Stop() } catch { } }
-    }
-}
-
-function Get-FreePort {
-    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'), 0)
-    $listener.Start()
-    $p = $listener.LocalEndpoint.Port
-    $listener.Stop()
-    return $p
-}
-
-
-# =====================================================================
-# V5 Stage 2 â€” Phase 1A: æ¤œçŸ¥ç‰ˆã‚¹ãƒŠãƒƒãƒ—ã‚·ãƒ§ãƒƒãƒˆ (input history)
-# =====================================================================
-
-function Get-InputHistoryRoot([string]$Language) {
-    return (Join-Path (Get-WorkspacePath $Language) 'input-history')
-}
-function Get-WorkbookHistoryDir([string]$Language, [string]$WorkbookId) {
-    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-    return (Join-Path (Get-InputHistoryRoot $Language) $safeWorkbookId)
-}
-function Get-SnapshotDir([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
-    return (Join-Path (Get-WorkbookHistoryDir $Language $WorkbookId) $safeSnapshotId)
-}
-function Get-EphemeralJobRoot([string]$Language) {
-    return (Join-Path (Get-WorkspacePath $Language) 'state\jobs')
-}
-
-function Write-HistoryEvent([string]$Language, [string]$Type, $Data) {
-    # V5-Â§4.3: 1ã‚¤ãƒ™ãƒ³ãƒˆ1ãƒ•ã‚¡ã‚¤ãƒ«ã€‚å…±æœ‰ãƒ‰ãƒ©ã‚¤ãƒ–ä¸Šã§ã®JSONLè¿½è¨˜ã¯è¡ŒãŒæ··ã–ã‚‹ãŸã‚ä½¿ã‚ãªã„ã€‚
-    if (-not (Test-InputHistoryEnabled)) { return }
-    try {
-        $dir = Join-Path (Get-WorkspacePath $Language) 'history\events'
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $safeType = [regex]::Replace([string]$Type, '[^A-Za-z0-9._-]+', '-')
-        $name = ('{0}_{1}.json' -f (New-RbId), $safeType)
-        $payload = [ordered]@{
-            schemaVersion = 1; eventType = [string]$Type; at = New-NowIso
-            pcName = $env:COMPUTERNAME; userName = "$env:USERDOMAIN\$env:USERNAME"
-            data = $Data
-        }
-        Write-JsonFile (Join-Path $dir $name) $payload
-    } catch { }
-}
-
-function Get-SnapshotManifest([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    $path = Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) 'manifest.json'
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { return (Read-JsonFile $path $null) } catch { return $null }
-}
-
-function Get-SnapshotIds([string]$Language, [string]$WorkbookId) {
-    $dir = Get-WorkbookHistoryDir $Language $WorkbookId
-    if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
-             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') } |
-             Sort-Object Name | ForEach-Object { [string]$_.Name })
-}
-
-function Find-SnapshotBySourceHash([string]$Language, [string]$WorkbookId, [string]$SourceHash) {
-    $target = Normalize-FileHash $SourceHash
-    if ([string]::IsNullOrWhiteSpace($target)) { return '' }
-    foreach ($id in (Get-SnapshotIds $Language $WorkbookId)) {
-        $m = Get-SnapshotManifest $Language $WorkbookId $id
-        if ($null -eq $m) { continue }
-        if ((Normalize-FileHash ([string](Get-DataProperty $m 'sourceHash' ''))) -eq $target) { return $id }
-    }
-    return ''
-}
-
-function Get-SnapshotSourceState([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    # V5-IV-5: ç¾ç‰©ã®æœ‰ç„¡ã¯ immutable ãª manifest ã«ã¯æ›¸ã‹ãªã„ã€‚
-    $dir = Get-SnapshotDir $Language $WorkbookId $SnapshotId
-    $statePath = Join-Path $dir 'source-state.json'
-    $sourcePath = Join-Path $dir 'source.xlsx'
-    $exists = Test-Path -LiteralPath $sourcePath
-    $state = $null
-    if (Test-Path -LiteralPath $statePath) { try { $state = Read-JsonFile $statePath $null } catch { } }
-    return [ordered]@{
-        sourceRetained = [bool]$exists
-        sourcePath = $sourcePath
-        removedAt = [string](Get-DataProperty $state 'removedAt' '')
-        removedReason = [string](Get-DataProperty $state 'removedReason' '')
-    }
-}
-
-function Set-SnapshotSourceState([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [bool]$Retained, [string]$Reason) {
-    $dir = Get-SnapshotDir $Language $WorkbookId $SnapshotId
-    if (-not (Test-Path -LiteralPath $dir)) { return }
-    Write-JsonFile (Join-Path $dir 'source-state.json') ([ordered]@{
-        schemaVersion = 1; sourceRetained = $Retained
-        removedAt = $(if ($Retained) { '' } else { New-NowIso })
-        removedReason = $(if ($Retained) { '' } else { [string]$Reason })
-    })
-}
-
-# ---- pins / leases -------------------------------------------------
-
-function Get-SnapshotPinDir([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    return (Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) 'pins')
-}
-function Get-SnapshotLeaseDir([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    return (Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) 'leases')
-}
-
-function New-SnapshotPin([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$PinName, $Data) {
-    # V5-IV-2: ä¿è­·ã¯ãƒ•ã‚¡ã‚¤ãƒ«ã®ä½œæˆãƒ»å‰Šé™¤ã§è¡¨ã™ã€‚é…åˆ—ã®æ›¸ãæ›ãˆã¯ã—ãªã„ã€‚
-    try {
-        $dir = Get-SnapshotPinDir $Language $WorkbookId $SnapshotId
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Write-JsonFile (Join-Path $dir ("{0}.json" -f $PinName)) $Data
-        return $true
-    } catch { return $false }
-}
-
-function Remove-SnapshotPin([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$PinName) {
-    try {
-        $path = Join-Path (Get-SnapshotPinDir $Language $WorkbookId $SnapshotId) ("{0}.json" -f $PinName)
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-    } catch { }
-}
-
-function Get-SnapshotPins([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    $dir = Get-SnapshotPinDir $Language $WorkbookId $SnapshotId
-    if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.BaseName })
-}
-
-function New-SnapshotLease([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$Purpose, [string]$JobId, [int]$MinutesValid = 30, [string]$VersionId = '') {
-    try {
-        $dir = Get-SnapshotLeaseDir $Language $WorkbookId $SnapshotId
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $name = ('{0}_{1}.json' -f $Purpose, $JobId)
-        Write-JsonFile (Join-Path $dir $name) ([ordered]@{
-            jobId = $JobId; purpose = $Purpose; versionId = $VersionId
-            createdAt = New-NowIso; heartbeatAt = New-NowIso
-            expiresAt = ([DateTime]::UtcNow.AddMinutes($MinutesValid).ToString('o'))
-            pcName = $env:COMPUTERNAME
-        })
-        return $name
-    } catch { return '' }
-}
-
-function Remove-SnapshotLease([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$LeaseName) {
-    try {
-        if ([string]::IsNullOrWhiteSpace($LeaseName)) { return }
-        $path = Join-Path (Get-SnapshotLeaseDir $Language $WorkbookId $SnapshotId) $LeaseName
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-    } catch { }
-}
-
-function Test-LeaseActive($LeaseFile) {
-    try {
-        $j = Read-JsonFile $LeaseFile.FullName $null
-        $exp = [string](Get-DataProperty $j 'expiresAt' '')
-        if ([string]::IsNullOrWhiteSpace($exp)) { return $false }
-        return ([DateTime]::Parse($exp).ToUniversalTime() -gt [DateTime]::UtcNow)
-    } catch { return $false }
-}
-
-function Get-ActiveLeaseCount([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    $dir = Get-SnapshotLeaseDir $Language $WorkbookId $SnapshotId
-    if (-not (Test-Path -LiteralPath $dir)) { return 0 }
-    $n = 0
-    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
-        if (Test-LeaseActive $f) { $n++ } else { try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue } catch { } }
-    }
-    return $n
-}
-
-
-function Clear-ExpiredLeases([string]$Language) {
-    # Snapshot and content-PDF leases both expire after abnormal termination.
-    try {
-        $root = Get-InputHistoryRoot $Language
-        if (Test-Path -LiteralPath $root) {
-            foreach ($wb in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-                foreach ($sn in @(Get-ChildItem -LiteralPath $wb.FullName -Directory -ErrorAction SilentlyContinue)) {
-                    [void](Get-ActiveLeaseCount $Language $wb.Name $sn.Name)
-                }
-            }
-        }
-    } catch { }
-    try {
-        $contentRoot = Join-Path (Get-WorkspacePath $Language) 'content-pdf'
-        if (Test-Path -LiteralPath $contentRoot) {
-            foreach ($wb in @(Get-ChildItem -LiteralPath $contentRoot -Directory -ErrorAction SilentlyContinue)) {
-                foreach ($ver in @(Get-ChildItem -LiteralPath $wb.FullName -Directory -ErrorAction SilentlyContinue)) {
-                    $leaseDir = Join-Path $ver.FullName 'leases'
-                    if (-not (Test-Path -LiteralPath $leaseDir)) { continue }
-                    foreach ($f in @(Get-ChildItem -LiteralPath $leaseDir -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
-                        if (-not (Test-LeaseActive $f)) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
-                    }
-                }
-            }
-        }
-    } catch { }
-}
-
-function Ensure-SnapshotMetadata([string]$Language, [string]$WorkbookId, [string]$RelativePath, [string]$Category, [string]$SourcePath, [string]$SourceHash, [string]$CaptureReason) {
-    # V5-Â§C: ãƒ¡ã‚¿ãƒ‡ãƒ¼ã‚¿ã®é‡è¤‡æŽ’é™¤ã ã‘ã‚’æ‹…å½“ã™ã‚‹ã€‚å…¥åŠ›ãƒ•ã‚¡ã‚¤ãƒ«ã®ç¢ºä¿ã¯ Capture-RenderInput ã®å½¹ç›®ã€‚
-    if (-not (Test-InputHistoryEnabled)) { return [ordered]@{ ok = $false; reason = 'not-approved'; snapshotId = '' } }
-    $hash = Normalize-FileHash $SourceHash
-    if ([string]::IsNullOrWhiteSpace($hash)) { return [ordered]@{ ok = $false; reason = 'no-hash'; snapshotId = '' } }
-
-    $lockPath = Join-Path (Get-WorkspacePath $Language) ("locks\snapshot_{0}.lock" -f $WorkbookId)
-    return Invoke-WithLock $lockPath {
-        $existing = Find-SnapshotBySourceHash $Language $WorkbookId $hash
-        if (-not [string]::IsNullOrWhiteSpace($existing)) {
-            Write-HistoryEvent $Language 'input.snapshot.deduplicated' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $existing; sourceHash = $hash; captureReason = $CaptureReason })
-            return [ordered]@{ ok = $true; snapshotId = $existing; isNew = $false }
-        }
-        $ids = @(Get-SnapshotIds $Language $WorkbookId)
-        $previous = $(if ($ids.Count -gt 0) { [string]$ids[-1] } else { '' })
-        $parent = Get-WorkbookHistoryDir $Language $WorkbookId
-        if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        $created = New-UniqueDirectory $parent { New-RbId }
-        $snapshotId = [string]$created.id
-        $item = $null
-        try { $item = Get-Item -LiteralPath $SourcePath -ErrorAction Stop } catch { }
-        # V5-Â§3.2: manifest.json ã®å­˜åœ¨ãŒå®Œæˆãƒžãƒ¼ã‚«ãƒ¼ã€‚å…ˆã« pending ã¨ã—ã¦æ›¸ãã€
-        # source ã®ã‚³ãƒ”ãƒ¼ãƒ»æ¤œè¨¼ãŒçµ‚ã‚ã£ã¦ã‹ã‚‰ manifest.json ã¸æ”¹åã™ã‚‹(Complete-Snapshot)ã€‚
-        Write-JsonFile (Join-Path ([string]$created.path) 'manifest.pending.json') ([ordered]@{
-            schemaVersion = 1
-            snapshotId = $snapshotId
-            workbookId = $WorkbookId
-            language = $Language
-            category = $Category
-            relativePath = $RelativePath
-            sourceHashAlgorithm = 'SHA-256'
-            sourceHash = $hash
-            sourceSize = $(if ($item) { $item.Length } else { 0 })
-            sourceLastWriteUtcTicks = $(if ($item) { [string]$item.LastWriteTimeUtc.Ticks } else { '' })
-            sourceModifiedAt = $(if ($item) { $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz') } else { '' })
-            detectedAt = New-NowIso
-            captureReason = $CaptureReason
-            previousSnapshotId = $previous
-            status = 'complete'
-            parserVersion = 1
-            capturedBy = [ordered]@{ pcName = $env:COMPUTERNAME; userName = "$env:USERDOMAIN\$env:USERNAME" }
-        })
-        Set-SnapshotSourceState $Language $WorkbookId $snapshotId $false 'not-captured'
-        return [ordered]@{ ok = $true; snapshotId = $snapshotId; isNew = $true; pending = $true }
-    }
-}
-
-function Complete-Snapshot([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    # pending ã‹ã‚‰ manifest.json ã¸æ”¹åã—ã¦å®Œæˆã•ã›ã‚‹ã€‚ä»¥å¾Œã“ã®æ¤œçŸ¥ç‰ˆã¯å‚ç…§å¯èƒ½ã«ãªã‚‹ã€‚
-    $dir = Get-SnapshotDir $Language $WorkbookId $SnapshotId
-    $pending = Join-Path $dir 'manifest.pending.json'
-    $final = Join-Path $dir 'manifest.json'
-    if (Test-Path -LiteralPath $final) { return $true }
-    if (-not (Test-Path -LiteralPath $pending)) { return $false }
-    try {
-        Move-Item -LiteralPath $pending -Destination $final -Force
-        Write-HistoryEvent $Language 'input.snapshot.created' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $SnapshotId })
-        return $true
-    } catch { return $false }
-}
-
-function Save-SnapshotSourceFile([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$SourcePath, [string]$SourceHash) {
-    # V5-Â§3.2 æ‰‹é †4-8: ã‚³ãƒ”ãƒ¼ -> ãƒãƒƒã‚·ãƒ¥æ¤œè¨¼ -> å±¥æ­´ãƒ•ã‚©ãƒ«ãƒ€ã¸ç§»å‹• -> å†ãƒãƒƒã‚·ãƒ¥ã€‚
-    if (-not (Test-SourceRetentionEnabled)) { return [ordered]@{ ok = $false; reason = 'retention-not-approved' } }
-    $dir = Get-SnapshotDir $Language $WorkbookId $SnapshotId
-    if (-not (Test-Path -LiteralPath $dir)) { return [ordered]@{ ok = $false; reason = 'snapshot-missing' } }
-    $dest = Join-Path $dir 'source.xlsx'
-    if (Test-Path -LiteralPath $dest) { return [ordered]@{ ok = $true; path = $dest; reused = $true } }
-
-    $tmpDir = Join-Path (Get-WorkspacePath $Language) ('state\tmp\' + (New-RbId))
-    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-    $tmp = Join-Path $tmpDir 'source.xlsx'
-    try {
-        $before = Get-Item -LiteralPath $SourcePath -ErrorAction Stop
-        $copied = $false; $lastError = ''
-        for ($i = 1; $i -le 3; $i++) {
-            try { Copy-FileSharedRead $SourcePath $tmp; $copied = $true; break } catch { $lastError = $_.Exception.Message }
-            if ($i -lt 3) { Start-Sleep -Seconds 2 }
-        }
-        if (-not $copied) { return [ordered]@{ ok = $false; reason = 'copy-failed'; message = $lastError } }
-        try { Unblock-File -LiteralPath $tmp -ErrorAction SilentlyContinue } catch { }
-        $copyHash = Normalize-FileHash (New-Sha256 $tmp)
-        if ($copyHash -ne (Normalize-FileHash $SourceHash)) { return [ordered]@{ ok = $false; reason = 'hash-mismatch' } }
-        $after = Get-Item -LiteralPath $SourcePath -ErrorAction Stop
-        if ($after.Length -ne $before.Length -or $after.LastWriteTimeUtc -ne $before.LastWriteTimeUtc) {
-            return [ordered]@{ ok = $false; reason = 'source-changed-during-copy' }
-        }
-        Move-Item -LiteralPath $tmp -Destination $dest -Force
-        $finalHash = Normalize-FileHash (New-Sha256 $dest)
-        if ($finalHash -ne $copyHash) {
-            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
-            return [ordered]@{ ok = $false; reason = 'verify-failed' }
-        }
-        Set-SnapshotSourceState $Language $WorkbookId $SnapshotId $true ''
-        return [ordered]@{ ok = $true; path = $dest; reused = $false }
-    } catch {
-        return [ordered]@{ ok = $false; reason = 'error'; message = $_.Exception.Message }
-    } finally {
-        if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-function Capture-DetectedSnapshot([string]$Language, [string]$WorkbookId, [string]$CaptureReason) {
-    # V5-Â§3.1/Â§3.3: æ¤œçŸ¥ã¨åŒæ™‚ã«ä¿å­˜ã™ã‚‹ã€‚é™æ­¢å¾…ã¡ã‚ˆã‚Šå‰ã€‚
-    if (-not (Test-InputHistoryEnabled)) { return [ordered]@{ ok = $false; reason = 'not-approved' } }
-    $paths = Get-Paths
-    $structure = Get-Structure $Language
-    $wb = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-    if ($wb.Count -eq 0) { return [ordered]@{ ok = $false; reason = 'workbook-missing' } }
-    $w = $wb[0]
-    $sourcePath = Join-Safe ([string]$paths.submissionDir) ([string]$w.relativePath)
-    if (-not (Test-Path -LiteralPath $sourcePath)) { return [ordered]@{ ok = $false; reason = 'file-missing' } }
-
-    $expectedPrevious = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
-    $item = Get-Item -LiteralPath $sourcePath -ErrorAction Stop
-    $capturedHash = Normalize-FileHash (New-Sha256 $sourcePath)
-    if ([string]::IsNullOrWhiteSpace($capturedHash)) { return [ordered]@{ ok = $false; reason = 'hash-failed' } }
-    $capturedTicks = [string]$item.LastWriteTimeUtc.Ticks
-    $capturedSize = $item.Length
-
-    $meta = Ensure-SnapshotMetadata $Language $WorkbookId ([string]$w.relativePath) ([string]$w.category) $sourcePath $capturedHash $CaptureReason
-    if (-not [bool]$meta.ok) { return $meta }
-    $snapshotId = [string]$meta.snapshotId
-    if ([bool](Get-DataProperty $meta 'pending' $false)) {
-        if (Test-SourceRetentionEnabled) {
-            $saved = Save-SnapshotSourceFile $Language $WorkbookId $snapshotId $sourcePath $capturedHash
-            if (-not [bool]$saved.ok) { return [ordered]@{ ok = $false; reason = [string]$saved.reason } }
-        }
-        if (-not (Complete-Snapshot $Language $WorkbookId $snapshotId)) { return [ordered]@{ ok = $false; reason = 'complete-failed' } }
-    }
-
-    # V5-Â§3.3: ã‚³ãƒŸãƒƒãƒˆã¯ compare-and-setã€‚PC ã®æ™‚åˆ»ã§ã¯ãªãæå‡ºãƒ•ã‚¡ã‚¤ãƒ«ã®å®ŸçŠ¶æ…‹ã§åˆ¤å®šã™ã‚‹ã€‚
-    $committed = Update-StructureLocked $Language {
-        param($st)
-        $x = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-        if (-not $x.Count) { return [ordered]@{ committed = $false; reason = 'workbook-missing' } }
-        $t = $x[0]
-        $live = $null
-        try { $live = Get-Item -LiteralPath $sourcePath -ErrorAction Stop } catch { }
-        $stillCurrent = ($null -ne $live) -and
-                        ([string]$live.LastWriteTimeUtc.Ticks -eq $capturedTicks) -and
-                        ($live.Length -eq $capturedSize)
-        if (-not $stillCurrent) { return [ordered]@{ committed = $false; reason = 'superseded' } }
-        # V5-P1(#9): ticks/size ãŒåŒä¸€ã§ã‚‚å†…å®¹ãŒæ›¸ãæ›ã‚ã£ã¦ã„ã‚‹å¯èƒ½æ€§ãŒã‚ã‚‹ãŸã‚ã€
-        # ã‚³ãƒŸãƒƒãƒˆç›´å‰ã«å®Ÿãƒ•ã‚¡ã‚¤ãƒ«ã‚’å†ãƒãƒƒã‚·ãƒ¥ã—ã€æ•æ‰æ™‚ã®ãƒãƒƒã‚·ãƒ¥ã¨ä¸€è‡´ã™ã‚‹ã“ã¨ã‚’ç¢ºèªã™ã‚‹ã€‚
-        $liveHash = Normalize-FileHash (New-Sha256 $sourcePath)
-        if ([string]::IsNullOrWhiteSpace($liveHash) -or $liveHash -ne $capturedHash) {
-            return [ordered]@{ committed = $false; reason = 'superseded' }
-        }
-        $latest = Normalize-FileHash ([string](Get-DataProperty $t 'currentExcelHash' ''))
-        if (-not ([string]::IsNullOrWhiteSpace($latest)) -and $latest -ne $expectedPrevious -and $latest -ne $capturedHash) {
-            return [ordered]@{ committed = $false; reason = 'concurrent-update' }
-        }
-        Add-NotePropertyIfMissing $t 'currentSnapshotId' ''
-        Add-NotePropertyIfMissing $t 'lastDetectedAt' ''
-        Set-NoteProperty $t 'currentExcelHash' $capturedHash
-        Set-NoteProperty $t 'currentExcelLastWriteUtcTicks' $capturedTicks
-        Set-NoteProperty $t 'currentExcelSize' $capturedSize
-        Set-NoteProperty $t 'currentExcelModifiedAt' ($live.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz'))
-        Set-NoteProperty $t 'currentSnapshotId' $snapshotId
-        Set-NoteProperty $t 'lastDetectedAt' (New-NowIso)
-        $rendered = Normalize-FileHash ([string](Get-DataProperty $t 'lastRenderedExcelHash' ''))
-        if ($rendered -and $rendered -ne $capturedHash -and [string]$t.status -ne 'render-error') { Set-NoteProperty $t 'status' 'excel-updated' }
-        return [ordered]@{ committed = $true }
-    }
-    return [ordered]@{ ok = $true; snapshotId = $snapshotId; isNew = [bool]$meta.isNew; committed = [bool]$committed.committed; reason = [string]$committed.reason }
-}
-
-function Update-InputHistoryAfterScan([string]$Language) {
-    # Scan-Updates ã®ç›´å¾Œã«å‘¼ã¶ã€‚ç¾åœ¨ãƒãƒƒã‚·ãƒ¥ã«å¯¾å¿œã™ã‚‹æ¤œçŸ¥ç‰ˆãŒç„¡ã„ãƒ–ãƒƒã‚¯ã ã‘ã‚’ä¿å­˜ã™ã‚‹ã€‚
-    if (-not (Test-InputHistoryEnabled)) { return @() }
-    $result = @()
-    try {
-        $structure = Get-Structure $Language
-        foreach ($w in @(Get-Array $structure.workbooks)) {
-            $id = [string]$w.workbookId
-            $cur = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
-            if ([string]::IsNullOrWhiteSpace($cur)) { continue }
-            $curSnap = [string](Get-DataProperty $w 'currentSnapshotId' '')
-            if (-not [string]::IsNullOrWhiteSpace($curSnap)) {
-                $m = Get-SnapshotManifest $Language $id $curSnap
-                if ($null -ne $m -and (Normalize-FileHash ([string](Get-DataProperty $m 'sourceHash' ''))) -eq $cur) { continue }
-            }
-            $r = Capture-DetectedSnapshot $Language $id 'scan'
-            if ([bool]$r.ok) { $result += [ordered]@{ workbookId = $id; snapshotId = [string]$r.snapshotId } }
-        }
-    } catch { }
-    return $result
-}
-
-function Capture-RenderInput([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$JobId) {
-    # V5-Â§C-2: æ¤œçŸ¥ç‰ˆãŒæ—¢ã«ã‚ã£ã¦ã‚‚ã€ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°äºˆå®šãªã‚‰å…¥åŠ›ãƒ•ã‚¡ã‚¤ãƒ«ã¯å¿…ãšç¢ºä¿ã™ã‚‹ã€‚
-    $paths = Get-Paths
-    $structure = Get-Structure $Language
-    $wb = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-    if ($wb.Count -eq 0) { throw "WorkbookãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $WorkbookId" }
-    $w = $wb[0]
-    $livePath = Join-Safe ([string]$paths.submissionDir) ([string]$w.relativePath)
-    $snap = $SnapshotId
-    if ([string]::IsNullOrWhiteSpace($snap)) { $snap = [string](Get-DataProperty $w 'currentSnapshotId' '') }
-
-    if (-not (Test-InputHistoryEnabled) -or [string]::IsNullOrWhiteSpace($snap)) {
-        # å±¥æ­´æ©Ÿèƒ½ãŒç„¡åŠ¹: å¾“æ¥ã©ãŠã‚Šæå‡ºãƒ•ã‚©ãƒ«ãƒ€ã®ç¾ç‰©ã‚’ç›´æŽ¥ä½¿ã†ã€‚
-        return [ordered]@{ path = ''; snapshotId = ''; ephemeral = $false; hash = '' }
-    }
-    $m = Get-SnapshotManifest $Language $WorkbookId $snap
-    if ($null -eq $m) { return [ordered]@{ path = ''; snapshotId = ''; ephemeral = $false; hash = '' } }
-    $hash = Normalize-FileHash ([string](Get-DataProperty $m 'sourceHash' ''))
-
-    if (Test-SourceRetentionEnabled) {
-        $state = Get-SnapshotSourceState $Language $WorkbookId $snap
-        if ([bool]$state.sourceRetained) {
-            return [ordered]@{ path = [string]$state.sourcePath; snapshotId = $snap; ephemeral = $false; hash = $hash }
-        }
-        # ç¾ç‰©ãŒæ¶ˆãˆã¦ã„ã‚‹: æå‡ºãƒ•ã‚©ãƒ«ãƒ€ã®ç¾ç‰©ãŒåŒã˜ãƒãƒƒã‚·ãƒ¥ãªã‚‰å¾©å…ƒã™ã‚‹ã€‚
-        if (Test-Path -LiteralPath $livePath) {
-            $liveHash = Normalize-FileHash (New-Sha256 $livePath)
-            if ($liveHash -eq $hash) {
-                $r = Save-SnapshotSourceFile $Language $WorkbookId $snap $livePath $hash
-                if ([bool]$r.ok) { return [ordered]@{ path = [string]$r.path; snapshotId = $snap; ephemeral = $false; hash = $hash } }
-            }
-        }
-    }
-
-    # ç¸®é€€ãƒ¢ãƒ¼ãƒ‰ã€ã¾ãŸã¯ç¾ç‰©ã‚’å¾©å…ƒã§ããªã„å ´åˆã¯ä¸€æ™‚ã‚³ãƒ”ãƒ¼ã‚’ä½œã‚‹ã€‚
-    if (-not (Test-Path -LiteralPath $livePath)) { return [ordered]@{ path = ''; snapshotId = $snap; ephemeral = $false; hash = $hash } }
-    $captureId = $(if ([string]::IsNullOrWhiteSpace($JobId)) { New-RbId } else { $JobId })
-    $dir = Join-Path (Get-EphemeralJobRoot $Language) $captureId
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $tmp = Join-Path $dir 'source.xlsx'
-    if (-not (Test-Path -LiteralPath $tmp)) {
-        Copy-FileSharedRead $livePath $tmp
-        try { Unblock-File -LiteralPath $tmp -ErrorAction SilentlyContinue } catch { }
-    }
-    $tmpHash = Normalize-FileHash (New-Sha256 $tmp)
-    if ($tmpHash -ne $hash) {
-        # æå‡ºãƒ•ã‚©ãƒ«ãƒ€ã®ç¾ç‰©ã¯æ—¢ã«åˆ¥ã®ç‰ˆã«ãªã£ã¦ã„ã‚‹ã€‚
-        # ã“ã®æ¤œçŸ¥ç‰ˆã®å…¥åŠ›ã¨ã—ã¦ã¯ä½¿ãˆãªã„(H1ã®PDFã¨ã—ã¦H2ã‚’çµ„ã‚“ã§ã—ã¾ã†ãŸã‚)ã€‚
-        Remove-EphemeralCopy $Language $captureId
-        return [ordered]@{ path = ''; snapshotId = ''; ephemeral = $false; hash = '' }
-    }
-    return [ordered]@{ path = $tmp; snapshotId = $snap; ephemeral = $true; hash = $tmpHash; captureId = $captureId }
-}
-
-function Remove-EphemeralCopy([string]$Language, [string]$CaptureId) {
-    try {
-        if ([string]::IsNullOrWhiteSpace($CaptureId)) { return }
-        $dir = Join-Path (Get-EphemeralJobRoot $Language) $CaptureId
-        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
-    } catch { }
-}
-
-function Clear-StaleEphemeralCopies([string]$Language) {
-    # V5-Â§1.3: éžä¿æŒæ‰¿èªãªã®ã«ç¾ç‰©ãŒé•·æœŸé–“æ®‹ã‚‰ãªã„ã‚ˆã†ã€ä¸Šé™æ™‚é–“ã§å¿…ãšæ¶ˆã™ã€‚
-    try {
-        $root = Get-EphemeralJobRoot $Language
-        if (-not (Test-Path -LiteralPath $root)) { return }
-        $maxAge = [int](Get-InputHistorySettings).ephemeralCopyMaxAgeMinutes
-        if ($maxAge -le 0) { $maxAge = 30 }
-        $limit = [DateTime]::UtcNow.AddMinutes(-1 * $maxAge)
-        foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-            if ($d.LastWriteTimeUtc -lt $limit) {
-                Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                Write-HistoryEvent $Language 'history.cleanup' ([ordered]@{ kind = 'ephemeral-copy'; captureId = [string]$d.Name })
-            }
-        }
-    } catch { }
-}
-
-
-# ---- æŽƒé™¤ (V5-Â§3.6 / Â§3.7) -----------------------------------------
-
-function Get-ProtectedSnapshotIds([string]$Language, [string]$WorkbookId) {
-    # V5-Â§C-3: ä¿æŒæ•°ã®æž ã¨ã¯ç„¡é–¢ä¿‚ã«å¸¸æ™‚ä¿è­·ã™ã‚‹æ¤œçŸ¥ç‰ˆã€‚
-    # H1 -> H2 -> å†H1 ã§ã¯ manifest ã® detectedAt ãŒå¤ã„ã¾ã¾ãªã®ã§ã€æ—¥æ™‚é †ã®ã€Œç›´è¿‘Nç‰ˆã€ã§ã¯ç¾åœ¨ç‰ˆã‚’æ¶ˆã—ã†ã‚‹ã€‚
-    $ids = @()
-    try {
-        $structure = Get-Structure $Language
-        $wb = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-        if ($wb.Count -gt 0) {
-            $ids += [string](Get-DataProperty $wb[0] 'currentSnapshotId' '')
-            $ids += [string](Get-DataProperty $wb[0] 'lastRenderedSnapshotId' '')
-        }
-    } catch { }
-    try {
-        $auto = Read-AutoState $Language $WorkbookId
-        if ($null -ne $auto) { $ids += [string](Get-DataProperty $auto 'pendingSnapshotId' '') }
-    } catch { }
-    try {
-        $ptr = Get-ComparisonBaselinePointer $Language $WorkbookId
-        if ($null -ne $ptr) { $ids += [string](Get-DataProperty $ptr 'snapshotId' '') }
-    } catch { }
-    return @($ids | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-}
-
-function Get-FinalPdfPinAgeDays([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    # æ­£å¼PDFã§ä½¿ã‚ã‚ŒãŸç‰ˆã®ã†ã¡ã€æœ€ã‚‚æ–°ã—ã„å‡ºåŠ›ã‹ã‚‰ã®çµŒéŽæ—¥æ•°ã‚’è¿”ã™ã€‚pin ãŒç„¡ã‘ã‚Œã° -1ã€‚
-    $dir = Get-SnapshotPinDir $Language $WorkbookId $SnapshotId
-    if (-not (Test-Path -LiteralPath $dir)) { return -1 }
-    $newest = $null
-    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter 'final-pdf_*.json' -ErrorAction SilentlyContinue)) {
-        if ($null -eq $newest -or $f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
-    }
-    if ($null -eq $newest) { return -1 }
-    return ([DateTime]::UtcNow - $newest).TotalDays
-}
-
-function Invoke-InputHistoryCleanup([string]$Language) {
-    if (-not (Test-InputHistoryEnabled)) { return }
-    $lockPath = Join-Path (Get-WorkspacePath $Language) 'locks\history-cleanup.lock'
-    $handle = Try-AcquireLockHandle $lockPath
-    if ($null -eq $handle) { return }   # ä»–ã‚µãƒ¼ãƒãƒ¼ãŒæŽƒé™¤ä¸­
-    try {
-        $cfg = Get-InputHistorySettings
-        $root = Get-InputHistoryRoot $Language
-        if (-not (Test-Path -LiteralPath $root)) { return }
-        foreach ($wbDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-            $workbookId = [string]$wbDir.Name
-            $protected = @(Get-ProtectedSnapshotIds $Language $workbookId)
-            $all = @(Get-SnapshotIds $Language $workbookId)
-            # æœªå®Œæˆä¸–ä»£(manifest ãªã—)ã‚’å‰Šé™¤
-            foreach ($d in @(Get-ChildItem -LiteralPath $wbDir.FullName -Directory -ErrorAction SilentlyContinue)) {
-                if (-not (Test-Path -LiteralPath (Join-Path $d.FullName 'manifest.json'))) {
-                    if ($d.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddHours(-6)) {
-                        Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            }
-            if ($all.Count -eq 0) { continue }
-            $keepRecent = @($all | Select-Object -Last ([Math]::Max(1, [int]$cfg.retainSourceVersions)))
-            foreach ($sn in $all) {
-                if ($protected -contains $sn) { continue }
-                if ($keepRecent -contains $sn) { continue }
-                if ((Get-ActiveLeaseCount $Language $workbookId $sn) -gt 0) { continue }
-                $pins = @(Get-SnapshotPins $Language $workbookId $sn)
-                if ($pins -contains 'comparison-baseline') { continue }
-                if ($pins -contains 'manual') { continue }
-                $finalPins = @($pins | Where-Object { $_ -like 'final-pdf_*' })
-
-                # --- æ®µéšŽ1: source.xlsx ã ã‘ã‚’å‰Šé™¤ã™ã‚‹ ---
-                $state = Get-SnapshotSourceState $Language $workbookId $sn
-                if ([bool]$state.sourceRetained) {
-                    $canRemoveSource = $true
-                    if ($finalPins.Count -gt 0) {
-                        $days = [double](Get-InputHistorySettings).sourceRetentionDaysAfterBuild
-                        $configured = (Get-InputHistorySettings).sourceRetentionDaysAfterBuild
-                        if ($null -eq $configured) { $canRemoveSource = $false }
-                        else {
-                            $age = Get-FinalPdfPinAgeDays $Language $workbookId $sn
-                            if ($age -lt [double]$configured) { $canRemoveSource = $false }
-                        }
-                    }
-                    if ($canRemoveSource) {
-                        Remove-Item -LiteralPath ([string]$state.sourcePath) -Force -ErrorAction SilentlyContinue
-                        Set-SnapshotSourceState $Language $workbookId $sn $false 'retention'
-                        Write-HistoryEvent $Language 'input.source.removed' ([ordered]@{ workbookId = $workbookId; snapshotId = $sn; reason = 'retention' })
-                    }
-                }
-
-                # --- æ®µéšŽ2: pin ãŒ1ä»¶ã‚‚ç„¡ã‘ã‚Œã°ãƒ•ã‚©ãƒ«ãƒ€ã”ã¨å‰Šé™¤ã™ã‚‹ ---
-                if ($finalPins.Count -eq 0 -and $pins.Count -eq 0) {
-                    $m = Get-SnapshotManifest $Language $workbookId $sn
-                    if ($null -ne $m -and [string](Get-DataProperty $m 'status' '') -eq 'complete') {
-                        Remove-Item -LiteralPath (Get-SnapshotDir $Language $workbookId $sn) -Recurse -Force -ErrorAction SilentlyContinue
-                        Write-HistoryEvent $Language 'history.cleanup' ([ordered]@{ kind = 'snapshot'; workbookId = $workbookId; snapshotId = $sn })
-                    }
-                }
-            }
-        }
-    } catch {
-        # æŽƒé™¤ã®å¤±æ•—ã¯ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã®å¤±æ•—ã«ã—ãªã„ã€‚
-        Write-Warning ("å±¥æ­´ã®æŽƒé™¤ã«å¤±æ•—ã—ã¾ã—ãŸ: " + $_.Exception.Message)
-    } finally {
-        Release-LockHandle $handle
-        # V5-P2: æŽƒé™¤ã§å®¹é‡ãŒå¤‰ã‚ã‚‹ãŸã‚ã€æ¬¡å›žã® /api/state ã§å®Ÿæ¸¬ã•ã›ã‚‹ã€‚
-        Reset-InputHistorySizeCache
-    }
-}
-
-function Get-InputHistorySizeMb([string]$Language) {
-    # input-history é…ä¸‹ã®å…¨å†å¸°åˆ—æŒ™ã¯å…±æœ‰ãƒ‰ãƒ©ã‚¤ãƒ–ä¸Šã§éžå¸¸ã«é‡ã„ã€‚
-    # /api/state ã®ãƒãƒ¼ãƒªãƒ³ã‚°ã”ã¨ã«å®Ÿè¡Œã›ãš60ç§’ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã™ã‚‹ã€‚
-    # dataDir ã‚’åˆ‡ã‚Šæ›¿ãˆãŸç›´å¾Œã«æ—§ãƒ¯ãƒ¼ã‚¯ã‚¹ãƒšãƒ¼ã‚¹ã®å€¤ã‚’è¿”ã•ãªã„ã‚ˆã†ã€ãƒ«ãƒ¼ãƒˆãƒ‘ã‚¹ã‚‚ã‚­ãƒ¼ã«å«ã‚ã‚‹ã€‚
-    $root = ''
-    try { $root = Get-InputHistoryRoot $Language } catch { }
-    $cacheKey = ('{0}|{1}' -f $Language, [string]$root).ToLowerInvariant()
-    if ($null -ne $Script:HistorySizeCache -and $Script:HistorySizeCacheKey -eq $cacheKey -and (([DateTime]::UtcNow - $Script:HistorySizeCacheAtUtc).TotalSeconds -lt $Script:HistorySizeCacheSeconds)) {
-        return $Script:HistorySizeCache
-    }
-    $value = 0
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($root) -and (Test-Path -LiteralPath $root)) {
-            $bytes = (Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-            if ($null -ne $bytes) { $value = [Math]::Round(($bytes / 1MB), 1) }
-        }
-    } catch { $value = 0 }
-    $Script:HistorySizeCache = $value
-    $Script:HistorySizeCacheKey = $cacheKey
-    $Script:HistorySizeCacheAtUtc = [DateTime]::UtcNow
-    return $value
-}
-
-function Reset-InputHistorySizeCache {
-    $Script:HistorySizeCache = $null
-    $Script:HistorySizeCacheKey = ''
-    $Script:HistorySizeCacheAtUtc = [DateTime]::MinValue
-}
-
-# ---- content-pdf ã®ä¿è­· (V5-Â§3.7) ----------------------------------
-
-function Get-ContentPdfVersionDir([string]$Workspace, [string]$WorkbookId, [string]$VersionId) {
-    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
-    return (Join-Path $Workspace (Join-Path 'content-pdf' (Join-Path $safeWorkbookId $safeVersionId)))
-}
-
-function New-ContentPdfPin([string]$Workspace, [string]$WorkbookId, [string]$VersionId, [string]$PinName, $Data) {
-    # V5-P0(#4): å¤±æ•—ã‚’æ¡ã‚Šã¤ã¶ã•ãš $true/$false ã§è¿”ã™ã€‚å‘¼å‡ºå…ƒãŒçµæžœã‚’æ¤œæŸ»ã—ã¦ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ã§ãã‚‹ã‚ˆã†ã«ã™ã‚‹ã€‚
-    try {
-        $dir = Join-Path (Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId) 'pins'
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $pinPath = Join-Path $dir ("{0}.json" -f $PinName)
-        Write-JsonFile $pinPath $Data
-        return (Test-Path -LiteralPath $pinPath)
-    } catch { return $false }
-}
-
-function Remove-ContentPdfPin([string]$Workspace, [string]$WorkbookId, [string]$VersionId, [string]$PinName) {
-    try {
-        if ([string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($PinName)) { return }
-        $path = Join-Path (Join-Path (Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId) 'pins') ("{0}.json" -f $PinName)
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-    } catch { }
-}
-
-
-function New-ContentPdfLease([string]$Workspace, [string]$WorkbookId, [string]$VersionId, [string]$Purpose, [string]$JobId, [int]$MinutesValid = 120) {
-    try {
-        $dir = Join-Path (Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId) 'leases'
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $name = ('{0}_{1}.json' -f $Purpose, $JobId)
-        $path = Join-Path $dir $name
-        Write-JsonFile $path ([ordered]@{
-            jobId = $JobId; purpose = $Purpose; versionId = $VersionId
-            createdAt = New-NowIso; heartbeatAt = New-NowIso
-            expiresAt = ([DateTime]::UtcNow.AddMinutes($MinutesValid).ToString('o'))
-            pcName = $env:COMPUTERNAME
-        })
-        if (-not (Test-Path -LiteralPath $path)) { return '' }
-        return $name
-    } catch { return '' }
-}
-
-function Remove-ContentPdfLease([string]$Workspace, [string]$WorkbookId, [string]$VersionId, [string]$LeaseName) {
-    try {
-        if ([string]::IsNullOrWhiteSpace($LeaseName)) { return }
-        $path = Join-Path (Join-Path (Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId) 'leases') $LeaseName
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-    } catch { }
-}
-
-function Refresh-LeaseFile([string]$Path, [int]$MinutesValid = 120) {
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $false }
-    try {
-        $lease = Read-JsonFile $Path $null
-        if ($null -eq $lease) { return $false }
-        Set-NoteProperty $lease 'heartbeatAt' (New-NowIso)
-        Set-NoteProperty $lease 'expiresAt' ([DateTime]::UtcNow.AddMinutes($MinutesValid).ToString('o'))
-        Write-JsonFile $Path $lease
-        return $true
-    } catch { return $false }
-}
-
-function New-DiffJobLeases([string]$Language, $Context, [string]$JobId) {
-    $workspace = Get-WorkspacePath $Language
-    $historyLock = Join-Path $workspace 'locks\history-cleanup.lock'
-    $contentLock = Get-ContentPdfMaintenanceLockPath $workspace ([string]$Context.workbookId)
-    return Invoke-WithLock $historyLock {
-        Invoke-WithLock $contentLock {
-            $leases = @()
-            try {
-                foreach ($side in @(
-                    [ordered]@{ role = 'baseline'; snapshotId = [string]$Context.baselineSnapshotId; versionId = [string]$Context.baselineVersionId },
-                    [ordered]@{ role = 'current'; snapshotId = [string]$Context.currentSnapshotId; versionId = [string]$Context.currentVersionId }
-                )) {
-                    if ($null -eq (Get-SnapshotManifest $Language ([string]$Context.workbookId) ([string]$side.snapshotId))) {
-                        throw 'æ¯”è¼ƒå¯¾è±¡ã®å±¥æ­´ç‰ˆãŒæ•´ç†ã•ã‚ŒãŸãŸã‚ã€å‡¦ç†ã‚’é–‹å§‹ã§ãã¾ã›ã‚“ã€‚'
-                    }
-                    $availability = Get-HistoryRenderVersionAvailability $Language ([string]$Context.workbookId) ([string]$side.snapshotId) ([string]$side.versionId)
-                    if (-not [bool]$availability.ready) { throw [string]$availability.reason }
-                    $snapshotLease = New-SnapshotLease $Language ([string]$Context.workbookId) ([string]$side.snapshotId) ('diff-' + [string]$side.role) $JobId 120 ([string]$side.versionId)
-                    if ([string]::IsNullOrWhiteSpace($snapshotLease)) { throw 'å±¥æ­´ç‰ˆã®ä¿è­·leaseã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-                    $lease = [ordered]@{
-                        role = [string]$side.role
-                        snapshotId = [string]$side.snapshotId
-                        versionId = [string]$side.versionId
-                        snapshotLeaseName = $snapshotLease
-                        contentLeaseName = ''
-                    }
-                    $leases += $lease
-                    $contentLease = New-ContentPdfLease $workspace ([string]$Context.workbookId) ([string]$side.versionId) ('diff-' + [string]$side.role) $JobId 120
-                    if ([string]::IsNullOrWhiteSpace($contentLease)) { throw 'content PDFã®ä¿è­·leaseã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-                    $lease.contentLeaseName = $contentLease
-                }
-                return @($leases)
-            } catch {
-                foreach ($lease in @($leases)) {
-                    Remove-SnapshotLease $Language ([string]$Context.workbookId) ([string]$lease.snapshotId) ([string]$lease.snapshotLeaseName)
-                    Remove-ContentPdfLease $workspace ([string]$Context.workbookId) ([string]$lease.versionId) ([string]$lease.contentLeaseName)
-                }
-                throw
-            }
-        }
-    }
-}
-
-function Refresh-DiffJobLeases($Job) {
-    $language = [string](Get-DataProperty $Job 'mode' $Mode)
-    $workbookId = [string](Get-DataProperty $Job 'workbookId' '')
-    $workspace = Get-WorkspacePath $language
-    foreach ($lease in @(Get-Array (Get-DataProperty $Job 'leases' @()))) {
-        $snapshotPath = Join-Path (Get-SnapshotLeaseDir $language $workbookId ([string]$lease.snapshotId)) ([string]$lease.snapshotLeaseName)
-        $contentPath = Join-Path (Join-Path (Get-ContentPdfVersionDir $workspace $workbookId ([string]$lease.versionId)) 'leases') ([string]$lease.contentLeaseName)
-        if (-not (Refresh-LeaseFile $snapshotPath 120)) { throw 'å±¥æ­´ç‰ˆã®ä¿è­·leaseã‚’æ›´æ–°ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-        if (-not (Refresh-LeaseFile $contentPath 120)) { throw 'content PDFã®ä¿è­·leaseã‚’æ›´æ–°ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-    }
-}
-
-function Remove-DiffJobLeases($Job) {
-    try {
-        $language = [string](Get-DataProperty $Job 'mode' $Mode)
-        $workbookId = [string](Get-DataProperty $Job 'workbookId' '')
-        $workspace = Get-WorkspacePath $language
-        foreach ($lease in @(Get-Array (Get-DataProperty $Job 'leases' @()))) {
-            Remove-SnapshotLease $language $workbookId ([string]$lease.snapshotId) ([string]$lease.snapshotLeaseName)
-            Remove-ContentPdfLease $workspace $workbookId ([string]$lease.versionId) ([string]$lease.contentLeaseName)
-        }
-    } catch { }
-}
-
-function Test-ContentPdfProtected([string]$Workspace, [string]$WorkbookId, [string]$VersionId) {
-    $base = Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId
-    foreach ($sub in @('pins','leases')) {
-        $d = Join-Path $base $sub
-        if (Test-Path -LiteralPath $d) {
-            $files = @(Get-ChildItem -LiteralPath $d -File -Filter '*.json' -ErrorAction SilentlyContinue)
-            if ($sub -eq 'pins' -and $files.Count -gt 0) { return $true }
-            if ($sub -eq 'leases') { foreach ($f in $files) { if (Test-LeaseActive $f) { return $true } } }
-        }
-    }
-    return $false
-}
-
-
-# =====================================================================
-# V5 Stage 3 â€” Phase 2A: æ¤œçŸ¥ãƒ‘ã‚¤ãƒ—ãƒ©ã‚¤ãƒ³ã¨è‡ªå‹•ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼
-# =====================================================================
-
-function Get-AutoStateDir([string]$Language) {
-    return (Join-Path (Get-WorkspacePath $Language) 'state\auto-render')
-}
-function Read-AutoState([string]$Language, [string]$WorkbookId) {
-    try {
-        $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-        $p = Join-Path (Get-AutoStateDir $Language) ("{0}.json" -f $safeWorkbookId)
-        if (-not (Test-Path -LiteralPath $p)) { return $null }
-        return (Read-JsonFile $p $null)
-    } catch { return $null }
-}
-function Write-AutoState([string]$Language, [string]$WorkbookId, $State) {
-    try {
-        $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-        $dir = Get-AutoStateDir $Language
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Set-NoteProperty $State 'workbookId' $safeWorkbookId
-        Set-NoteProperty $State 'updatedAt' (New-NowIso)
-        Write-JsonFile (Join-Path $dir ("{0}.json" -f $safeWorkbookId)) $State
-    } catch { }
-}
-function New-AutoState([string]$WorkbookId) {
-    return [ordered]@{
-        schemaVersion = 1; workbookId = $WorkbookId; updatedAt = New-NowIso
-        pendingSnapshotId = ''; pendingHash = ''; stableCount = 0
-        firstDetectedAt = ''; lastSeenAt = ''; quietDeadline = ''
-        state = 'idle'; deferReason = ''; ownerPcName = ''; ownerJobId = ''
-    }
-}
-
-function Test-InteractiveExcelInUse([string]$SourcePath) {
-    # V5-Â§5.3: å˜ç´”ãª Get-Process EXCEL ã§ã¯æ­¢ã¾ã‚Šã™ãŽã‚‹ã€‚
-    # ReportBinder ã®ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ç”¨ Excel ã¯ Visible=$false ãªã®ã§ãƒ¡ã‚¤ãƒ³ã‚¦ã‚£ãƒ³ãƒ‰ã‚¦ã‚’æŒãŸãªã„ã€‚
-    # å¯¾è©±æ“ä½œã•ã‚Œã¦ã„ã‚‹ Excel ã¨ã€å¯¾è±¡ãƒ•ã‚¡ã‚¤ãƒ«ã®ãƒ­ãƒƒã‚¯ãƒ•ã‚¡ã‚¤ãƒ«ã ã‘ã‚’è¦‹ã‚‹ã€‚
-    try {
-        $procs = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
-        if ($procs.Count -gt 0) { return $true }
-    } catch { }
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
-            $dir = Split-Path -Parent $SourcePath
-            $name = [IO.Path]::GetFileName($SourcePath)
-            $lock = Join-Path $dir ('~$' + $name)
-            if (Test-Path -LiteralPath $lock) { return $true }
-        }
-    } catch { }
-    return $false
-}
-
-function Test-RenderEngineBusy([string]$Language) {
-    $h = Try-AcquireLockHandle (Get-RenderEngineLockPath $Language)
-    if ($null -eq $h) { return $true }
-    Release-LockHandle $h
-    return $false
-}
-
-function Start-AutoRenderJobForWorkbook([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    # V5-P0: é™æ­¢ç¢ºèªã—ãŸã®ã¯ã€Œãã®æ¤œçŸ¥ç‰ˆã€ãªã®ã§ã€ã‚¸ãƒ§ãƒ–å®Ÿè¡Œæ™‚ã«åˆ¥ã®ç‰ˆã¸ã™ã‚Šæ›¿ã‚ã£ã¦ã¯ã„ã‘ãªã„ã€‚
-    # å¯¾è±¡snapshotã‚’æ˜Žç¤ºçš„ã«å›ºå®šã—ã¦ã‚¸ãƒ§ãƒ–ã¸æ¸¡ã™ã€‚
-    try {
-        $pins = @{}
-        if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) {
-            $m = Get-SnapshotManifest $Language $WorkbookId $SnapshotId
-            if ($null -ne $m) {
-                $pins[$WorkbookId] = [ordered]@{ snapshotId = $SnapshotId; expectedHash = [string](Get-DataProperty $m 'sourceHash' '') }
-            }
-        }
-        $job = Start-RenderJob $Language @($WorkbookId) $false '' $pins
-        return [ordered]@{ ok = $true; jobId = [string]$job.jobId }
-    } catch {
-        return [ordered]@{ ok = $false; message = $_.Exception.Message }
-    }
-}
-
-function Invoke-AutoSchedulerTick([string]$Language, $OwnedLocks) {
-    # V5-Â§5.5/Â§A-3: tick å†…ã§ã‚¹ãƒªãƒ¼ãƒ—ã—ãªã„çŠ¶æ…‹æ©Ÿæ¢°ã€‚ãƒ–ãƒƒã‚¯ã”ã¨ã«ç›´åˆ—ã§180ç§’å¾…ãŸãªã„ã€‚
-    $settings = Get-AutoRenderSettings
-    if (-not [bool]$settings.enabled) { return }
-    # V5-P0: ãƒ–ãƒ©ã‚¦ã‚¶ã®30ç§’ã‚¿ã‚¤ãƒžãƒ¼ã«ä¾å­˜ã—ãªã„ã€‚ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼è‡ªèº«ãŒæ¤œçŸ¥ã—ã€æ¤œçŸ¥ã¨åŒæ™‚ã«ä¿å­˜ã™ã‚‹ã€‚
-    try { [void](Scan-Updates $Language $null $false) } catch { Write-Warning $_.Exception.Message }
-    try { [void](Update-InputHistoryAfterScan $Language) } catch { Write-Warning $_.Exception.Message }
-    $paths = Get-Paths
-    $structure = $null
-    try { $structure = Get-Structure $Language } catch { return }
-    $now = [DateTime]::UtcNow
-
-    foreach ($w in @(Get-Array $structure.workbooks)) {
-        $id = [string]$w.workbookId
-        if ([string]::IsNullOrWhiteSpace($id)) { continue }
-
-        # V5-Â§5.5: ãƒ–ãƒƒã‚¯å˜ä½ã®æ‰€æœ‰æ¨©ã€‚å–å¾—ã§ããªã„ãƒ–ãƒƒã‚¯ã¯ä»–ã‚µãƒ¼ãƒãƒ¼ã®æ‹…å½“ãªã®ã§é»™ã£ã¦é£›ã°ã™ã€‚
-        if (-not $OwnedLocks.ContainsKey($id)) {
-            $lockPath = Join-Path (Get-WorkspacePath $Language) ("locks\auto-owner_{0}.lock" -f $id)
-            $h = Try-AcquireLockHandle $lockPath
-            if ($null -eq $h) { continue }
-            $OwnedLocks[$id] = $h
-        }
-
-        $state = Read-AutoState $Language $id
-        if ($null -eq $state) { $state = New-AutoState $id }
-
-        $sourcePath = Join-Safe ([string]$paths.submissionDir) ([string]$w.relativePath)
-        if (-not (Test-Path -LiteralPath $sourcePath)) {
-            Set-NoteProperty $state 'state' 'idle'; Set-NoteProperty $state 'deferReason' 'file-missing'
-            Write-AutoState $Language $id $state; continue
-        }
-
-        $currentHash = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
-        $renderedHash = Normalize-FileHash ([string](Get-DataProperty $w 'lastRenderedExcelHash' ''))
-        if ([string]::IsNullOrWhiteSpace($currentHash) -or $currentHash -eq $renderedHash) {
-            if ([string](Get-DataProperty $state 'state' '') -ne 'idle') {
-                Set-NoteProperty $state 'state' 'idle'; Set-NoteProperty $state 'pendingSnapshotId' ''
-                Set-NoteProperty $state 'pendingHash' ''; Set-NoteProperty $state 'stableCount' 0
-                Write-AutoState $Language $id $state
-            }
-            continue
-        }
-
-        $pendingHash = Normalize-FileHash ([string](Get-DataProperty $state 'pendingHash' ''))
-        if ($pendingHash -ne $currentHash) {
-            # æ–°ã—ã„ç‰ˆã‚’æ¤œçŸ¥ã€‚å¾…æ©Ÿã‚’ã‚„ã‚Šç›´ã™(å¤ã„ä¸€æ™‚ã‚³ãƒ”ãƒ¼ã¯ç ´æ£„)ã€‚
-            $oldCapture = [string](Get-DataProperty $state 'ephemeralCaptureId' '')
-            if (-not [string]::IsNullOrWhiteSpace($oldCapture)) { Remove-EphemeralCopy $Language $oldCapture }
-            Set-NoteProperty $state 'pendingHash' $currentHash
-            Set-NoteProperty $state 'pendingSnapshotId' ([string](Get-DataProperty $w 'currentSnapshotId' ''))
-            Set-NoteProperty $state 'stableCount' 1
-            Set-NoteProperty $state 'firstDetectedAt' (New-NowIso)
-            Set-NoteProperty $state 'quietDeadline' ($now.AddSeconds([int]$settings.quietPeriodSeconds).ToString('o'))
-            Set-NoteProperty $state 'state' 'waiting'
-            Set-NoteProperty $state 'deferReason' ''
-            Set-NoteProperty $state 'ownerPcName' $env:COMPUTERNAME
-            Write-AutoState $Language $id $state
-            Write-HistoryEvent $Language 'auto.detected' ([ordered]@{ workbookId = $id; hash = $currentHash })
-            continue
-        }
-
-        Set-NoteProperty $state 'stableCount' ([int](Get-DataProperty $state 'stableCount' 0) + 1)
-        Set-NoteProperty $state 'lastSeenAt' (New-NowIso)
-
-        $deadlineText = [string](Get-DataProperty $state 'quietDeadline' '')
-        $deadlineReached = $false
-        if (-not [string]::IsNullOrWhiteSpace($deadlineText)) {
-            try { $deadlineReached = ([DateTime]::Parse($deadlineText).ToUniversalTime() -le $now) } catch { $deadlineReached = $true }
-        }
-        if (-not $deadlineReached -or [int](Get-DataProperty $state 'stableCount' 0) -lt [int]$settings.requireStableHashCount) {
-            Set-NoteProperty $state 'state' 'waiting'; Write-AutoState $Language $id $state; continue
-        }
-        if ([bool]$settings.deferWhileExcelInUse -and (Test-InteractiveExcelInUse $sourcePath)) {
-            Set-NoteProperty $state 'state' 'deferred'; Set-NoteProperty $state 'deferReason' 'excel-in-use'
-            Write-AutoState $Language $id $state
-            Write-HistoryEvent $Language 'auto.deferred' ([ordered]@{ workbookId = $id; reason = 'excel-in-use' })
-            continue
-        }
-        if (Test-RenderEngineBusy $Language) {
-            Set-NoteProperty $state 'state' 'deferred'; Set-NoteProperty $state 'deferReason' 'job-busy'
-            Write-AutoState $Language $id $state; continue
-        }
-
-        Set-NoteProperty $state 'state' 'rendering'; Set-NoteProperty $state 'deferReason' ''
-        Write-AutoState $Language $id $state
-        $started = Start-AutoRenderJobForWorkbook $Language $id ([string](Get-DataProperty $state 'pendingSnapshotId' ''))
-        if ([bool]$started.ok) {
-            Set-NoteProperty $state 'ownerJobId' ([string]$started.jobId)
-            Write-HistoryEvent $Language 'render.started' ([ordered]@{ workbookId = $id; jobId = [string]$started.jobId; trigger = 'auto' })
-        } else {
-            Set-NoteProperty $state 'state' 'waiting'
-            Set-NoteProperty $state 'deferReason' 'start-failed'
-        }
-        Write-AutoState $Language $id $state
-    }
-}
-
-function Invoke-AutoSchedulerFromFile([string]$ControlPath, [int]$ParentProcessId) {
-    # V5-Â§5.7: é™æ­¢å¾…ã¡ã¯ HTTP ãƒªã‚¹ãƒŠãƒ¼ã®ä¸­ã§è¡Œã‚ãªã„ã€‚
-    # V4 ã®ã‚µãƒ¼ãƒãƒ¼ã¯å˜ä¸€ã‚¹ãƒ¬ãƒƒãƒ‰ã® AcceptTcpClient ãƒ«ãƒ¼ãƒ—ãªã®ã§ã€Handle-Api å†…ã§å¾…ã¤ã¨ç”»é¢ãŒæ­¢ã¾ã‚‹ã€‚
-    $language = 'ja'
-    try {
-        $control = Read-JsonFile $ControlPath $null
-        if ($null -ne $control) { $language = [string](Get-DataProperty $control 'language' 'ja') }
-    } catch { }
-    $owned = @{}
-    try {
-        Clear-ExpiredLeases $language
-        Clear-StaleEphemeralCopies $language
-        Recover-AutoStates $language
-        while ($true) {
-            # è¦ªPIDç›£è¦–ã«åŠ ãˆã€stopãƒ•ã‚¡ã‚¤ãƒ«ã‚’100mså˜ä½ã§ç¢ºèªã™ã‚‹ã€‚
-            # å¾“æ¥ã®10ç§’Sleepã§ã¯æ­£å¸¸çµ‚äº†ã§ã‚‚è¦ªãŒå­ã‚’Killã™ã‚‹å¿…è¦ãŒã‚ã‚Šã€finallyã®çŠ¶æ…‹å¾©æ—§ãŒèµ°ã‚‰ãªã‹ã£ãŸã€‚
-            if ($ParentProcessId -le 0 -or $null -eq (Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue)) { break }
-            if (Test-Path -LiteralPath ($ControlPath + '.stop')) { break }
-            try { Invoke-AutoSchedulerTick $language $owned } catch { Write-Warning $_.Exception.Message }
-            try { Clear-StaleEphemeralCopies $language } catch { }
-            # åœæ­¢ç¢ºèªã¯ 500ms é–“éš”ã€‚ControlPath ã¯å…±æœ‰ãƒ‰ãƒ©ã‚¤ãƒ–ä¸Šã«ã‚ã‚‹ãŸã‚ã€
-            # 100ms é–“éš”ã ã¨åˆ©ç”¨è€…ã”ã¨ã«æ¯Žç§’10å›žã®SMB Test-Path ãŒå¸¸æ™‚ç™ºç”Ÿã™ã‚‹ã€‚
-            # è¦ªå´ã¯ WaitForExit(2500) å¾…ã¤ã®ã§ã€500ms ã§ã‚‚æ­£å¸¸çµ‚äº†ã¨å¾Œç‰‡ä»˜ã‘ã¯é–“ã«åˆã†ã€‚
-            $stopRequested = $false
-            for ($i = 0; $i -lt 20; $i++) {
-                if ($ParentProcessId -le 0 -or $null -eq (Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath ($ControlPath + '.stop'))) {
-                    $stopRequested = $true
-                    break
-                }
-                Start-Sleep -Milliseconds 500
-            }
-            if ($stopRequested) { break }
-        }
-    } finally {
-        foreach ($k in @($owned.Keys)) { Release-LockHandle $owned[$k] }
-        try {
-            foreach ($f in @(Get-ChildItem -LiteralPath (Get-AutoStateDir $language) -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
-                $st = Read-JsonFile $f.FullName $null
-                if ($null -ne $st -and @('rendering','ready') -contains [string](Get-DataProperty $st 'state' '')) {
-                    Set-NoteProperty $st 'state' 'waiting'
-                    Write-JsonFile $f.FullName $st
-                }
-            }
-        } catch { }
-        # æ­£å¸¸çµ‚äº†ã®ãŸã³ã«åˆ¶å¾¡JSON/.stopã‚’æ®‹ã•ãªã„ã€‚
-        foreach ($path in @($ControlPath, ($ControlPath + '.stop'))) {
-            try { if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } } catch { }
-        }
-    }
-}
-
-function Recover-AutoStates([string]$Language) {
-    # V5-Â§5.5: èµ·å‹•æ™‚ãƒªã‚«ãƒãƒªãƒ¼ã€‚
-    try {
-        $dir = Get-AutoStateDir $Language
-        if (-not (Test-Path -LiteralPath $dir)) { return }
-        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
-            $st = Read-JsonFile $f.FullName $null
-            if ($null -eq $st) { continue }
-            $state = [string](Get-DataProperty $st 'state' '')
-            $changed = $false
-            if ($state -eq 'rendering') { Set-NoteProperty $st 'state' 'waiting'; $changed = $true }
-            elseif ($state -eq 'ready') { Set-NoteProperty $st 'state' 'waiting'; $changed = $true }
-            $pending = [string](Get-DataProperty $st 'pendingSnapshotId' '')
-            $wbId = [string](Get-DataProperty $st 'workbookId' '')
-            if (-not [string]::IsNullOrWhiteSpace($pending) -and -not [string]::IsNullOrWhiteSpace($wbId)) {
-                if ($null -eq (Get-SnapshotManifest $Language $wbId $pending)) {
-                    Set-NoteProperty $st 'pendingSnapshotId' ''; Set-NoteProperty $st 'pendingHash' ''
-                    Set-NoteProperty $st 'stableCount' 0; Set-NoteProperty $st 'state' 'idle'; $changed = $true
-                }
-            }
-            if ($changed) { Write-JsonFile $f.FullName $st }
-        }
-    } catch { }
-}
-
-function Start-AutoSchedulerProcess([string]$Language) {
-    $controlPath = ''
-    try {
-        $settings = Get-AutoRenderSettings
-        if (-not [bool]$settings.enabled) { return $null }
-        $dir = Join-Path (Get-WorkspacePath $Language) 'state'
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        # åˆ¶å¾¡ãƒ•ã‚¡ã‚¤ãƒ«ã¯PCå+è¦ªPIDã§ãƒ—ãƒ­ã‚»ã‚¹å˜ä½ã«åˆ†é›¢ã™ã‚‹ã€‚
-        $controlName = 'auto-scheduler_{0}_{1}.json' -f ([regex]::Replace([string]$env:COMPUTERNAME, '[^A-Za-z0-9_.-]+', '_')), $PID
-        $controlPath = Join-Path $dir $controlName
-        Write-JsonFile $controlPath ([ordered]@{ schemaVersion = 1; language = $Language; startedAt = New-NowIso; parentPid = $PID; pcName = [string]$env:COMPUTERNAME })
-        if (Test-Path -LiteralPath ($controlPath + '.stop')) { Remove-Item -LiteralPath ($controlPath + '.stop') -Force -ErrorAction SilentlyContinue }
-        # AppRoot / åˆ¶å¾¡ãƒ•ã‚¡ã‚¤ãƒ«ã®ãƒ‘ã‚¹ã«ç©ºç™½ãŒå«ã¾ã‚Œã¦ã‚‚å­ãƒ—ãƒ­ã‚»ã‚¹ãŒèµ·å‹•ã§ãã‚‹ã‚ˆã†æ˜Žç¤ºçš„ã«å¼•ç”¨ã™ã‚‹ã€‚
-        $serverScript = Join-Path $Script:AppRoot 'server.ps1'
-        $psi = @('-NoProfile','-ExecutionPolicy','Bypass','-File', ('"{0}"' -f $serverScript),
-                 '-Mode', $Language, '-AutoSchedulerPath', ('"{0}"' -f $controlPath), '-ParentProcessId', [string]$PID)
-        $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $psi -WindowStyle Hidden -PassThru
-        $Script:AutoSchedulerProcess = $proc
-        $Script:AutoSchedulerProcessId = $proc.Id
-        $Script:AutoSchedulerControlPath = $controlPath
-        return $proc
-    } catch {
-        foreach ($path in @($controlPath, ($controlPath + '.stop'))) {
-            try { if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } } catch { }
-        }
-        Write-Warning ('è‡ªå‹•ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼ã‚’èµ·å‹•ã§ãã¾ã›ã‚“ã§ã—ãŸ: ' + $_.Exception.Message)
-        return $null
-    }
-}
-
-function Test-AutoSchedulerProcessRunning {
-    try {
-        if ($null -ne $Script:AutoSchedulerProcess) {
-            $Script:AutoSchedulerProcess.Refresh()
-            return (-not $Script:AutoSchedulerProcess.HasExited)
-        }
-        if ($Script:AutoSchedulerProcessId -gt 0) {
-            return ($null -ne (Get-Process -Id $Script:AutoSchedulerProcessId -ErrorAction SilentlyContinue))
-        }
-    } catch { }
-    return $false
-}
-
-function Stop-AutoSchedulerProcess {
-    $controlPath = [string]$Script:AutoSchedulerControlPath
-    try {
-        if ($controlPath) {
-            Set-Content -LiteralPath ($controlPath + '.stop') -Value 'stop' -Encoding ASCII -ErrorAction SilentlyContinue
-        }
-        $p = $Script:AutoSchedulerProcess
-        if ($null -eq $p -and $Script:AutoSchedulerProcessId -gt 0) {
-            $p = Get-Process -Id $Script:AutoSchedulerProcessId -ErrorAction SilentlyContinue
-        }
-        if ($null -ne $p) {
-            # å­å´ã¯100mså˜ä½ã§stopã‚’ç¢ºèªã™ã‚‹ãŸã‚ã€ã¾ãšæ­£å¸¸çµ‚äº†ã¨finallyã®å¾Œç‰‡ä»˜ã‘ã‚’å¾…ã¤ã€‚
-            $exited = $false
-            try { $exited = $p.WaitForExit(2500) } catch { }
-            if (-not $exited) {
-                try { $p.Kill() } catch { }
-                try { [void]$p.WaitForExit(1000) } catch { }
-            }
-        }
-    } catch { }
-    finally {
-        foreach ($path in @($controlPath, ($controlPath + '.stop'))) {
-            try { if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } } catch { }
-        }
-        $Script:AutoSchedulerProcess = $null
-        $Script:AutoSchedulerProcessId = 0
-        $Script:AutoSchedulerControlPath = ''
-    }
-}
-
-
-# =====================================================================
-# V5 Stage 4 â€” Phase 2B: ç”»åƒãƒãƒƒã‚·ãƒ¥ã¨æ¯”è¼ƒ
-# =====================================================================
-
-$Script:VisualHashProfileVersion = 2
-$Script:VisualHashPageDistanceLimit = 0.075
-$Script:VisualHashAverageDistanceLimit = 0.040
-$Script:VisualHashDpi = 120
-
-function Get-RenderRecordDir([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
-    return (Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) (Join-Path 'renders' $VersionId))
-}
-
-function Get-VisualHashProfile {
-    $pdfBoxVersion = ''
-    try {
-        $vf = Join-Path $Script:AppRoot 'lib\pdfbox\PDFBOX_VERSION.txt'
-        if (Test-Path -LiteralPath $vf) { $pdfBoxVersion = ((Get-Content -LiteralPath $vf -Raw) -replace '\s+', ' ').Trim() }
-    } catch { }
-    return [ordered]@{
-        profileVersion = $Script:VisualHashProfileVersion
-        pdfBoxVersion = $pdfBoxVersion
-        dpi = $Script:VisualHashDpi
-        colorMode = 'RGB'
-    }
-}
-
-function Get-HexHammingRatio([string]$Left, [string]$Right) {
-    $a = ([string]$Left).Trim().ToUpperInvariant()
-    $b = ([string]$Right).Trim().ToUpperInvariant()
-    if ([string]::IsNullOrWhiteSpace($a) -or $a.Length -ne $b.Length) { return 1.0 }
-    $differentBits = 0
-    for ($i = 0; $i -lt $a.Length; $i++) {
-        try {
-            $xor = ([Convert]::ToInt32($a[$i].ToString(), 16) -bxor [Convert]::ToInt32($b[$i].ToString(), 16))
-        } catch { return 1.0 }
-        while ($xor -gt 0) {
-            $differentBits += ($xor -band 1)
-            $xor = $xor -shr 1
-        }
-    }
-    return ([double]$differentBits / [Math]::Max(1, $a.Length * 4))
-}
-
-function Test-SheetVisualEquivalent($Before, $After) {
-    if ($null -eq $Before -or $null -eq $After) { return $false }
-    if ((Get-IntDataProperty $Before 'pageCount' -1) -ne (Get-IntDataProperty $After 'pageCount' -2)) { return $false }
-    $beforeText = Normalize-FileHash ([string](Get-DataProperty $Before 'textHash' ''))
-    $afterText = Normalize-FileHash ([string](Get-DataProperty $After 'textHash' ''))
-    $hasComparableText = -not [string]::IsNullOrWhiteSpace($beforeText) -and -not [string]::IsNullOrWhiteSpace($afterText)
-    if ($hasComparableText -and $beforeText -ne $afterText) { return $false }
-
-    $beforePages = @(Get-Array (Get-DataProperty $Before 'pagePerceptualHashes' @()))
-    $afterPages = @(Get-Array (Get-DataProperty $After 'pagePerceptualHashes' @()))
-    if ($beforePages.Count -eq 0 -or $beforePages.Count -ne $afterPages.Count) { return $false }
-    $total = 0.0
-    $pageLimit = $(if ($hasComparableText) { $Script:VisualHashPageDistanceLimit } else { 0.035 })
-    $averageLimit = $(if ($hasComparableText) { $Script:VisualHashAverageDistanceLimit } else { 0.020 })
-    for ($i = 0; $i -lt $beforePages.Count; $i++) {
-        $distance = Get-HexHammingRatio ([string]$beforePages[$i]) ([string]$afterPages[$i])
-        if ($distance -gt $pageLimit) { return $false }
-        $total += $distance
-    }
-    return (($total / [Math]::Max(1, $beforePages.Count)) -le $averageLimit)
-}
-
-function Test-PdfPageAnalyzerAvailable {
-    if ($null -ne $Script:PdfPageAnalyzerAvailable) { return [bool]$Script:PdfPageAnalyzerAvailable }
-    $Script:PdfPageAnalyzerAvailable = $false
-    try {
-        $jar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
-        if (-not (Test-Path -LiteralPath $jar)) { return $false }
-        Add-Type -AssemblyName 'System.IO.Compression.FileSystem' -ErrorAction SilentlyContinue
-        $zip = [IO.Compression.ZipFile]::OpenRead($jar)
-        try { $Script:PdfPageAnalyzerAvailable = @($zip.Entries | Where-Object { $_.FullName -eq 'PdfPageAnalyzer.class' }).Count -gt 0 }
-        finally { $zip.Dispose() }
-    } catch { $Script:PdfPageAnalyzerAvailable = $false }
-    return [bool]$Script:PdfPageAnalyzerAvailable
-}
-
-function Invoke-PdfPageAnalyzer([hashtable[]]$Sheets) {
-    # ãƒ–ãƒƒã‚¯ã”ã¨ã« Java ã‚’1å›žã ã‘èµ·å‹•ã—ã¦å…¨ã‚·ãƒ¼ãƒˆã‚’è§£æžã™ã‚‹ã€‚
-    if ($null -eq $Sheets -or $Sheets.Count -eq 0) { return $null }
-    $tool = $null
-    try { $tool = Get-PdfBatchToolInfo } catch { }
-    $javaExe = ''
-    $cp = ''
-    try {
-        $javaExe = Resolve-JavaExe
-        $cp = (Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar') + ';' + (Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar')
-    } catch { return $null }
-    # V5-P0: JAR ã« PdfPageAnalyzer.class ãŒå…¥ã£ã¦ã„ãªã„é…å¸ƒç‰©ã§ã¯ã€è§£æžã ã‘ã‚’é»™ã£ã¦è«¦ã‚ã‚‹ã€‚
-    # (build.ps1 ã‚’å®Ÿè¡Œã—ã¦ JAR ã‚’å†ç”Ÿæˆã™ã‚‹ã¨æœ‰åŠ¹ã«ãªã‚‹)
-    if (-not (Test-PdfPageAnalyzerAvailable)) { return [ordered]@{ ok = $false; message = 'PdfPageAnalyzer ãŒ JAR ã«å«ã¾ã‚Œã¦ã„ã¾ã›ã‚“ã€‚app\lib\pdfbox\build.ps1 ã‚’å®Ÿè¡Œã—ã¦ãã ã•ã„ã€‚' } }
-    $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('rb-analyze-' + (New-RbId))
-    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-    try {
-        $req = Join-Path $tmpDir 'request.json'
-        $res = Join-Path $tmpDir 'result.json'
-        Write-JsonFile $req ([ordered]@{ sheets = @($Sheets | ForEach-Object { [ordered]@{ sheetName = [string]$_.sheetName; pdf = [string]$_.pdf } }) })
-        $run = Invoke-NativeCapture $javaExe @('-Djava.awt.headless=true', '-cp', $cp, 'PdfPageAnalyzer', '--input', $req, '--output', $res, '--dpi', [string]$Script:VisualHashDpi)
-        if ([int]$run.exitCode -ne 0 -or -not (Test-Path -LiteralPath $res)) {
-            return [ordered]@{ ok = $false; message = ("exit=" + [string]$run.exitCode + "`n" + [string]$run.text) }
-        }
-        $parsed = Read-JsonFile $res $null
-        return [ordered]@{ ok = $true; result = $parsed }
-    } catch {
-        return [ordered]@{ ok = $false; message = $_.Exception.Message }
-    } finally {
-        if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-}
-
-function Write-RenderRecord([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$Purpose, [bool]$ContentPdfRetained, $Analysis) {
-    # V5-IV-3: ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°çµæžœã¯ renders\<versionId>\ ã«ä¸–ä»£ã”ã¨ã«ç½®ãã€æ›¸ã„ãŸã‚‰å¤‰æ›´ã—ãªã„ã€‚
-    if ([string]::IsNullOrWhiteSpace($SnapshotId) -or [string]::IsNullOrWhiteSpace($VersionId)) { return }
-    try {
-        $dir = Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $manifestPath = Join-Path $dir 'render-manifest.json'
-        if (-not (Test-Path -LiteralPath $manifestPath)) {
-            Write-JsonFile $manifestPath ([ordered]@{
-                schemaVersion = 1
-                purpose = $Purpose
-                # Immutable render record: this says whether content PDF was produced for this render.
-                # Current retention is determined from the actual content-pdf directory, never from this manifest.
-                contentPdfProduced = $ContentPdfRetained
-                contentPdfRetained = $ContentPdfRetained # legacy compatibility; do not use as current-state truth
-                sourceSnapshotId = $SnapshotId
-                workbookId = $WorkbookId
-                versionId = $VersionId
-                createdAt = New-NowIso
-                status = 'complete'
-                renderEnvironmentFingerprint = [string]$Script:CurrentRenderEnvFingerprint
-                renderEnvironment = $Script:CurrentRenderEnvInfo
-                excelPrintProfileVersion = $Script:ExcelPrintProfileVersion
-                visualHashProfile = (Get-VisualHashProfile)
-            })
-        }
-        $hashPath = Join-Path $dir 'visual-hashes.json'
-        if ($null -ne $Analysis -and -not (Test-Path -LiteralPath $hashPath)) {
-            Write-JsonFile $hashPath ([ordered]@{
-                schemaVersion = 1
-                snapshotId = $SnapshotId
-                versionId = $VersionId
-                renderEnvironmentFingerprint = [string]$Script:CurrentRenderEnvFingerprint
-                visualHashProfile = (Get-VisualHashProfile)
-                analyzerVersion = [int](Get-DataProperty $Analysis 'analyzerVersion' 1)
-                javaVersion = [string](Get-DataProperty $Analysis 'javaVersion' '')
-                javaVendor = [string](Get-DataProperty $Analysis 'javaVendor' '')
-                sheets = @(Get-Array (Get-DataProperty $Analysis 'sheets' @()))
-            })
-        }
-    } catch { }
-}
-
-function Get-VisualHashes([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
-    $p = Join-Path (Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId) 'visual-hashes.json'
-    if (-not (Test-Path -LiteralPath $p)) { return $null }
-    try { return (Read-JsonFile $p $null) } catch { return $null }
-}
-
-function Get-RenderVersionIds([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    $dir = Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) 'renders'
-    if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { [string]$_.Name })
-}
-
-# ---- baseline ãƒã‚¤ãƒ³ã‚¿ (V5-Â§6.6) -----------------------------------
-
-function Get-ComparisonBaselinePointerPath([string]$Language, [string]$WorkbookId) {
-    return (Join-Path (Get-WorkbookHistoryDir $Language $WorkbookId) 'comparison-baseline.json')
-}
-function Get-ComparisonBaselinePointer([string]$Language, [string]$WorkbookId) {
-    $p = Get-ComparisonBaselinePointerPath $Language $WorkbookId
-    if (-not (Test-Path -LiteralPath $p)) { return $null }
-    try { return (Read-JsonFile $p $null) } catch { return $null }
-}
-function Set-ComparisonBaseline([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$EnvFingerprint) {
-    # åˆ‡æ›¿é †åº: æ–°snapshot/content pin -> ãƒã‚¤ãƒ³ã‚¿ç½®æ› -> æ—§pinå‰Šé™¤ã€‚é€”ä¸­åœæ­¢æ™‚ã¯ä¿è­·éŽå¤šå´ã«å€’ã™ã€‚
-    $workspace = Get-WorkspacePath $Language
-    $historyLock = Join-Path $workspace 'locks\history-cleanup.lock'
-    $contentLock = Get-ContentPdfMaintenanceLockPath $workspace $WorkbookId
-    Invoke-WithLock $historyLock {
-        Invoke-WithLock $contentLock {
-            if ($null -eq (Get-SnapshotManifest $Language $WorkbookId $SnapshotId)) { throw 'æ¯”è¼ƒåŸºæº–ã®å±¥æ­´ç‰ˆãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-            $availability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $SnapshotId $VersionId
-            if (-not [bool]$availability.ready) { throw ('æ¯”è¼ƒåŸºæº–ã‚’ä¿è­·ã§ãã¾ã›ã‚“: ' + [string]$availability.reason) }
-            $old = Get-ComparisonBaselinePointer $Language $WorkbookId
-            $oldSnapshot = [string](Get-DataProperty $old 'snapshotId' '')
-            $oldVersion = [string](Get-DataProperty $old 'versionId' '')
-            $pinData = [ordered]@{
-                snapshotId = $SnapshotId; versionId = $VersionId
-                renderEnvironmentFingerprint = $EnvFingerprint
-                visualHashProfileVersion = $Script:VisualHashProfileVersion
-                pinnedAt = New-NowIso
-            }
-            if (-not (New-SnapshotPin $Language $WorkbookId $SnapshotId 'comparison-baseline' $pinData)) {
-                throw 'æ¯”è¼ƒåŸºæº–ã®å±¥æ­´ç‰ˆã‚’ä¿è­·ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-            }
-            if (-not (New-ContentPdfPin $workspace $WorkbookId $VersionId 'comparison-baseline' $pinData)) {
-                Remove-SnapshotPin $Language $WorkbookId $SnapshotId 'comparison-baseline'
-                throw 'æ¯”è¼ƒåŸºæº–ã®content PDFã‚’ä¿è­·ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-            }
-            Write-JsonFile (Get-ComparisonBaselinePointerPath $Language $WorkbookId) ([ordered]@{
-                schemaVersion = 2; snapshotId = $SnapshotId; versionId = $VersionId
-                renderEnvironmentFingerprint = $EnvFingerprint; updatedAt = New-NowIso
-            })
-            if (-not [string]::IsNullOrWhiteSpace($oldSnapshot) -and $oldSnapshot -ne $SnapshotId) {
-                Remove-SnapshotPin $Language $WorkbookId $oldSnapshot 'comparison-baseline'
-            }
-            if (-not [string]::IsNullOrWhiteSpace($oldVersion) -and $oldVersion -ne $VersionId) {
-                Remove-ContentPdfPin $workspace $WorkbookId $oldVersion 'comparison-baseline'
-            }
-        }
-    } | Out-Null
-}
-
-function Get-LatestComparisonAssetPointerPath([string]$Language, [string]$WorkbookId) {
-    return (Join-Path (Get-WorkbookHistoryDir $Language $WorkbookId) 'latest-comparison-assets.json')
-}
-
-function Get-LatestComparisonAssetPointer([string]$Language, [string]$WorkbookId) {
-    $path = Get-LatestComparisonAssetPointerPath $Language $WorkbookId
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { return (Read-JsonFile $path $null) } catch { return $null }
-}
-
-function Set-LatestComparisonAssets([string]$Language, [string]$WorkbookId, $Comparison) {
-    # å¤‰æ›´ãƒãƒƒã‚¸ãŒç¤ºã™ç›´è¿‘ã®è‡ªå‹•æ¯”è¼ƒã¯ã€æ¬¡å›žæ¯”è¼ƒåŸºæº–ã®åˆ‡æ›¿ã¨ã¯åˆ¥ã«ä¸¡ç‰ˆã‚’ä¿è­·ã™ã‚‹ã€‚
-    # å›ºå®šroleåã‚’åˆ¥ã€…ã«ä½¿ã†ãŸã‚ã€æ—§currentãŒæ–°baselineã«ãªã‚‹å ´åˆã‚‚å®‰å…¨ã«åˆ‡ã‚Šæ›¿ãˆã‚‰ã‚Œã‚‹ã€‚
-    if ($null -eq $Comparison -or [string](Get-DataProperty $Comparison 'scope' '') -ne 'automatic' -or
-        [string](Get-DataProperty $Comparison 'status' '') -ne 'complete') { throw 'ç›´è¿‘æ¯”è¼ƒã¨ã—ã¦ä¿è­·ã§ãã‚‹è‡ªå‹•æ¯”è¼ƒçµæžœãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-    foreach ($field in @('baselineSnapshotId','baselineVersionId','currentSnapshotId','currentVersionId')) {
-        if ([string]::IsNullOrWhiteSpace([string](Get-DataProperty $Comparison $field ''))) { throw "ç›´è¿‘æ¯”è¼ƒã®è­˜åˆ¥å­ãŒä¸è¶³ã—ã¦ã„ã¾ã™: $field" }
-    }
-    $workspace = Get-WorkspacePath $Language
-    $historyLock = Join-Path $workspace 'locks\history-cleanup.lock'
-    $contentLock = Get-ContentPdfMaintenanceLockPath $workspace $WorkbookId
-    Invoke-WithLock $historyLock {
-        Invoke-WithLock $contentLock {
-            $baselineAvailability = Get-HistoryRenderVersionAvailability $Language $WorkbookId ([string]$Comparison.baselineSnapshotId) ([string]$Comparison.baselineVersionId)
-            $currentAvailability = Get-HistoryRenderVersionAvailability $Language $WorkbookId ([string]$Comparison.currentSnapshotId) ([string]$Comparison.currentVersionId)
-            if (-not [bool]$baselineAvailability.ready -or -not [bool]$currentAvailability.ready) {
-                throw 'ç›´è¿‘æ¯”è¼ƒã®ç”»åƒãƒãƒƒã‚·ãƒ¥ã¨åŒä¸€ä¸–ä»£ã®content PDFã‚’ä¿è­·ã§ãã¾ã›ã‚“ã€‚'
-            }
-            $old = Get-LatestComparisonAssetPointer $Language $WorkbookId
-            $pinData = [ordered]@{
-                scope = 'automatic'
-                baselineSnapshotId = [string]$Comparison.baselineSnapshotId
-                baselineVersionId = [string]$Comparison.baselineVersionId
-                currentSnapshotId = [string]$Comparison.currentSnapshotId
-                currentVersionId = [string]$Comparison.currentVersionId
-                comparedAt = [string](Get-DataProperty $Comparison 'comparedAt' '')
-                pinnedAt = New-NowIso
-            }
-            $specs = @(
-                [ordered]@{ role = 'baseline'; pinName = 'latest-comparison-baseline'; snapshotId = [string]$Comparison.baselineSnapshotId; versionId = [string]$Comparison.baselineVersionId },
-                [ordered]@{ role = 'current'; pinName = 'latest-comparison-current'; snapshotId = [string]$Comparison.currentSnapshotId; versionId = [string]$Comparison.currentVersionId }
-            )
-            # é€”ä¸­å¤±æ•—æ™‚ã¯å‰Šé™¤ã›ãšä¿è­·éŽå¤šå´ã¸å€’ã™ã€‚æ—§pointer/pinã‚‚æ®‹ã‚‹ãŸã‚æ¯”è¼ƒè³‡ç”£ã¯å¤±ã‚ã‚Œãªã„ã€‚
-            foreach ($spec in $specs) {
-                $data = [ordered]@{}
-                foreach ($key in @($pinData.Keys)) { $data[$key] = $pinData[$key] }
-                $data.role = [string]$spec.role
-                if (-not (New-SnapshotPin $Language $WorkbookId ([string]$spec.snapshotId) ([string]$spec.pinName) $data)) {
-                    throw 'ç›´è¿‘æ¯”è¼ƒã®å±¥æ­´ç‰ˆã‚’ä¿è­·ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-                }
-                if (-not (New-ContentPdfPin $workspace $WorkbookId ([string]$spec.versionId) ([string]$spec.pinName) $data)) {
-                    throw 'ç›´è¿‘æ¯”è¼ƒã®content PDFã‚’ä¿è­·ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-                }
-            }
-            $pointerPath = Get-LatestComparisonAssetPointerPath $Language $WorkbookId
-            Write-JsonFile $pointerPath ([ordered]@{
-                schemaVersion = 1
-                baselineSnapshotId = [string]$Comparison.baselineSnapshotId
-                baselineVersionId = [string]$Comparison.baselineVersionId
-                currentSnapshotId = [string]$Comparison.currentSnapshotId
-                currentVersionId = [string]$Comparison.currentVersionId
-                comparedAt = [string](Get-DataProperty $Comparison 'comparedAt' '')
-                updatedAt = New-NowIso
-            })
-            $savedPointer = Read-JsonFile $pointerPath $null
-            if ($null -eq $savedPointer) { throw 'ç›´è¿‘æ¯”è¼ƒã®ä¿è­·ãƒã‚¤ãƒ³ã‚¿ã‚’ä¿å­˜å¾Œã«å†èª­è¾¼ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-            foreach ($field in @('baselineSnapshotId','baselineVersionId','currentSnapshotId','currentVersionId')) {
-                if ([string](Get-DataProperty $savedPointer $field '') -ne [string](Get-DataProperty $Comparison $field '')) {
-                    throw "ç›´è¿‘æ¯”è¼ƒã®ä¿è­·ãƒã‚¤ãƒ³ã‚¿æ¤œè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸ: $field"
-                }
-            }
-            foreach ($oldSpec in @(
-                [ordered]@{ pinName = 'latest-comparison-baseline'; snapshotId = [string](Get-DataProperty $old 'baselineSnapshotId' ''); versionId = [string](Get-DataProperty $old 'baselineVersionId' ''); newSnapshotId = [string]$Comparison.baselineSnapshotId; newVersionId = [string]$Comparison.baselineVersionId },
-                [ordered]@{ pinName = 'latest-comparison-current'; snapshotId = [string](Get-DataProperty $old 'currentSnapshotId' ''); versionId = [string](Get-DataProperty $old 'currentVersionId' ''); newSnapshotId = [string]$Comparison.currentSnapshotId; newVersionId = [string]$Comparison.currentVersionId }
-            )) {
-                if (-not [string]::IsNullOrWhiteSpace([string]$oldSpec.snapshotId) -and [string]$oldSpec.snapshotId -ne [string]$oldSpec.newSnapshotId) {
-                    Remove-SnapshotPin $Language $WorkbookId ([string]$oldSpec.snapshotId) ([string]$oldSpec.pinName)
-                }
-                if (-not [string]::IsNullOrWhiteSpace([string]$oldSpec.versionId) -and [string]$oldSpec.versionId -ne [string]$oldSpec.newVersionId) {
-                    Remove-ContentPdfPin $workspace $WorkbookId ([string]$oldSpec.versionId) ([string]$oldSpec.pinName)
-                }
-            }
-        }
-    } | Out-Null
-}
-
-# ---- æ¯”è¼ƒå°‚ç”¨ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚° (V5-Â§6.7) --------------------------------
-
-
-function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    # structure.jsonç­‰ã¯å¤‰æ›´ã—ãªã„ãŒã€ç”»åƒãƒãƒƒã‚·ãƒ¥ã¨åŒä¸€ä¸–ä»£ã®content PDFã¯ä¿æŒã™ã‚‹ã€‚
-    # ã“ã‚Œã«ã‚ˆã‚Šå†ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°æ¯”è¼ƒã§ã‚‚ã€åˆ¤å®šå¯¾è±¡ã¨ç”»é¢è¡¨ç¤ºå¯¾è±¡ãŒå¿…ãšä¸€è‡´ã™ã‚‹ã€‚
-    $state = Get-SnapshotSourceState $Language $WorkbookId $SnapshotId
-    if (-not [bool]$state.sourceRetained) { return [ordered]@{ ok = $false; reason = 'source-missing' } }
-    return Invoke-WithRenderLock $Language $WorkbookId {
-        $versionId = New-RbVersionId
-        $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('rb-cmp-' + (New-RbId))
-        $workspace = Get-WorkspacePath $Language
-        $contentDir = Get-ContentPdfVersionDir $workspace $WorkbookId $versionId
-        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-        New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
-        $leaseJobId = New-RbId
-        $snapshotLease = ''; $contentLease = ''
-        try {
-            $historyLock = Join-Path $workspace 'locks\history-cleanup.lock'
-            $contentLock = Get-ContentPdfMaintenanceLockPath $workspace $WorkbookId
-            $leaseResult = Invoke-WithLock $historyLock {
-                Invoke-WithLock $contentLock {
-                    if ($null -eq (Get-SnapshotManifest $Language $WorkbookId $SnapshotId)) { throw 'æ¯”è¼ƒå…ƒã®å±¥æ­´ç‰ˆãŒæ•´ç†ã•ã‚Œã¾ã—ãŸã€‚' }
-                    $newSnapshotLease = New-SnapshotLease $Language $WorkbookId $SnapshotId 'compare' $leaseJobId 120 $versionId
-                    if ([string]::IsNullOrWhiteSpace($newSnapshotLease)) { throw 'å±¥æ­´ç‰ˆã®ä¿è­·leaseã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-                    $newContentLease = New-ContentPdfLease $workspace $WorkbookId $versionId 'compare' $leaseJobId 120
-                    if ([string]::IsNullOrWhiteSpace($newContentLease)) {
-                        Remove-SnapshotLease $Language $WorkbookId $SnapshotId $newSnapshotLease
-                        throw 'content PDFã®ä¿è­·leaseã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-                    }
-                    return [pscustomobject][ordered]@{ snapshotLease = $newSnapshotLease; contentLease = $newContentLease }
-                }
-            }
-            $snapshotLease = [string]$leaseResult.snapshotLease
-            $contentLease = [string]$leaseResult.contentLease
-        } catch {
-            Remove-SnapshotLease $Language $WorkbookId $SnapshotId $snapshotLease
-            Remove-ContentPdfLease $workspace $WorkbookId $versionId $contentLease
-            Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue
-            return [ordered]@{ ok = $false; reason = 'lease-failed'; message = $_.Exception.Message }
-        }
-        $excel = $null; $book = $null; $success = $false
-        try {
-            $work = Join-Path $tmpDir 'source.xlsx'
-            Copy-FileSharedRead ([string]$state.sourcePath) $work
-            try { Unblock-File -LiteralPath $work -ErrorAction SilentlyContinue } catch { }
-            try { [void](Remove-XlsxHeaderFooterXml $work) } catch { }
-            $excel = New-ExcelApplicationForRender
-            $envInfo = Get-RenderEnvironment $excel
-            $Script:CurrentRenderEnvFingerprint = Get-RenderEnvironmentFingerprint $envInfo
-            $Script:CurrentRenderEnvInfo = $envInfo
-            $book = Open-ExcelWorkbookSafe $excel $work $true
-            $sheets = @()
-            $sheetCount = 0
-            try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
-            for ($i = 1; $i -le $sheetCount; $i++) {
-                $ws = $null
-                try {
-                    $ws = $book.Worksheets.Item($i)
-                    $sheetName = [string]$ws.Name
-                    if (-not (([int]$ws.Visible -eq -1) -and $sheetName -match '^[0-9]+$')) { continue }
-                    $outPdf = Join-Path $contentDir ("{0}.pdf" -f $sheetName)
-                    [void](Export-WorksheetToPdfSafe $excel $book $ws $outPdf $sheetName $false)
-                    if (Test-Path -LiteralPath $outPdf) { $sheets += @{ sheetName = $sheetName; pdf = $outPdf } }
-                } catch {
-                } finally { Invoke-ComRelease $ws }
-            }
-            if ($sheets.Count -eq 0) { return [ordered]@{ ok = $false; reason = 'no-sheets' } }
-            $analysis = Invoke-PdfPageAnalyzer $sheets
-            if ($null -eq $analysis -or -not [bool]$analysis.ok) { return [ordered]@{ ok = $false; reason = 'analyze-failed' } }
-            Write-RenderRecord $Language $WorkbookId $SnapshotId $versionId 'comparison' $true ([pscustomobject]$analysis.result)
-            $availability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $SnapshotId $versionId
-            if (-not [bool]$availability.ready) { return [ordered]@{ ok = $false; reason = 'retention-verify-failed'; message = [string]$availability.reason } }
-            $success = $true
-            return [ordered]@{ ok = $true; versionId = $versionId; envFingerprint = [string]$Script:CurrentRenderEnvFingerprint }
-        } catch {
-            return [ordered]@{ ok = $false; reason = 'error'; message = $_.Exception.Message }
-        } finally {
-            if ($book) { try { $book.Close($false) } catch { } ; Invoke-ComRelease $book }
-            if ($excel) { Close-ExcelApplicationForRender $excel }
-            Remove-SnapshotLease $Language $WorkbookId $SnapshotId $snapshotLease
-            Remove-ContentPdfLease $workspace $WorkbookId $versionId $contentLease
-            if (-not $success -and (Test-Path -LiteralPath $contentDir)) { Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue }
-            if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
-            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-        }
-    }
-}
-
-function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]$CurrentSnapshotId, [string]$CurrentVersionId) {
-    # è¡¨ç¾ã¯ã€Œè¦‹è½ã¨ã—ãªã—ã€ã§ã¯ãªãã€Œæœ€çµ‚PDFã®è¦‹ãŸç›®ã‚’åŸºæº–ã¨ã—ãŸé«˜ç²¾åº¦ãªåˆ¤å®šã€ã€‚
-    $result = [ordered]@{
-        schemaVersion = 2; status = 'unavailable'
-        scope = 'automatic'
-        baselineSnapshotId = ''; baselineVersionId = ''
-        currentSnapshotId = $CurrentSnapshotId; currentVersionId = $CurrentVersionId
-        comparedAt = New-NowIso; method = ''
-        changedSheets = @(); unchangedSheets = @(); unknownSheets = @()
-        addedSheets = @(); removedSheets = @(); message = ''
-    }
-    $cur = Get-VisualHashes $Language $WorkbookId $CurrentSnapshotId $CurrentVersionId
-    if ($null -eq $cur) { $result.message = 'ä»Šå›žç‰ˆã®ç”»åƒãƒãƒƒã‚·ãƒ¥ãŒã‚ã‚Šã¾ã›ã‚“ã€‚'; return $result }
-    $curEnv = [string](Get-DataProperty $cur 'renderEnvironmentFingerprint' '')
-
-    $ptr = Get-ComparisonBaselinePointer $Language $WorkbookId
-    $baseSnap = [string](Get-DataProperty $ptr 'snapshotId' '')
-    $baseVer = [string](Get-DataProperty $ptr 'versionId' '')
-    # ç”»åƒè§£æžã¯PDFã‚¸ãƒ§ãƒ–å®Œäº†é€šçŸ¥ã®å¾Œã§èµ°ã‚‹ã€‚çŸ­æ™‚é–“ã«æ¬¡ç‰ˆã‚’ä½œæˆã—ãŸå ´åˆã‚„
-    # åŒã˜ç‰ˆã®è§£æžãŒå†å®Ÿè¡Œã•ã‚ŒãŸå ´åˆã€baselineãƒã‚¤ãƒ³ã‚¿ãŒæ—¢ã«ä»Šå›žç‰ˆã‚’æŒ‡ã™
-    # ã“ã¨ãŒã‚ã‚‹ã€‚manifestã®ç›´å‰ç‰ˆã«æœ‰åŠ¹ãªç”»åƒãƒãƒƒã‚·ãƒ¥ãŒã‚ã‚Œã°æ¯”è¼ƒå…ƒã¨ã—ã¦
-    # å›žå¾©ã—ã€æ¯”è¼ƒçµæžœã‚’æ¬ è½ã•ã›ãªã„ã€‚
-    if ([string]::IsNullOrWhiteSpace($baseSnap) -or $baseSnap -eq $CurrentSnapshotId) {
-        $currentManifest = Get-SnapshotManifest $Language $WorkbookId $CurrentSnapshotId
-        $previousSnapshotId = [string](Get-DataProperty $currentManifest 'previousSnapshotId' '')
-        if (-not [string]::IsNullOrWhiteSpace($previousSnapshotId) -and $previousSnapshotId -ne $CurrentSnapshotId) {
-            # ãƒãƒƒã‚·ãƒ¥ãŒç„¡ã„æ—§å±¥æ­´ã§ã‚‚ source.xlsx ãŒæ®‹ã£ã¦ã„ã‚Œã°ã€å¾Œæ®µã§å†ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ã§ãã‚‹ã€‚
-            $baseSnap = $previousSnapshotId
-            $baseVer = ''
-            foreach ($candidateVersion in @((Get-RenderVersionIds $Language $WorkbookId $previousSnapshotId) | Sort-Object -Descending)) {
-                if ($null -ne (Get-VisualHashes $Language $WorkbookId $previousSnapshotId ([string]$candidateVersion))) {
-                    $baseVer = [string]$candidateVersion
-                    break
-                }
-            }
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($baseSnap) -or $baseSnap -eq $CurrentSnapshotId) {
-        $result.message = 'å‰å›žã®æ¯”è¼ƒåŸºæº–ãŒã‚ã‚Šã¾ã›ã‚“ã€‚ä»Šå›žç‰ˆã‚’æ–°ã—ã„åŸºæº–ã«ã—ã¾ã™ã€‚'
-        return $result
-    }
-
-    # è‡ªå‹•æ¯”è¼ƒã‚‚å±¥æ­´æ¯”è¼ƒã¨åŒã˜ãã€åˆ¤å®šãƒãƒƒã‚·ãƒ¥ã¨è¡¨ç¤ºPDFã®ä¸–ä»£ä¸€è‡´ã‚’å¿…é ˆã«ã™ã‚‹ã€‚
-    $currentAvailability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $CurrentSnapshotId $CurrentVersionId
-    if (-not [bool]$currentAvailability.ready) {
-        $result.message = 'ä»Šå›žç‰ˆã®ç”»åƒãƒãƒƒã‚·ãƒ¥ã¨åŒä¸€ä¸–ä»£ã®content PDFãŒãã‚ã£ã¦ã„ãªã„ãŸã‚ã€è‡ªå‹•æ¯”è¼ƒã§ãã¾ã›ã‚“ã€‚'
-        return $result
-    }
-    $base = $null
-    if (-not [string]::IsNullOrWhiteSpace($baseVer)) { $base = Get-VisualHashes $Language $WorkbookId $baseSnap $baseVer }
-    $baseAvailability = $null
-    if ($null -ne $base -and -not [string]::IsNullOrWhiteSpace($baseVer)) {
-        $baseAvailability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $baseSnap $baseVer
-    }
-    $curProfile = Get-DataProperty $cur 'visualHashProfile' $null
-    $baseProfile = $(if ($null -ne $base) { Get-DataProperty $base 'visualHashProfile' $null } else { $null })
-    $environmentChanged = ($null -ne $base -and (
-        [string](Get-DataProperty $base 'renderEnvironmentFingerprint' '') -ne $curEnv -or
-        (Get-IntDataProperty $base 'analyzerVersion' 0) -ne (Get-IntDataProperty $cur 'analyzerVersion' 0) -or
-        (Get-IntDataProperty $baseProfile 'profileVersion' 0) -ne (Get-IntDataProperty $curProfile 'profileVersion' 0)))
-    $assetsMissing = ($null -eq $baseAvailability -or -not [bool]$baseAvailability.ready)
-    $method = 'stored-hash'
-    if ($null -eq $base -or $environmentChanged -or $assetsMissing) {
-        # ç’°å¢ƒå·®ãƒ»ãƒãƒƒã‚·ãƒ¥æ¬ è½ãƒ»åŒä¸€ä¸–ä»£PDFæ¬ è½ã®ã„ãšã‚Œã§ã‚‚ã€ä¿å­˜æ¸ˆã¿Excelã‹ã‚‰ä¸€çµ„ã‚’å†ç”Ÿæˆã™ã‚‹ã€‚
-        $re = Render-SnapshotForComparison $Language $WorkbookId $baseSnap
-        if ([bool]$re.ok) {
-            $baseVer = [string]$re.versionId
-            $base = Get-VisualHashes $Language $WorkbookId $baseSnap $baseVer
-            $baseAvailability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $baseSnap $baseVer
-            $method = 're-rendered'
-        } else {
-            $result.message = 'å‰å›žç‰ˆã®æ¯”è¼ƒè³‡ç”£ã‚’åŒä¸€ä¸–ä»£ã§ç¢ºä¿ã§ããªã„ãŸã‚ã€è‡ªå‹•æ¯”è¼ƒã§ãã¾ã›ã‚“ã€‚ä»Šå›žç‰ˆã‚’æ–°ã—ã„æ¯”è¼ƒåŸºæº–ã¨ã—ã¾ã™ã€‚'
-            return $result
-        }
-    }
-    if ($null -eq $base -or $null -eq $baseAvailability -or -not [bool]$baseAvailability.ready) {
-        $result.message = 'å‰å›žç‰ˆã®ç”»åƒãƒãƒƒã‚·ãƒ¥ã¨åŒä¸€ä¸–ä»£ã®content PDFã‚’ç¢ºèªã§ãã¾ã›ã‚“ã€‚'
-        return $result
-    }
-
-    $baseMap = @{}
-    foreach ($s in @(Get-Array (Get-DataProperty $base 'sheets' @()))) { $baseMap[[string]$s.sheetName] = $s }
-    $curNames = @{}
-    $changed = @(); $unchanged = @(); $unknown = @(); $added = @(); $removed = @()
-    foreach ($s in @(Get-Array (Get-DataProperty $cur 'sheets' @()))) {
-        $name = [string]$s.sheetName
-        $curNames[$name] = $true
-        if ([string](Get-DataProperty $s 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if (-not $baseMap.ContainsKey($name)) { $added += $name; continue }
-        $b = $baseMap[$name]
-        if ([string](Get-DataProperty $b 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if ((Normalize-FileHash ([string](Get-DataProperty $b 'sheetVisualHash' ''))) -eq (Normalize-FileHash ([string](Get-DataProperty $s 'sheetVisualHash' ''))) -or
-            (Test-SheetVisualEquivalent $b $s)) { $unchanged += $name }
-        else { $changed += $name }
-    }
-    $result.status = 'complete'
-    $result.baselineSnapshotId = $baseSnap
-    $result.baselineVersionId = $baseVer
-    $result.method = $method
-    # V5-P1: ä»Šå›žç‰ˆã®ã‚·ãƒ¼ãƒˆã ã‘ã‚’å›žã™ã¨ã€å‰Šé™¤ã•ã‚ŒãŸã‚·ãƒ¼ãƒˆãŒå·®åˆ†ã«å‡ºãªã„ã€‚
-    foreach ($k in @($baseMap.Keys)) { if (-not $curNames.ContainsKey([string]$k)) { $removed += [string]$k } }
-    $result.changedSheets = @($changed)
-    $result.unchangedSheets = @($unchanged)
-    $result.unknownSheets = @($unknown)
-    $result.addedSheets = @($added)
-    $result.removedSheets = @($removed)
-    $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $CurrentSnapshotId $CurrentVersionId) 'comparisons'
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $comparisonKey = (Get-Sha256Text ("{0}|{1}|{2}|{3}|automatic" -f $baseSnap, $baseVer, $CurrentSnapshotId, $CurrentVersionId)).Substring(7, 16)
-    $comparisonPath = Join-Path $dir ("cmp-{0}.json" -f $comparisonKey)
-    Write-JsonFile $comparisonPath $result
-    $saved = Read-JsonFile $comparisonPath $null
-    if ($null -eq $saved) { throw 'è‡ªå‹•æ¯”è¼ƒçµæžœã‚’ä¿å­˜å¾Œã«å†èª­è¾¼ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-    foreach ($field in @('scope','baselineSnapshotId','baselineVersionId','currentSnapshotId','currentVersionId')) {
-        if ([string](Get-DataProperty $saved $field '') -ne [string](Get-DataProperty $result $field '')) {
-            throw "è‡ªå‹•æ¯”è¼ƒçµæžœã®ä¿å­˜æ¤œè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸ: $field"
-        }
-    }
-    try {
-        Set-LatestComparisonAssets $Language $WorkbookId $saved
-    } catch {
-        # ä¿è­·ã§ããªã„æ¯”è¼ƒã‚’æœ€æ–°å¤‰æ›´ãƒãƒƒã‚¸ã¸å…¬é–‹ã—ãªã„ã€‚
-        Remove-Item -LiteralPath $comparisonPath -Force -ErrorAction SilentlyContinue
-        throw
-    }
-    Write-HistoryEvent $Language 'compare.completed' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $CurrentSnapshotId; changed = @($changed); unknown = @($unknown) })
-    return $saved
-}
-
-function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, $Rendered) {
-    # V5-Â§6.5: PDFä½œæˆã®ã‚¯ãƒªãƒ†ã‚£ã‚«ãƒ«ãƒ‘ã‚¹ã®å¤–ã€‚å¤±æ•—ã—ã¦ã‚‚ PDF ä½œæˆã¯æˆåŠŸæ‰±ã„ã®ã¾ã¾ã€‚
-    if (-not (Test-InputHistoryEnabled)) { return $null }
-    if ([string]::IsNullOrWhiteSpace($SnapshotId)) { return $null }
-    try {
-        $sheets = @()
-        foreach ($r in @(Get-Array $Rendered)) {
-            $pdf = [string](Get-DataProperty $r 'pdf' '')
-            $name = [string](Get-DataProperty $r 'sheetName' '')
-            if ($pdf -and $name -and (Test-Path -LiteralPath $pdf)) { $sheets += @{ sheetName = $name; pdf = $pdf } }
-        }
-        if ($sheets.Count -eq 0) { return $null }
-        $analysis = Invoke-PdfPageAnalyzer $sheets
-        $parsed = $null
-        if ($null -ne $analysis -and [bool]$analysis.ok) { $parsed = [pscustomobject]$analysis.result }
-        Write-RenderRecord $Language $WorkbookId $SnapshotId $VersionId 'normal' $true $parsed
-        if ($null -eq $parsed) { return $null }
-        $cmp = Compare-SnapshotVisual $Language $WorkbookId $SnapshotId $VersionId
-        # complete/unavailableã®ã©ã¡ã‚‰ã§ã‚‚è§£æžçµæžœã‚’ç‰ˆã®è¨˜éŒ²ã¸æ®‹ã™ã€‚
-        # éžåŒæœŸè§£æžã®ç«¶åˆã‚„ç’°å¢ƒå·®ã§æ¯”è¼ƒã§ããªã„å ´åˆã«ã€ç†ç”±ã‚’å¾Œã‹ã‚‰ç¢ºèªã§ãã‚‹ã€‚
-        try {
-            $analysisRecordDir = Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId
-            Write-JsonFile (Join-Path $analysisRecordDir 'comparison-analysis.json') $cmp
-        } catch { }
-        # V5-Â§6.6: baseline ã‚’æ›´æ–°ã™ã‚‹ã®ã¯ä»Šå›žã®è§£æžã«æˆåŠŸã—ãŸã¨ãã ã‘ã€‚
-        # unknown ç‰ˆã‚’åŸºæº–ã«ã™ã‚‹ã¨æ¬¡å›žã®æ¯”è¼ƒå…ƒãŒå¤±ã‚ã‚Œã‚‹ã€‚
-        $hasOk = @(Get-Array (Get-DataProperty $parsed 'sheets' @()) | Where-Object { [string]$_.status -eq 'ok' }).Count -gt 0
-        if ($hasOk) { Set-ComparisonBaseline $Language $WorkbookId $SnapshotId $VersionId ([string]$Script:CurrentRenderEnvFingerprint) }
-        return $cmp
-    } catch {
-        Write-Warning ('ç”»åƒãƒãƒƒã‚·ãƒ¥ã®è§£æžã«å¤±æ•—ã—ã¾ã—ãŸ: ' + $_.Exception.Message)
-        return $null
-    }
-}
-
-function Get-LatestComparison([string]$Language, [string]$WorkbookId, $Workbook = $null) {
-    try {
-        # V5-P2: å‘¼å‡ºå…ƒãŒæ—¢ã« structure ã‚’èª­ã‚“ã§ã„ã‚‹å ´åˆã¯å†èª­è¾¼ã—ãªã„ã€‚
-        # /api/state ã¯ãƒ–ãƒƒã‚¯1ä»¶ã”ã¨ã«ã“ã“ã¸æ¥ã‚‹ãŸã‚ã€90ä»¶ãªã‚‰ structure.json ã‚’90å›žèª­ã‚“ã§ã„ãŸã€‚
-        $target = $Workbook
-        if ($null -eq $target) {
-            $structure = Get-Structure $Language
-            $wb = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-            if ($wb.Count -eq 0) { return $null }
-            $target = $wb[0]
-        }
-        $snap = [string](Get-DataProperty $target 'lastRenderedSnapshotId' '')
-        $ver = [string](Get-DataProperty $target 'lastRenderedVersionId' '')
-        if ([string]::IsNullOrWhiteSpace($snap) -or [string]::IsNullOrWhiteSpace($ver)) { return $null }
-        $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $snap $ver) 'comparisons'
-        if (-not (Test-Path -LiteralPath $dir)) { return $null }
-        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
-            try {
-                $candidate = Read-JsonFile $f.FullName $null
-                if ($null -eq $candidate) { continue }
-                $scope = [string](Get-DataProperty $candidate 'scope' '')
-                # scopeç„¡ã—ã¯æ—§ç‰ˆäº’æ›ã€‚å±¥æ­´ç”»é¢ã‹ã‚‰ä½œã£ãŸä»»æ„æ¯”è¼ƒã¯ã€
-                # æœ€æ–°ç‰ˆã®å¤‰æ›´ãƒãƒƒã‚¸ã‚„è‡ªå‹•æ¯”è¼ƒåŸºæº–ã¨ã—ã¦æ‰±ã‚ãªã„ã€‚
-                if (-not ([string]::IsNullOrWhiteSpace($scope) -or $scope -eq 'automatic')) { continue }
-                # æ–°å½¢å¼ã¯ç¾åœ¨ç‰ˆã®snapshot/versionã‚‚å®Œå…¨ä¸€è‡´ã•ã›ã‚‹ã€‚æ—§å½¢å¼ã§é …ç›®ãŒç„¡ã„å ´åˆã ã‘ã€
-                # ç‰©ç†çš„ã«ç¾åœ¨ç‰ˆrenderãƒ•ã‚©ãƒ«ãƒ€å†…ã«ã‚ã‚‹ã“ã¨ã‚’æ ¹æ‹ ã«äº’æ›èª­è¾¼ã™ã‚‹ã€‚
-                $candidateSnapshot = [string](Get-DataProperty $candidate 'currentSnapshotId' '')
-                $candidateVersion = [string](Get-DataProperty $candidate 'currentVersionId' '')
-                if (-not [string]::IsNullOrWhiteSpace($candidateSnapshot) -and $candidateSnapshot -ne $snap) { continue }
-                if (-not [string]::IsNullOrWhiteSpace($candidateVersion) -and $candidateVersion -ne $ver) { continue }
-                return $candidate
-            } catch { }
-        }
-        return $null
-    } catch { return $null }
-}
-
-
-# =====================================================================
-# V5 Stage 5 â€” Phase 1B / 2C: ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ãƒ»ãƒ¬ã‚¤ã‚¢ã‚¦ãƒˆå±¥æ­´ãƒ»å‡ºåŠ›ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³
-# =====================================================================
-
-function Get-ArchiveRoot([string]$Language) { return (Join-Path (Get-WorkspacePath $Language) 'exports\archive') }
-function Get-LayoutHistoryDir([string]$Language, [string]$Category) { return (Join-Path (Get-WorkspacePath $Language) (Join-Path 'layout-history' $Category)) }
-function Get-FinalTransactionDir([string]$Language) { return (Join-Path (Get-WorkspacePath $Language) 'state\final-transactions') }
-function Get-FinalTransactionBackupDir([string]$Language, [string]$TransactionId) { return (Join-Path (Get-WorkspacePath $Language) (Join-Path 'state\final-backups' $TransactionId)) }
-function Remove-FinalTransactionBackupDir([string]$Language, [string]$TransactionId) {
-    if ([string]::IsNullOrWhiteSpace($TransactionId)) { return }
-    try {
-        $dir = Get-FinalTransactionBackupDir $Language $TransactionId
-        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
-    } catch { }
-}
-
-# ---- ãƒ¬ã‚¤ã‚¢ã‚¦ãƒˆæŠ•å½±ã‚¹ãƒŠãƒƒãƒ—ã‚·ãƒ§ãƒƒãƒˆã¨é™å®šå¾©å…ƒ (V5-Â§4.2) -------------
-
-function Save-LayoutSnapshot([string]$Language, [string]$Category, [string]$Reason, $Structure = $null) {
-    if (-not (Test-InputHistoryEnabled)) { return '' }
-    try {
-        $st = $Structure
-        if ($null -eq $st) { $st = Get-Structure $Language }
-        $pages = @()
-        foreach ($p in @(Get-Array $st.pages)) {
-            $wb = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq [string]$p.workbookId } | Select-Object -First 1)
-            if ($wb.Count -eq 0) { continue }
-            if (-not (Test-WorkbookCategory $wb[0] $Category)) { continue }
-            # V5-Â§4.2: ãƒ¬ã‚¤ã‚¢ã‚¦ãƒˆé …ç›®ã ã‘ã‚’ä¿å­˜ã™ã‚‹ã€‚structure å…¨ä½“ã¯ä¿å­˜ã—ãªã„ã€‚
-            $pages += [ordered]@{
-                pageId = (Resolve-PageId $p)
-                title = [string]$p.title
-                volume = [string]$p.volume
-                enabled = [bool]$p.enabled
-                order = [double]$p.order
-                orderManual = [bool](Get-DataProperty $p 'orderManual' $false)
-                numberingMode = [string](Get-DataProperty $p 'numberingMode' 'visible')
-                numberingManual = [bool](Get-DataProperty $p 'numberingManual' $false)
-            }
-        }
-        if ($pages.Count -eq 0) { return '' }
-        $dir = Get-LayoutHistoryDir $Language $Category
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $id = New-RbId
-        Write-JsonFile (Join-Path $dir ("{0}.json" -f $id)) ([ordered]@{
-            schemaVersion = 1; snapshotId = $id; language = $Language; category = $Category
-            createdAt = New-NowIso; reason = $Reason; pages = $pages
-        })
-        Write-HistoryEvent $Language 'layout.changed' ([ordered]@{ category = $Category; reason = $Reason; snapshotId = $id; pageCount = $pages.Count })
-        return $id
-    } catch { return '' }
-}
-
-function Get-LayoutSnapshots([string]$Language, [string]$Category) {
-    $dir = Get-LayoutHistoryDir $Language $Category
-    if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    $out = @()
-    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 100)) {
-        try {
-            $j = Read-JsonFile $f.FullName $null
-            $out += [ordered]@{
-                snapshotId = [string](Get-DataProperty $j 'snapshotId' $f.BaseName)
-                createdAt = [string](Get-DataProperty $j 'createdAt' '')
-                reason = [string](Get-DataProperty $j 'reason' '')
-                pageCount = @(Get-Array (Get-DataProperty $j 'pages' @())).Count
-            }
-        } catch { }
-    }
-    return $out
-}
-
-function Read-LayoutSnapshot([string]$Language, [string]$Category, [string]$SnapshotId) {
-    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
-    $p = Join-Path (Get-LayoutHistoryDir $Language $Category) ("{0}.json" -f $safeSnapshotId)
-    if (-not (Test-Path -LiteralPath $p)) { throw "ãƒ¬ã‚¤ã‚¢ã‚¦ãƒˆå±¥æ­´ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“: $SnapshotId" }
-    return (Read-JsonFile $p $null)
-}
-
-function Get-LayoutRestorePreview([string]$Language, [string]$Category, [string]$SnapshotId) {
-    $snap = Read-LayoutSnapshot $Language $Category $SnapshotId
-    $st = Get-Structure $Language
-    $currentIds = @{}
-    foreach ($p in @(Get-Array $st.pages)) {
-        $wb = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq [string]$p.workbookId } | Select-Object -First 1)
-        if ($wb.Count -eq 0) { continue }
-        if (-not (Test-WorkbookCategory $wb[0] $Category)) { continue }
-        $currentIds[(Resolve-PageId $p)] = $p
-    }
-    $applied = 0; $pastOnly = @(); $volumeChanges = @()
-    $snapIds = @{}
-    foreach ($sp in @(Get-Array (Get-DataProperty $snap 'pages' @()))) {
-        $pageKey = [string]$sp.pageId
-        $snapIds[$pageKey] = $true
-        if (-not $currentIds.ContainsKey($pageKey)) { $pastOnly += $pageKey; continue }
-        $applied++
-        $cur = $currentIds[$pageKey]
-        if ([string]$cur.volume -ne [string]$sp.volume) {
-            $volumeChanges += [ordered]@{ pageId = $pageKey; title = [string]$cur.title; from = [string]$cur.volume; to = [string]$sp.volume }
-        }
-    }
-    $currentOnly = @($currentIds.Keys | Where-Object { -not $snapIds.ContainsKey($_) })
-    return [ordered]@{
-        snapshotId = $SnapshotId
-        createdAt = [string](Get-DataProperty $snap 'createdAt' '')
-        reason = [string](Get-DataProperty $snap 'reason' '')
-        appliedPageCount = $applied
-        pastOnlyPageIds = @($pastOnly)
-        currentOnlyPageIds = @($currentOnly)
-        volumeChanges = @($volumeChanges)
-        requiresRebuild = $true
-    }
-}
-
-function Restore-LayoutSnapshot([string]$Language, [string]$Category, [string]$SnapshotId) {
-    $snap = Read-LayoutSnapshot $Language $Category $SnapshotId
-    # å¾©å…ƒã®ç›´å‰ã«ã‚‚ä¿å­˜ã—ã¦ãŠãã€ã€Œå¾©å…ƒã‚’å–ã‚Šæ¶ˆã™ã€ã‚’å¯èƒ½ã«ã™ã‚‹ã€‚
-    $undoId = Save-LayoutSnapshot $Language $Category 'pre-restore'
-    $applied = Update-StructureLocked $Language {
-        param($st)
-        $map = @{}
-        foreach ($p in @(Get-Array $st.pages)) { $map[(Resolve-PageId $p)] = $p }
-        $n = 0
-        foreach ($sp in @(Get-Array (Get-DataProperty $snap 'pages' @()))) {
-            $pageKey = [string]$sp.pageId
-            if (-not $map.ContainsKey($pageKey)) { continue }
-            $p = $map[$pageKey]
-            # V5-Â§4.2: é©ç”¨ã—ã¦ã‚ˆã„ã®ã¯ãƒ¬ã‚¤ã‚¢ã‚¦ãƒˆé …ç›®ã®ã¿ã€‚
-            # contentPdf / status / warnings / currentExcelHash / lastRendered* / volumes ã¯è§¦ã‚‰ãªã„ã€‚
-            Set-NoteProperty $p 'title' ([string]$sp.title)
-            Set-NoteProperty $p 'volume' ([string]$sp.volume)
-            Set-NoteProperty $p 'enabled' ([bool]$sp.enabled)
-            Set-NoteProperty $p 'order' ([double]$sp.order)
-            Set-NoteProperty $p 'orderManual' ([bool]$sp.orderManual)
-            Set-NoteProperty $p 'numberingMode' ([string]$sp.numberingMode)
-            Set-NoteProperty $p 'numberingManual' ([bool]$sp.numberingManual)
-            Set-NoteProperty $p 'updatedAt' (New-NowIso)
-            $n++
-        }
-        Apply-DefaultNumberingPerVolume $Language $st $Category
-        $vols = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
-        Mark-VolumeNeedsRebuild $st $Language $Category $vols 'layout-restored' 'ãƒšãƒ¼ã‚¸æ§‹æˆã‚’éŽåŽ»ã®çŠ¶æ…‹ã¸æˆ»ã—ã¾ã—ãŸ'
-        return $n
-    }
-    Write-HistoryEvent $Language 'layout.restored' ([ordered]@{ category = $Category; snapshotId = $SnapshotId; undoSnapshotId = $undoId; appliedPageCount = $applied })
-    return [ordered]@{ appliedPageCount = $applied; undoSnapshotId = $undoId }
-}
-
-# ---- æœ€çµ‚PDFã‚¢ãƒ¼ã‚«ã‚¤ãƒ– (V5-Â§4.1) -----------------------------------
-
-function New-FinalArchive([string]$Language, [string]$Category, [string]$Volume, [string]$BuildId, [string]$OutputPdf, $Manifest, $Snapshot) {
-    # å†ªç­‰: ä¸€æ™‚ãƒ•ã‚©ãƒ«ãƒ€ã§å®Œæˆã•ã›ã¦ã‹ã‚‰ buildId ãƒ•ã‚©ãƒ«ãƒ€ã¸ç§»å‹•ã™ã‚‹ã€‚
-    try {
-        $target = Join-Path (Join-Path (Join-Path (Get-ArchiveRoot $Language) $Category) $Volume) $BuildId
-        if (Test-Path -LiteralPath $target) { return $target }
-        $stage = $target + '.staging'
-        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-        New-Item -ItemType Directory -Path $stage -Force | Out-Null
-        Copy-Item -LiteralPath $OutputPdf -Destination (Join-Path $stage 'final.pdf') -Force
-        $sha = Normalize-FileHash (New-Sha256 (Join-Path $stage 'final.pdf'))
-        Set-Content -LiteralPath (Join-Path $stage 'sha256.txt') -Value $sha -Encoding ASCII
-        Write-JsonFile (Join-Path $stage 'manifest.json') $Manifest
-
-        # V5-P0: å‡ºåŠ›ã«ã€Œå®Ÿéš›ã«ä½¿ã£ãŸã€ä¸å¤‰ã®æƒ…å ±ã ã‘ã‚’è¨˜éŒ²ã™ã‚‹ã€‚
-        # ã“ã“ã§æ§‹é€ ãƒ‡ãƒ¼ã‚¿ã‚’èª­ã¿ç›´ã™ã¨ã€å‡ºåŠ›å¾Œã«åˆ¥ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ãŒå®Œäº†ã—ãŸå ´åˆã«
-        # æ­£å¼PDFã§ä½¿ã£ã¦ã„ãªã„ snapshot / versionId ã‚’è¨˜éŒ²ã—ã¦ã—ã¾ã†ã€‚
-        $envs = [ordered]@{}
-        $sourceWorkbooks = @()
-        foreach ($sw in @(Get-Array (Get-DataProperty $Snapshot 'sourceWorkbooks' @()))) {
-            $fp = [string](Get-DataProperty $sw 'renderEnvironmentFingerprint' '')
-            if ($fp -and -not $envs.Contains($fp)) { $envs[$fp] = (Get-DataProperty $sw 'renderEnvironment' $null) }
-            $sourceWorkbooks += $sw
-        }
-        Write-JsonFile (Join-Path $stage 'metadata.json') ([ordered]@{
-            schemaVersion = 1; buildId = $BuildId; language = $Language; category = $Category; volume = $Volume
-            projectId = [string](Get-DataProperty $Snapshot 'projectId' ''); builtAt = New-NowIso
-            inputFingerprint = [string](Get-DataProperty $Snapshot 'fingerprint' '')
-            outputPdfSha256 = $sha; outputFileName = [IO.Path]::GetFileName($OutputPdf)
-            pageCount = @(Get-Array (Get-DataProperty $Snapshot 'pages' @())).Count
-            sourceWorkbooks = @($sourceWorkbooks)
-            excelPrintProfileVersion = $Script:ExcelPrintProfileVersion
-            renderEnvironments = $envs
-            composerEnvironment = [ordered]@{ pcName = $env:COMPUTERNAME; osVersion = [Environment]::OSVersion.VersionString }
-            builtBy = [ordered]@{ pcName = $env:COMPUTERNAME; userName = "$env:USERDOMAIN\$env:USERNAME" }
-        })
-        Move-Item -LiteralPath $stage -Destination $target -Force
-
-        # V5-P0: pin ã¯ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ãŒæ­£å¼ãƒ•ã‚©ãƒ«ãƒ€ã¸ç§»å‹•ã§ãã¦ã‹ã‚‰ä½œã‚‹ã€‚
-        # å…ˆã«ä½œã‚‹ã¨ã€ç§»å‹•ã«å¤±æ•—ã—ãŸã¨ãã«ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ãŒç„¡ã„ã®ã« pin ã ã‘æ®‹ã‚‹ã€‚
-        foreach ($sw in $sourceWorkbooks) {
-            $wbId = [string](Get-DataProperty $sw 'workbookId' '')
-            $snapshotId = [string](Get-DataProperty $sw 'snapshotId' '')
-            $versionId = [string](Get-DataProperty $sw 'versionId' '')
-            if ([string]::IsNullOrWhiteSpace($wbId) -or [string]::IsNullOrWhiteSpace($snapshotId)) { continue }
-            # V5-P0(#4): pin ã‚’ä½œã‚Œãªã‘ã‚Œã°ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³ã‚’å¤±æ•—ã•ã›ã‚‹ã€‚
-            # pin ã¯æ­£å¼PDFãŒå‚ç…§ã™ã‚‹ source/content-pdf ã‚’å¾Œæ—¥ã®æŽƒé™¤ã‹ã‚‰å®ˆã‚‹å”¯ä¸€ã®ä»•çµ„ã¿ã§ã‚ã‚Šã€
-            # ä½œæˆã«å¤±æ•—ã—ãŸã¾ã¾ completed ã«ã™ã‚‹ã¨ã€å‚ç…§å…ˆãŒå‰Šé™¤ã•ã‚Œå¾—ã‚‹ã€‚
-            $pinOk = New-SnapshotPin $Language $wbId $snapshotId ("final-pdf_{0}" -f $BuildId) ([ordered]@{
-                buildId = $BuildId; snapshotId = $snapshotId; versionId = $versionId
-                volume = $Volume; category = $Category; archivePath = $target
-            })
-            if (-not $pinOk) { throw ("ã‚¹ãƒŠãƒƒãƒ—ã‚·ãƒ§ãƒƒãƒˆä¿è­·(pin)ã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸ: {0} / {1}" -f $wbId, $snapshotId) }
-            if ($versionId) {
-                $cpPinOk = New-ContentPdfPin (Get-WorkspacePath $Language) $wbId $versionId ("final-pdf_{0}" -f $BuildId) ([ordered]@{
-                    buildId = $BuildId; volume = $Volume; category = $Category
-                })
-                if (-not $cpPinOk) { throw ("content-pdf ä¿è­·(pin)ã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸ: {0} / {1}" -f $wbId, $versionId) }
-            }
-        }
-        Write-HistoryEvent $Language 'final.archive.created' ([ordered]@{ category = $Category; volume = $Volume; buildId = $BuildId; path = $target })
-        return $target
-    } catch {
-        # V5-P0: æ¡ã‚Šã¤ã¶ã•ãªã„ã€‚å‘¼å‡ºå…ƒãŒãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯ã™ã‚‹ã€‚
-        try { if (Test-Path -LiteralPath ($target + '.staging')) { Remove-Item -LiteralPath ($target + '.staging') -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
-        throw ("æœ€çµ‚PDFã®ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ã«å¤±æ•—ã—ã¾ã—ãŸ: " + $_.Exception.Message)
-    }
-}
-
-function Remove-FinalArchiveArtifacts([string]$Language, [string]$Category, [string]$Volume, [string]$BuildId) {
-    # ãƒ­ãƒ¼ãƒ«ãƒãƒƒã‚¯æ™‚ã«ã€éƒ¨åˆ†çš„ã«ã§ããŸã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ã¨ pin ã‚’æŽƒé™¤ã™ã‚‹ã€‚
-    try {
-        $target = Join-Path (Join-Path (Join-Path (Get-ArchiveRoot $Language) $Category) $Volume) $BuildId
-        foreach ($path in @($target, ($target + '.staging'))) {
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
-        }
-        $root = Get-InputHistoryRoot $Language
-        if (Test-Path -LiteralPath $root) {
-            foreach ($wbDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-                foreach ($snDir in @(Get-ChildItem -LiteralPath $wbDir.FullName -Directory -ErrorAction SilentlyContinue)) {
-                    Remove-SnapshotPin $Language $wbDir.Name $snDir.Name ("final-pdf_{0}" -f $BuildId)
-                }
-            }
-        }
-        $cpRoot = Join-Path (Get-WorkspacePath $Language) 'content-pdf'
-        if (Test-Path -LiteralPath $cpRoot) {
-            foreach ($f in @(Get-ChildItem -LiteralPath $cpRoot -Recurse -File -Filter ("final-pdf_{0}.json" -f $BuildId) -ErrorAction SilentlyContinue)) {
-                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-            }
-        }
-    } catch { }
-}
-
-function Get-FinalArchives([string]$Language, [string]$Category) {
-    $root = Join-Path (Get-ArchiveRoot $Language) $Category
-    if (-not (Test-Path -LiteralPath $root)) { return @() }
-    $out = @()
-    foreach ($volDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-        foreach ($b in @(Get-ChildItem -LiteralPath $volDir.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 50)) {
-            try {
-                $meta = Read-JsonFile (Join-Path $b.FullName 'metadata.json') $null
-                if ($null -eq $meta) { continue }
-                $out += [ordered]@{
-                    buildId = [string](Get-DataProperty $meta 'buildId' $b.Name)
-                    volume = [string]$volDir.Name
-                    builtAt = [string](Get-DataProperty $meta 'builtAt' '')
-                    pageCount = [int](Get-DataProperty $meta 'pageCount' 0)
-                    outputFileName = [string](Get-DataProperty $meta 'outputFileName' '')
-                    outputPdfSha256 = [string](Get-DataProperty $meta 'outputPdfSha256' '')
-                    builtBy = (Get-DataProperty $meta 'builtBy' $null)
-                    path = [string]$b.FullName
-                }
-            } catch { }
-        }
-    }
-    return @($out | Sort-Object { [string]$_.builtAt } -Descending)
-}
-
-
-# ---- æ­£å¼å‡ºåŠ›ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³ (V5-Â§7.2) ----------------------------
-
-function Write-FinalJournal([string]$Language, $Journal) {
-    $dir = Get-FinalTransactionDir $Language
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Set-NoteProperty $Journal 'updatedAt' (New-NowIso)
-    Write-JsonFile (Join-Path $dir ("{0}.json" -f [string]$Journal.transactionId)) $Journal
-}
-function Set-JournalPhase([string]$Language, $Journal, [string]$Phase) {
-    # V5-Â§7.2: phase ã¯ãã®å‰¯ä½œç”¨ã‚’ã€Œå§‹ã‚ã‚‹å‰ã€ã«æ›¸ãã€‚å¾Œã§æ›¸ãã¨å¾©æ—§ã§ããªã„çª“ãŒæ®‹ã‚‹ã€‚
-    Set-NoteProperty $Journal 'phase' $Phase
-    Write-FinalJournal $Language $Journal
-}
-function Get-JournalTarget($Journal, [string]$Volume) {
-    foreach ($t in @(Get-Array $Journal.targets)) { if ([string]$t.volume -eq $Volume) { return $t } }
-    return $null
-}
-
-function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [string[]]$Volumes) {
-    # å˜ä½“å‡ºåŠ›ã‚‚ã¾ã¨ã‚ã¦å‡ºåŠ›ã‚‚ã€å¿…ãšã“ã®1æœ¬ã‚’é€šã‚‹(å˜ä½“ã ã‘éšœå®³å¾©æ—§ãŒç„¡ã„çŠ¶æ…‹ã‚’ä½œã‚‰ãªã„)ã€‚
-    $cat = Require-WorkbookCategory $Category
-    $paths = Get-Paths
-    $workspace = Get-WorkspacePath $Language
-    try { [void](Scan-Updates $Language $null $false) } catch { }
-
-    $allowed = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
-    $requested = @($Volumes | Where-Object { $allowed -contains $_ })
-    if ($requested.Count -eq 0) { throw [System.ArgumentException]::new('volumeã«ã¯æœ¬ä½“ã¾ãŸã¯è£œè¶³ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚') }
-
-    # V5-Â§7.2: å¯¾è±¡ã¯ pageCount > 0 ã® volume ã®ã¿ã€‚
-    # Get-FinalBuildInputSnapshot ã¯ 0ãƒšãƒ¼ã‚¸ã‚’ no-pages blocker ã«ã™ã‚‹ãŸã‚ã€
-    # è£œè¶³ãŒç©ºã®æ¡ˆä»¶ã§ã€Œã¾ã¨ã‚ã¦å‡ºåŠ›ã€ãŒå¸¸ã«å¤±æ•—ã—ã¦ã—ã¾ã†ã€‚
-    $lockPath = Join-Path $workspace ("locks\final-build_{0}.lock" -f $cat)
-    return Invoke-WithLock $lockPath {
-        $snapshots = @{}
-        $targets = @()
-        $skipped = @()
-        foreach ($v in $requested) {
-            $snap = Update-StructureLocked $Language {
-                param($st)
-                Apply-DefaultNumberingPerVolume $Language $st $cat
-                $sn = Get-FinalBuildInputSnapshot $st $Language $v $cat
-                # V5-P0: ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ç”¨ã®æƒ…å ±ã¯ã“ã®æ™‚ç‚¹ã§å›ºå®šã™ã‚‹(å¾Œã§ structure ã‚’èª­ã¿ç›´ã•ãªã„)ã€‚
-                $seen = @{}
-                $sw = @()
-                foreach ($pg in @(Get-Array (Get-DataProperty $sn 'pages' @()))) {
-                    $wid = [string]$pg.workbookId
-                    if ([string]::IsNullOrWhiteSpace($wid) -or $seen.ContainsKey($wid)) { continue }
-                    $seen[$wid] = $true
-                    $w = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $wid } | Select-Object -First 1)
-                    if ($w.Count -eq 0) { continue }
-                    $sw += [ordered]@{
-                        workbookId = $wid
-                        fileName = [string]$w[0].fileName
-                        snapshotId = [string](Get-DataProperty $w[0] 'lastRenderedSnapshotId' '')
-                        versionId = [string](Get-DataProperty $w[0] 'lastRenderedVersionId' '')
-                        sourceHash = Normalize-FileHash ([string](Get-DataProperty $w[0] 'lastRenderedExcelHash' ''))
-                        renderEnvironmentFingerprint = [string](Get-DataProperty $w[0] 'renderEnvironmentFingerprint' '')
-                        renderEnvironment = (Get-DataProperty $w[0] 'renderEnvironment' $null)
-                    }
-                }
-                Set-NoteProperty $sn 'sourceWorkbooks' @($sw)
-                return $sn
-            }
-            if ([int]$snap.pageCount -le 0) { $skipped += $v; continue }
-            $blockers = @(Get-Array $snap.blockers | Where-Object { [string]$_.code -ne 'no-pages' })
-            if ($blockers.Count -gt 0) { throw [InvalidOperationException]::new(("{0}ï¼š{1}" -f (Get-VolumeLabelForMessage $v), [string]$blockers[0].message)) }
-            $snapshots[$v] = $snap
-            $targets += $v
-        }
-        if ($targets.Count -eq 0) { return [ordered]@{ built = @(); skipped = @($skipped); message = 'å‡ºåŠ›å¯¾è±¡ãŒã‚ã‚Šã¾ã›ã‚“ã€‚' } }
-
-        $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
-        $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-        if (-not (Test-Path $composerJar)) { throw 'ReportPdfComposer.jar ãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-        if (-not (Test-Path $pdfboxJar)) { throw 'pdfbox-app.jar ãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-
-        $txId = New-RbId
-        $journal = [ordered]@{
-            schemaVersion = 1; transactionId = $txId; language = $Language; category = $cat
-            startedAt = New-NowIso; phase = 'prepared'
-            targets = @($targets | ForEach-Object { [ordered]@{ volume = $_; buildId = (New-RbId); backupCreated = $false; fileReplaced = $false; oldPdfHash = ''; newPdfHash = ''; existed = $false; finalPath = ''; backupPath = ''; tempPath = '' } })
-            beforeFingerprints = [ordered]@{}
-            oldVolumeStates = [ordered]@{}
-            newVolumeStates = [ordered]@{}
-        }
-        foreach ($v in $targets) { $journal.beforeFingerprints[$v] = [string]$snapshots[$v].fingerprint }
-        Write-FinalJournal $Language $journal
-
-        $backupDir = Join-Path $workspace ("state\final-backups\" + $txId)
-        try {
-            # 5. å‡ºåŠ›å…ˆPDFãŒé–‹ã‹ã‚Œã¦ã„ãªã„ã‹ã‚’ã€å¯¾è±¡ã™ã¹ã¦ã¾ã¨ã‚ã¦ç¢ºèª
-            foreach ($v in $targets) {
-                $t = Get-JournalTarget $journal $v
-                $outName = Get-OutputFileName $v ([string]$snapshots[$v].projectId) $Category
-                $outPath = Join-Path ([string]$paths.outputDir) $outName
-                Set-NoteProperty $t 'finalPath' $outPath
-                Set-NoteProperty $t 'existed' ([bool](Test-Path -LiteralPath $outPath))
-                if (Test-Path -LiteralPath $outPath) {
-                    $f = $null
-                    try { $f = [IO.File]::Open($outPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-                    catch { throw "å‡ºåŠ›å…ˆã®æœ€çµ‚PDFãŒé–‹ã‹ã‚Œã¦ã„ã‚‹ãŸã‚ä¸Šæ›¸ãã§ãã¾ã›ã‚“: $outName" }
-                    finally { if ($f) { $f.Dispose() } }
-                }
-            }
-            Write-FinalJournal $Language $journal
-
-            # 7-8. ä¸€æ™‚ãƒ•ã‚¡ã‚¤ãƒ«ã¸çµ„ç‰ˆ
-            foreach ($v in $targets) {
-                $t = Get-JournalTarget $journal $v
-                $tmp = Join-Path ([string]$paths.outputDir) ("~building_{0}_{1}_{2}.pdf" -f $v, $cat, $txId)
-                if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-                Set-NoteProperty $t 'tempPath' $tmp
-                $snap = $snapshots[$v]
-                $manifest = [ordered]@{ schemaVersion=2; language=$Language; category=$cat; volume=$v; projectId=[string]$snap.projectId; inputFingerprint=[string]$snap.fingerprint; outputPdf=$tmp; createdAt=New-NowIso; pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true}; pages=$snap.manifestPages }
-                $manifestPath = Join-Path $workspace ("exports\manifest_{0}_{1}.json" -f $v, $cat)
-                Write-JsonFile $manifestPath $manifest
-                $java = Resolve-JavaExe
-                $run = Invoke-NativeCapture $java @('-cp', "$composerJar;$pdfboxJar", 'ReportPdfComposer', '--manifest', $manifestPath)
-                $exit = [int]$run.exitCode
-                $text = [string]$run.text
-                if ($exit -ne 0) { throw "PDFBoxçµ„ç‰ˆã«å¤±æ•—ã—ã¾ã—ãŸã€‚exit=$exit`n$text" }
-                if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -le 0) { throw 'æœ€çµ‚PDFã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-                Set-NoteProperty $t 'newPdfHash' (Normalize-FileHash (New-Sha256 $tmp))
-                Set-NoteProperty $t 'manifest' $manifest
-            }
-            Write-FinalJournal $Language $journal
-
-            # 9. fingerprint å†ç¢ºèª
-            foreach ($v in $targets) {
-                $after = Update-StructureLocked $Language { param($st) return Get-FinalBuildInputSnapshot $st $Language $v $cat }
-                if ([string]$after.fingerprint -ne [string]$journal.beforeFingerprints[$v]) {
-                    throw 'PDFä½œæˆä¸­ã«ãƒšãƒ¼ã‚¸æ§‹æˆã¾ãŸã¯PDFå…¥åŠ›ãŒå¤‰æ›´ã•ã‚Œã¾ã—ãŸã€‚æœ€æ–°ã®çŠ¶æ…‹ã§å†åº¦å‡ºåŠ›ã—ã¦ãã ã•ã„ã€‚'
-                }
-            }
-
-            # 10. ãƒãƒƒã‚¯ã‚¢ãƒƒãƒ—
-            Set-JournalPhase $Language $journal 'backups-created'
-            if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
-            foreach ($v in $targets) {
-                $t = Get-JournalTarget $journal $v
-                if ([bool]$t.existed) {
-                    $bak = Join-Path $backupDir ("{0}.pdf" -f $v)
-                    Copy-Item -LiteralPath ([string]$t.finalPath) -Destination $bak -Force
-                    Set-NoteProperty $t 'backupPath' $bak
-                    Set-NoteProperty $t 'oldPdfHash' (Normalize-FileHash (New-Sha256 $bak))
-                }
-                Set-NoteProperty $t 'backupCreated' $true
-                Write-FinalJournal $Language $journal
-            }
-
-            # 11. å·®ã—æ›¿ãˆ
-            Set-JournalPhase $Language $journal 'replacing-files'
-            foreach ($v in $targets) {
-                $t = Get-JournalTarget $journal $v
-                Move-Item -LiteralPath ([string]$t.tempPath) -Destination ([string]$t.finalPath) -Force
-                Set-NoteProperty $t 'fileReplaced' $true
-                Write-FinalJournal $Language $journal
-            }
-            Set-JournalPhase $Language $journal 'files-replaced'
-
-            # 12. structure æ›´æ–°(ãƒ­ãƒƒã‚¯å†…ã§ fingerprint å†ç¢ºèªã€old/new ã‚’å…ˆã«æ›¸ãçµ‚ãˆã‚‹)
-            Set-JournalPhase $Language $journal 'structure-committing'
-            $commit = Update-StructureLocked $Language {
-                param($st)
-                foreach ($v in $targets) {
-                    $after = Get-FinalBuildInputSnapshot $st $Language $v $cat
-                    if ([string]$after.fingerprint -ne [string]$journal.beforeFingerprints[$v]) { return [ordered]@{ changed = $true; volume = $v } }
-                }
-                foreach ($v in $targets) {
-                    $key = Get-VolumeStateKey $v $cat
-                    $old = Get-DataProperty $st.volumes $key $null
-                    $journal.oldVolumeStates[$v] = $(if ($null -eq $old) { $null } else { [ordered]@{
-                        builtFingerprint = [string](Get-DataProperty $old 'builtFingerprint' '')
-                        status = [string](Get-DataProperty $old 'status' '')
-                        outputPdf = [string](Get-DataProperty $old 'outputPdf' '')
-                        lastBuiltAt = [string](Get-DataProperty $old 'lastBuiltAt' '')
-                        staleReasons = @(Get-Array (Get-DataProperty $old 'staleReasons' @()))
-                    } })
-                    $t = Get-JournalTarget $journal $v
-                    $journal.newVolumeStates[$v] = [ordered]@{
-                        builtFingerprint = [string]$journal.beforeFingerprints[$v]
-                        status = 'built'; outputPdf = [string]$t.finalPath; lastBuiltAt = New-NowIso; staleReasons = @()
-                    }
-                }
-                Write-FinalJournal $Language $journal
-                foreach ($v in $targets) {
-                    $key = Get-VolumeStateKey $v $cat
-                    $vs = Get-DataProperty $st.volumes $key $null
-                    if ($null -eq $vs) { $vs = New-EmptyVolumeState; Set-NoteProperty $st.volumes $key $vs }
-                    $n = $journal.newVolumeStates[$v]
-                    Set-NoteProperty $vs 'builtFingerprint' ([string]$n.builtFingerprint)
-                    Set-NoteProperty $vs 'lastBuiltAt' ([string]$n.lastBuiltAt)
-                    Set-NoteProperty $vs 'outputPdf' ([string]$n.outputPdf)
-                    Set-NoteProperty $vs 'staleReasons' @()
-                    $ready = Get-FinalBuildReadiness $st $Language $v $cat
-                    if ($ready.blockers.Count -gt 0) {
-                        Set-NoteProperty $vs 'status' 'needs-rebuild'
-                        Add-StaleReason $vs 'excel-updated' 'å…ƒExcelãŒæ›´æ–°ã•ã‚ŒãŸãŸã‚ã€PDFã‚’å†ä½œæˆå¾Œã«æœ€çµ‚PDFã‚’å†å‡ºåŠ›ã—ã¦ãã ã•ã„'
-                    } else { Set-NoteProperty $vs 'status' 'built' }
-                }
-                return [ordered]@{ changed = $false }
-            }
-            if ([bool]$commit.changed) { throw 'PDFä½œæˆä¸­ã«ãƒšãƒ¼ã‚¸æ§‹æˆã¾ãŸã¯PDFå…¥åŠ›ãŒå¤‰æ›´ã•ã‚Œã¾ã—ãŸã€‚æœ€æ–°ã®çŠ¶æ…‹ã§å†åº¦å‡ºåŠ›ã—ã¦ãã ã•ã„ã€‚' }
-            Set-JournalPhase $Language $journal 'structure-committed'
-
-            # 13. ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–ã¨ pin(å†ªç­‰)
-            Set-JournalPhase $Language $journal 'archiving'
-            $built = @()
-            foreach ($v in $targets) {
-                $t = Get-JournalTarget $journal $v
-                $archive = New-FinalArchive $Language $cat $v ([string]$t.buildId) ([string]$t.finalPath) (Get-DataProperty $t 'manifest' $null) $snapshots[$v]
-                Save-LayoutSnapshot $Language $cat 'final-build' | Out-Null
-                Write-HistoryEvent $Language 'final.built' ([ordered]@{ category = $cat; volume = $v; buildId = [string]$t.buildId; outputPdf = [string]$t.finalPath })
-                $built += [ordered]@{ volume = $v; category = $cat; outputPdf = [string]$t.finalPath; buildId = [string]$t.buildId; archivePath = $archive; inputFingerprint = [string]$journal.beforeFingerprints[$v] }
-            }
-            Set-JournalPhase $Language $journal 'completed'
-            if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue }
-            return [ordered]@{ built = @($built); skipped = @($skipped); transactionId = $txId }
-        } catch {
-            foreach ($t in @(Get-Array $journal.targets)) { Remove-FinalArchiveArtifacts $Language $cat ([string]$t.volume) ([string]$t.buildId) }
-            Restore-FinalTransaction $Language $journal
-            Write-HistoryEvent $Language 'final.build.failed' ([ordered]@{ category = $cat; transactionId = $txId; message = $_.Exception.Message })
-            throw
-        }
-    }
-}
-
-function Restore-FinalTransaction([string]$Language, $Journal) {
-    # V5-Â§B-1: å¾©æ—§åˆ¤å®šã¯ãƒ•ãƒ©ã‚°ã§ã¯ãªãå®Ÿãƒ•ã‚¡ã‚¤ãƒ«ã®ãƒãƒƒã‚·ãƒ¥ã‚’æ­£ã¨ã™ã‚‹ã€‚
-    # fileReplaced=true ã‚’æ›¸ãå‰ã«è½ã¡ã‚‹çª“ãŒã‚ã‚‹ãŸã‚ã€‚
-    try {
-        $phase = [string](Get-DataProperty $Journal 'phase' '')
-        foreach ($t in @(Get-Array $Journal.targets)) {
-            $final = [string](Get-DataProperty $t 'finalPath' '')
-            if ([string]::IsNullOrWhiteSpace($final)) { continue }
-            $tmp = [string](Get-DataProperty $t 'tempPath' '')
-            if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-            $newHash = Normalize-FileHash ([string](Get-DataProperty $t 'newPdfHash' ''))
-            $oldHash = Normalize-FileHash ([string](Get-DataProperty $t 'oldPdfHash' ''))
-            $existed = [bool](Get-DataProperty $t 'existed' $false)
-            $backup = [string](Get-DataProperty $t 'backupPath' '')
-            $current = ''
-            if (Test-Path -LiteralPath $final) { $current = Normalize-FileHash (New-Sha256 $final) }
-
-            if ([string]::IsNullOrWhiteSpace($current)) {
-                if (-not $existed) { continue }            # å…ƒã‹ã‚‰ç„¡ãã€ä»Šã‚‚ç„¡ã„
-                if ($backup -and (Test-Path -LiteralPath $backup)) { Copy-Item -LiteralPath $backup -Destination $final -Force }
-                continue
-            }
-            if ($newHash -and $current -eq $newHash) {
-                if (-not $existed) { Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue }
-                elseif ($backup -and (Test-Path -LiteralPath $backup)) { Copy-Item -LiteralPath $backup -Destination $final -Force }
-                continue
-            }
-            if ($oldHash -and $current -eq $oldHash) { continue }   # æœªå·®ã—æ›¿ãˆ
-            # ã©ã‚Œã¨ã‚‚ä¸€è‡´ã—ãªã„: è‡ªå‹•ã§ä¸Šæ›¸ãã—ãªã„ã€‚
-            Set-NoteProperty $Journal 'phase' 'manual-recovery-required'
-            Set-NoteProperty $Journal 'manualRecoveryReason' ("å‡ºåŠ›å…ˆPDFãŒè¨˜éŒ²ã•ã‚ŒãŸã©ã®çŠ¶æ…‹ã¨ã‚‚ä¸€è‡´ã—ã¾ã›ã‚“: " + $final)
-            Write-FinalJournal $Language $Journal
-            return
-        }
-        # structure ã®å·»ãæˆ»ã—(å¯¾è±¡volumeã®é …ç›®ã ã‘)
-        if (@('structure-committing','structure-committed','archiving') -contains $phase) {
-            $olds = Get-DataProperty $Journal 'oldVolumeStates' $null
-            $news = Get-DataProperty $Journal 'newVolumeStates' $null
-            if ($null -ne $olds) {
-                $cat = [string](Get-DataProperty $Journal 'category' '')
-                Update-StructureLocked $Language {
-                    param($st)
-                    foreach ($t in @(Get-Array $Journal.targets)) {
-                        $v = [string]$t.volume
-                        $key = Get-VolumeStateKey $v $cat
-                        $vs = Get-DataProperty $st.volumes $key $null
-                        if ($null -eq $vs) { continue }
-                        $newState = Get-DataProperty $news $v $null
-                        if ($null -ne $newState -and [string](Get-DataProperty $vs 'builtFingerprint' '') -ne [string](Get-DataProperty $newState 'builtFingerprint' '')) { continue }
-                        $oldState = Get-DataProperty $olds $v $null
-                        if ($null -eq $oldState) { continue }
-                        Set-NoteProperty $vs 'builtFingerprint' ([string](Get-DataProperty $oldState 'builtFingerprint' ''))
-                        Set-NoteProperty $vs 'status' ([string](Get-DataProperty $oldState 'status' 'not-built'))
-                        Set-NoteProperty $vs 'outputPdf' ([string](Get-DataProperty $oldState 'outputPdf' ''))
-                        Set-NoteProperty $vs 'lastBuiltAt' ([string](Get-DataProperty $oldState 'lastBuiltAt' ''))
-                        Set-NoteProperty $vs 'staleReasons' @(Get-Array (Get-DataProperty $oldState 'staleReasons' @()))
-                    }
-                } | Out-Null
-            }
-        }
-        Set-NoteProperty $Journal 'phase' 'rolled-back'
-        Write-FinalJournal $Language $Journal
-        # å·»ãæˆ»ã—ã«ä½¿ã„çµ‚ãˆãŸæ—§PDFãƒãƒƒã‚¯ã‚¢ãƒƒãƒ—ã‚’æ®‹ã•ãªã„ã€‚
-        Remove-FinalTransactionBackupDir $Language ([string](Get-DataProperty $Journal 'transactionId' ''))
-    } catch { }
-}
-
-function Recover-FinalTransactions([string]$Language) {
-    # V5: èµ·å‹•æ™‚å¾©æ—§ã‚‚ final-build ãƒ­ãƒƒã‚¯ã‚’å–ã‚‹(è¤‡æ•°ã‚µãƒ¼ãƒãƒ¼ãŒåŒã˜å¾©æ—§ã‚’èµ°ã‚‰ã›ãªã„)ã€‚
-    try {
-        $dir = Get-FinalTransactionDir $Language
-        if (-not (Test-Path -LiteralPath $dir)) { return }
-        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
-            $j = Read-JsonFile $f.FullName $null
-            if ($null -eq $j) { continue }
-            $phase = [string](Get-DataProperty $j 'phase' '')
-            if (@('completed','rolled-back') -contains $phase) {
-                # å®Œäº†æ¸ˆã¿/å·»ãæˆ»ã—æ¸ˆã¿ã§ã¯ãƒãƒƒã‚¯ã‚¢ãƒƒãƒ—ã¯ä¸è¦ã€‚å‰å›žå‰Šé™¤ã«å¤±æ•—ã—ã¦ã„ã¦ã‚‚èµ·å‹•æ™‚ã«å†è©¦è¡Œã™ã‚‹ã€‚
-                # ã‚¸ãƒ£ãƒ¼ãƒŠãƒ«æœ¬ä½“ã¯30æ—¥æ®‹ã—ã€manual-recovery-required ã¯æ‹…å½“è€…ãŒç¢ºèªã™ã‚‹ã¾ã§æ®‹ã™ã€‚
-                try {
-                    Remove-FinalTransactionBackupDir $Language ([string](Get-DataProperty $j 'transactionId' $f.BaseName))
-                    if ($f.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddDays(-30)) {
-                        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
-                    }
-                } catch { }
-                continue
-            }
-            if ($phase -eq 'manual-recovery-required') { continue }
-            $cat = [string](Get-DataProperty $j 'category' '')
-            $lockPath = Join-Path (Get-WorkspacePath $Language) ("locks\final-build_{0}.lock" -f $cat)
-            $h = Try-AcquireLockHandle $lockPath
-            if ($null -eq $h) { continue }
-            try {
-                # V5-P1(#8): é€šå¸¸ã®å¤±æ•—çµŒè·¯(Invoke-FinalBuildTransaction ã® catch)ã¨åŒã˜ãã€
-                # èµ·å‹•æ™‚å¾©æ—§ã§ã‚‚éƒ¨åˆ†çš„ã«ã§ããŸã‚¢ãƒ¼ã‚«ã‚¤ãƒ–/pin ã‚’æŽƒé™¤ã—ã¦ã‹ã‚‰å·»ãæˆ»ã™ã€‚
-                # archiving ä¸­ã«å¼·åˆ¶çµ‚äº†ã™ã‚‹ã¨ã€ä¸€éƒ¨ã®å·»ã ã‘ã‚¢ãƒ¼ã‚«ã‚¤ãƒ–/pin ãŒæ®‹ã‚Šã€structure ã ã‘å·»ãæˆ»ã‚‹ã€‚
-                foreach ($t in @(Get-Array $j.targets)) { Remove-FinalArchiveArtifacts $Language $cat ([string]$t.volume) ([string]$t.buildId) }
-                Restore-FinalTransaction $Language $j
-            } finally { Release-LockHandle $h }
-        }
-    } catch { }
-}
-
-function Get-VolumeLabelForMessage([string]$Volume) {
-    switch ($Volume) {
-        'ja-main' { return 'æœ¬ä½“' } 'ja-appendix' { return 'è£œè¶³' }
-        'en-main' { return 'Main' } 'en-appendix' { return 'Appendix' }
-        default { return $Volume }
-    }
-}
-
-
-# ---- API è£œåŠ© (V5) --------------------------------------------------
-
-function Get-HistoryTimeline([string]$Language, [int]$Limit) {
-    try {
-        $dir = Join-Path (Get-WorkspacePath $Language) 'history\events'
-        if (-not (Test-Path -LiteralPath $dir)) { return @() }
-        $out = @()
-        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First $Limit)) {
-            try {
-                $j = Read-JsonFile $f.FullName $null
-                if ($null -ne $j) { $out += $j }
-            } catch { }
-        }
-        return $out
-    } catch { return @() }
-}
-
-
-function Resolve-ContentPdfSheetPathExact([string]$Language, [string]$WorkbookId, [string]$VersionId, [string]$SheetName) {
-    if ([string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
-    $workspace = Get-WorkspacePath $Language
-    $dir = Get-ContentPdfVersionDir $workspace $WorkbookId (Assert-SafeStorageSegment $VersionId 'versionId')
-    if (-not (Test-Path -LiteralPath $dir)) { return '' }
-    $safeName = [regex]::Replace($SheetName, '[^0-9A-Za-z]+', '-')
-    foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.pdf' -ErrorAction SilentlyContinue)) {
-        if ([string]::Equals([string]$file.BaseName, $SheetName, [StringComparison]::OrdinalIgnoreCase) -or
-            [string]::Equals([string]$file.BaseName, $safeName, [StringComparison]::OrdinalIgnoreCase)) {
-            $full = [IO.Path]::GetFullPath($file.FullName)
-            $root = [IO.Path]::GetFullPath($workspace)
-            if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
-            if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $full }
-        }
-    }
-    return ''
-}
-
-function Get-HistoryRenderVersionAvailability([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
-    $result = [ordered]@{
-        versionId = [string]$VersionId
-        visualHashAvailable = $false
-        contentPdfAvailable = $false
-        ready = $false
-        missingSheets = @()
-        reason = ''
-    }
-    $hashes = Get-VisualHashes $Language $WorkbookId $SnapshotId $VersionId
-    if ($null -eq $hashes) {
-        $result.reason = 'ç”»åƒãƒãƒƒã‚·ãƒ¥ãŒä¿å­˜ã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚'
-        return [pscustomobject]$result
-    }
-    $result.visualHashAvailable = $true
-    $sheets = @(Get-Array (Get-DataProperty $hashes 'sheets' @()))
-    if ($sheets.Count -eq 0) {
-        $result.reason = 'æ¯”è¼ƒå¯¾è±¡ã‚·ãƒ¼ãƒˆã®ç”»åƒãƒãƒƒã‚·ãƒ¥ãŒã‚ã‚Šã¾ã›ã‚“ã€‚'
-        return [pscustomobject]$result
-    }
-    $missing = @()
-    foreach ($sheet in $sheets) {
-        $name = [string](Get-DataProperty $sheet 'sheetName' '')
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $missing += '[sheetName missing]'
-            continue
-        }
-        if ([string]::IsNullOrWhiteSpace((Resolve-ContentPdfSheetPathExact $Language $WorkbookId $VersionId $name))) { $missing += $name }
-    }
-    $result.missingSheets = @($missing)
-    $result.contentPdfAvailable = ($missing.Count -eq 0)
-    $result.ready = ([bool]$result.visualHashAvailable -and [bool]$result.contentPdfAvailable)
-    if (-not [bool]$result.ready) {
-        $result.reason = $(if ($missing.Count -gt 0) { 'åŒã˜ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ä¸–ä»£ã®content PDFãŒä¸è¶³ã—ã¦ã„ã¾ã™ã€‚' } else { 'content PDFãŒä¿å­˜ã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' })
-    }
-    return [pscustomobject]$result
-}
-
-
-function Get-SnapshotSummaries([string]$Language, [string]$WorkbookId) {
-    if ([string]::IsNullOrWhiteSpace($WorkbookId)) { return @() }
-    $out = @()
-    foreach ($id in (Get-SnapshotIds $Language $WorkbookId)) {
-        $m = Get-SnapshotManifest $Language $WorkbookId $id
-        if ($null -eq $m) { continue }
-        $state = Get-SnapshotSourceState $Language $WorkbookId $id
-        $versions = @(Get-RenderVersionIds $Language $WorkbookId $id)
-        $preferred = ''
-        $visualAvailable = $false
-        $contentAvailable = $false
-        $reason = 'PDFä½œæˆæ¸ˆã¿ã®æ¯”è¼ƒå¯èƒ½ãªç‰ˆãŒã‚ã‚Šã¾ã›ã‚“ã€‚'
-        foreach ($versionId in @($versions | Sort-Object -Descending)) {
-            $availability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $id ([string]$versionId)
-            if ([bool]$availability.visualHashAvailable) { $visualAvailable = $true }
-            if ([bool]$availability.contentPdfAvailable) { $contentAvailable = $true }
-            if ([string]::IsNullOrWhiteSpace($preferred) -and [bool]$availability.ready) {
-                $preferred = [string]$versionId
-                $reason = ''
-            } elseif ([string]::IsNullOrWhiteSpace($preferred) -and -not [string]::IsNullOrWhiteSpace([string]$availability.reason)) {
-                $reason = [string]$availability.reason
-            }
-        }
-        $out += [ordered]@{
-            snapshotId = $id
-            detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
-            captureReason = [string](Get-DataProperty $m 'captureReason' '')
-            sourceHash = [string](Get-DataProperty $m 'sourceHash' '')
-            sourceRetained = [bool]$state.sourceRetained
-            pins = @(Get-SnapshotPins $Language $WorkbookId $id)
-            renderVersionIds = @($versions)
-            visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
-            preferredVersionId = $preferred
-            visualHashAvailable = $visualAvailable
-            contentPdfAvailable = $contentAvailable
-            unavailableReason = $reason
-        }
-    }
-    return @($out | Sort-Object { [string]$_.snapshotId } -Descending)
-}
-
-
-function Get-StoredComparison(
-    [string]$Language,
-    [string]$WorkbookId,
-    [string]$FromSnapshotId,
-    [string]$ToSnapshotId,
-    [string]$FromVersionId = '',
-    [string]$ToVersionId = '',
-    [string]$Scope = 'history'
-) {
-    if ([string]::IsNullOrWhiteSpace($WorkbookId) -or [string]::IsNullOrWhiteSpace($FromSnapshotId) -or [string]::IsNullOrWhiteSpace($ToSnapshotId)) { return $null }
-    $versions = if (-not [string]::IsNullOrWhiteSpace($ToVersionId)) { @($ToVersionId) } else { @(Get-RenderVersionIds $Language $WorkbookId $ToSnapshotId) }
-    foreach ($ver in $versions) {
-        $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $ToSnapshotId ([string]$ver)) 'comparisons'
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
-            try {
-                $candidate = Read-JsonFile $f.FullName $null
-                if ($null -eq $candidate) { continue }
-                if ([string](Get-DataProperty $candidate 'scope' '') -ne $Scope) { continue }
-                if ([string](Get-DataProperty $candidate 'baselineSnapshotId' '') -ne $FromSnapshotId) { continue }
-                if ([string](Get-DataProperty $candidate 'currentSnapshotId' '') -ne $ToSnapshotId) { continue }
-                if (-not [string]::IsNullOrWhiteSpace($FromVersionId) -and
-                    [string](Get-DataProperty $candidate 'baselineVersionId' '') -ne $FromVersionId) { continue }
-                if (-not [string]::IsNullOrWhiteSpace($ToVersionId) -and
-                    [string](Get-DataProperty $candidate 'currentVersionId' '') -ne $ToVersionId) { continue }
-                return $candidate
-            } catch { }
-        }
-    }
-    return $null
-}
-
-function Serve-HistoryContentPdf($Context, [string]$Language, [string]$WorkbookId, [string]$VersionId, [string]$SheetName, [string]$SnapshotId = '') {
-    if ([string]::IsNullOrWhiteSpace($WorkbookId) -or [string]::IsNullOrWhiteSpace($SheetName)) {
-        throw 'workbookId / sheetName ãŒå¿…è¦ã§ã™ã€‚'
-    }
-    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-    $safeSnapshotId = ''
-    if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) { $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId' }
-    if ([string]::IsNullOrWhiteSpace($VersionId)) {
-        if ([string]::IsNullOrWhiteSpace($safeSnapshotId)) { throw 'versionId ã¾ãŸã¯ snapshotId ãŒå¿…è¦ã§ã™ã€‚' }
-        $VersionId = Get-PreferredHistoryRenderVersion $Language $safeWorkbookId $safeSnapshotId
-        if ([string]::IsNullOrWhiteSpace($VersionId)) { throw 'æŒ‡å®šã—ãŸæ¤œçŸ¥ç‰ˆã®PDFã¯ä¿æŒã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' }
-    }
-    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
-    if (-not [string]::IsNullOrWhiteSpace($safeSnapshotId) -and
-        @(Get-RenderVersionIds $Language $safeWorkbookId $safeSnapshotId) -notcontains $safeVersionId) {
-        throw 'æŒ‡å®šã—ãŸPDFä¸–ä»£ã¯ã€ã“ã®å±¥æ­´ç‰ˆã«å±žã—ã¦ã„ã¾ã›ã‚“ã€‚'
-    }
-    $full = Resolve-ContentPdfSheetPathExact $Language $safeWorkbookId $safeVersionId $SheetName
-    if ([string]::IsNullOrWhiteSpace($full)) { throw 'æŒ‡å®šã—ãŸä¸–ä»£ã®PDFãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
-}
-
-function Get-AutoStateSummary([string]$Language) {
-    $settings = Get-AutoRenderSettings
-    $policy = Get-WorkspacePolicy
-    $items = @()
-    try {
-        $dir = Get-AutoStateDir $Language
-        if (Test-Path -LiteralPath $dir) {
-            foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
-                $j = Read-JsonFile $f.FullName $null
-                if ($null -eq $j) { continue }
-                if ([string](Get-DataProperty $j 'state' '') -eq 'idle') { continue }
-                $items += [ordered]@{
-                    workbookId = [string](Get-DataProperty $j 'workbookId' $f.BaseName)
-                    state = [string](Get-DataProperty $j 'state' '')
-                    deferReason = [string](Get-DataProperty $j 'deferReason' '')
-                    quietDeadline = [string](Get-DataProperty $j 'quietDeadline' '')
-                    firstDetectedAt = [string](Get-DataProperty $j 'firstDetectedAt' '')
-                    ownerPcName = [string](Get-DataProperty $j 'ownerPcName' '')
-                }
-            }
-        }
-    } catch { }
-    return [ordered]@{
-        enabled = [bool]$settings.enabled
-        inputHistoryApproved = [bool](Get-DataProperty $policy 'inputHistoryApproved' $false)
-        sourceRetentionApproved = [bool](Test-SourceRetentionEnabled)
-        quietPeriodSeconds = [int]$settings.quietPeriodSeconds
-        schedulerRunning = (Test-AutoSchedulerProcessRunning)
-        historySizeMb = (Get-InputHistorySizeMb $Language)
-        softCapMegabytes = [int](Get-InputHistorySettings).softCapMegabytes
-        items = @($items)
-    }
-}
-
-function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
-    # å»¶æœŸä¸­ã®ãƒ–ãƒƒã‚¯ã‚’å³æ™‚å®Ÿè¡Œã™ã‚‹ã€‚ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼å­ãƒ—ãƒ­ã‚»ã‚¹ãŒæ¬¡ã® tick ã§æ‹¾ã†ã€‚
-    if ([string]::IsNullOrWhiteSpace($WorkbookId)) { throw 'workbookId ãŒå¿…è¦ã§ã™ã€‚' }
-    $state = Read-AutoState $Language $WorkbookId
-    if ($null -eq $state) { $state = New-AutoState $WorkbookId }
-    Set-NoteProperty $state 'quietDeadline' ([DateTime]::UtcNow.AddSeconds(-1).ToString('o'))
-    Set-NoteProperty $state 'stableCount' 99
-    Set-NoteProperty $state 'deferReason' ''
-    Set-NoteProperty $state 'state' 'waiting'
-    Write-AutoState $Language $WorkbookId $state
-    return [ordered]@{ workbookId = $WorkbookId; requested = $true }
-}
-
-# =====================================================================
-# V5 å·®åˆ†è©³ç´°ãƒ»è¦–è¦šæ¯”è¼ƒ
-# =====================================================================
-
-$Script:DiffDetailAlgorithmVersion = 8
-$Script:DiffDetailDpi = 120
-$Script:DiffDetailThreshold = 24
-$Script:DiffDetailMinimumRegionPixels = 24
-$Script:DiffDetailPadding = 5
-
-function Get-DiffSnapshotDate([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$Fallback = '') {
-    try {
-        $m = Get-SnapshotManifest $Language $WorkbookId $SnapshotId
-        $detected = [string](Get-DataProperty $m 'detectedAt' '')
-        if (-not [string]::IsNullOrWhiteSpace($detected)) { return $detected }
-    } catch { }
-    return $Fallback
-}
-
-
-function Get-PreferredHistoryRenderVersion([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    foreach ($versionId in @((Get-RenderVersionIds $Language $WorkbookId $SnapshotId) | Sort-Object -Descending)) {
-        $availability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $SnapshotId ([string]$versionId)
-        if ([bool]$availability.ready) { return [string]$versionId }
-    }
-    return ''
-}
-
-
-function New-HistoricalSnapshotComparison(
-    [string]$Language,
-    [string]$WorkbookId,
-    [string]$BaselineSnapshotId,
-    [string]$BaselineVersionId,
-    [string]$CurrentSnapshotId,
-    [string]$CurrentVersionId
-) {
-    $base = Get-VisualHashes $Language $WorkbookId $BaselineSnapshotId $BaselineVersionId
-    $current = Get-VisualHashes $Language $WorkbookId $CurrentSnapshotId $CurrentVersionId
-    $result = [ordered]@{
-        schemaVersion = 2
-        status = 'unavailable'
-        scope = 'history'
-        baselineSnapshotId = $BaselineSnapshotId
-        baselineVersionId = $BaselineVersionId
-        currentSnapshotId = $CurrentSnapshotId
-        currentVersionId = $CurrentVersionId
-        comparedAt = New-NowIso
-        method = 'stored-hash-history'
-        confidence = 1.0
-        changedSheets = @()
-        unchangedSheets = @()
-        unknownSheets = @()
-        addedSheets = @()
-        removedSheets = @()
-        message = ''
-    }
-    if ($null -eq $base -or $null -eq $current) {
-        $result.message = 'é¸æŠžã—ãŸç‰ˆã®ç”»åƒãƒãƒƒã‚·ãƒ¥ãŒä¿å­˜ã•ã‚Œã¦ã„ãªã„ãŸã‚æ¯”è¼ƒã§ãã¾ã›ã‚“ã€‚'
-        return [pscustomobject]$result
-    }
-    $baseEnvironment = [string](Get-DataProperty $base 'renderEnvironmentFingerprint' '')
-    $currentEnvironment = [string](Get-DataProperty $current 'renderEnvironmentFingerprint' '')
-    if (-not [string]::IsNullOrWhiteSpace($baseEnvironment) -and
-        -not [string]::IsNullOrWhiteSpace($currentEnvironment) -and
-        $baseEnvironment -ne $currentEnvironment) {
-        $result.method = 'stored-hash-history-environment-mismatch'
-        $result.confidence = 0.65
-        $result.message = '2ç‰ˆã®PDFä½œæˆç’°å¢ƒãŒç•°ãªã‚Šã¾ã™ã€‚è¡¨ç¤ºçµæžœã‚’ç›®è¦–ã§ç¢ºèªã—ã¦ãã ã•ã„ã€‚'
-    }
-    $baseMap = @{}
-    foreach ($sheet in @(Get-Array (Get-DataProperty $base 'sheets' @()))) {
-        $name = [string](Get-DataProperty $sheet 'sheetName' '')
-        if (-not [string]::IsNullOrWhiteSpace($name)) { $baseMap[$name] = $sheet }
-    }
-    $currentNames = @{}
-    $changed = @(); $unchanged = @(); $unknown = @(); $added = @(); $removed = @()
-    foreach ($sheet in @(Get-Array (Get-DataProperty $current 'sheets' @()))) {
-        $name = [string](Get-DataProperty $sheet 'sheetName' '')
-        if ([string]::IsNullOrWhiteSpace($name)) { continue }
-        $currentNames[$name] = $true
-        if ([string](Get-DataProperty $sheet 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if (-not $baseMap.ContainsKey($name)) { $added += $name; continue }
-        $before = $baseMap[$name]
-        if ([string](Get-DataProperty $before 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if ((Normalize-FileHash ([string](Get-DataProperty $before 'sheetVisualHash' ''))) -eq
-            (Normalize-FileHash ([string](Get-DataProperty $sheet 'sheetVisualHash' ''))) -or
-            (Test-SheetVisualEquivalent $before $sheet)) { $unchanged += $name } else { $changed += $name }
-    }
-    foreach ($name in @($baseMap.Keys)) { if (-not $currentNames.ContainsKey([string]$name)) { $removed += [string]$name } }
-    $result.status = 'complete'
-    $result.changedSheets = @($changed)
-    $result.unchangedSheets = @($unchanged)
-    $result.unknownSheets = @($unknown)
-    $result.addedSheets = @($added)
-    $result.removedSheets = @($removed)
-    return [pscustomobject]$result
-}
-
-
-function Save-HistoricalSnapshotComparison([string]$Language, [string]$WorkbookId, $Comparison) {
-    if ($null -eq $Comparison -or [string](Get-DataProperty $Comparison 'status' '') -ne 'complete') { throw 'ä¿å­˜ã§ãã‚‹å±¥æ­´æ¯”è¼ƒçµæžœãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-    foreach ($field in @('baselineSnapshotId','baselineVersionId','currentSnapshotId','currentVersionId')) {
-        if ([string]::IsNullOrWhiteSpace([string](Get-DataProperty $Comparison $field ''))) { throw "å±¥æ­´æ¯”è¼ƒçµæžœã®è­˜åˆ¥å­ãŒä¸è¶³ã—ã¦ã„ã¾ã™: $field" }
-    }
-    if ([string](Get-DataProperty $Comparison 'scope' '') -ne 'history') { throw 'å±¥æ­´æ¯”è¼ƒä»¥å¤–ã¯ã“ã®ä¿å­˜çµŒè·¯ã‚’ä½¿ç”¨ã§ãã¾ã›ã‚“ã€‚' }
-    $currentSnapshotId = [string]$Comparison.currentSnapshotId
-    $currentVersionId = [string]$Comparison.currentVersionId
-    $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $currentSnapshotId $currentVersionId) 'comparisons'
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $key = (Get-Sha256Text ("history|{0}|{1}|{2}|{3}" -f $Comparison.baselineSnapshotId, $Comparison.baselineVersionId, $currentSnapshotId, $currentVersionId)).Substring(7, 16)
-    $path = Join-Path $dir ("hcmp-{0}.json" -f $key)
-    Write-JsonFile $path $Comparison
-    $saved = Read-JsonFile $path $null
-    if ($null -eq $saved) { throw 'å±¥æ­´æ¯”è¼ƒçµæžœã‚’ä¿å­˜å¾Œã«å†èª­è¾¼ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-    foreach ($field in @('scope','baselineSnapshotId','baselineVersionId','currentSnapshotId','currentVersionId')) {
-        if ([string](Get-DataProperty $saved $field '') -ne [string](Get-DataProperty $Comparison $field '')) {
-            throw "å±¥æ­´æ¯”è¼ƒçµæžœã®ä¿å­˜æ¤œè¨¼ã«å¤±æ•—ã—ã¾ã—ãŸ: $field"
-        }
-    }
-    Write-HistoryEvent $Language 'compare.history.created' ([ordered]@{
-        workbookId = $WorkbookId
-        baselineSnapshotId = [string]$Comparison.baselineSnapshotId
-        baselineVersionId = [string]$Comparison.baselineVersionId
-        currentSnapshotId = $currentSnapshotId
-        currentVersionId = $currentVersionId
-        changed = @(Get-Array $Comparison.changedSheets)
-        unknown = @(Get-Array $Comparison.unknownSheets)
-    })
-    return $saved
-}
-
-
-function Get-DiffDetailContext(
-    [string]$Language,
-    [string]$WorkbookId,
-    [string]$BaselineSnapshotId = '',
-    [string]$CurrentSnapshotId = ''
-) {
-    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-    $structure = Get-Structure $Language
-    $matches = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $safeWorkbookId } | Select-Object -First 1)
-    if ($matches.Count -eq 0) { throw 'ç™»éŒ²æ¸ˆã¿ExcelãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-    $workbook = $matches[0]
-    $displayName = [string](Get-DataProperty $workbook 'displayName' '')
-    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = [string](Get-DataProperty $workbook 'fileName' $safeWorkbookId) }
-    $baseResult = [ordered]@{
-        available = $false; status = 'unavailable'; message = ''
-        workbookId = $safeWorkbookId; workbookName = $displayName; workbook = $workbook
-        comparison = $null; comparisonPersisted = $false
-        currentSnapshotId = ''; currentVersionId = ''; baselineSnapshotId = ''; baselineVersionId = ''
-        currentAt = ''; baselineAt = ''; method = ''; scope = 'automatic'
-    }
-    if (-not (Test-InputHistoryEnabled)) {
-        $baseResult.message = 'å…¥åŠ›å±¥æ­´ãŒç„¡åŠ¹ãªãŸã‚ã€å·®åˆ†è©³ç´°ã¯åˆ©ç”¨ã§ãã¾ã›ã‚“ã€‚'
-        return [pscustomobject]$baseResult
-    }
-    $hasBaseline = -not [string]::IsNullOrWhiteSpace($BaselineSnapshotId)
-    $hasCurrent = -not [string]::IsNullOrWhiteSpace($CurrentSnapshotId)
-    if ($hasBaseline -xor $hasCurrent) { throw 'å±¥æ­´æ¯”è¼ƒã§ã¯æ¯”è¼ƒå…ƒã¨æ¯”è¼ƒå…ˆã®ä¸¡æ–¹ã‚’æŒ‡å®šã—ã¦ãã ã•ã„ã€‚' }
-    if ($hasBaseline -and $hasCurrent) {
-        $baselineSnapshotId = Assert-SafeStorageSegment $BaselineSnapshotId 'baselineSnapshotId'
-        $currentSnapshotId = Assert-SafeStorageSegment $CurrentSnapshotId 'currentSnapshotId'
-        $baseResult.scope = 'history'
-        if ($baselineSnapshotId -eq $currentSnapshotId) { $baseResult.message = 'ç•°ãªã‚‹2ç‰ˆã‚’é¸æŠžã—ã¦ãã ã•ã„ã€‚'; return [pscustomobject]$baseResult }
-        if ($null -eq (Get-SnapshotManifest $Language $safeWorkbookId $baselineSnapshotId) -or
-            $null -eq (Get-SnapshotManifest $Language $safeWorkbookId $currentSnapshotId)) {
-            $baseResult.message = 'é¸æŠžã—ãŸå±¥æ­´ç‰ˆãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚ä¿å­˜æœŸé™ã¾ãŸã¯å±¥æ­´æ•´ç†ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚'
-            return [pscustomobject]$baseResult
-        }
-        $baselineVersionId = Get-PreferredHistoryRenderVersion $Language $safeWorkbookId $baselineSnapshotId
-        $currentVersionId = Get-PreferredHistoryRenderVersion $Language $safeWorkbookId $currentSnapshotId
-        if ([string]::IsNullOrWhiteSpace($baselineVersionId) -or [string]::IsNullOrWhiteSpace($currentVersionId)) {
-            $baseResult.message = 'é¸æŠžã—ãŸ2ç‰ˆã¯ã€ç”»åƒãƒãƒƒã‚·ãƒ¥ã¨åŒä¸€ä¸–ä»£ã®content PDFãŒãã‚ã£ã¦ã„ãªã„ãŸã‚è¦–è¦šæ¯”è¼ƒã§ãã¾ã›ã‚“ã€‚'
-            return [pscustomobject]$baseResult
-        }
-        $comparison = Get-StoredComparison $Language $safeWorkbookId $baselineSnapshotId $currentSnapshotId $baselineVersionId $currentVersionId 'history'
-        if ($null -eq $comparison) {
-            $comparison = New-HistoricalSnapshotComparison $Language $safeWorkbookId $baselineSnapshotId $baselineVersionId $currentSnapshotId $currentVersionId
-        } else { $baseResult.comparisonPersisted = $true }
-        if ($null -eq $comparison -or [string](Get-DataProperty $comparison 'status' '') -ne 'complete') {
-            $baseResult.message = [string](Get-DataProperty $comparison 'message' 'é¸æŠžã—ãŸ2ç‰ˆã‚’æ¯”è¼ƒã§ãã¾ã›ã‚“ã€‚')
-            return [pscustomobject]$baseResult
-        }
-        $baseResult.available = $true; $baseResult.status = 'available'; $baseResult.comparison = $comparison
-        $baseResult.currentSnapshotId = $currentSnapshotId; $baseResult.currentVersionId = $currentVersionId
-        $baseResult.baselineSnapshotId = $baselineSnapshotId; $baseResult.baselineVersionId = $baselineVersionId
-        $baseResult.currentAt = Get-DiffSnapshotDate $Language $safeWorkbookId $currentSnapshotId ''
-        $baseResult.baselineAt = Get-DiffSnapshotDate $Language $safeWorkbookId $baselineSnapshotId ''
-        $baseResult.method = [string](Get-DataProperty $comparison 'method' 'stored-hash-history')
-        return [pscustomobject]$baseResult
-    }
-    $status = [string](Get-DataProperty $workbook 'status' '')
-    $currentHash = Normalize-FileHash ([string](Get-DataProperty $workbook 'currentExcelHash' ''))
-    $renderedHash = Normalize-FileHash ([string](Get-DataProperty $workbook 'lastRenderedExcelHash' ''))
-    if ([string]::IsNullOrWhiteSpace($renderedHash) -or $status -in @('new','excel-updated','render-error','rendering') -or
-        ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and $currentHash -ne $renderedHash)) {
-        $baseResult.message = 'æœ€æ–°ã®PDFã‚’ä½œæˆã—ã¦ã‹ã‚‰å·®åˆ†ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚'; return [pscustomobject]$baseResult
-    }
-    $currentSnapshotId = [string](Get-DataProperty $workbook 'lastRenderedSnapshotId' '')
-    $currentVersionId = [string](Get-DataProperty $workbook 'lastRenderedVersionId' '')
-    if ([string]::IsNullOrWhiteSpace($currentSnapshotId) -or [string]::IsNullOrWhiteSpace($currentVersionId)) {
-        $baseResult.message = 'ç¾åœ¨ç‰ˆã‚’ä¸€æ„ã«è­˜åˆ¥ã§ããªã„ãŸã‚ã€å·®åˆ†è©³ç´°ã‚’é–‹ã‘ã¾ã›ã‚“ã€‚'; return [pscustomobject]$baseResult
-    }
-    $currentSnapshotId = Assert-SafeStorageSegment $currentSnapshotId 'currentSnapshotId'
-    $currentVersionId = Assert-SafeStorageSegment $currentVersionId 'currentVersionId'
-    $comparison = Get-LatestComparison $Language $safeWorkbookId $workbook
-    if ($null -eq $comparison) { $baseResult.message = 'ä¿å­˜æ¸ˆã¿ã®æ¯”è¼ƒçµæžœãŒã‚ã‚Šã¾ã›ã‚“ã€‚PDFã‚’å†ä½œæˆã—ã¦ãã ã•ã„ã€‚'; return [pscustomobject]$baseResult }
-    $baselineSnapshotId = [string](Get-DataProperty $comparison 'baselineSnapshotId' '')
-    $baselineVersionId = [string](Get-DataProperty $comparison 'baselineVersionId' '')
-    if ([string](Get-DataProperty $comparison 'status' '') -ne 'complete' -or
-        [string]::IsNullOrWhiteSpace($baselineSnapshotId) -or [string]::IsNullOrWhiteSpace($baselineVersionId)) {
-        $baseResult.message = [string](Get-DataProperty $comparison 'message' 'å‰å›žã®æ¯”è¼ƒåŸºæº–ãŒã‚ã‚Šã¾ã›ã‚“ã€‚'); return [pscustomobject]$baseResult
-    }
-    $baselineSnapshotId = Assert-SafeStorageSegment $baselineSnapshotId 'baselineSnapshotId'
-    $baselineVersionId = Assert-SafeStorageSegment $baselineVersionId 'baselineVersionId'
-    $currentAvailability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $currentSnapshotId $currentVersionId
-    $baselineAvailability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $baselineSnapshotId $baselineVersionId
-    if (-not [bool]$currentAvailability.ready -or -not [bool]$baselineAvailability.ready) {
-        $baseResult.message = 'è‡ªå‹•æ¯”è¼ƒã«ä½¿ã£ãŸç”»åƒãƒãƒƒã‚·ãƒ¥ã¨åŒä¸€ä¸–ä»£ã®content PDFãŒä¿æŒã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚PDFã‚’å†ä½œæˆã—ã¦ãã ã•ã„ã€‚'
-        return [pscustomobject]$baseResult
-    }
-    $baseResult.available = $true; $baseResult.status = 'available'; $baseResult.comparison = $comparison; $baseResult.comparisonPersisted = $true
-    $baseResult.currentSnapshotId = $currentSnapshotId; $baseResult.currentVersionId = $currentVersionId
-    $baseResult.baselineSnapshotId = $baselineSnapshotId; $baseResult.baselineVersionId = $baselineVersionId
-    $baseResult.currentAt = Get-DiffSnapshotDate $Language $safeWorkbookId $currentSnapshotId ([string](Get-DataProperty $workbook 'lastRenderedAt' ''))
-    $baseResult.baselineAt = Get-DiffSnapshotDate $Language $safeWorkbookId $baselineSnapshotId ''
-    $baseResult.method = [string](Get-DataProperty $comparison 'method' '')
-    return [pscustomobject]$baseResult
-}
-
-
-function Get-DiffPairKey($Context) {
-    return (Get-Sha256Text ("{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f
-        [string]$Context.scope, [string]$Context.workbookId,
-        [string]$Context.baselineSnapshotId, [string]$Context.baselineVersionId,
-        [string]$Context.currentSnapshotId, [string]$Context.currentVersionId,
-        $Script:DiffDetailAlgorithmVersion)).Substring(7, 24)
-}
-function Get-DiffLaunchLockPath([string]$Language, $Context) {
-    return (Join-Path (Get-WorkspacePath $Language) ("locks\diff-launch_{0}.lock" -f (Get-DiffPairKey $Context)))
-}
-function Get-DiffGenerationLockPath([string]$Language, $Context) {
-    return (Join-Path (Get-WorkspacePath $Language) ("locks\diff-generate_{0}.lock" -f (Get-DiffPairKey $Context)))
-}
-
-function Get-DiffDetailCacheDir($Context) {
-    $record = Get-RenderRecordDir (Get-EffectiveLanguage) ([string]$Context.workbookId) ([string]$Context.currentSnapshotId) ([string]$Context.currentVersionId)
-    $baseline = Assert-SafeStorageSegment ([string]$Context.baselineSnapshotId) 'baselineSnapshotId'
-    $cacheKey = (Get-Sha256Text ("{0}|{1}|{2}|{3}" -f [string]$Context.scope, $baseline, [string]$Context.baselineVersionId, $Script:DiffDetailAlgorithmVersion)).Substring(7, 16)
-    return (Join-Path $record (Join-Path 'comparisons' ("d{0}" -f $cacheKey)))
-}
-
-function Get-DiffDetailCacheDirForLanguage([string]$Language, $Context) {
-    $record = Get-RenderRecordDir $Language ([string]$Context.workbookId) ([string]$Context.currentSnapshotId) ([string]$Context.currentVersionId)
-    $baseline = Assert-SafeStorageSegment ([string]$Context.baselineSnapshotId) 'baselineSnapshotId'
-    $cacheKey = (Get-Sha256Text ("{0}|{1}|{2}|{3}" -f [string]$Context.scope, $baseline, [string]$Context.baselineVersionId, $Script:DiffDetailAlgorithmVersion)).Substring(7, 16)
-    return (Join-Path $record (Join-Path 'comparisons' ("d{0}" -f $cacheKey)))
-}
-
-function Get-DiffSheetKey([string]$SheetName) {
-    $hash = Get-Sha256Text $SheetName
-    return ('s-' + $hash.Substring(7, 10))
-}
-
-function Test-DiffDetailMatchesContext($Detail, $Context) {
-    if ($null -eq $Detail -or $null -eq $Context) { return $false }
-    if ((Get-IntDataProperty $Detail 'algorithmVersion' 0) -ne $Script:DiffDetailAlgorithmVersion) { return $false }
-    if ([string](Get-DataProperty $Detail 'workbookId' '') -ne [string]$Context.workbookId) { return $false }
-    $comparison = Get-DataProperty $Detail 'comparison' $null
-    if ($null -eq $comparison) { return $false }
-    foreach ($field in @('scope','baselineSnapshotId','baselineVersionId','currentSnapshotId','currentVersionId')) {
-        if ([string](Get-DataProperty $comparison $field '') -ne [string](Get-DataProperty $Context $field '')) { return $false }
-    }
-    return $true
-}
-
-function Get-DiffHashSheetMap($Hashes) {
-    $map = @{}
-    if ($null -eq $Hashes) { return $map }
-    foreach ($sheet in @(Get-Array (Get-DataProperty $Hashes 'sheets' @()))) {
-        $map[[string](Get-DataProperty $sheet 'sheetName' '')] = $sheet
-    }
-    return $map
-}
-
-function New-DiffDetailSkeleton([string]$Language, $Context) {
-    $comparison = $Context.comparison
-    $addedSet = @{}
-    $removedSet = @{}
-    $unknownSet = @{}
-    foreach ($name in @(Get-Array (Get-DataProperty $comparison 'addedSheets' @()))) { $addedSet[[string]$name] = $true }
-    foreach ($name in @(Get-Array (Get-DataProperty $comparison 'removedSheets' @()))) { $removedSet[[string]$name] = $true }
-    foreach ($name in @(Get-Array (Get-DataProperty $comparison 'unknownSheets' @()))) { $unknownSet[[string]$name] = $true }
-
-    $items = @()
-    $seen = @{}
-    foreach ($group in @(
-        [ordered]@{ kind = 'modified'; names = @(Get-Array (Get-DataProperty $comparison 'changedSheets' @())) },
-        [ordered]@{ kind = 'added'; names = @(Get-Array (Get-DataProperty $comparison 'addedSheets' @())) },
-        [ordered]@{ kind = 'removed'; names = @(Get-Array (Get-DataProperty $comparison 'removedSheets' @())) },
-        [ordered]@{ kind = 'unknown'; names = @(Get-Array (Get-DataProperty $comparison 'unknownSheets' @())) },
-        [ordered]@{ kind = 'unchanged'; names = @(Get-Array (Get-DataProperty $comparison 'unchangedSheets' @())) }
-    )) {
-        foreach ($rawName in @($group.names)) {
-            $name = [string]$rawName
-            if ([string]::IsNullOrWhiteSpace($name) -or $seen.ContainsKey($name)) { continue }
-            if ([string]$group.kind -eq 'modified' -and ($addedSet.ContainsKey($name) -or $removedSet.ContainsKey($name) -or $unknownSet.ContainsKey($name))) { continue }
-            $seen[$name] = $true
-            $items += [pscustomobject][ordered]@{
-                sheetName = $name
-                sheetKey = Get-DiffSheetKey $name
-                kind = [string]$group.kind
-                beforePages = 0
-                afterPages = 0
-                pageCount = 0
-                regionCount = 0
-                status = $(if ([string]$group.kind -eq 'unchanged') { 'deferred' } else { 'pending' })
-                message = $(if ([string]$group.kind -eq 'unchanged') { 'å¤‰æ›´ãªã—ã‚·ãƒ¼ãƒˆã®ç”»åƒã¯ã€é¸æŠžã—ãŸã¨ãã«ä½œæˆã—ã¾ã™ã€‚' } else { '' })
-                confirmed = $false
-                pages = @()
-            }
-        }
-    }
-    $currentHashes = $null
-    $baselineHashes = $null
-    # æ¯”è¼ƒçµæžœãŒã¾ã ç„¡ã„åˆå›žPDFä½œæˆç›´å¾Œã¯ã€Contextã®ç‰ˆIDãŒç©ºã®ã¾ã¾
-    # unavailableã‚’è¿”ã™ã€‚ç©ºIDã‚’å±¥æ­´ãƒ‘ã‚¹é–¢æ•°ã¸æ¸¡ã—ã¦400ã«ã—ãªã„ã€‚
-    if ([bool]$Context.available) {
-        $currentHashes = Get-VisualHashes $Language ([string]$Context.workbookId) ([string]$Context.currentSnapshotId) ([string]$Context.currentVersionId)
-        $baselineHashes = Get-VisualHashes $Language ([string]$Context.workbookId) ([string]$Context.baselineSnapshotId) ([string]$Context.baselineVersionId)
-    }
-    $currentMap = Get-DiffHashSheetMap $currentHashes
-    $baselineMap = Get-DiffHashSheetMap $baselineHashes
-    foreach ($item in $items) {
-        if ($baselineMap.ContainsKey([string]$item.sheetName)) { $item.beforePages = Get-IntDataProperty $baselineMap[[string]$item.sheetName] 'pageCount' 0 }
-        if ($currentMap.ContainsKey([string]$item.sheetName)) { $item.afterPages = Get-IntDataProperty $currentMap[[string]$item.sheetName] 'pageCount' 0 }
-        $item.pageCount = [Math]::Max([int]$item.beforePages, [int]$item.afterPages)
-    }
-    $modifiedCount = @($items | Where-Object { [string]$_.kind -eq 'modified' }).Count
-    $addedCount = @($items | Where-Object { [string]$_.kind -eq 'added' }).Count
-    $removedCount = @($items | Where-Object { [string]$_.kind -eq 'removed' }).Count
-    $unknownCount = @($items | Where-Object { [string]$_.kind -eq 'unknown' }).Count
-    $unchangedCount = @($items | Where-Object { [string]$_.kind -eq 'unchanged' }).Count
-    return [pscustomobject][ordered]@{
-        schemaVersion = 1
-        algorithmVersion = $Script:DiffDetailAlgorithmVersion
-        status = $(if ([bool]$Context.available) { 'not-generated' } else { 'unavailable' })
-        message = [string]$Context.message
-        workbookId = [string]$Context.workbookId
-        workbookName = [string]$Context.workbookName
-        comparison = [ordered]@{
-            baselineSnapshotId = [string]$Context.baselineSnapshotId
-            baselineVersionId = [string]$Context.baselineVersionId
-            currentSnapshotId = [string]$Context.currentSnapshotId
-            currentVersionId = [string]$Context.currentVersionId
-            baselineAt = [string]$Context.baselineAt
-            currentAt = [string]$Context.currentAt
-            comparedAt = [string](Get-DataProperty $comparison 'comparedAt' '')
-            method = [string]$Context.method
-            scope = [string]$Context.scope
-            confidence = [double](Get-DataProperty $comparison 'confidence' 1.0)
-        }
-        summary = [ordered]@{
-            changed = $modifiedCount
-            added = $addedCount
-            removed = $removedCount
-            unknown = $unknownCount
-            unchanged = $unchangedCount
-        }
-        generation = [ordered]@{ status = 'idle'; jobId = ''; percent = 0; message = ''; currentSheet = '' }
-        sheets = @($items)
-        generatedAt = ''
-    }
-}
-
-function Get-DiffDetail(
-    [string]$Language,
-    [string]$WorkbookId,
-    [string]$BaselineSnapshotId = '',
-    [string]$CurrentSnapshotId = ''
-) {
-    $context = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
-    $detail = New-DiffDetailSkeleton $Language $context
-    if (-not [bool]$context.available) { return $detail }
-    $cacheDir = Get-DiffDetailCacheDirForLanguage $Language $context
-    $detailPath = Join-Path $cacheDir 'diff-detail.json'
-    if (Test-Path -LiteralPath $detailPath) {
-        try {
-            $stored = Read-JsonFile $detailPath $null
-            if (Test-DiffDetailMatchesContext $stored $context) {
-                return $stored
-            }
-        } catch { }
-    }
-    $pointerPath = Join-Path $cacheDir 'diff-job.json'
-    if (Test-Path -LiteralPath $pointerPath) {
-        try {
-            $pointer = Read-JsonFile $pointerPath $null
-            $jobId = [string](Get-DataProperty $pointer 'jobId' '')
-            if (-not [string]::IsNullOrWhiteSpace($jobId)) {
-                $job = Read-RenderJobStatus $Language $jobId
-                $jobStatus = [string](Get-DataProperty $job 'status' '')
-                $terminal = @('completed','completed-with-errors','failed','missing','cancelled') -contains $jobStatus
-                # Workerã¯diff-detail.jsonã‚’ä¿å­˜ã—ã¦ã‹ã‚‰statusã‚’çµ‚ç«¯ã¸æ›´æ–°ã™ã‚‹ã€‚
-                # çµ‚ç«¯ãªã®ã«çµæžœãƒ•ã‚¡ã‚¤ãƒ«ãŒç„¡ã„å ´åˆã¯ã€Œç”Ÿæˆä¸­ã€ã¸æˆ»ã•ãšã€å†è©¦è¡Œå¯èƒ½ãªå¤±æ•—ã¨ã—ã¦è¿”ã™ã€‚
-                $detail.status = $(if ($terminal) { 'failed' } else { 'generating' })
-                $jobMessage = [string](Get-DataProperty $job 'message' '')
-                $detail.message = $(if ($terminal -and $jobStatus -in @('completed','completed-with-errors')) {
-                    'å·®åˆ†ç”»åƒã®ä½œæˆå‡¦ç†ã¯çµ‚äº†ã—ã¾ã—ãŸãŒã€çµæžœã‚’èª­ã¿è¾¼ã‚ã¾ã›ã‚“ã§ã—ãŸã€‚å†è©¦è¡Œã—ã¦ãã ã•ã„ã€‚'
-                } else { $jobMessage })
-                $detail.generation = [ordered]@{
-                    status = $jobStatus
-                    jobId = $jobId
-                    percent = Get-IntDataProperty $job 'percent' 0
-                    message = [string](Get-DataProperty $job 'message' '')
-                    currentSheet = [string](Get-DataProperty $job 'currentSheet' '')
-                }
-            }
-        } catch { }
-    }
-    return $detail
-}
-
-
-function Resolve-DiffContentPdfPath([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$SheetName) {
-    # Strict identity: never fall back to another render version. Hashes and displayed PDF must be the same generation.
-    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
-    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
-    if (@(Get-RenderVersionIds $Language $WorkbookId $safeSnapshotId) -notcontains $safeVersionId) { return '' }
-    return (Resolve-ContentPdfSheetPathExact $Language $WorkbookId $safeVersionId $SheetName)
-}
-
-function Invoke-DiffImagePageGeneration([string]$BeforePdf, [string]$AfterPdf, [string]$OutputDirectory, [string]$Kind) {
-    $scriptPath = Join-Path $Script:AppRoot 'tools\diff-image-pages.ps1'
-    if (-not (Test-Path -LiteralPath $scriptPath)) { throw 'å·®åˆ†ç”»åƒç”Ÿæˆãƒ„ãƒ¼ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-    $arguments = @{
-        OutputDirectory = $OutputDirectory
-        Kind = $Kind
-        Dpi = $Script:DiffDetailDpi
-        Threshold = $Script:DiffDetailThreshold
-        MinimumRegionPixels = $Script:DiffDetailMinimumRegionPixels
-        Padding = $Script:DiffDetailPadding
-    }
-    if (-not [string]::IsNullOrWhiteSpace($BeforePdf)) { $arguments.BeforePdf = $BeforePdf }
-    if (-not [string]::IsNullOrWhiteSpace($AfterPdf)) { $arguments.AfterPdf = $AfterPdf }
-    $raw = @(& $scriptPath @arguments | ForEach-Object { [string]$_ })
-    $text = ($raw -join '')
-    if ([string]::IsNullOrWhiteSpace($text)) { throw 'å·®åˆ†ç”»åƒç”Ÿæˆçµæžœã‚’å–å¾—ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-    return ($text | ConvertFrom-Json)
-}
-
-function Invoke-DiffImageBatchGeneration($Items) {
-    $scriptPath = Join-Path $Script:AppRoot 'tools\diff-image-batch.ps1'
-    if (-not (Test-Path -LiteralPath $scriptPath)) { throw 'å·®åˆ†ç”»åƒä¸€æ‹¬ç”Ÿæˆãƒ„ãƒ¼ãƒ«ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-    $requestPath = Join-Path ([IO.Path]::GetTempPath()) ('rb-diff-request-' + [Guid]::NewGuid().ToString('N') + '.json')
-    try {
-        Write-JsonFile $requestPath ([ordered]@{ schemaVersion = 1; items = @($Items) })
-        $raw = @(& $scriptPath -RequestPath $requestPath -Dpi $Script:DiffDetailDpi `
-            -Threshold $Script:DiffDetailThreshold -MinimumRegionPixels $Script:DiffDetailMinimumRegionPixels `
-            -Padding $Script:DiffDetailPadding | ForEach-Object { [string]$_ })
-        $text = ($raw -join '')
-        if ([string]::IsNullOrWhiteSpace($text)) { throw 'å·®åˆ†ç”»åƒä¸€æ‹¬ç”Ÿæˆçµæžœã‚’å–å¾—ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-        $result = $text | ConvertFrom-Json
-        if (-not [bool](Get-DataProperty $result 'ok' $false)) { throw 'å·®åˆ†ç”»åƒã®ä¸€æ‹¬ç”Ÿæˆã«å¤±æ•—ã—ã¾ã—ãŸã€‚' }
-        return $result
-    } finally {
-        Remove-Item -LiteralPath $requestPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-
-function Start-DiffDetailJob(
-    [string]$Language,
-    [string]$WorkbookId,
-    [string]$BaselineSnapshotId = '',
-    [string]$CurrentSnapshotId = '',
-    [string]$SheetKey = ''
-) {
-    $context = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
-    if (-not [bool]$context.available) {
-        return [pscustomobject][ordered]@{ ok = $true; jobId = ''; status = 'unavailable'; percent = 100; message = [string]$context.message }
-    }
-    $safeSheetKey = ''
-    if (-not [string]::IsNullOrWhiteSpace($SheetKey)) { $safeSheetKey = Assert-SafeStorageSegment $SheetKey 'sheetKey' }
-    $launchLock = Get-DiffLaunchLockPath $Language $context
-    return Invoke-WithLock $launchLock {
-        $freshContext = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
-        if (-not [bool]$freshContext.available) { throw [string]$freshContext.message }
-        foreach ($field in @('scope','currentSnapshotId','currentVersionId','baselineSnapshotId','baselineVersionId')) {
-            if ([string](Get-DataProperty $context $field '') -ne [string](Get-DataProperty $freshContext $field '')) {
-                throw 'æ¯”è¼ƒå¯¾è±¡ãŒæ›´æ–°ã•ã‚Œã¾ã—ãŸã€‚å·®åˆ†è©³ç´°ã‚’é–‹ãç›´ã—ã¦ãã ã•ã„ã€‚'
-            }
-        }
-        $context = $freshContext
-        $skeleton = New-DiffDetailSkeleton $Language $context
-        if (-not [string]::IsNullOrWhiteSpace($safeSheetKey) -and
-            @($skeleton.sheets | Where-Object { [string]$_.sheetKey -eq $safeSheetKey }).Count -eq 0) {
-            throw 'æŒ‡å®šã—ãŸã‚·ãƒ¼ãƒˆã¯æ¯”è¼ƒå¯¾è±¡ã«å«ã¾ã‚Œã¦ã„ã¾ã›ã‚“ã€‚'
-        }
-        $cacheDir = Get-DiffDetailCacheDirForLanguage $Language $context
-        if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
-        $detailPath = Join-Path $cacheDir 'diff-detail.json'
-        $existing = $null
-        if (Test-Path -LiteralPath $detailPath) { try { $existing = Read-JsonFile $detailPath $null } catch { } }
-        if (Test-DiffDetailMatchesContext $existing $context) {
-            if ([string]::IsNullOrWhiteSpace($safeSheetKey) -and [string](Get-DataProperty $existing 'status' '') -eq 'ready') {
-                return [pscustomobject][ordered]@{ ok = $true; jobId = ''; status = 'completed'; percent = 100; message = 'å·®åˆ†è©³ç´°ã¯ä½œæˆæ¸ˆã¿ã§ã™ã€‚'; detailReady = $true }
-            }
-            if (-not [string]::IsNullOrWhiteSpace($safeSheetKey)) {
-                $target = @(Get-Array $existing.sheets | Where-Object { [string]$_.sheetKey -eq $safeSheetKey } | Select-Object -First 1)
-                if ($target.Count -gt 0 -and [string](Get-DataProperty $target[0] 'status' '') -eq 'ready') {
-                    return [pscustomobject][ordered]@{ ok = $true; jobId = ''; status = 'completed'; percent = 100; message = 'ã“ã®ã‚·ãƒ¼ãƒˆã®å·®åˆ†ç”»åƒã¯ä½œæˆæ¸ˆã¿ã§ã™ã€‚'; detailReady = $true }
-                }
-            }
-        }
-        $pointerPath = Join-Path $cacheDir 'diff-job.json'
-        if (Test-Path -LiteralPath $pointerPath) {
-            try {
-                $pointer = Read-JsonFile $pointerPath $null
-                $activeId = [string](Get-DataProperty $pointer 'jobId' '')
-                if (-not [string]::IsNullOrWhiteSpace($activeId)) {
-                    $active = Read-RenderJobStatus $Language $activeId
-                    if (@('completed','completed-with-errors','failed','missing','cancelled') -notcontains [string](Get-DataProperty $active 'status' '')) {
-                        Set-NoteProperty $active 'joinedExistingDiffJob' $true
-                        return $active
-                    }
-                }
-            } catch { }
-        }
-        $jobId = 'job_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
-        $leases = @(New-DiffJobLeases $Language $context $jobId)
-        $jobDir = Get-RenderJobDir $Language
-        $inputPath = Join-Path $jobDir "$jobId.diff.input.json"
-        $statusPath = Join-Path $jobDir "$jobId.status.json"
-        $stdoutPath = Join-Path $jobDir "$jobId.diff.out.log"
-        $stderrPath = Join-Path $jobDir "$jobId.diff.err.log"
-        $sheetCount = if ([string]::IsNullOrWhiteSpace($safeSheetKey)) {
-            @($skeleton.sheets | Where-Object { [string]$_.kind -ne 'unchanged' }).Count
-        } else { 1 }
-        $initial = [pscustomobject][ordered]@{
-            ok = $true; jobType = 'diff-detail'; jobId = $jobId; status = 'queued'; total = $sheetCount
-            completed = 0; failed = 0; percent = 1; message = 'å·®åˆ†è©³ç´°ã‚’æº–å‚™ã—ã¦ã„ã¾ã™ã€‚'
-            currentWorkbookId = [string]$context.workbookId; currentWorkbookName = [string]$context.workbookName
-            currentSheet = ''; processId = 0; stdoutPath = $stdoutPath; stderrPath = $stderrPath
-            results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = ''
-        }
-        try {
-            if ([string]$context.scope -eq 'history' -and -not [bool]$context.comparisonPersisted) {
-                $saved = Save-HistoricalSnapshotComparison $Language ([string]$context.workbookId) $context.comparison
-                $context.comparison = $saved
-                $context.comparisonPersisted = $true
-            }
-            Write-RenderJobStatus $statusPath $initial
-            Write-JsonFile $inputPath ([ordered]@{
-                jobId = $jobId; mode = $Language; workbookId = [string]$context.workbookId
-                currentSnapshotId = [string]$context.currentSnapshotId; currentVersionId = [string]$context.currentVersionId
-                baselineSnapshotId = [string]$context.baselineSnapshotId; baselineVersionId = [string]$context.baselineVersionId
-                scope = [string]$context.scope; sheetKey = $safeSheetKey
-                cacheDir = $cacheDir; detailPath = $detailPath; statusPath = $statusPath
-                stdoutPath = $stdoutPath; stderrPath = $stderrPath; leases = @($leases)
-                generationLockPath = (Get-DiffGenerationLockPath $Language $context)
-            })
-            Write-JsonFile $pointerPath ([ordered]@{ jobId = $jobId; sheetKey = $safeSheetKey; createdAt = New-NowIso })
-            $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
-            $serverScript = Join-Path $Script:AppRoot 'server.ps1'
-            $command = "& '$($serverScript.Replace("'", "''"))' -Mode '$($Language.Replace("'", "''"))' -DiffJobPath '$($inputPath.Replace("'", "''"))'"
-            $proc = Start-HiddenPowerShellChild $psExe $command $stdoutPath $stderrPath
-            if (-not $proc -or -not $proc.Id) { throw 'å·®åˆ†ç”»åƒã®ä½œæˆãƒ—ãƒ­ã‚»ã‚¹IDã‚’å–å¾—ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚' }
-            $initial.processId = [int]$proc.Id; $initial.status = 'launching'; $initial.percent = 2
-            $initial.message = 'å·®åˆ†ç”»åƒã®ä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã‚’èµ·å‹•ã—ã¾ã—ãŸã€‚'
-            Write-RenderJobStatus $statusPath $initial
-            return $initial
-        } catch {
-            $initial.status = 'failed'; $initial.percent = 100; $initial.message = 'å·®åˆ†ç”»åƒã®ä½œæˆãƒ—ãƒ­ã‚»ã‚¹ã‚’èµ·å‹•ã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-            $initial.errors = @([ordered]@{ error = $_.Exception.Message; detail = Get-ErrorDetail $_ })
-            try { Write-RenderJobStatus $statusPath $initial } catch { }
-            Remove-DiffJobLeases ([pscustomobject][ordered]@{ mode=$Language; workbookId=[string]$context.workbookId; leases=@($leases) })
-            throw
-        }
-    }
-}
-
-
-function Invoke-DiffDetailJobCore($Job) {
-    $language = [string](Get-DataProperty $Job 'mode' $Mode)
-    $workbookId = [string](Get-DataProperty $Job 'workbookId' '')
-    $statusPath = [string](Get-DataProperty $Job 'statusPath' '')
-    $detailPath = [string](Get-DataProperty $Job 'detailPath' '')
-    $cacheDir = [IO.Path]::GetFullPath([string](Get-DataProperty $Job 'cacheDir' ''))
-    $jobId = [string](Get-DataProperty $Job 'jobId' '')
-    $requestedSheetKey = [string](Get-DataProperty $Job 'sheetKey' '')
-    $status = [pscustomobject][ordered]@{
-        ok = $true; jobType = 'diff-detail'; jobId = $jobId; status = 'running'; total = 0; completed = 0; failed = 0
-        percent = 3; message = 'æ¯”è¼ƒå¯¾è±¡ã‚’ç¢ºèªã—ã¦ã„ã¾ã™ã€‚'; currentWorkbookId = $workbookId; currentWorkbookName = ''
-        currentSheet = ''; processId = [System.Diagnostics.Process]::GetCurrentProcess().Id
-        results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = ''
-    }
-    Write-RenderJobStatus $statusPath $status
-    $detail = $null
-    try {
-        Refresh-DiffJobLeases $Job
-        $jobScope = [string](Get-DataProperty $Job 'scope' 'automatic')
-        $context = if ($jobScope -eq 'history') {
-            Get-DiffDetailContext $language $workbookId ([string]$Job.baselineSnapshotId) ([string]$Job.currentSnapshotId)
-        } else { Get-DiffDetailContext $language $workbookId }
-        if (-not [bool]$context.available) { throw [string]$context.message }
-        foreach ($field in @('currentSnapshotId','currentVersionId','baselineSnapshotId','baselineVersionId','scope')) {
-            if ([string](Get-DataProperty $Job $field '') -ne [string](Get-DataProperty $context $field '')) {
-                throw 'æ¯”è¼ƒå¯¾è±¡ãŒæ›´æ–°ã•ã‚Œã¾ã—ãŸã€‚å¤‰æ›´ãƒãƒƒã‚¸ã‚’é–‹ãç›´ã—ã¦ãã ã•ã„ã€‚'
-            }
-        }
-        $expectedCache = [IO.Path]::GetFullPath((Get-DiffDetailCacheDirForLanguage $language $context))
-        if ($expectedCache -ne $cacheDir) { throw 'å·®åˆ†ã‚­ãƒ£ãƒƒã‚·ãƒ¥ã®ä¿å­˜å…ˆãŒä¸æ­£ã§ã™ã€‚' }
-        if (-not (Test-Path -LiteralPath $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
-        # å…¨ä½“å†è©¦è¡Œã§ã‚‚æ—¢å­˜è©³ç´°ã‚’èª­ã¿è¾¼ã¿ã€failedã«ãªã£ãŸå¤‰æ›´ãªã—ã‚·ãƒ¼ãƒˆã‚’ä¿æŒã™ã‚‹ã€‚
-        # èª­ã¿è¾¼ã‚“ã å†…å®¹ã¯ç›´å¾Œã®Test-DiffDetailMatchesContextã§æ¯”è¼ƒå¯¾è±¡ã¨ã®å®Œå…¨ä¸€è‡´ã‚’æ¤œè¨¼ã™ã‚‹ã€‚
-        if (Test-Path -LiteralPath $detailPath) {
-            $detail = Read-JsonFile $detailPath $null
-        }
-        if (-not (Test-DiffDetailMatchesContext $detail $context)) {
-            $detail = New-DiffDetailSkeleton $language $context
-        }
-        $allSheets = @(Get-Array $detail.sheets)
-        $workIndexes = @()
-        if ([string]::IsNullOrWhiteSpace($requestedSheetKey)) {
-            for ($n = 0; $n -lt $allSheets.Count; $n++) {
-                $sheetKind = [string](Get-DataProperty $allSheets[$n] 'kind' '')
-                $sheetStatus = [string](Get-DataProperty $allSheets[$n] 'status' '')
-                if ($sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed') { $workIndexes += $n }
-                elseif ($sheetStatus -ne 'ready') {
-                    $allSheets[$n].status = 'deferred'
-                    $allSheets[$n].message = 'å¤‰æ›´ãªã—ã‚·ãƒ¼ãƒˆã®ç”»åƒã¯ã€é¸æŠžã—ãŸã¨ãã«ä½œæˆã—ã¾ã™ã€‚'
-                }
-            }
-        } else {
-            for ($n = 0; $n -lt $allSheets.Count; $n++) { if ([string]$allSheets[$n].sheetKey -eq $requestedSheetKey) { $workIndexes += $n; break } }
-            if ($workIndexes.Count -eq 0) { throw 'æŒ‡å®šã—ãŸã‚·ãƒ¼ãƒˆã¯æ¯”è¼ƒå¯¾è±¡ã«å«ã¾ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' }
-        }
-        $detail.sheets = @($allSheets)
-        $detail.status = 'generating'
-        $detail.generation = [ordered]@{ status = 'running'; jobId = $jobId; percent = 3; message = 'å·®åˆ†ç”»åƒã‚’ä½œæˆã—ã¦ã„ã¾ã™ã€‚'; currentSheet = '' }
-        Write-JsonFile $detailPath $detail
-        $status.total = $workIndexes.Count; $status.currentWorkbookName = [string]$context.workbookName
-        Write-RenderJobStatus $statusPath $status
-
-        # å¤‰æ›´ã‚·ãƒ¼ãƒˆã”ã¨ã« Java/PDFBox ã‚’2å›žèµ·å‹•ã—ã¦ã„ãŸæ—§çµŒè·¯ã‚’é¿ã‘ã‚‹ã€‚
-        # å…¨ã‚·ãƒ¼ãƒˆã®æ–°æ—§PDFã‚’1ã¤ã®JVMã¸æ¸¡ã—ã€æœ€å¤§4ä¸¦åˆ—ã§ãƒ©ã‚¹ã‚¿ãƒ©ã‚¤ã‚ºã—ã¦ã‹ã‚‰ä¸€æ‹¬è§£æžã™ã‚‹ã€‚
-        $batchRequest = @()
-        $batchIdByIndex = @{}
-        $batchPreparationErrors = @{}
-        for ($position = 0; $position -lt $workIndexes.Count; $position++) {
-            $i = [int]$workIndexes[$position]
-            $sheet = $detail.sheets[$i]
-            $name = [string]$sheet.sheetName
-            $kind = [string]$sheet.kind
-            try {
-                $beforePdf = ''; $afterPdf = ''
-                if ($kind -ne 'added') { $beforePdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $name }
-                if ($kind -ne 'removed') { $afterPdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.currentSnapshotId) ([string]$context.currentVersionId) $name }
-                $missing = (($kind -in @('modified','unchanged') -and ([string]::IsNullOrWhiteSpace($beforePdf) -or [string]::IsNullOrWhiteSpace($afterPdf))) -or
-                    ($kind -eq 'added' -and [string]::IsNullOrWhiteSpace($afterPdf)) -or ($kind -eq 'removed' -and [string]::IsNullOrWhiteSpace($beforePdf)))
-                if ($missing) { throw 'åŒä¸€ãƒ¬ãƒ³ãƒ€ãƒªãƒ³ã‚°ä¸–ä»£ã®content PDFãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚' }
-                if ($kind -eq 'unknown' -and [string]::IsNullOrWhiteSpace($beforePdf) -and [string]::IsNullOrWhiteSpace($afterPdf)) { throw 'æ¯”è¼ƒå…ƒãƒ»æ¯”è¼ƒå…ˆã®PDFã‚’ç¢ºèªã§ãã¾ã›ã‚“ã€‚' }
-                $sheetDir = Join-Path $cacheDir (Join-Path 'p' ([string]$sheet.sheetKey))
-                if (Test-Path -LiteralPath $sheetDir) { Remove-Item -LiteralPath $sheetDir -Recurse -Force -ErrorAction SilentlyContinue }
-                New-Item -ItemType Directory -Path $sheetDir -Force | Out-Null
-                $batchId = 'i' + $position.ToString('0000')
-                $batchIdByIndex[[string]$i] = $batchId
-                $batchRequest += [ordered]@{
-                    id = $batchId
-                    beforePdf = $beforePdf
-                    afterPdf = $afterPdf
-                    outputDirectory = $sheetDir
-                    kind = $kind
-                }
-            } catch {
-                $batchPreparationErrors[[string]$i] = $_.Exception.Message
-            }
-        }
-        $batchResultMap = @{}
-        $batchTimings = $null
-        if ($batchRequest.Count -gt 0) {
-            Refresh-DiffJobLeases $Job
-            $status.message = "æ–°æ—§PDFã‚’ã¾ã¨ã‚ã¦ç”»åƒåŒ–ãƒ»è§£æžã—ã¦ã„ã¾ã™ï¼ˆ$($batchRequest.Count)ã‚·ãƒ¼ãƒˆï¼‰ã€‚"
-            $status.currentSheet = ''
-            $status.percent = 5
-            $detail.generation = [ordered]@{ status = 'running'; jobId = $jobId; percent = 5; message = $status.message; currentSheet = '' }
-            Write-JsonFile $detailPath $detail; Write-RenderJobStatus $statusPath $status
-            $batchGenerated = Invoke-DiffImageBatchGeneration $batchRequest
-            $batchTimings = Get-DataProperty $batchGenerated 'timings' $null
-            foreach ($batchItem in @(Get-Array (Get-DataProperty $batchGenerated 'items' @()))) {
-                $batchResultMap[[string](Get-DataProperty $batchItem 'id' '')] = $batchItem
-            }
-        }
-
-        for ($position = 0; $position -lt $workIndexes.Count; $position++) {
-            Refresh-DiffJobLeases $Job
-            $i = [int]$workIndexes[$position]
-            $sheet = $detail.sheets[$i]
-            $name = [string]$sheet.sheetName; $kind = [string]$sheet.kind
-            $sheet.status = 'generating'; $sheet.message = ''
-            $status.currentSheet = $name
-            $status.message = "å·®åˆ†ç”»åƒã‚’ä½œæˆã—ã¦ã„ã¾ã™: $($position + 1) / $($workIndexes.Count) ã‚·ãƒ¼ãƒˆ $name"
-            $status.percent = [int][Math]::Max(5, [Math]::Min(95, [Math]::Floor((([double]$position) / [Math]::Max(1, $workIndexes.Count)) * 90) + 5))
-            Write-RenderJobStatus $statusPath $status
-            try {
-                if ($batchPreparationErrors.ContainsKey([string]$i)) { throw [string]$batchPreparationErrors[[string]$i] }
-                $batchId = [string]$batchIdByIndex[[string]$i]
-                if ([string]::IsNullOrWhiteSpace($batchId) -or -not $batchResultMap.ContainsKey($batchId)) {
-                    throw 'å·®åˆ†ç”»åƒä¸€æ‹¬ç”Ÿæˆçµæžœã«å¯¾è±¡ã‚·ãƒ¼ãƒˆãŒã‚ã‚Šã¾ã›ã‚“ã€‚'
-                }
-                $generated = $batchResultMap[$batchId]
-                if (-not [bool](Get-DataProperty $generated 'ok' $false)) {
-                    throw [string](Get-DataProperty $generated 'message' 'å·®åˆ†ç”»åƒã‚’ç”Ÿæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚')
-                }
-                $pages = @(); $regionTotal = 0; $hasUnknownPage = $false
-                foreach ($page in @(Get-Array $generated.pages)) {
-                    $regions = @(Get-Array (Get-DataProperty $page 'regions' @())); $regionTotal += $regions.Count
-                    if ([string](Get-DataProperty $page 'status' '') -eq 'unknown') { $hasUnknownPage = $true }
-                    $pages += [pscustomobject][ordered]@{
-                        pageNumber = Get-IntDataProperty $page 'pageNumber' 0; width = Get-IntDataProperty $page 'width' 0; height = Get-IntDataProperty $page 'height' 0
-                        pageSizeChanged = [bool](Get-DataProperty $page 'pageSizeChanged' $false); status = [string](Get-DataProperty $page 'status' 'ready')
-                        message = [string](Get-DataProperty $page 'message' ''); confidence = [double](Get-DataProperty $page 'confidence' 1)
-                        changedRatio = [double](Get-DataProperty $page 'changedRatio' 0); beforeAsset = [string](Get-DataProperty $page 'beforeFile' '')
-                        afterAsset = [string](Get-DataProperty $page 'afterFile' ''); beforeMaskAsset = [string](Get-DataProperty $page 'beforeMaskFile' '')
-                        beforeOverlayAsset = [string](Get-DataProperty $page 'beforeOverlayFile' ''); maskAsset = [string](Get-DataProperty $page 'afterMaskFile' '')
-                        overlayAsset = [string](Get-DataProperty $page 'afterOverlayFile' ''); regions = @($regions)
-                    }
-                }
-                $sheet.pages = @($pages); $sheet.beforePages = Get-IntDataProperty $generated 'beforePageCount' 0
-                $sheet.afterPages = Get-IntDataProperty $generated 'afterPageCount' 0
-                $sheet.pageCount = [Math]::Max([int]$sheet.beforePages, [int]$sheet.afterPages); $sheet.regionCount = $regionTotal
-                $sheet.status = $(if ($kind -eq 'unknown' -or $hasUnknownPage) { 'unknown' } else { 'ready' })
-                if ($kind -eq 'unknown') { $sheet.message = 'ä¿¡é ¼ã§ãã‚‹å·®åˆ†é ˜åŸŸã‚’åˆ¤å®šã§ããªã„ãŸã‚ã€å¼·èª¿è¡¨ç¤ºã¯è¡Œã„ã¾ã›ã‚“ã€‚' }
-            } catch {
-                # ç”»åƒç”Ÿæˆãã®ã‚‚ã®ã®å¤±æ•—ã¯ã€æ¯”è¼ƒä¸Šã®ã€Œåˆ¤å®šä¸èƒ½ã€ã¨åŒºåˆ¥ã™ã‚‹ã€‚
-                # failed ã®ã¾ã¾æ®‹ã™ã“ã¨ã§ã€å…¨ä½“å†è©¦è¡Œã¾ãŸã¯ã‚·ãƒ¼ãƒˆå†é¸æŠžã‹ã‚‰å†ç”Ÿæˆã§ãã‚‹ã€‚
-                $sheet.status = 'failed'; $sheet.message = $_.Exception.Message; $sheet.pages = @(); $sheet.regionCount = 0
-                $status.failed++; $status.errors = @($status.errors) + @([ordered]@{ sheetName = $name; error = $_.Exception.Message; detail = Get-ErrorDetail $_ })
-            }
-            $status.completed = $position + 1
-            $status.percent = [int][Math]::Max(8, [Math]::Min(98, [Math]::Floor((([double]($position + 1)) / [Math]::Max(1, $workIndexes.Count)) * 93) + 5))
-            $detail.sheets[$i] = $sheet
-            $detail.generation = [ordered]@{ status = 'running'; jobId = $jobId; percent = $status.percent; message = $status.message; currentSheet = $name }
-            Write-JsonFile $detailPath $detail; Write-RenderJobStatus $statusPath $status
-        }
-        # 1ã‚·ãƒ¼ãƒˆã ã‘ã®é…å»¶ç”Ÿæˆã§ã‚‚ 'ready' ã‚’æ›¸ã„ã¦ã„ãŸãŸã‚ã€å…¨ã‚·ãƒ¼ãƒˆç”ŸæˆãŒé€”ä¸­ã§å¤±æ•—ã—ãŸå¾Œã«
-        # ã€Œå¤‰æ›´ãªã—ã€ã‚·ãƒ¼ãƒˆã‚’1ä»¶é–‹ãã¨ status ãŒ ready ã«ä¸Šæ›¸ãã•ã‚Œã€pending ã®ã¾ã¾æ®‹ã£ãŸ
-        # ã‚·ãƒ¼ãƒˆãŒäºŒåº¦ã¨ç”Ÿæˆã§ããªããªã£ã¦ã„ãŸ(Start-DiffDetailJob ãŒã€Œä½œæˆæ¸ˆã¿ã€ã‚’è¿”ã™)ã€‚
-        # å®Ÿéš›ã®æ®‹ä»¶ã‹ã‚‰ status ã‚’æ±ºã‚ã‚‹ã€‚
-        $pendingSheets = @(Get-Array $detail.sheets | Where-Object { @('pending','generating') -contains [string](Get-DataProperty $_ 'status' '') }).Count
-        $failedSheets = @(Get-Array $detail.sheets | Where-Object { [string](Get-DataProperty $_ 'status' '') -eq 'failed' }).Count
-        if ($pendingSheets -eq 0 -and $failedSheets -eq 0) {
-            $detail.status = 'ready'; $detail.message = ''
-        } else {
-            $detail.status = 'failed'
-            $parts = @()
-            if ($pendingSheets -gt 0) { $parts += "æœªä½œæˆ $pendingSheets ä»¶" }
-            if ($failedSheets -gt 0) { $parts += "ä½œæˆå¤±æ•— $failedSheets ä»¶" }
-            $detail.message = ('å·®åˆ†ç”»åƒã«æœªå®Œäº†ã®ã‚·ãƒ¼ãƒˆãŒã‚ã‚Šã¾ã™ï¼ˆ' + ($parts -join 'ã€') + 'ï¼‰ã€‚å†è©¦è¡Œã—ã¦ãã ã•ã„ã€‚')
-        }
-        $detail.generatedAt = New-NowIso
-        Set-NoteProperty $detail 'performance' $batchTimings
-        $detail.generation = [ordered]@{ status = 'completed'; jobId = $jobId; percent = 100; message = 'å·®åˆ†è©³ç´°ã‚’ä½œæˆã—ã¾ã—ãŸã€‚'; currentSheet = '' }
-        Write-JsonFile $detailPath $detail
-        $status.status = $(if ($status.failed -gt 0) { 'completed-with-errors' } else { 'completed' }); $status.percent = 100; $status.currentSheet = ''
-        $status.message = $(if ($status.failed -gt 0) { 'ä¸€éƒ¨ã®ã‚·ãƒ¼ãƒˆã‚’é™¤ãã€å·®åˆ†è©³ç´°ã‚’ä½œæˆã—ã¾ã—ãŸã€‚' } else { 'å·®åˆ†è©³ç´°ã‚’ä½œæˆã—ã¾ã—ãŸã€‚' })
-        $status.results = @([ordered]@{ workbookId = $workbookId; detailPath = $detailPath; sheetCount = $workIndexes.Count; performance = $batchTimings })
-        Write-RenderJobStatus $statusPath $status
-    } catch {
-        $status.status = 'failed'; $status.percent = 100; $status.message = 'å·®åˆ†è©³ç´°ã‚’ä½œæˆã§ãã¾ã›ã‚“ã§ã—ãŸã€‚'
-        $status.errors = @([ordered]@{ error = $_.Exception.Message; detail = Get-ErrorDetail $_ }); Write-RenderJobStatus $statusPath $status
-        if ($null -ne $detail) {
-            try {
-                $detail.status = 'failed'
-                if (-not [string]::IsNullOrWhiteSpace($requestedSheetKey)) {
-                    $target = @(Get-Array $detail.sheets | Where-Object { [string](Get-DataProperty $_ 'sheetKey' '') -eq $requestedSheetKey } | Select-Object -First 1)
-                    if ($target.Count -gt 0) {
-                        $target[0].status = 'failed'
-                        $target[0].message = $_.Exception.Message
-                        $target[0].pages = @()
-                        $target[0].regionCount = 0
-                    }
-                }
-                $detail.message = $_.Exception.Message
-                $detail.generation = [ordered]@{ status = 'failed'; jobId = $jobId; percent = 100; message = $_.Exception.Message; currentSheet = '' }
-                Write-JsonFile $detailPath $detail
-            } catch { }
-        }
-    }
-}
-
-
-function Invoke-DiffDetailJobFromFile([string]$JobPath) {
-    $job = Read-JsonFile $JobPath $null
-    if ($null -eq $job) { throw "Diff job file is not readable: $JobPath" }
-    try {
-        $language = [string](Get-DataProperty $job 'mode' $Mode)
-        $workbookId = [string](Get-DataProperty $job 'workbookId' '')
-        $jobScope = [string](Get-DataProperty $job 'scope' 'automatic')
-        $context = if ($jobScope -eq 'history') {
-            Get-DiffDetailContext $language $workbookId ([string]$job.baselineSnapshotId) ([string]$job.currentSnapshotId)
-        } else { Get-DiffDetailContext $language $workbookId }
-        if (-not [bool]$context.available) { throw [string]$context.message }
-        $expectedLock = [IO.Path]::GetFullPath((Get-DiffGenerationLockPath $language $context))
-        $providedLockText = [string](Get-DataProperty $job 'generationLockPath' '')
-        if ([string]::IsNullOrWhiteSpace($providedLockText)) { throw 'å·®åˆ†ç”Ÿæˆãƒ­ãƒƒã‚¯ã®ä¿å­˜å…ˆãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-        $providedLock = [IO.Path]::GetFullPath($providedLockText)
-        if ($expectedLock -ne $providedLock) { throw 'å·®åˆ†ç”Ÿæˆãƒ­ãƒƒã‚¯ã®ä¿å­˜å…ˆãŒä¸æ­£ã§ã™ã€‚' }
-        Invoke-WithLock $expectedLock { Invoke-DiffDetailJobCore $job }
-    } finally {
-        Remove-DiffJobLeases $job
-    }
-}
-
-function Serve-DiffPage($Context, [string]$Language, [string]$WorkbookId, [string]$CurrentSnapshotId, [string]$BaselineSnapshotId, [string]$SheetKey, [string]$PageNumberText, [string]$Asset, [string]$Scope = 'automatic') {
-    $allowedAssets = @('before','after','before-mask','before-overlay','mask','overlay')
-    if ($allowedAssets -notcontains $Asset) { throw [ArgumentException]::new('asset ãŒä¸æ­£ã§ã™ã€‚') }
-    $pageNumber = 0
-    if (-not [int]::TryParse($PageNumberText, [ref]$pageNumber) -or $pageNumber -le 0) {
-        throw [ArgumentException]::new('pageNumber ãŒä¸æ­£ã§ã™ã€‚')
-    }
-    if ([string]::IsNullOrWhiteSpace($Scope)) { $Scope = 'automatic' }
-    if ($Scope -notin @('automatic','history')) { throw [ArgumentException]::new('scope ãŒä¸æ­£ã§ã™ã€‚') }
-    $diffContext = if ($Scope -eq 'history') {
-        Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
-    } else {
-        Get-DiffDetailContext $Language $WorkbookId
-    }
-    if (-not [bool]$diffContext.available) { throw [string]$diffContext.message }
-    if ((Assert-SafeStorageSegment $CurrentSnapshotId 'currentSnapshotId') -ne [string]$diffContext.currentSnapshotId -or
-        (Assert-SafeStorageSegment $BaselineSnapshotId 'baselineSnapshotId') -ne [string]$diffContext.baselineSnapshotId) {
-        throw 'æ¯”è¼ƒå¯¾è±¡ãŒæ›´æ–°ã•ã‚Œã¾ã—ãŸã€‚å·®åˆ†è©³ç´°ã‚’é–‹ãç›´ã—ã¦ãã ã•ã„ã€‚'
-    }
-    $safeSheetKey = Assert-SafeStorageSegment $SheetKey 'sheetKey'
-    $cacheDir = Get-DiffDetailCacheDirForLanguage $Language $diffContext
-    $detailPath = Join-Path $cacheDir 'diff-detail.json'
-    if (-not (Test-Path -LiteralPath $detailPath)) { throw 'å·®åˆ†è©³ç´°ã¯ã¾ã ä½œæˆã•ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' }
-    $detail = Read-JsonFile $detailPath $null
-    if (-not (Test-DiffDetailMatchesContext $detail $diffContext)) {
-        throw 'å·®åˆ†è©³ç´°ã®æ¯”è¼ƒå¯¾è±¡ãŒä¸€è‡´ã—ã¾ã›ã‚“ã€‚å·®åˆ†è©³ç´°ã‚’å†ä½œæˆã—ã¦ãã ã•ã„ã€‚'
-    }
-    $sheet = @(Get-Array $detail.sheets | Where-Object { [string]$_.sheetKey -eq $safeSheetKey } | Select-Object -First 1)
-    if ($sheet.Count -eq 0) { throw 'æŒ‡å®šã—ãŸã‚·ãƒ¼ãƒˆã¯æ¯”è¼ƒå¯¾è±¡ã«å«ã¾ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' }
-    $page = @(Get-Array $sheet[0].pages | Where-Object { (Get-IntDataProperty $_ 'pageNumber' 0) -eq $pageNumber } | Select-Object -First 1)
-    if ($page.Count -eq 0) { throw 'æŒ‡å®šã—ãŸãƒšãƒ¼ã‚¸ã¯æ¯”è¼ƒå¯¾è±¡ã«å«ã¾ã‚Œã¦ã„ã¾ã›ã‚“ã€‚' }
-    $property = switch ($Asset) {
-        'before' { 'beforeAsset' }
-        'after' { 'afterAsset' }
-        'before-mask' { 'beforeMaskAsset' }
-        'before-overlay' { 'beforeOverlayAsset' }
-        'mask' { 'maskAsset' }
-        'overlay' { 'overlayAsset' }
-    }
-    $fileName = [string](Get-DataProperty $page[0] $property '')
-    if ([string]::IsNullOrWhiteSpace($fileName) -or $fileName -notmatch '^[A-Za-z0-9._-]+\.png$') { throw 'å·®åˆ†ç”»åƒãŒã‚ã‚Šã¾ã›ã‚“ã€‚' }
-    $full = [IO.Path]::GetFullPath((Join-Path $cacheDir (Join-Path 'p' (Join-Path $safeSheetKey $fileName))))
-    $root = [IO.Path]::GetFullPath($cacheDir)
-    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
-    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $full)) {
-        throw 'å·®åˆ†ç”»åƒãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚'
-    }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'image/png'
-}
-
-function Get-WorkbookChangeSummary([string]$Language, [string]$WorkbookId, $Workbook = $null) {
-    $cmp = Get-LatestComparison $Language $WorkbookId $Workbook
-    if ($null -eq $cmp) { return $null }
-    return [ordered]@{
-        status = [string](Get-DataProperty $cmp 'status' '')
-        method = [string](Get-DataProperty $cmp 'method' '')
-        changedSheets = @(Get-Array (Get-DataProperty $cmp 'changedSheets' @()))
-        unchangedSheets = @(Get-Array (Get-DataProperty $cmp 'unchangedSheets' @()))
-        unknownSheets = @(Get-Array (Get-DataProperty $cmp 'unknownSheets' @()))
-        # V5-P1(#10): è¿½åŠ ãƒ»å‰Šé™¤ã‚·ãƒ¼ãƒˆã‚‚ state ã«è¼‰ã›ã‚‹ã€‚æ¯”è¼ƒçµæžœã¯æŒã£ã¦ã„ã‚‹ã®ã«ã“ã“ã§æ¨ã¦ã¦ã„ãŸã€‚
-        addedSheets = @(Get-Array (Get-DataProperty $cmp 'addedSheets' @()))
-        removedSheets = @(Get-Array (Get-DataProperty $cmp 'removedSheets' @()))
-        message = [string](Get-DataProperty $cmp 'message' '')
-        comparedAt = [string](Get-DataProperty $cmp 'comparedAt' '')
-    }
-}
-
-function Invoke-StartupRecovery([string]$Language) {
-    try { Clear-ExpiredLeases $Language } catch { }
-    try { Clear-StaleEphemeralCopies $Language } catch { }
-    try { Recover-AutoStates $Language } catch { }
-    try { Recover-FinalTransactions $Language } catch { }
-    try { Invoke-InputHistoryCleanup $Language } catch { }
-}
-
-# V5-P0: ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼ãƒ¢ãƒ¼ãƒ‰ã€‚ã“ã‚ŒãŒç„¡ã„ã¨å­ãƒ—ãƒ­ã‚»ã‚¹ãŒé€šå¸¸ã‚µãƒ¼ãƒãƒ¼ã¨ã—ã¦èµ·å‹•ã—ã€
-# ã•ã‚‰ã«å­«ã‚¹ã‚±ã‚¸ãƒ¥ãƒ¼ãƒ©ãƒ¼ã‚’èµ·å‹•ã—ã¦ç„¡é™ã«å¢—æ®–ã™ã‚‹ã€‚é€šå¸¸ã‚µãƒ¼ãƒãƒ¼åˆæœŸåŒ–ã‚ˆã‚Šå‰ã«ç½®ãã“ã¨ã€‚
-if (-not [string]::IsNullOrWhiteSpace($AutoSchedulerPath)) {
-    Invoke-AutoSchedulerFromFile -ControlPath $AutoSchedulerPath -ParentProcessId $ParentProcessId
-    return
-}
-
-if (-not [string]::IsNullOrWhiteSpace($DiffJobPath)) {
-    Invoke-DiffDetailJobFromFile $DiffJobPath
-    return
-}
-
-if (-not [string]::IsNullOrWhiteSpace($RenderJobPath)) {
-    Invoke-RenderJobFromFile $RenderJobPath
-    return
-}
-
-if ($Port -le 0) { $Port = Get-FreePort }
-$config0 = Get-AppConfig
-$config0.lastMode = $Mode
-Save-AppConfig $config0
-try { $startupPaths=Get-Paths; if($startupPaths.dataDir -and (Test-Path -LiteralPath ([string]$startupPaths.dataDir))){Ensure-Package $startupPaths} } catch { Write-Warning $_.Exception.Message }
-
-# V5: èµ·å‹•æ™‚ãƒªã‚«ãƒãƒªãƒ¼(æœŸé™åˆ‡ã‚Œleaseã€å­¤å…ã®ä¸€æ™‚ã‚³ãƒ”ãƒ¼ã€è‡ªå‹•çŠ¶æ…‹ã€æœªå®Œäº†ãƒˆãƒ©ãƒ³ã‚¶ã‚¯ã‚·ãƒ§ãƒ³ã€å±¥æ­´ã®æŽƒé™¤)
-try { Invoke-StartupRecovery (Get-EffectiveLanguage) } catch { Write-Warning $_.Exception.Message }
-try { [void](Start-AutoSchedulerProcess (Get-EffectiveLanguage)) } catch { Write-Warning $_.Exception.Message }
-
-$prefix = "http://127.0.0.1:$Port/"
-$url = ("http://127.0.0.1:{0}/?token={1}&mode={2}" -f $Port, $Script:Token, $Mode)
-
-# Use a small TcpListener-based HTTP server instead of HttpListener.
-# This avoids URL ACL / administrator-rights issues on locked-down Windows PCs.
-Start-LocalTcpServer $Port $url ([bool]$NoOpen)
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×žv÷tèµ©hºÚn¶X§zÍ{îïÜ\˜[JˆÕ˜[Y]TÙ]
+	Ú˜IË	Ù[‰ÊWBˆÜÝš[™×I[ÙHH	Ú˜IËˆÚ[IÜHˆÜÝš[™×IÚÙ[ˆH	ÉËˆÜÝÚ]ÚI›ÓÜ[‹ˆÜÝš[™×I™[™\’›Ø”]H	ÉËˆÜÝš[™×IY™’›Ø”]H	ÉËˆÜÝš[™×I]]ÔØÚY[\”]H	ÉËˆÚ[I\™[›ØÙ\ÜÒYHŠB‚‰\œ›ÜXÝ[Û”™Y™\™[˜ÙHH	ÔÝÜ	Â‚‰ØÜš\\›ÛÝHÜ]T]T\™[	^R[›ØØ][Û‹“^PÛÛ[X[™”]‰ØÜš\•ÙX”›ÛÝH›Ú[‹T]	ØÜš\\›ÛÝ	ÝÙX‰Â‰ØÜš\‘Y˜][ÛÛ™šYÔ]H›Ú[‹T]	ØÜš\\›ÛÝ	ÙY˜][XÛÛ™šYËšœÛÛ‰Â‰ØØ[ÛÛ™šYÓÝ™\œšYHH
+ÜÝš[™×I[Ž”‘TÔ•’S‘T—ÓÐÐSÐÓÓ‘’Q×Ô“ÓÕ
+K•š[J
+BšYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ØØ[ÛÛ™šYÓÝ™\œšYJJHÂˆ	ØÜš\“ØØ[ÛÛ™šYÔ›ÛÝH›Ú[‹T]
+Ñ[š\›Û›Y[NŽ‘Ù]›Û\”]
+	ÓØØ[\XØ][Û‘]IÊJH	Ô™\Üš[™\‰ÂŸH[ÙHÂˆ	ØÜš\“ØØ[ÛÛ™šYÔ›ÛÝHÒSË”]NŽ‘Ù][]
+	ØØ[ÛÛ™šYÓÝ™\œšYJBŸB‰ØÜš\ÛÛ™šYÔ]H›Ú[‹T]	ØÜš\“ØØ[ÛÛ™šYÔ›ÛÝ	ØÛÛ™šYËšœÛÛ‰ÂšYˆ
+[›Ý
+\ÝT]S]\˜[]	ØÜš\“ØØ[ÛÛ™šYÔ›ÛÝ
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	ØÜš\“ØØ[ÛÛ™šYÔ›ÛÝQ›Ü˜ÙHÝ]S[BšYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÚÙ[ŠJHÂˆ	ÚÙ[ž]\ÈH™]ËSØš™XÝž]V×HÌ‚ˆ	ÚÙ[”›™ÈHÔÙXÝ\š]KÜž\ÙÜ˜\K”˜[™ÛS[X™\‘Ù[™\˜]Ü—NŽÜ™X]J
+BˆžHÂˆ	ÚÙ[”›™Ë‘Ù]ž]\Ê	ÚÙ[ž]\ÊBˆHš[˜[HÂˆ	ÚÙ[”›™Ë‘\ÜÜÙJ
+BˆBˆ	ØÜš\•ÚÙ[ˆHÐÛÛ™\NŽ•Ð˜\ÙMÝš[™Ê	ÚÙ[ž]\ÊK•š[Q[™
+	ÏIÊK”™\XÙJ	ÊÉË	ËIÊK”™\XÙJ	ËÉË	×ÉÊBŸH[ÙHÂˆ	ØÜš\•ÚÙ[ˆH	ÚÙ[‚ŸB‚‰ØÜš\ÛY[]XÚYH	˜[ÙB‰ØÜš\“\ÝX\™X]]ÈHÑ]U[YWNŽ•]Ó›ÝÂ‰ØÜš\ÛY[ÛÜÙS›ÝYšYY]ÈHÑ]U[YWNŽ“Z[•˜[YB‰ØÜš\”Ú]ÝÛ”™\]Y\ÝYH	˜[ÙB‰ØÜš\ØXÚY˜]˜Q^HH	ÉÂˆÈ9§ 9l#ùc%¸à¬øàìøà¯xàï8àêøàiú-mùbåxàexà£8àgøàj8àcxà y/exàk¸à©¸à¨øàìøàâxà©¸àbùb!¸àbøà¢øà¢8àa¸àjøà¯øà©8àâ8àêøà¤¹.æ8àdxà¢øà ‚žHÈ	ÜÝ•RK”˜]ÕRK•Ú[™ÝÕ]HH”™\Üš[™\ˆ8à­xàï8àä8àï
+	[ÙJHH8àdøàk¸à©¸à¨øàìøàâxà©¸à¤ºe¢xàf8à¢øàj9í`¹.¡¸àeøào¸àfHˆHØ]ÚÈB‰ØÜš\]]Ô™[™\’[”›ÙÜ™\ÜÈH	˜[ÙB‰ØÜš\”Ù\™\”Ý\Y]ÈHÑ]U[YWNŽ•]Ó›ÝÂ‰ØÜš\’YU[Y[Ý]ÙXÛÛ™ÈHN‰ØÜš\“›ÐÛY[Ý\\[Y[Ý]ÙXÛÛ™ÈHŒ‰ØÜš\”™XYQÚYž]\ÈHÐÛÛ™\NŽ‘œ›ÛP˜\ÙMÝš[™Ê	ÔŒÓÑTPPRPPPPPPPTËËÞ]ÐPPPPPTPPPPPÐU]ÐSÝÏOIÊB‰ØÜš\‘^Ù[š[›Ùš[U™\œÚ[ÛˆHŒŒÌŒŒB‰ØÜš\‘š[˜[ÛÛ\ÜÙ\”›Ùš[U™\œÚ[ÛˆHŒŒŒ‰ØÜš\”™[™\‘[š\›Û›Y[ØXÚHH	[‰ØÜš\”™[™\‘[š\›Û›Y[ÛÛ\\™YH	˜[ÙB‰ØÜš\Ý\œ™[™[™\‘[‘š[™Ù\œš[H	ÉÂ‰ØÜš\Ý\œ™[™[™\‘[’[™›ÈH	[‰ØÜš\“\Ý™[™\][\H	[‰ØÜš\””YÙP[˜[^™\•™\œÚ[ÛˆHB‰ØÜš\’˜]˜T[[YTÚYÛ˜]\™HH	ÉÂ‰ØÜš\”[™[™Ð[˜[\Ú\ÈH	[‰ØÜš\””YÙP[˜[^™\]˜Z[X›HH	[‰ØÜš\]]ÔØÚY[\”›ØÙ\ÜÒYH‰ØÜš\]]ÔØÚY[\”›ØÙ\ÜÈH	[‰ØÜš\]]ÔØÚY[\ÛÛ›Û]H	ÉÂˆÈKTŽˆ:*+yk¦¸àîøàäxà®xàîù¢oú*£xàçxàê¸à­øàï8àkÈÙ]UÛÜšÜÜXÙT]9íc9å,xàiøànøào9aj:e¨¹¥l8àbøà¢ydo8àl8à£8à¢øà ‚ˆÈ9«ã¹fç¸àáøà¨øà®xà«øà¤º*«xà 
+8àexà¢xàjÈÛÛ™šYÈ8àkù¦î8àcÊxàj8à yaly§"xàâxàêxà©8àå¹."¸àiú!í9doyæ¡8àjú`axàcøàj¸à¢øà ¹çëy¦`ºe¤øàh8àdxà«xàèøààøà­øàéxàfxà¢øà ‚‰ØÜš\\ÛÛ™šYÐØXÚHH	[‰ØÜš\\ÛÛ™šYÐØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YB‰ØÜš\”]ÐØXÚHH	[‰ØÜš\”]ÐØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YB‰ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚHH	[‰ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YB‰ØÜš\’\ÝÜžTÚ^™PØXÚHH	[‰ØÜš\’\ÝÜžTÚ^™PØXÚRÙ^HH	ÉÂ‰ØÜš\’\ÝÜžTÚ^™PØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YB‰ØÜš\ÛÛ™šYÐØXÚTÙXÛÛ™ÈH‚‰ØÜš\”ÛXÞPØXÚTÙXÛÛ™ÈHB‰ØÜš\’\ÝÜžTÚ^™PØXÚTÙXÛÛ™ÈHŒ‰ØÜš\ÛÛ™šYÓY\™ÙPÚ[™ÙYH	˜[ÙB‚™[˜Ý[Ûˆ™]ËS›ÝÒ\ÛÈÂˆ™]\›ˆ
+Ù]Q]JK•ÔÝš[™Ê	Þ^^^KSSKY›[NœÜÞžž‰ÊBŸB‚™[˜Ý[ÛˆÙ]Q\œ›Ü‘]Z[
+	\œ›Ü”™XÛÜ™
+HÂˆYˆ
+	[Y\H	\œ›Ü”™XÛÜ™
+HÈ™]\›ˆ	ÉÈBˆ	\ÈH
+
+BˆÈKTÎˆ9.éybcxàkÈ^Ù\[Û‹•ÔÝš[™Ê
+H8àc9cå¸à£8àj¸àa8àj8à xàèxààøà®øàï8à®z(c8àh8àdxàjøàj¸à¢¹c§ùfè:/ïz-èxàc8àiøàcxàj¸àbøàhøàgøà ‚ˆÈ9g¢øàîÒ™\Ý[8àîË“‘U8à®xà¯øààøà«øàîùa¡z`ê9/¢ùi%¸àîùæn¹å'ú(c8à¤¸à ycå¸à£8àgøà ¸àk¸àbøà¢yoáxàf¹êcxà 8à ‚ˆžHÂˆ	^H	\œ›Ü”™XÛÜ™‘^Ù\[Û‚ˆ	\HˆÚ[H
+	[[™H	^X[™	\[JHÂˆ	[™HH
+	ÖÞÌWHÌ_IÈYˆ	^‘Ù]\J
+K‘[˜[YKÜÝš[™×I^“Y\ÜØYÙJBˆžHÈ	[™H
+ÏH
+	È
+™\Ý[LÌ–JIÈYˆÚ[I^’™\Ý[
+HHØ]ÚÈBˆ	\È
+ÏH	[™BˆžHÈYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I^”ÝXÚÕ˜XÙJJHÈ	\È
+ÏHÜÝš[™×I^”ÝXÚÕ˜XÙHHHØ]ÚÈBˆžHÈ	^H	^’[›™\‘^Ù\[ÛˆHØ]ÚÈ	^H	[Bˆ	\
+ÊÂˆBˆHØ]ÚÈBˆžHÂˆ	ZHH	\œ›Ü”™XÛÜ™’[›ØØ][Û’[™›ÂˆYˆ
+	[[™H	ZJHÂˆ	\È
+ÏH
+	Ø][™HÌKÚ\ˆÌ_NˆÌŸIÈYˆÚ[IZK”ØÜš\[™S[X™\‹Ú[IZK“Ù™œÙ][“[™KÜÝš[™×IZK“[™JK•š[J
+BˆBˆHØ]ÚÈBˆžHÈYˆ
+	\œ›Ü”™XÛÜ™‘[T]X[YšYY\œ›Ü’Y
+HÈ	\È
+ÏH
+	Ù\œ›Ü’Yˆ	È
+ÈÜÝš[™×I\œ›Ü”™XÛÜ™‘[T]X[YšYY\œ›Ü’Y
+HHHØ]ÚÈBˆžHÂˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I\œ›Ü”™XÛÜ™”ØÜš\ÝXÚÕ˜XÙJJHÂˆ	\È
+ÏH”ÝÙ\”Ú[ÝXÚÎ˜‰
+ÜÝš[™×I\œ›Ü”™XÛÜ™”ØÜš\ÝXÚÕ˜XÙJH‚ˆBˆHØ]ÚÈBˆžHÂˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I\œ›Ü”™XÛÜ™’[›ØØ][Û’[™›Ë”ÜÚ][Û“Y\ÜØYÙJJHÂˆ	\È
+ÏHÜÝš[™×I\œ›Ü”™XÛÜ™’[›ØØ][Û’[™›Ë”ÜÚ][Û“Y\ÜØYÙBˆBˆHØ]ÚÈBˆYˆ
+	\ËÛÝ[Y\H
+HÈ™]\›ˆÜÝš[™×I\œ›Ü”™XÛÜ™Bˆ™]\›ˆ
+	\ÈZ›Ú[ˆ˜ˆŠBŸB‚‚‚™[˜Ý[Ûˆ[›ÚÙKS˜]]™PØ\\™JÜÝš[™×Iš[T]ÜÝš[™Ö×WI\™Ý[Y[\Ý
+HÂˆÈKTÎˆÚ[™ÝÜÈÝÙ\”Ú[KŒH8àiøàkøà xàãxà©8àá¸à¨øàå¸à¬øàç¸àìøàâxàkˆÝ\œˆ8à¤ˆ‰ŒH8àiùcå¸à¢º/¯8à 8àjˆÈ\œ›Ü”™XÛÜ™8àj8àeøài¸àäxà©8àåøàêxà©8àìøàjù­`xà£8à I\œ›ÜXÝ[Û”™Y™\™[˜ÙOIÔÝÜ	È8àk¹."øàiøàkÂˆÈ˜]]™PÛÛ[X[™\œ›Üˆ8àk¹/¢ùi%¸àjøàj¸à¢øà ‚ˆÈ›Þ8àkù¥éy§+:*§¸àåxàªxàìøàâ8à¤¹d*øà ¸àiú+i¹dbŠ›Ü›X]MÛX\X›H‹‹Šxà¤ˆÝ\œˆ8àjùaî¸àfxàgøà xà BˆÈ:)èù§¤8à¡9ía9âb8àc9¢$9b§øàeøài¸àa8ài¸à ¹do8àlùaî¸àeù`m8àc8à#9i,y¥eøà#xàj:*©:*£xàeøài¸àa8àgøà ‚ˆÈ8àdøàdøàh8àdHÛÛ[YH8àjú$/xàj8àeøài¹aî¹b¦øà¤¹¥¡ùkeùb%øàj8àeøài¹fç¹cã¸àfxà¢øà ‚ˆ	™]š[Ý\ÈH	\œ›ÜXÝ[Û”™Y™\™[˜ÙBˆ	\œ›ÜXÝ[Û”™Y™\™[˜ÙHH	ÐÛÛ[YIÂˆ	[™\ÈH
+
+Bˆ	^]HLBˆžHÂˆ	[™\ÈH
+	ˆ	š[T]\™Ý[Y[\Ý‰ŒH›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈJBˆ	^]H	TÕVUÓÑBˆHš[˜[HÂˆ	\œ›ÜXÝ[Û”™Y™\™[˜ÙHH	™]š[Ý\ÂˆBˆ™]\›ˆÛÜ™\™YPÈ^]ÛÙHH	^]ÈÝ]]H	[™\ÎÈ^H
+	[™\ÈZ›Ú[ˆ˜ˆŠHBŸB‚ˆÈ™XYHš[H[Y\Ý[\œ›ÛH[ˆÜ[ˆÚ[™ÝÜÈš[H[™KˆÛˆÓPˆÚ\™\È\È\ÂˆÈ[Ü™H™[XX›H[ˆ\™XÝÜžKY[[Y\˜][ÛˆY]Y]H[™X]Ú\È^Ü™\‰ÜÂˆÈ¹¦í9¥¬9¥éy¦`ˆˆ˜[YKˆ˜[˜XÚÈÈÞ\Ý[K’SÈÛˆ›Û‹UÚ[™ÝÜÈÜˆYˆH[™HØ[˜Z[Ë‚šYˆ
+	[Ž“ÔÈY\H	ÕÚ[™ÝÜ×Ó•	ÈX[™[›Ý
+	Ô™\Üš[™\“˜]]™K‘š[U[Y\ÉÈX\ÈÝ\WJJHÂˆYU\HU\QYš[š][Ûˆ	Â\Ú[™ÈÞ\Ý[NÂ\Ú[™ÈÞ\Ý[KÛÛ\Û™[[Ù[Â\Ú[™ÈÞ\Ý[K”[[YK’[\›ÜÙ\šXÙ\ÎÂ\Ú[™ÈZXÜ›ÜÛÙ•Ú[ŒÌ‹”ØY™R[™\ÎÂ‚›˜[Y\ÜXÙH™\Üš[™\“˜]]™HÂˆX›XÈÝ]XÈÛ\ÜÈš[U[Y\ÈÂˆš]˜]HÛÛœÝZ[’SWÔ‘PQÐU’P•UTÈHÂˆš]˜]HÛÛœÝZ[’SWÔÒT‘WÔ‘PQHNÂˆš]˜]HÛÛœÝZ[’SWÔÒT‘WÕÔ’UHHŽÂˆš]˜]HÛÛœÝZ[’SWÔÒT‘WÑSUHHÂˆš]˜]HÛÛœÝZ[ÔS—ÑVTÕS‘ÈHÎÂˆš]˜]HÛÛœÝZ[’SWÐU’P•UWÓ“Ô“PSHÂ‚ˆÑ[\Ü
+šÙ\›™[Ì‹™‹Ú\”Ù]HÚ\”Ù]•[šXÛÙKÙ]\Ý\œ›ÜˆHYJWBˆš]˜]HÝ]XÈ^\›ˆØY™Qš[R[™HÜ™X]Qš[JˆÝš[™Èš[S˜[YKˆZ[\Ú\™YXØÙ\ÜËˆZ[Ú\™S[ÙKˆ[ˆÙXÝ\š]P]šX]\ËˆZ[Ü™X][Û‘\ÜÜÚ][Û‹ˆZ[›YÜÐ[™]šX]\Ëˆ[ˆ[\]Qš[JNÂ‚ˆÑ[\Ü
+šÙ\›™[Ì‹™‹Ù]\Ý\œ›ÜˆHYJWBˆš]˜]HÝ]XÈ^\›ˆ›ÛÛÙ]š[U[YJˆØY™Qš[R[™Hš[R[™KˆÝ]Û™ÈÜ™X][Û•[YKˆÝ]Û™È\ÝXØÙ\ÜÕ[YKˆÝ]Û™È\ÝÜš]U[YJNÂ‚ˆX›XÈÝ]XÈÛ™ÈÙ]\ÝÜš]Qš[U[YU]ÊÝš[™È]
+HÂˆ\Ú[™È
+ØY™Qš[R[™H[™HHÜ™X]Qš[Jˆ]ˆ’SWÔ‘PQÐU’P•UTËˆ’SWÔÒT‘WÔ‘PQ’SWÔÒT‘WÕÔ’UH’SWÔÒT‘WÑSUKˆ[‹–™\›ËˆÔS—ÑVTÕS‘Ëˆ’SWÐU’P•UWÓ“Ô“PSˆ[‹–™\›ÊJHÂˆYˆ
+[™K’\Ò[˜[Y
+HÂˆ›ÝÈ™]ÈÚ[ŒÌ‘^Ù\[ÛŠX\œÚ[‘Ù]\ÝÚ[ŒÌ‘\œ›ÜŠ
+JNÂˆBˆÛ™ÈÜ™X][Û‹XØÙ\ÜËÜš]NÂˆYˆ
+QÙ]š[U[YJ[™KÝ]Ü™X][Û‹Ý]XØÙ\ÜËÝ]Üš]JJHÂˆ›ÝÈ™]ÈÚ[ŒÌ‘^Ù\[ÛŠX\œÚ[‘Ù]\ÝÚ[ŒÌ‘\œ›ÜŠ
+JNÂˆBˆ™]\›ˆÜš]NÂˆBˆBˆBŸB‰ÐŸB‚™[˜Ý[ÛˆÙ]Qš[S\ÝÜš]TÛ˜\ÚÝ
+ÜÝš[™×I]
+HÂˆ	]ÈH	[ˆYˆ
+	[Ž“ÔÈY\H	ÕÚ[™ÝÜ×Ó•	ÈX[™
+	Ô™\Üš[™\“˜]]™K‘š[U[Y\ÉÈX\ÈÝ\WJJHÂˆžHÂˆ	š[U[YU]ÈHÔ™\Üš[™\“˜]]™K‘š[U[Y\×NŽ‘Ù]\ÝÜš]Qš[U[YU]Ê	]
+Bˆ	]ÈHÑ]U[YWNŽ‘œ›ÛQš[U[YU]Ê	š[U[YU]ÊBˆHØ]ÚÈBˆBˆYˆ
+	[Y\H	]ÊHÂˆ	]ÈHÒSË‘š[WNŽ‘Ù]\ÝÜš]U[YU]Ê	]
+BˆBˆ	ØØ[H	]Ë•ÓØØ[[YJ
+Bˆ™]\›ˆÛÜ™\™YPÂˆ]ÈH	]ÂˆØØ[H	ØØ[ˆ\Ü^HH	ØØ[•ÔÝš[™Ê	Þ^^^KÓSKÙ›[IÊBˆ[š^\ÈHÚ[JÑ]U[YSÙ™œÙ]NŽ›™]Ê	]ÊK•Õ[š^[YSZ[\ÙXÛÛ™Ê
+JBˆBŸB‚™[˜Ý[Ûˆ™XYU^š[TÚ\™Y
+ÜÝš[™×I]
+HÂˆ	Ú\™HHÒSË‘š[TÚ\™WJÚ[VÒSË‘š[TÚ\™WNŽ”™XYÜš]HX›ÜˆÚ[VÒSË‘š[TÚ\™WNŽ‘[]JBˆ	œÈHÒSË‘š[WNŽ“Ü[Š	]ÒSË‘š[S[ÙWNŽ“Ü[‹ÒSË‘š[PXØÙ\Ü×NŽ”™XY	Ú\™JBˆžHÂˆ	™XY\ˆH™]ËSØš™XÝSË”Ý™X[T™XY\Š	œËÕ^‘[˜ÛÙ[™×NŽ•UŽ	YJBˆžHÈ™]\›ˆ	™XY\‹”™XYÑ[™
+
+HBˆš[˜[HÈ	™XY\‹‘\ÜÜÙJ
+HBˆHš[˜[HÂˆ	œË‘\ÜÜÙJ
+BˆBŸB‚™[˜Ý[Ûˆ™XYRœÛÛ‘š[JÜÝš[™×I]	Y˜][˜[YJHÂˆ›Üˆ
+	][\HÈ	][\[LÈ	][\
+ÊÊHÂˆžHÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	]
+JHÈ™]\›ˆ	Y˜][˜[YHBˆ	^H™XYU^š[TÚ\™Y	]ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^
+JHÈ™]\›ˆ	Y˜][˜[YHBˆ™]\›ˆ	^ÛÛ™\œ›ÛKRœÛÛ‚ˆHØ]ÚÔÞ\Ý[K’SË‘š[S›Ý›Ý[™^Ù\[Û—HÂˆ™]\›ˆ	Y˜][˜[YBˆHØ]ÚÔÞ\Ý[K’SË’SÑ^Ù\[Û—HÂˆYˆ
+	][\YÙHJHÈ›ÝÈBˆÝ\TÛY\SZ[\ÙXÛÛ™È
+Œ
+È
+H
+ˆ	][\
+JBˆHØ]ÚÔÞ\Ý[K•[˜]]Üš^™YXØÙ\ÜÑ^Ù\[Û—HÂˆYˆ
+	][\YÙHJHÈ›ÝÈBˆÝ\TÛY\SZ[\ÙXÛÛ™È
+Œ
+È
+H
+ˆ	][\
+JBˆHØ]ÚÂˆÈH›ÙÜ™\ÜÈ”ÓÓˆš[HØ[ˆ™H™XY^XÝHÚ[H]\È™Z[™È™]Üš][‹‚ˆÈ™]žH\œÙH˜Z[\™\È[œÝXYÙˆ™X][™ÈH[\Ü˜\žH\X[š[H\ÈH˜][›Øˆ\œ›Ü‹‚ˆYˆ
+	][\YÙHJHÂˆYˆ
+	[[™H	Y˜][˜[YJHÈ™]\›ˆ	Y˜][˜[YHBˆ›ÝÂˆBˆÝ\TÛY\SZ[\ÙXÛÛ™È
+Ì
+È
+L
+ˆ	][\
+JBˆBˆBˆ™]\›ˆ	Y˜][˜[YBŸB‚™[˜Ý[ÛˆÜš]KU]Ž›Ð›ÛQš[JÜÝš[™×I]ÜÝš[™×I^
+HÂˆÈÚ[™ÝÜÈÝÙ\”Ú[KŒIÜÈÙ]PÛÛ[Q[˜ÛÙ[™ÈUŽÜš]\ÈH“ÓK‚ˆÈ™\ÜÛÛ\ÜÙ\‰ÜÈÛÛ\XÝ”ÓÓˆ™XY\ˆ^XÝÈZ[ˆU‹NÛÈÜš]H”ÓÓˆš[\ÈÚ]Ý]“ÓK‚ˆ	[˜ÛÙ[™ÈH™]ËSØš™XÝÞ\Ý[K•^•UŽ[˜ÛÙ[™ÈP\™Ý[Y[\Ý	˜[ÙBˆÒSË‘š[WNŽ•Üš]P[^
+	]	^	[˜ÛÙ[™ÊBŸB‚™[˜Ý[ÛˆÜš]KU]Ž›Ð›ÛQš[TÚ\™Y
+ÜÝš[™×I]ÜÝš[™×I^
+HÂˆÈ˜[˜XÚÈ›Üˆ›ÝXÝYÈÞ[˜ÙY›Û\œÈÚ\™Hš[K”™\XÙHØ[ˆ[\›Z][BˆÈ˜Z\ÙHXØÙ\ÜÈ[šYYˆ™XY\œÈ\ÙH™XYÜš]KÑ[]HÚ\š[™È[™™XYRœÛÛ‘š[BˆÈ™]šY\È\X[™XYËÛÈ›ÙÜ™\ÜÈÙY\È[Ýš[™È[œÝXYÙˆÝ^Z[™È]	K‚ˆ	[˜ÛÙ[™ÈH™]ËSØš™XÝÞ\Ý[K•^•UŽ[˜ÛÙ[™ÈP\™Ý[Y[\Ý	˜[ÙBˆ	ž]\ÈH	[˜ÛÙ[™Ë‘Ù]ž]\Ê	^
+Bˆ	\™[HÜ]T]T\™[	]ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\™[
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	\™[Q›Ü˜ÙHÝ]S[Bˆ›Üˆ
+	][\HÈ	][\[LŽÈ	][\
+ÊÊHÂˆ	œÈH	[ˆžHÂˆ	Ú\™HHÒSË‘š[TÚ\™WJÚ[VÒSË‘š[TÚ\™WNŽ”™XYÜš]HX›ÜˆÚ[VÒSË‘š[TÚ\™WNŽ‘[]JBˆ	œÈHÒSË‘š[WNŽ“Ü[Š	]ÒSË‘š[S[ÙWNŽÜ™X]KÒSË‘š[PXØÙ\Ü×NŽ•Üš]K	Ú\™JBˆ	œË•Üš]J	ž]\Ë	ž]\Ë“[™Ý
+BˆžHÈ	œË‘›\Ú
+	YJHHØ]ÚÈ	œË‘›\Ú
+
+HBˆ™]\›‚ˆHØ]ÚÔÞ\Ý[K’SË’SÑ^Ù\[Û—HÂˆYˆ
+	][\YÙHLJHÈ›ÝÈBˆHØ]ÚÔÞ\Ý[K•[˜]]Üš^™YXØÙ\ÜÑ^Ù\[Û—HÂˆYˆ
+	][\YÙHLJHÈ›ÝÈBˆHš[˜[HÂˆYˆ
+	œÊHÈžHÈ	œË‘\ÜÜÙJ
+HHØ]ÚÈHBˆBˆÝ\TÛY\SZ[\ÙXÛÛ™È
+L
+È
+ÍH
+ˆ	][\
+JBˆBŸB‚™[˜Ý[Ûˆ[Ý™KQš[P]ÛZXÐÛÛ\]
+ÜÝš[™×IÛÝ\˜ÙT]ÜÝš[™×I\Ý[˜][Û”]
+HÂˆ›Üˆ
+	][\HÈ	][\[LŽÈ	][\
+ÊÊHÂˆžHÂˆYˆ
+\ÝT]S]\˜[]	\Ý[˜][Û”]
+HÂˆÒSË‘š[WNŽ”™\XÙJ	ÛÝ\˜ÙT]	\Ý[˜][Û”]	[	YJBˆH[ÙHÂˆÒSË‘š[WNŽ“[Ý™J	ÛÝ\˜ÙT]	\Ý[˜][Û”]
+BˆBˆ™]\›‚ˆHØ]ÚÔÞ\Ý[K’SË‘š[S›Ý›Ý[™^Ù\[Û—HÂˆžHÈÒSË‘š[WNŽ“[Ý™J	ÛÝ\˜ÙT]	\Ý[˜][Û”]
+NÈ™]\›ˆHØ]ÚÈYˆ
+	][\YÙHLJHÈ›ÝÈHBˆHØ]ÚÔÞ\Ý[K’SË’SÑ^Ù\[Û—HÂˆYˆ
+	][\YÙHLJHÈ›ÝÈBˆHØ]ÚÔÞ\Ý[K•[˜]]Üš^™YXØÙ\ÜÑ^Ù\[Û—HÂˆYˆ
+	][\YÙHLJHÈ›ÝÈBˆBˆÝ\TÛY\SZ[\ÙXÛÛ™È
+L
+È
+Ì
+ˆ	][\
+JBˆBŸB‚™[˜Ý[ÛˆÜš]KRœÛÛ‘š[JÜÝš[™×I]	˜[YJHÂˆ	\™[HÜ]T]T\™[	]ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\™[
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	\™[Q›Ü˜ÙHÝ]S[Bˆ	\H‰]\‰
+ÑÝZYNŽ“™]ÑÝZY
+
+K•ÔÝš[™Ê	Ó‰ÊJH‚ˆ	œÛÛˆHÛÛ™\ËRœÛÛˆR[œ]Øš™XÝ	˜[YHQ\Lˆ	]ÛZXÑ\œ›ÜˆH	ÉÂˆžHÂˆÈ9­ìxàa9aly§"xàåxàªxàêøàà8àiøàkøà y§ 9í`¸àäxà®xàkù¢lxàb8ài¸à ‘ÕRQ9.æ8àcy. 9¦`¹d#xàh8àdxàcˆÈPVÔU8à¤º-¡xàb8à¢øàdøàj8àc8à`¸à¢øà ¹/g9¢$8à žya¡xàjùïk¸àcxà yæí9£©y¦î:/¯8àn9î+º` 8àfxà¢øà ‚ˆÜš]KU]Ž›Ð›ÛQš[H	\	œÛÛ‚ˆ[Ý™KQš[P]ÛZXÐÛÛ\]	\	]ˆ™]\›‚ˆHØ]ÚÂˆ	]ÛZXÑ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆÈÛÛYHÚ[™ÝÜËÓÛ™Qš]™KØ[]š\\ÈÛÛXš[˜][ÛœÈ[žHš[K”™\XÙHÛˆ”ÓÓˆš[\ÂˆÈ]\™H™Z[™ÈØ]ÚYÜˆ™]šY]ÙYˆ\ÙHHÚ\™Y\™XÝÜš]H\ÈH˜[˜XÚË‚ˆžHÂˆÜš]KU]Ž›Ð›ÛQš[TÚ\™Y	]	œÛÛ‚ˆ™]\›‚ˆHØ]ÚÂˆ›ÝÈ’”ÓÓ¹/çykf8àjùi,y¥eøàeøào¸àeøàgÎˆ	]È]ÛZXÏI]ÛZXÑ\œ›ÜˆÈÚ\™YI
+	Ë‘^Ù\[Û‹“Y\ÜØYÙJH‚ˆBˆHš[˜[HÂˆYˆ
+\ÝT]S]\˜[]	\
+HÈ™[[Ý™KR][HS]\˜[]	\Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHBˆBŸB‚™[˜Ý[Ûˆ™XYU^š[UZ[ØY™JÜÝš[™×I]Ú[IX^Ú\œÈH
+HÂˆžHÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	]
+JHÈ™]\›ˆ	ÉÈBˆ	^H™XYU^š[TÚ\™Y	]ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^
+JHÈ™]\›ˆ	ÉÈBˆYˆ
+	^“[™Ý[H	X^Ú\œÊHÈ™]\›ˆ	^Bˆ™]\›ˆ	^”ÝXœÝš[™Ê	^“[™ÝH	X^Ú\œÊBˆHØ]ÚÈ™]\›ˆ	ÉÈBŸB‚™[˜Ý[ÛˆÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[JÜÝš[™×IÝ]\Ô]	›Ø‹ÜÝš[™×IY\ÜØYÙJHÂˆYˆ
+	[Y\H	›ØŠHÈ™]\›ˆ	›ØˆBˆÙ]S›ÝT›Ü\H	›Øˆ	ÜÝ]\ÉÈ	Ù˜Z[Y	ÂˆÙ]S›ÝT›Ü\H	›Øˆ	Ü\˜Ù[	ÈLˆÙ]S›ÝT›Ü\H	›Øˆ	ÛY\ÜØYÙIÈ	Y\ÜØYÙBˆ	ÝÝ]]HÜÝš[™×JÙ]Q]T›Ü\H	›Øˆ	ÜÝÝ]]	È	ÉÊBˆ	Ý\œ”]HÜÝš[™×JÙ]Q]T›Ü\H	›Øˆ	ÜÝ\œ”]	È	ÉÊBˆ	ÝÝ]Z[H™XYU^š[UZ[ØY™H	ÝÝ]]Ìˆ	Ý\œ•Z[H™XYU^š[UZ[ØY™H	Ý\œ”]Ìˆ	]Z[H
+
+BˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý\œ•Z[
+JHÈ	]Z[
+ÏHœÝ\œŽ˜‰Ý\œ•Z[ˆBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÝÝ]Z[
+JHÈ	]Z[
+ÏHœÝÝ]˜‰ÝÝ]Z[ˆBˆYˆ
+	]Z[ÛÝ[YÝ
+HÈÙ]S›ÝT›Ü\H	›Øˆ	ÜÝ\\ÙÉÈ
+	]Z[Z›Ú[ˆ˜˜ˆŠHBˆ	\œˆHÛÜ™\™YPÈ\œ›ÜˆH	Y\ÜØYÙNÈ\Ù\‘\œ›ÜˆH	Ô¹/g9¢$8àåøàëxà®øà®xà¤º-mùbåxàiøàcxào¸àføà¤øàiøàeøàgøà ”™\Üš[™\¸à¤¹. 9n©¹í`¹.¡¸àeøài¸àbøà¢ya£yk§ú(c8àeøài¸àcøàh8àexàa8à ‰ÎÈ]Z[H
+ÜÝš[™×JÙ]Q]T›Ü\H	›Øˆ	ÜÝ\\ÙÉÈ	ÉÊJHBˆÙ]S›ÝT›Ü\H	›Øˆ	Ù\œ›ÜœÉÈ
+	\œŠBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	›Ø‚ˆ™]\›ˆ	›Ø‚ŸB‚™[˜Ý[ÛˆÙ]P\œ˜^J	˜[YJHÂˆYˆ
+	[Y\H	˜[YJHÈ™]\›ˆ
+
+HBˆYˆ
+	˜[YHZ\ÈÔÞ\Ý[K\œ˜^WJHÈ™]\›ˆ
+	˜[YJHBˆ™]\›ˆ
+	˜[YJBŸB‚‚™[˜Ý[ÛˆÙ]P\œ˜^T›Ü\J	Øš™XÝÜÝš[™×I˜[YJHÂˆYˆ
+	[Y\H	Øš™XÝ
+HÈ™]\›ˆBˆ	\œˆH
+Ù]P\œ˜^H	Øš™XÝ‰˜[YJBˆYˆ
+	Øš™XÝ”ÓØš™XÝ”›Ü\Y\ÖÉ˜[YWJHÂˆ	Øš™XÝ‰˜[YHH	\œ‚ˆH[ÙHÂˆ	Øš™XÝYSY[X™\ˆS›ÝT›Ü\S˜[YH	˜[YHS›ÝT›Ü\U˜[YH	\œ‚ˆBŸB‚™[˜Ý[Ûˆ›Ü›X[^™KTÝXÝ\™PÛÛXÝ[ÛœÊ	ÝXÝ\™JHÂˆYˆ
+	[Y\H	ÝXÝ\™JHÈ™]\›ˆ	ÝXÝ\™HBˆÙ]P\œ˜^T›Ü\H	ÝXÝ\™H	ÝÛÜšØ›ÛÚÜÉÂˆÙ]P\œ˜^T›Ü\H	ÝXÝ\™H	ÜYÙ\ÉÂˆYˆ
+	[Y\H	ÝXÝ\™K›Û[Y\ÊHÂˆ	ÝXÝ\™HYSY[X™\ˆS›ÝT›Ü\S˜[YH	Ý›Û[Y\ÉÈS›ÝT›Ü\U˜[YH
+ÛÜ™\™YPßJHQ›Ü˜ÙBˆBˆ™]\›ˆ	ÝXÝ\™BŸB‚™[˜Ý[Ûˆ\ÝQ\™XÝ^Ù[™[]]™T]
+ÜÝš[™×I™[]]™T]
+HÂˆ\ÝT™[]]™T]	™[]]™T]Ý]S[ˆYˆ
+	™[]]™T][X]Ú	Ö××IÊHÈ›ÝÈ	ù£ä9aî¸àåxàªxàêøàà9æí9."øàk‘^Ù[8àh8àdyænúc,¸àiøàcxào¸àfxà ¹kd8àåxàªxàêøàà9a¡xàk¸àåxà¨xà©8àêøàkùkïº,hyi%¸àiøàfxà ‰ÈBˆ	^HÒSË”]NŽ‘Ù]^[œÚ[ÛŠ	™[]]™T]
+K•ÓÝÙ\’[˜\šX[
+
+BˆYˆ
+	^[™H	ËžÞ	ÊHÈ›ÝÈ	ù¢èyo-ykd8àcžÞ8àk‘^Ù[8àh8àdyænúc,¸àiøàcxào¸àfxà ‰ÈBˆYˆ
+ÒSË”]NŽ‘Ù]š[S˜[YJ	™[]]™T]
+H[ZÙH	ß‰
+‰ÊHÈ›ÝÈ	Ñ^Ù[8àk¹. 9¦`¸àåxà¨xà©8àêøàkùænúc,¸àiøàcxào¸àføà¤øà ‰ÈBˆ™]\›ˆ	YBŸB‚™[˜Ý[ÛˆÙ]PÛÛ™šYÒÙ^S˜[Y\Ê	Øš™XÝ
+HÂˆYˆ
+	[Y\H	Øš™XÝ
+HÈ™]\›ˆ
+
+HBˆYˆ
+	Øš™XÝZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJHÈ™]\›ˆ
+	Øš™XÝ’Ù^\È›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈJHBˆ™]\›ˆ
+	Øš™XÝ”ÓØš™XÝ”›Ü\Y\È›Ü‘XXÚSØš™XÝÈÜÝš[™×IË“˜[YHJBŸB‚™[˜Ý[Ûˆ\ÝPÛÛ™šYÒ\ÒÙ^J	Øš™XÝÜÝš[™×I˜[YJHÂˆYˆ
+	[Y\H	Øš™XÝ
+HÈ™]\›ˆ	˜[ÙHBˆYˆ
+	Øš™XÝZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJHÈ™]\›ˆ	Øš™XÝÛÛZ[œÊ	˜[YJHBˆ™]\›ˆ
+	[[™H	Øš™XÝ”ÓØš™XÝ”›Ü\Y\ÖÉ˜[YWJBŸB‚™[˜Ý[ÛˆY\™ÙKPÛÛ™šYÑY˜][Ê	\™Ù]	Y˜][ÊHÂˆÈ9¥è¹k¦¹`)8à¤¸à«xàï9cf9/cxàiùa£yn,9æ¡8àjú(ç9k£8àfxà¢øà ¹¥è¸àjøà`¸à¢ù`)8àkùoáxàf¹a*¹ab8àfxà¢Ê9b*yå*: !xàkº*+yk¦¸à¤¹hâ¸àexàj¸àa
+xà ‚ˆÈ\™Ù]ÑY˜][È8àkÈÐÝ\ÝÛSØš™XÝ8àiøà ˆÜ™\™Y\ÚX›H8àiøà ¸à¢8àa8à ‚ˆYˆ
+	[Y\H	Y˜][ÊHÈ™]\›ˆ	\™Ù]BˆYˆ
+	[Y\H	\™Ù]
+HÈ™]\›ˆ	Y˜][ÈBˆ›Ü™XXÚ
+	˜[YH[ˆ
+Ù]PÛÛ™šYÒÙ^S˜[Y\È	Y˜][ÊJHÂˆ	Y•˜[YHHÙ]Q]T›Ü\H	Y˜][È	˜[YH	[ˆYˆ
+[›Ý
+\ÝPÛÛ™šYÒ\ÒÙ^H	\™Ù]	˜[YJJHÂˆÙ]S›ÝT›Ü\H	\™Ù]	˜[YH	Y•˜[YBˆÈKTŽˆ9¥è¹k¦¹`)8à¤¹k§úf¦øàjú(ç9k£8àeøàgøàj8àcxàh8àdHÛÛ™šYËšœÛÛˆ8à¤¹¦î8àcy¢.øàfxà ‚ˆ	ØÜš\ÛÛ™šYÓY\™ÙPÚ[™ÙYH	YBˆÛÛ[YBˆBˆ	Ý\ˆHÙ]Q]T›Ü\H	\™Ù]	˜[YH	[ˆ	Y’\ÓØšˆH
+	Y•˜[YHZ\ÈÜØÝ\ÝÛ[Øš™XÝJH[Üˆ
+	Y•˜[YHZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJBˆ	Ý\’\ÓØšˆH
+	Ý\ˆZ\ÈÜØÝ\ÝÛ[Øš™XÝJH[Üˆ
+	Ý\ˆZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJBˆYˆ
+	Y’\ÓØšˆX[™	Ý\’\ÓØšŠHÈÝ›ÚYJY\™ÙKPÛÛ™šYÑY˜][È	Ý\ˆ	Y•˜[YJHBˆBˆ™]\›ˆ	\™Ù]ŸB‚™[˜Ý[Ûˆ™\Ù]PÛÛ™šYÐØXÚ\ÈÂˆÈ:*+yk¦¸àîøàäxà®xàîøàçxàê¸à­øàï8à¤¹i"y¦í8àeøàgøà¢yoáxàf¹do8àm¸à ‚ˆ	ØÜš\\ÛÛ™šYÐØXÚHH	[ˆ	ØÜš\\ÛÛ™šYÐØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YBˆ	ØÜš\”]ÐØXÚHH	[ˆ	ØÜš\”]ÐØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YBˆ	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚHH	[ˆ	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YBˆÈ]Q\ˆ8àk¹b!ù¦ïù¦`¸àjù¥éøàëøàï8à«øà®xàæ¸àï8à®xàk¹k®zaãøà¤º/å8àexàj¸àa8à ‚ˆ	ØÜš\’\ÝÜžTÚ^™PØXÚHH	[ˆ	ØÜš\’\ÝÜžTÚ^™PØXÚRÙ^HH	ÉÂˆ	ØÜš\’\ÝÜžTÚ^™PØXÚP]]ÈHÑ]U[YWNŽ“Z[•˜[YBŸB‚™[˜Ý[ÛˆÙ]P\ÛÛ™šYÈÂˆÈNˆ8àëxàï8àªøàêØÛÛ™šYøà¤¸àgxàk¸ào¸àoº/å8àfxàj8à y¥è¹kf9b*yå*: !xàjù¥¬8àeøàa8à«xàï
+]]Ô™[™\ˆ8àj¸àjJxàc9cãy¦(8àexà£8àj¸àa8à ‚ˆÈ9¥è¹k¦¹`)8à¤º*«xàoøà xàëxàï8àªøàêùa*¹ab8àiøà«xàï9cf9/cxàjøàç¸àï8à®8àeøài¸àbøà¢z/å8àfxà ‚ˆÈKTŽˆ9.éybcxàkøàdøàkºe¨¹¥l8àc9do8àl8à£8à¢øàgøàløàjÈÛÛ™šYËšœÛÛˆ8à¤¹¦î8àcy¢.øàeøài¸àa8àgøà ‚ˆÈÙ]T]ÈOˆÙ]UÛÜšÜÜXÙT]9íc9å,xàiøànøào9aj:e¨¹¥l8àbøà¢ydo8àl8à£8à¢øàgøà xà BˆÈ9©'9çéyâb8àk¹. :)©ùcå¹o¥øàj¸àjxàiÌy.í¸àe8àj8àjøàåxà¨xà©8àêù¦î8àcz/¯8àoøàc9æn¹å'øàeøài¸àa8àgøà ‚ˆÈ9k§úf¦øàjù¥è¹k¦¹`)8à¤º(ç9k£8àeøàgøàj8àcxàh8àdy¦î8àcxà yíd9§§8àkùçëy¦`ºe¤øà«xàèøààøà­øàéxàfxà¢øà ‚ˆYˆ
+	[[™H	ØÜš\\ÛÛ™šYÐØXÚHX[™
+
+Ñ]U[YWNŽ•]Ó›ÝÈH	ØÜš\\ÛÛ™šYÐØXÚP]]ÊK•Ý[ÙXÛÛ™È[	ØÜš\ÛÛ™šYÐØXÚTÙXÛÛ™ÊJHÂˆ™]\›ˆ	ØÜš\\ÛÛ™šYÐØXÚBˆBˆ	Y˜][HÛÜ™\™YPÈØÚ[XU™\œÚ[ÛˆHNÈ\ÝÝX›Z\ÜÚ[Û‘\ˆH	ÉÎÈ\Ý]Q\ˆH	ÉÎÈ\ÝÝ]]\ˆH	ÉÎÈ\Ý[ÙHH	[ÙHBˆ	ÙYYH™XYRœÛÛ‘š[H	ØÜš\‘Y˜][ÛÛ™šYÔ]	Y˜][ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	ØÜš\ÛÛ™šYÔ]
+JHÂˆžHÈÜš]KRœÛÛ‘š[H	ØÜš\ÛÛ™šYÔ]	ÙYYHØ]ÚÈBˆ	ØÜš\\ÛÛ™šYÐØXÚHH	ÙYYˆ	ØÜš\\ÛÛ™šYÐØXÚP]]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ™]\›ˆ	ÙYYˆBˆ	ØØ[H™XYRœÛÛ‘š[H	ØÜš\ÛÛ™šYÔ]	Y˜][ˆ	ØÜš\ÛÛ™šYÓY\™ÙPÚ[™ÙYH	˜[ÙBˆ	Y\™ÙYHY\™ÙKPÛÛ™šYÑY˜][È	ØØ[	ÙYYˆYˆ
+ÜÝš[™×JÙ]Q]T›Ü\H	Y\™ÙY	ÜØÚ[XU™\œÚ[Û‰È	ÉÊH[™H	Ì‰ÊHÂˆÙ]S›ÝT›Ü\H	Y\™ÙY	ÜØÚ[XU™\œÚ[Û‰È‚ˆ	ØÜš\ÛÛ™šYÓY\™ÙPÚ[™ÙYH	YBˆBˆYˆ
+	ØÜš\ÛÛ™šYÓY\™ÙPÚ[™ÙY
+HÈžHÈÜš]KRœÛÛ‘š[H	ØÜš\ÛÛ™šYÔ]	Y\™ÙYHØ]ÚÈHBˆ	ØÜš\\ÛÛ™šYÐØXÚHH	Y\™ÙYˆ	ØÜš\\ÛÛ™šYÐØXÚP]]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ™]\›ˆ	Y\™ÙYŸB‚™[˜Ý[ÛˆÙ]UÛÜšÜÜXÙTÛXÞHÂˆÈNˆ9©kybæy¢oú*£xàkøàëøàï8à«øà®xàæ¸àï8à®ycf9/cxà ¹`"ù.®º*+yk¦¸àbøà¢xàkù."¹¦î8àcxàiøàcxàj¸àa8à ‚ˆÈ9¬ê9¡#Îˆ8àdøà£8àkù¢ :(dùæ¡8àj¸à¨¸à«øà®øà®yb-¹o¨xàiøàkøàj¸àcú`bùå*8àåxàêxà¬8àiøà`¸à¢øà ‚ˆÈ9aly§"Y]Q\¸àn9¦î8àcz/¯8à xà¢ùb*yå*: !xàkÈÛXÞKšœÛÛˆ8à ¹íê:fá¸àiøàcxà¢øà ‚ˆÈKTŽˆ\ÝR[œ]\ÝÜžQ[˜X›Y8àkÈÜš]KR\ÝÜžQ]™[8àj¸àjxàbøà¢yi&¹¥l9fç¹do8àl8à£8à¢øà ‚ˆÈ9aly§"xàâxàêxà©8àå¹."¸àkˆÛXÞKšœÛÛˆ8à¤¹«ã¹fçº*«xào¸àj¸àa8à¢8àa¹çëy¦`ºe¤øà«xàèøààøà­øàéxàfxà¢øà ‚ˆYˆ
+	[[™H	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚHX[™
+
+Ñ]U[YWNŽ•]Ó›ÝÈH	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚP]]ÊK•Ý[ÙXÛÛ™È[	ØÜš\”ÛXÞPØXÚTÙXÛÛ™ÊJHÂˆ™]\›ˆ	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚBˆBˆ	Y˜][HÛÜ™\™YPÈØÚ[XU™\œÚ[ÛˆHNÈ[œ]\ÝÜžP\›Ý™YH	˜[ÙNÈÛÝ\˜ÙT™][[Û\›Ý™YH	˜[ÙNÈ\›Ý™YžHH	ÉÎÈ\›Ý™Y]H	ÉÎÈZ[š[][P\™\œÚ[ÛˆH	ÉÈBˆ	™\Ý[H	Y˜][ˆžHÂˆ	]ÈHÙ]T]ÂˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I]Ë™]Q\ŠJHÂˆ	]H›Ú[‹T]
+ÜÝš[™×I]Ë™]Q\ŠH	ØÛÛ[[Û—ÛXÞKšœÛÛ‰ÂˆYˆ
+\ÝT]S]\˜[]	]
+HÈ	™\Ý[H™XYRœÛÛ‘š[H	]	Y˜][BˆBˆHØ]ÚÈ	™\Ý[H	Y˜][Bˆ	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚHH	™\Ý[ˆ	ØÜš\•ÛÜšÜÜXÙTÛXÞPØXÚP]]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ™]\›ˆ	™\Ý[ŸB‚™[˜Ý[Ûˆ\ÝR[œ]\ÝÜžQ[˜X›YÂˆ™]\›ˆØ›ÛÛJÙ]Q]T›Ü\H
+Ù]UÛÜšÜÜXÙTÛXÞJH	Ú[œ]\ÝÜžP\›Ý™Y	È	˜[ÙJBŸB‚™[˜Ý[Ûˆ\ÝTÛÝ\˜ÙT™][[Û‘[˜X›YÂˆ	ÛXÞHHÙ]UÛÜšÜÜXÙTÛXÞBˆYˆ
+[›ÝØ›ÛÛJÙ]Q]T›Ü\H	ÛXÞH	Ú[œ]\ÝÜžP\›Ý™Y	È	˜[ÙJJHÈ™]\›ˆ	˜[ÙHBˆYˆ
+[›ÝØ›ÛÛJÙ]Q]T›Ü\H	ÛXÞH	ÜÛÝ\˜ÙT™][[Û\›Ý™Y	È	˜[ÙJJHÈ™]\›ˆ	˜[ÙHBˆÈ9¢oú*£y§hy.í¸à#9d#9. 8àkºfd9k¦¸àåxàªxàêøàà:acy."øàk¸àoøà#xà¤¸à¬øàï8àâxàiùè®º*£xàfxà¢øà ‚ˆÈ]Q\ˆ8àc9£ä9aî¸àåxàªxàêøàà8àk¹i%¸àjøà`¸à¢ùh-9d"8àkùãï¹âjxà¤¹/çykf8àeøàj¸àa8à ‚ˆžHÂˆ	]ÈHÙ]T]Âˆ	ÝXˆHÒSË”]NŽ‘Ù][]
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠBˆYˆ
+[›Ý	ÝX‹‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	ÝXˆ
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆ	]HHÒSË”]NŽ‘Ù][]
+ÜÝš[™×I]Ë™]Q\ŠBˆYˆ
+[›Ý	]K”Ý\ÕÚ]
+	ÝX‹ÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈ™]\›ˆ	˜[ÙHBˆHØ]ÚÈ™]\›ˆ	˜[ÙHBˆ™]\›ˆ	YBŸB‚™[˜Ý[ÛˆÙ]P]]Ô™[™\”Ù][™ÜÈÂˆ	ÛÛ™šYÈHÙ]P\ÛÛ™šYÂˆ	]]ÈHÙ]Q]T›Ü\H	ÛÛ™šYÈ	Ø]]Ô™[™\‰È	[ˆ	[˜X›YHØ›ÛÛJÙ]Q]T›Ü\H	]]È	Ù[˜X›Y	È	˜[ÙJBˆÈ9çæùæïº*+yk¦¸àkù¢ä¹d)¸àfxà¢Îˆ9liy«m8àc9§*¹¢oú*£xàj¸à¢z!ê¹båyaé¹ä!¸àkùbåxàbøàexàj¸àa8à ‚ˆYˆ
+	[˜X›YX[™[›Ý
+\ÝR[œ]\ÝÜžQ[˜X›Y
+JHÂˆ	[˜X›YH	˜[ÙBˆÜš]KUØ\›š[™È	Ø]]Ô™[™\‹™[˜X›Y8àc9§"yb®xàiøàfxàc8à xàëøàï8à«øà®xàæ¸àï8à®xàiùaiyb¦ùliy«m8àc9¢oú*£xàexà£8ài¸àa8ào¸àføà¤øà º!ê¹båyaé¹ä!¸à¤¹á(yb®xàjøàeøào¸àfxà ‰ÂˆBˆ™]\›ˆÛÜ™\™YPÂˆ[˜X›YH	[˜X›Yˆ]ZY]\š[ÙÙXÛÛ™ÈHÚ[JÙ]Q]T›Ü\H	]]È	Ü]ZY]\š[ÙÙXÛÛ™ÉÈN
+Bˆ™\]Z\™TÝX›R\ÚÛÝ[HÚ[JÙ]Q]T›Ü\H	]]È	Ü™\]Z\™TÝX›R\ÚÛÝ[	ÈŠBˆY™\•Ú[Q^Ù[[•\ÙHHØ›ÛÛJÙ]Q]T›Ü\H	]]È	ÙY™\•Ú[Q^Ù[[•\ÙIÈ	YJBˆBŸB‚™[˜Ý[ÛˆÙ]R[œ]\ÝÜžTÙ][™ÜÈÂˆ	ÛÛ™šYÈHÙ]P\ÛÛ™šYÂˆ	ZHÙ]Q]T›Ü\H	ÛÛ™šYÈ	Ú[œ]\ÝÜžIÈ	[ˆ™]\›ˆÛÜ™\™YPÂˆ™]Z[”ÛÝ\˜ÙU™\œÚ[ÛœÈHÚ[JÙ]Q]T›Ü\H	Z	Ü™]Z[”ÛÝ\˜ÙU™\œÚ[ÛœÉÈŠBˆ™]Z[ÛÛ[•™\œÚ[ÛœÈHÚ[JÙ]Q]T›Ü\H	Z	Ü™]Z[ÛÛ[•™\œÚ[ÛœÉÈÊBˆÛÝ\˜ÙT™][[Û‘^\ÐY\Z[H
+Ù]Q]T›Ü\H	Z	ÜÛÝ\˜ÙT™][[Û‘^\ÐY\Z[	È	[
+BˆÛÙØ\YYØXž]\ÈHÚ[JÙ]Q]T›Ü\H	Z	ÜÛÙØ\YYØXž]\ÉÈLLŒ
+BˆØ\›]\˜Ù[HÚ[JÙ]Q]T›Ü\H	Z	ÝØ\›]\˜Ù[	È
+Bˆ\[Y\˜[ÛÜSX^YÙSZ[]\ÈHÚ[JÙ]Q]T›Ü\H	Z	Ù\[Y\˜[ÛÜSX^YÙSZ[]\ÉÈÌ
+BˆBŸB‚™[˜Ý[ÛˆØ]™KP\ÛÛ™šYÊ	ÛÛ™šYÊHÂˆÈÝ\œ™[˜[Y\È\™H[Ø^\È\‹]\Ù\‹ˆHÚ\™YY˜][XÛÛ™šYËšœÛÛˆ\È™XY[Û›H][[YK‚ˆÜš]KRœÛÛ‘š[H	ØÜš\ÛÛ™šYÔ]	ÛÛ™šYÂˆ™\Ù]PÛÛ™šYÐØXÚ\ÂŸB‚™[˜Ý[ÛˆÛÛ™\PÛUÔ
+ÙÝX›WIÛJHÈ™]\›ˆ	ÛH
+ˆŽŒÍMÈB‚‚™[˜Ý[ÛˆÙ]T™[]]™T]ÛÛ\]
+ÜÝš[™×I˜\ÙT]ÜÝš[™×I[]
+HÂˆ	˜\ÙHHÒSË”]NŽ‘Ù][]
+	˜\ÙT]
+BˆYˆ
+[›Ý	˜\ÙK‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	˜\ÙH
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆ	[HÒSË”]NŽ‘Ù][]
+	[]
+BˆÈ8àåxàªxàêøàà9d#xàjÈ	H8à¡È8à¤¹d*øà 8àj\šK“XZÙT™[]]™U\šHÈ[™\ØØ\Q]TÝš[™È8àcˆÈ8àäxà®xà¤¹hâ¸àf{ï"	LŒ8¡¤¹ên¹æoyc%¸à Hù.ézfcy«(:$/{ï"xà ºacy."øàk¹h-9d"8àkùcf9í%8àj¹b!øà¢¹aî¸àeøàiù¬`¸à xà¢øà ‚ˆYˆ
+	[”Ý\ÕÚ]
+	˜\ÙKÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÂˆ™]\›ˆ	[”ÝXœÝš[™Ê	˜\ÙK“[™Ý
+BˆBˆ	˜\ÙU\šHH™]ËSØš™XÝÞ\Ý[K•\šJ	˜\ÙJBˆ	[\šHH™]ËSØš™XÝÞ\Ý[K•\šJ	[
+Bˆ	™[HÔÞ\Ý[K•\šWNŽ•[™\ØØ\Q]TÝš[™Ê	˜\ÙU\šK“XZÙT™[]]™U\šJ	[\šJK•ÔÝš[™Ê
+JBˆ™]\›ˆ
+	™[\™\XÙH	ËÉËÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠBŸB‚™[˜Ý[Ûˆ›Ü›X[^™KQš[R\Ú
+ÜÝš[™×I˜[YJHÂˆÈNˆ8àåxà¨xà©8àêøàãøààøà­øàéxàkÈ™]ËTÚLMˆ8àk¹oh¹o#Ê9¥¡ùkeøàîùi)ù¥¡ùkeøàîÜ™Yš^8àj¸àeÊxàjùíly. 8àfxà¢øà ‚ˆÈ:`c¹c®øàáøàï8à¯øà¡9¢bù¦î8àcz*+yk¦¸àjÈ	ÜÚLMŽ‰È9.æ8àcyl#ù¥¡ùkeøàc9­íøàe¸àhøài¸àa8ài¸à ¹«å:/ øàc9hâ¸à£8àj¸àa8à¢8àa¹d.9cã¸àfxà¢øà ‚ˆÈ9¥¡ùkeùb%Èš[™Ù\œš[
+Ù]TÚLM•^
+H8àkˆ	ÜÚLMŽ‰Êùl#ù¥¡ùkeÈ8àj8àkùb)yâjxàj¸àk¸àiù­íøàg8àj¸àa8àdøàj8à ‚ˆ	ˆHÜÝš[™×I˜[YBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ŠJHÈ™]\›ˆ	ÉÈBˆYˆ
+	ˆ[X]Ú	×ŠÚJ\ÚLMŽ‰ÊHÈ	ˆH	‹”ÝXœÝš[™ÊÊHBˆ™]\›ˆ	‹•š[J
+K•Õ\\’[˜\šX[
+
+BŸB‚™[˜Ý[Ûˆ™]ËT˜’YÂˆÈNˆQH8à¯øà©8àè8à®xà¯øàìøàåÊ8àçøàê¹éäŠH
+È	×ÉÈ
+ÈÕRQ8à ‚ˆÈ8àãøààøà­øàéxà¡š[™Ù\œš[8àkÈQ8àjùgâøà z/¯8ào¸àj¸àa
+X[šY™\Ý8àk¹«hùo#øàåxà¨øàï8àêøàâxàj8àeøài¹£ xài
+xà ‚ˆ™]\›ˆ
+
+Ù]Q]JK•ÔÝš[™Ê	Þ^^^SSY[\ÜË™™™‰ÊH
+È	×ÉÈ
+È
+ÑÝZYNŽ“™]ÑÝZY
+
+K•ÔÝš[™Ê	Ó‰ÊK”ÝXœÝš[™Ê
+JJBŸB‚™[˜Ý[Ûˆ™]ËT˜•™\œÚ[Û’YÂˆ™]\›ˆ
+	Ý‰È
+È
+™]ËT˜’Y
+JBŸB‚™[˜Ý[Ûˆ™]ËU[š\]YQ\™XÝÜžJÜÝš[™×I\™[ÜØÜš\›ØÚ×IY˜XÝÜžJHÂˆÈ9å'ù¢$9o£8àjù¥è¹kf8àáøà¨øàë8à«øàâ8àê¸àc8à`¸à£8àl9a£yå'ù¢$8àfxà¢Ê9§ 9i)ÌùfçŠxà š[[]]X›H8àj¹.%¹.èøàåxàªxàêøàà8àc9­íøàe¸à¢øàk¸à¤ºf,¸àd8à ‚ˆ›Üˆ
+	][\HNÈ	][\[HÎÈ	][\
+ÊÊHÂˆ	YHÜÝš[™×J	ˆ	Y˜XÝÜžJBˆ	[H›Ú[‹T]	\™[	YˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[
+JHÂˆ™]ËR][HR][U\H\™XÝÜžHT]	[Q›Ü˜ÙHÝ]S[ˆ™]\›ˆÛÜ™\™YPÈYH	YÈ]H	[BˆBˆÝ\TÛY\SZ[\ÙXÛÛ™ÈBˆBˆ›ÝÈ¹. 9¡#øàj¸àåxàªxàêøàà9d#xà¤¹å'ù¢$8àiøàcxào¸àføà¤øàiøàeøàgÎˆ	\™[‚ŸB‚™[˜Ý[Ûˆ™]ËTÚLMŠÜÝš[™×I]
+HÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	]
+JHÈ™]\›ˆ	ÉÈBˆÈÙ]Qš[R\Ú8àkÈš[TÚ\™K”™XY8àiúe¢øàcøàgøà xà z*¬8àbøàc^Ù[8àiÊ9¦î8àcz/¯8àoøà¨¸à«øà®øà®y.æ8àcxàiÊze¢øàa8ài¸àa8à¢øàjˆÈ8à#9b)xàk¸àåøàëxà®øà®xàiù/oùå*8àexà£8ài¸àa8ào¸àfxà#xàiùi,y¥eøàfxà¢øà ‘š[TÚ\™K”™XYÜš]H8à¤¹¦#¹é.¸àeøàiºe¢øàdxàl:*«xà xà¢øà ‚ˆ	œÈH	[ˆ	ÚHH	[ˆžHÂˆ	œÈHÒSË‘š[WNŽ“Ü[Š	]ÒSË‘š[S[ÙWNŽ“Ü[‹ÒSË‘š[PXØÙ\Ü×NŽ”™XY
+ÒSË‘š[TÚ\™WNŽ”™XYÜš]HX›ÜˆÒSË‘š[TÚ\™WNŽ‘[]JJBˆ	ÚHHÔÙXÝ\š]KÜž\ÙÜ˜\K”ÒLM—NŽÜ™X]J
+Bˆ	\Úž]\ÈH	ÚKÛÛ\]R\Ú
+	œÊBˆ	^H
+Z›Ú[ˆ
+	\Úž]\È›Ü‘XXÚSØš™XÝÈ	Ë•ÔÝš[™Ê	Þ‰ÊHJJK•Õ\\’[˜\šX[
+
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^
+JHÈ›ÝÈ¸àãøààøà­øàéxà¤º*"9ë¥øàiøàcxào¸àføà¤øàiøàeøàgÎˆ	]ˆBˆ™]\›ˆ	^ˆHš[˜[HÂˆYˆ
+	ÚJHÈžHÈ	ÚK‘\ÜÜÙJ
+HHØ]ÚÈHBˆYˆ
+	œÊHÈžHÈ	œË‘\ÜÜÙJ
+HHØ]ÚÈHBˆBŸB‚™[˜Ý[ÛˆÛÜKQš[TÚ\™Y™XY
+ÜÝš[™×IÛÝ\˜ÙKÜÝš[™×I\Ý[˜][ÛŠHÂˆÈ^Ù[8àiúe¢øàbøà£8ài¸àa8à¢Ê9¦î8àcz/¯8àoøà¨¸à«øà®øà®y/çy£ y.+xàkŠxàåxà¨xà©8àêøà ¸à¬øàå8àï8àiøàcxà¢øà¢8àa¸à BˆÈ:*«xàoùcå¸à¢¹`m8à¤ˆš[TÚ\™K”™XYÜš]H8àiúe¢øàcøà ÛÜKR][H8àiøàkùd#8àf9ä!¹å,xàiùi,y¥eøàfxà¢øà ‚ˆ	[”Ý™X[HH	[ˆ	Ý]Ý™X[HH	[ˆžHÂˆ	[”Ý™X[HHÒSË‘š[WNŽ“Ü[Š	ÛÝ\˜ÙKÒSË‘š[S[ÙWNŽ“Ü[‹ÒSË‘š[PXØÙ\Ü×NŽ”™XY
+ÒSË‘š[TÚ\™WNŽ”™XYÜš]HX›ÜˆÒSË‘š[TÚ\™WNŽ‘[]JJBˆ	Ý]Ý™X[HHÒSË‘š[WNŽ“Ü[Š	\Ý[˜][Û‹ÒSË‘š[S[ÙWNŽÜ™X]KÒSË‘š[PXØÙ\Ü×NŽ•Üš]KÒSË‘š[TÚ\™WNŽ“›Û™JBˆ	[”Ý™X[KÛÜUÊ	Ý]Ý™X[JBˆHš[˜[HÂˆYˆ
+	Ý]Ý™X[JHÈžHÈ	Ý]Ý™X[K‘\ÜÜÙJ
+HHØ]ÚÈHBˆYˆ
+	[”Ý™X[JHÈžHÈ	[”Ý™X[K‘\ÜÜÙJ
+HHØ]ÚÈHBˆBŸB‚™[˜Ý[Ûˆ™]ËTÝX›R\Ú
+ÜÝš[™×I]
+HÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	]
+JHÈ™]\›ˆ	ÉÈBˆÈÛ[\[Y[][Ûˆ[Ø^\ÈØZ]Y]X\ÝL\È\ˆÛÜšØ›ÛÚËˆ]™XÛÛY\È™\žHš\ÚX›BˆÈÚ[ˆ¹/g9¢$›ØÙ\ÜÙ\ÈX[žH^Ù[š[\ËˆYˆHš[H\È›Ý™Y[ˆÝXÚY›ÜˆH™]ÈÙXÛÛ™ËˆÈ\Ú][[YYX][NÈÛ›H™XÙ[H[ÙYšYYš[\ÈÙ]HÚÜÝXš[]HÚXÚË‚ˆ	][HHÙ]R][HS]\˜[]	]Q\œ›ÜXÝ[ÛˆÝÜˆ	YÙS\ÈH
+Ñ]U[YWNŽ•]Ó›ÝÈH	][K“\ÝÜš]U[YU]ÊK•Ý[Z[\ÙXÛÛ™ÂˆYˆ
+	YÙS\ÈYÙHÌ
+HÈ™]\›ˆ™]ËTÚLMˆ	]B‚ˆ	\ÝÚ^™HH	][K“[™Ýˆ	\ÝÜš]HH	][K“\ÝÜš]U[YU]Âˆ›Üˆ
+	HHÈ	H[ŒÈ	JÊÊHÂˆÝ\TÛY\SZ[\ÙXÛÛ™ÈLˆ	™^HÙ]R][HS]\˜[]	]Q\œ›ÜXÝ[ÛˆÝÜˆYˆ
+	™^“[™ÝY\H	\ÝÚ^™HX[™	™^“\ÝÜš]U[YU]ÈY\H	\ÝÜš]JHÈœ™XZÈBˆ	\ÝÚ^™HH	™^“[™Ýˆ	\ÝÜš]HH	™^“\ÝÜš]U[YU]ÂˆBˆ™]\›ˆ™]ËTÚLMˆ	]ŸB‚™[˜Ý[Ûˆ™]ËTÛYÊÜÝš[™×I^
+HÂˆ	˜\ÙHHÒSË”]NŽ‘Ù]š[S˜[YUÚ]Ý]^[œÚ[ÛŠ	^
+K•ÓÝÙ\’[˜\šX[
+
+Bˆ	˜\ÙHHÜ™YÙ^NŽ”™\XÙJ	˜\ÙK	Ö×˜K^ŒNWJÉË	ËIÊBˆ	˜\ÙHH	˜\ÙK•š[J	ËIÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜\ÙJJHÈ	˜\ÙHH	Ú][IÈBˆ	ÚLHHÔÞ\Ý[K”ÙXÝ\š]KÜž\ÙÜ˜\K”ÒLWNŽÜ™X]J
+Bˆ	ž]\ÈHÕ^‘[˜ÛÙ[™×NŽ•UŽ‘Ù]ž]\Ê	^
+Bˆ	\ÚH
+Ðš]ÛÛ™\\—NŽ•ÔÝš[™Ê	ÚLKÛÛ\]R\Ú
+	ž]\ÊJJK”™\XÙJ	ËIË	ÉÊK”ÝXœÝš[™Ê
+K•ÓÝÙ\’[˜\šX[
+
+Bˆ™]\›ˆ‰˜\ÙKI\Ú‚ŸB‚™[˜Ý[Ûˆ\ÝT™[]]™T]
+ÜÝš[™×I™[]]™T]
+HÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[]]™T]
+JHÈ›ÝÈ	Ü™[]]™T]8àc9ên¸àiøàfxà ‰ÈBˆYˆ
+ÒSË”]NŽ’\Ô]›ÛÝY
+	™[]]™T]
+JHÈ›ÝÈ	ùím¹kï¸àäxà®xàkùcåøàdy.æ8àdxào¸àføà¤øà ‰ÈBˆYˆ
+	™[]]™T][X]Ú	ÊŸ××JW—Š	××JIÊHÈ›ÝÈ	Ë‹ˆ8à¤¹d*øà 8àäxà®xàkùcåøàdy.æ8àdxào¸àføà¤øà ‰ÈBˆYˆ
+	™[]]™T][X]Ú	Ö×WQ—IÊHÈ›ÝÈ	ùb-¹o¨y¥¡ùkeøà¤¹d*øà 8àäxà®xàkùcåøàdy.æ8àdxào¸àføà¤øà ‰ÈBˆ™]\›ˆ	YBŸB‚™[˜Ý[Ûˆ\ÜÙ\TØY™TÝÜ˜YÙTÙYÛY[
+ÜÝš[™×I˜[YKÜÝš[™×I˜[YHH	ú+f9b)ykd	ÊHÂˆÈÛÜšØ›ÛÚÒYÈÛ˜\ÚÝYÈ™\œÚ[Û’Y\™H\ÙY\ÈÚ[™ÛH\™XÝÜžHÜˆš[K[˜[YBˆÈÙYÛY[Ëˆ™]™\ˆ]TH[œ][›ÙXÙHÙ\\˜]ÜœËš]™H™Yš^\ËÜˆÝˆÈ˜]™\œØ[[ÈH\ÝÜžKØ\˜Ú]™H™Y\Ë‚ˆ	ÙYÛY[H
+ÜÝš[™×I˜[YJK•š[J
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÙYÛY[
+H[Ü‚ˆ	ÙYÛY[“[™ÝYÝŒ[Ü‚ˆ	ÙYÛY[Z[ˆ
+	Ë‰Ë	Ë‹‰ÊH[Ü‚ˆ	ÙYÛY[[›ÝX]Ú	×–ÐKV˜K^ŒNWVÐKV˜K^ŒNK—ËWJ‰	ÊHÂˆ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê‰˜[YH8àc9.#y«høàiøàfxà ˆŠBˆBˆ™]\›ˆ	ÙYÛY[ŸB‚™[˜Ý[Ûˆ›Ú[‹TØY™JÜÝš[™×I›ÛÝÜÝš[™×I™[]]™T]
+HÂˆ\ÝT™[]]™T]	™[]]™T]Ý]S[ˆ	[HÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	›ÛÝ	™[]]™T]
+JBˆ	›ÛÝ[HÒSË”]NŽ‘Ù][]
+	›ÛÝ
+BˆYˆ
+[›Ý	›ÛÝ[‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	›ÛÝ[
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆYˆ
+[›Ý	[”Ý\ÕÚ]
+	›ÛÝ[ÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈ›ÝÈ	ùænúc,¹®"8àoøàåxàªxàêøàà9i%¸àk¸àäxà®xàiøàfxà ‰ÈBˆ™]\›ˆ	[ŸB‚™[˜Ý[ÛˆÙ]T]ÈÂˆÈKTŽˆÙ]UÛÜšÜÜXÙT]9íc9å,xàiøànøào9aj:e¨¹¥l8àbøà¢ydo8àl8à£8à¢øà ¹aly§"xàâxàêxà©8àå¹."¸àk‚ˆÈÛÛ[[Û—]ËšœÛÛˆ8à¤Œyfç¸àk¹¤ãy/g8àiù/eyæo¹fç¸à º*«xàoùæí8àexàj¸àa8à¢8àa¹çëy¦`ºe¤øà«xàèøààøà­øàéxàfxà¢øà ‚ˆYˆ
+	[[™H	ØÜš\”]ÐØXÚHX[™
+
+Ñ]U[YWNŽ•]Ó›ÝÈH	ØÜš\”]ÐØXÚP]]ÊK•Ý[ÙXÛÛ™È[	ØÜš\ÛÛ™šYÐØXÚTÙXÛÛ™ÊJHÂˆ™]\›ˆ	ØÜš\”]ÐØXÚBˆBˆ	ÛÛ™šYÈHÙ]P\ÛÛ™šYÂˆ	]ÈHÛÜ™\™YPÂˆÝX›Z\ÜÚ[Û‘\ˆHÜÝš[™×IÛÛ™šYË›\ÝÝX›Z\ÜÚ[Û‘\‚ˆ]Q\ˆHÜÝš[™×IÛÛ™šYË›\Ý]Q\‚ˆÝ]]\ˆHÜÝš[™×IÛÛ™šYË›\ÝÝ]]\‚ˆBˆ	™\Ý[H	]ÂˆYˆ
+	]Ë™]Q\ˆX[™
+\ÝT]S]\˜[]
+›Ú[‹T]	]Ë™]Q\ˆ	ØÛÛ[[Û—]ËšœÛÛ‰ÊJJHÂˆ	ÝÜ™YH™XYRœÛÛ‘š[H
+›Ú[‹T]	]Ë™]Q\ˆ	ØÛÛ[[Û—]ËšœÛÛ‰ÊH	[ˆYˆ
+	ÝÜ™Y
+HÈ	™\Ý[H	ÝÜ™YBˆBˆ	ØÜš\”]ÐØXÚHH	™\Ý[ˆ	ØÜš\”]ÐØXÚP]]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ™]\›ˆ	™\Ý[ŸB‚‚™[˜Ý[ÛˆÙ]QY˜][Ú[]ÊÜÝš[™×IÝX›Z\ÜÚ[Û‘\ŠHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÝX›Z\ÜÚ[Û‘\ŠJHÂˆ™]\›ˆÛÜ™\™YPÈÝX›Z\ÜÚ[Û‘\ˆH	ÉÎÈ]Q\ˆH	ÉÎÈÝ]]\ˆH	ÉÈBˆBˆ	š[[YYH	ÝX›Z\ÜÚ[Û‘\‹•š[Q[™
+ØÚ\–×WP
+ØÚ\—NL‹ØÚ\—MÊJBˆ™]\›ˆÛÜ™\™YPÂˆÝX›Z\ÜÚ[Û‘\ˆH	š[[YYˆ]Q\ˆH
+›Ú[‹T]	š[[YY	×Ü™\Üš[™\‰ÊBˆÝ]]\ˆH
+›Ú[‹T]	š[[YY	ùaî¹b¦ÉÊBˆBŸB‚‚™[˜Ý[ÛˆÛÛ™\ËQ[˜\ÙM
+ÜÝš[™×I^
+HÂˆYˆ
+	[Y\H	^
+HÈ	^H	ÉÈBˆ™]\›ˆÐÛÛ™\NŽ•Ð˜\ÙMÝš[™ÊÕ^‘[˜ÛÙ[™×NŽ•UŽ‘Ù]ž]\Ê	^
+JBŸB‚™[˜Ý[ÛˆÙ[XÝQ›Û\‘X[ÙÊÜÝš[™×I]KÜÝš[™×I[š]X[\ŠHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	]JJHÈ	]HH	øàåxàªxàêøàà8à¤º`n9¢§¸àeøài¸àcøàh8àexàa	ÈBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	[š]X[\ŠH[Üˆ[›Ý
+\ÝT]S]\˜[]	[š]X[\ŠJHÈ	[š]X[\ˆHÑ[š\›Û›Y[NŽ‘Ù]›Û\”]
+	Ó^QØÝ[Y[ÉÊHB‚ˆ	[\ˆH›Ú[‹T]	ØÜš\\›ÛÝ	ÝÛÛ×Ù[XÝY›Û\‹œÌIÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[\ŠJHÈ›ÝÈ	øàåxàªxàêøàà:`n9¢§¹å*8àkº(ç9bªxà®xà«øàê¸àåøàâ8àc:)¢øài8àbøà¢¸ào¸àføà¤øà ‰ÈB‚ˆ	\H›Ú[‹T]
+ÒSË”]NŽ‘Ù][\]
+
+JH
+œ™\Üš[™\‹Y›Û\‹^ÌKˆYˆ
+ÑÝZYNŽ“™]ÑÝZY
+
+K•ÔÝš[™Ê	Ó‰ÊJJBˆ	Ñ^HH›Ú[‹T]	[Ž”Þ\Ý[T›ÛÝ	ÔÞ\Ý[LÌ—Ú[™ÝÜÔÝÙ\”Ú[ŒKŒÝÙ\œÚ[™^IÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	Ñ^JJHÈ	Ñ^HH	ÜÝÙ\œÚ[™^IÈB‚ˆ	Û]HHÑ[š\›Û›Y[NŽ‘Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÕUWÐ	Ë	Ô›ØÙ\ÜÉÊBˆ	Û[š]X[HÑ[š\›Û›Y[NŽ‘Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÒS’UPSÐ	Ë	Ô›ØÙ\ÜÉÊBˆ	ÛÝ]]HÑ[š\›Û›Y[NŽ‘Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÓÕUUÐ	Ë	Ô›ØÙ\ÜÉÊBˆžHÂˆÑ[š\›Û›Y[NŽ”Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÕUWÐ	Ë
+ÛÛ™\ËQ[˜\ÙM	]JK	Ô›ØÙ\ÜÉÊBˆÑ[š\›Û›Y[NŽ”Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÒS’UPSÐ	Ë
+ÛÛ™\ËQ[˜\ÙM	[š]X[\ŠK	Ô›ØÙ\ÜÉÊBˆÑ[š\›Û›Y[NŽ”Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÓÕUUÐ	Ë
+ÛÛ™\ËQ[˜\ÙM	\
+K	Ô›ØÙ\ÜÉÊB‚ˆ	\ØØ\Y[\ˆH	[\ˆ\™\XÙH‰È‹‰ÉÈ‚ˆ	[˜ÛÙYHÐÛÛ™\NŽ•Ð˜\ÙMÝš[™ÊÕ^‘[˜ÛÙ[™×NŽ•[šXÛÙK‘Ù]ž]\Ê‰ˆ	É\ØØ\Y[\‰ÈŠJBˆ	\™ÜÈH‹S›Ô›Ùš[HTÕHQ^XÝ][Û”ÛXÞHž\\ÜÈQ[˜ÛÙYÛÛ[X[™	[˜ÛÙY‚ˆ	›ØÈHÝ\T›ØÙ\ÜÈQš[T]	Ñ^HP\™Ý[Y[\Ý	\™ÜÈUÚ[™ÝÔÝ[HY[ˆT\ÜÕHUØZ]ˆYˆ
+	›ØË‘^]ÛÙH[™H
+HÈ›ÝÈ¸àåxàªxàêøàà:`n9¢§¸àà8à©8à¨¸àëxà¬8à¤ºe¢øàdxào¸àføà¤øàiøàeøàgøà ‘^]ÛÙOI
+	›ØË‘^]ÛÙJHˆBˆYˆ
+\ÝT]S]\˜[]	\
+HÂˆ	Ù[XÝYH
+Ù]PÛÛ[S]\˜[]	\T˜]ÈQ[˜ÛÙ[™ÈUŽ
+K•š[J
+BˆYˆ
+	Ù[XÝYX[™
+\ÝT]S]\˜[]	Ù[XÝY
+JHÈ™]\›ˆ	Ù[XÝYBˆ™]\›ˆ	ÉÂˆBˆ™]\›ˆ	ÉÂˆHš[˜[HÂˆÑ[š\›Û›Y[NŽ”Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÕUWÐ	Ë	Û]K	Ô›ØÙ\ÜÉÊBˆÑ[š\›Û›Y[NŽ”Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÒS’UPSÐ	Ë	Û[š]X[	Ô›ØÙ\ÜÉÊBˆÑ[š\›Û›Y[NŽ”Ù][š\›Û›Y[˜\šXX›J	Ô‘TÔ•’S‘T—ÔPÒÑT—ÓÕUUÐ	Ë	ÛÝ]]	Ô›ØÙ\ÜÉÊBˆYˆ
+\ÝT]S]\˜[]	\
+HÈ™[[Ý™KR][HS]\˜[]	\Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHBˆBŸB‚™[˜Ý[ÛˆÙ]UÛÜšÜÜXÙT]
+ÜÝš[™×I[™ÝXYÙKÜÝš[™×I]Q\ˆH	ÉÊHÂˆÈš\œÝ\[ˆ›Û\ˆÙ]\]\Ý™HX›HÈ[š]X[^™HHÙ[XÝYÛÜšÜÜXÙH™Y›Ü™BˆÈH\‹]\Ù\ˆÛÛ™šYÈ\ÈÛÛ[Z]Yˆ™Y™\ˆH^XÚ]]Q\ˆÚ[ˆÝ\YYÂˆÈ›Ü›X[THÜ\˜][ÛœÈÛÛ[YHÈ™\ÛÛ™H]œ›ÛHÙ]T]Ë‚ˆ	™\ÛÛ™Y]Q\ˆH
+ÜÝš[™×I]Q\ŠK•š[J
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™\ÛÛ™Y]Q\ŠJHÂˆ	]ÈHÙ]T]Âˆ	™\ÛÛ™Y]Q\ˆH
+ÜÝš[™×I]Ë™]Q\ŠK•š[J
+BˆBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™\ÛÛ™Y]Q\ŠJHÈ›ÝÈ	ùë¨yä!¸àáøàï8à¯øàåxàªxàêøàà8àc9§*º*+yk¦¸àiøàfxà ¹£ä9aî¸àåxàªxàêøàà8à¤º`n8à¤øàiøàcøàh8àexàa8à ‰ÈBˆ™]\›ˆ›Ú[‹T]	™\ÛÛ™Y]Q\ˆ	[™ÝXYÙBŸB‚™[˜Ý[Ûˆ™]ËQ[\U›Û[YTÝ]HÂˆ™]\›ˆÛÜ™\™YPÂˆÝ]\ÈH	Û›ÝXZ[	Âˆ\ÝZ[]H	[ˆÝ]]ˆH	[ˆZ[š[™Ù\œš[H	ÉÂˆÝ[T™X\ÛÛœÈH
+
+BˆY\ÜØYÙHH	ÉÂˆBŸB‚™[˜Ý[ÛˆÙ]U›Û[YTÝ]RÙ^JÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžH	ÉÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]
+JHÈ™]\›ˆ‰›Û[Y_ÈˆBˆ™]\›ˆ‰›Û[Y_	Ø]‚ŸB‚™[˜Ý[Ûˆ™]ËQ[\TÝXÝ\™JÜÝš[™×I[™ÝXYÙJHÂˆ	›Û[Y\ÈHÛÜ™\™YPßBˆ›Ü™XXÚ
+	›Û[YH[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJJHÂˆ›Ü™XXÚ
+	Ø]YÛÜžH[ˆ
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊJHÂˆ	›Û[Y\ÖÊÙ]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]YÛÜžJWHH™]ËQ[\U›Û[YTÝ]BˆBˆBˆ™]\›ˆÛÜ™\™YPÂˆØÚ[XU™\œÚ[ÛˆH‚ˆ[™ÝXYÙHH	[™ÝXYÙBˆÛÜšØ›ÛÚÜÈH
+
+BˆYÙ\ÈH
+
+Bˆ›Û[Y\ÈH	›Û[Y\Âˆ\]Y]H™]ËS›ÝÒ\ÛÂˆBŸB‚™[˜Ý[Ûˆ[œÝ\™KTXÚØYÙJ	]ÊHÂˆ›Ü™XXÚ
+	Ù^H[ˆ
+	ÜÝX›Z\ÜÚ[Û‘\‰Ë	Ù]Q\‰Ë	ÛÝ]]\‰ÊJHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I]Ë‰Ù^JJHÈ›ÝÈ‰Ù^H8àc9§*º*+yk¦¸àiøàfxà ˆˆBˆBˆ›Ü™XXÚ
+	\ˆ[ˆ
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\‹ÜÝš[™×I]Ë™]Q\‹ÜÝš[™×I]Ë›Ý]]\ŠJHÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\ŠJHÈ™]ËR][HR][U\H\™XÝÜžHT]	\ˆQ›Ü˜ÙHÝ]S[BˆBˆ	]Q\ˆHÜÝš[™×I]Ë™]Q\‚ˆ›Ü™XXÚ
+	\ˆ[ˆ
+	ØÛÛ[[Û‰Ë	ØÛÛ[[Û—]Y]	Ë	ØÛÛ[[Û—\	Ë	ØÛÛ[[Û—ØÚÜÉÊJHÂˆ™]ËR][HR][U\H\™XÝÜžHT]
+›Ú[‹T]	]Q\ˆ	\ŠHQ›Ü˜ÙHÝ]S[ˆBˆ	ÙÔ]H›Ú[‹T]	]Q\ˆ	ÜXÚØYÙKšœÛÛ‰ÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	ÙÔ]
+JHÂˆÜš]KRœÛÛ‘š[H	ÙÔ]
+ÛÜ™\™YPÈØÚ[XU™\œÚ[ÛˆHŽÈ\H	Ô™\Üš[™\‰ÎÈÜ™X]Y]H™]ËS›ÝÒ\ÛÈJBˆBˆÜš]KRœÛÛ‘š[H
+›Ú[‹T]	]Q\ˆ	ØÛÛ[[Û—]ËšœÛÛ‰ÊH
+ÛÜ™\™YPÂˆÝX›Z\ÜÚ[Û‘\ˆHÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\‚ˆ]Q\ˆHÜÝš[™×I]Ë™]Q\‚ˆÝ]]\ˆHÜÝš[™×I]Ë›Ý]]\‚ˆ\]Y]H™]ËS›ÝÒ\ÛÂˆJBˆÈKTŽˆ9b'yfç¸à®øààøàâ8à¨¸ààøàåùæí9o£8àjùcé8àa8à«xàèøààøà­øàéxà¤º/å8àexàj¸àa8à ‚ˆ™\Ù]PÛÛ™šYÐØXÚ\Âˆ›Ü™XXÚ
+	[™È[ˆ
+	Ú˜IË	Ù[‰ÊJHÂˆ›Ü™XXÚ
+	\ˆ[ˆ
+	ÉË	ÝÛÜšØ›ÛÚÜÉË	ÜYÙ\ÉË	ØÛÛ[\‰Ë	Ù^ÜÉË	ÜÝ]IË	ÛØÚÜÉË	ÛÙÜÉÊJHÂˆ™]ËR][HR][U\H\™XÝÜžHT]
+›Ú[‹T]
+›Ú[‹T]	]Q\ˆ	[™ÊH	\ŠHQ›Ü˜ÙHÝ]S[ˆBˆÈ\ÙHHÙ[XÝY]Q\ˆ\™XÝKˆÛˆš\œÝ[ˆHØØ[ÛÛ™šYÈ\È[[[Û˜[BˆÈØ]™YÛ›HY\ˆXÚØYÙH[š]X[^˜][ÛˆÝXØÙYYËÛÈÙ]T]È\ÈÝ[[\H\™K‚ˆ[š]X[^™KSÜ‹SZYÜ˜]TÝXÝ\™H	[™È
+ÜÝš[™×I]Ë™]Q\ŠHÝ]S[ˆBŸB‚‚™[˜Ý[Ûˆ™\ÛÛ™KTYÙRY
+	YÙJHÂˆYˆ
+	[Y\H	YÙJHÈ™]\›ˆ	ÉÈBˆ	^\Ý[™ÈHÜÝš[™×IYÙKœYÙRYˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^\Ý[™ÊJHÈ™]\›ˆ	^\Ý[™ÈBˆ	YØXÞHHÜÝš[™×IYÙKšYˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	YØXÞJJHÈ™]\›ˆ	YØXÞHBˆ	ØˆHÜÝš[™×IYÙKÛÜšØ›ÛÚÒYˆ	ÚY]˜[YHHÜÝš[™×IYÙKœÚY]˜[YBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ØŠH[ÜˆÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÚY]˜[YJJHÈ™]\›ˆ	ÉÈBˆ	ÚY]Ù^HHÜ™YÙ^NŽ”™\XÙJ	ÚY]˜[YK	Ö×ŒNPKV˜K^—JÉË	ËIÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÚY]Ù^JJHÈ	ÚY]Ù^HH	ÜÚY]	ÈBˆ™]\›ˆ‰Ø‹IÚY]Ù^H‚ŸB‚™[˜Ý[ÛˆÙ]S›ÝT›Ü\J	Øš™XÝÜÝš[™×I˜[YK	˜[YJHÂˆYˆ
+	[Y\H	Øš™XÝ
+HÈ™]\›ˆBˆYˆ
+	Øš™XÝZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJHÂˆ	Øš™XÝÉ˜[YWHH	˜[YBˆ™]\›‚ˆBˆYˆ
+	[Y\H	Øš™XÝ”ÓØš™XÝ”›Ü\Y\ÖÉ˜[YWJHÂˆ	Øš™XÝYSY[X™\ˆS›ÝT›Ü\S˜[YH	˜[YHS›ÝT›Ü\U˜[YH	˜[YHQ›Ü˜ÙBˆH[ÙHÂˆ	Øš™XÝ‰˜[YHH	˜[YBˆBŸB‚™[˜Ý[ÛˆÙ]Q]T›Ü\J	Øš™XÝÜÝš[™×I˜[YK	Y˜][˜[YHH	[
+HÂˆYˆ
+	[Y\H	Øš™XÝ
+HÈ™]\›ˆ	Y˜][˜[YHBˆYˆ
+	Øš™XÝZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJHÂˆYˆ
+	Øš™XÝÛÛZ[œÊ	˜[YJJHÈ™]\›ˆ	Øš™XÝÉ˜[YWHBˆ™]\›ˆ	Y˜][˜[YBˆBˆ	›ÜH	Øš™XÝ”ÓØš™XÝ”›Ü\Y\ÖÉ˜[YWBˆYˆ
+	[Y\H	›Ü
+HÈ™]\›ˆ	Y˜][˜[YHBˆ™]\›ˆ	›Ü•˜[YBŸB‚‚™[˜Ý[ÛˆÙ]R[]T›Ü\J	Øš™XÝÜÝš[™×I˜[YKÚ[IY˜][˜[YHH
+HÂˆžHÈ™]\›ˆÚ[JÙ]Q]T›Ü\H	Øš™XÝ	˜[YH	Y˜][˜[YJHHØ]ÚÈ™]\›ˆ	Y˜][˜[YHBŸB‚™[˜Ý[Ûˆ\ÝUÛÜšØ›ÛÚÔ™[™\’\ÐÝ\œ™[
+	ÛÜšØ›ÛÚÊHÂˆYˆ
+	[Y\H	ÛÜšØ›ÛÚÊHÈ™]\›ˆ	˜[ÙHBˆ	Ý]\ÈHÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	ÜÝ]\ÉÈ	ÉÊBˆYˆ
+	Ý]\ÈZ[ˆ
+	Û™]ÉË	Ù^Ù[]\]Y	Ë	ÛZ\ÜÚ[™ÉË	Ü™[™\‹Y\œ›Ü‰Ë	Ü™[™\š[™ÉË	ÜÝ[IË	Û›Ý\™[™\™Y	ÊJHÈ™]\›ˆ	˜[ÙHBˆ	\Ý™[™\™Y\ÚHÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	Û\Ý™[™\™Y^Ù[\Ú	È	ÉÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y\Ú
+JHÈ™]\›ˆ	˜[ÙHBˆ	Ý\œ™[\ÚHÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	ØÝ\œ™[^Ù[\Ú	È	ÉÊBˆYˆ
+
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý\œ™[\Ú
+JHX[™	Ý\œ™[\Ú[™H	\Ý™[™\™Y\Ú
+HÈ™]\›ˆ	˜[ÙHBˆ	›Ùš[U™\œÚ[ÛˆHÙ]R[]T›Ü\H	ÛÜšØ›ÛÚÈ	Ü™[™\”›Ùš[U™\œÚ[Û‰ÈˆYˆ
+	›Ùš[U™\œÚ[Ûˆ[	ØÜš\‘^Ù[š[›Ùš[U™\œÚ[ÛŠHÈ™]\›ˆ	˜[ÙHBˆ™]\›ˆ	YBŸB‚™[˜Ý[ÛˆX\šËUÛÜšØ›ÛÚÐÛÛ[Ý[Q›Ü”›Ùš[J	ÝXÝ\™K	ÛÜšØ›ÛÚÊHÂˆ	Ú[™ÙYH	˜[ÙBˆYˆ
+	[Y\H	ÛÜšØ›ÛÚÊHÈ™]\›ˆ	Ú[™ÙYBˆ	\Ý™[™\™Y\ÚHÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	Û\Ý™[™\™Y^Ù[\Ú	È	ÉÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y\Ú
+JHÈ™]\›ˆ	Ú[™ÙYBˆ	›Ùš[U™\œÚ[ÛˆHÙ]R[]T›Ü\H	ÛÜšØ›ÛÚÈ	Ü™[™\”›Ùš[U™\œÚ[Û‰ÈˆYˆ
+	›Ùš[U™\œÚ[ÛˆYÙH	ØÜš\‘^Ù[š[›Ùš[U™\œÚ[ÛŠHÈ™]\›ˆ	Ú[™ÙYBˆYˆ
+ÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	ÜÝ]\ÉÈ	ÉÊH[™H	Ù^Ù[]\]Y	ÊHÂˆÙ]S›ÝT›Ü\H	ÛÜšØ›ÛÚÈ	ÜÝ]\ÉÈ	Ù^Ù[]\]Y	Âˆ	Ú[™ÙYH	YBˆBˆ›Ü™XXÚ
+	[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\HÜÝš[™×IÛÜšØ›ÛÚËÛÜšØ›ÛÚÒYJJHÂˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I˜ÛÛ[ŠHX[™ÜÝš[™×IœÝ]\È[™H	ÜÝ[IÊHÂˆÙ]S›ÝT›Ü\H		ÜÝ]\ÉÈ	ÜÝ[IÂˆÙ]S›ÝT›Ü\H		Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊBˆ	Ú[™ÙYH	YBˆBˆBˆ™]\›ˆ	Ú[™ÙYŸB‚‚™[˜Ý[Ûˆ™\Z\‹TÝXÝ\™TYÙ\Ê	ÝXÝ\™JHÂˆ	Ú[™ÙYH	˜[ÙBˆYˆ
+	[Y\H	ÝXÝ\™KÛÜšØ›ÛÚÜÊHÈÙ]S›ÝT›Ü\H	ÝXÝ\™H	ÝÛÜšØ›ÛÚÜÉÈ
+
+NÈ	Ú[™ÙYH	YHBˆYˆ
+	[Y\H	ÝXÝ\™KœYÙ\ÊHÈÙ]S›ÝT›Ü\H	ÝXÝ\™H	ÜYÙ\ÉÈ
+
+NÈ	Ú[™ÙYH	YHBˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÊJHÂˆÈÝXÝ\™KšœÛÛˆÜ™X]YžHÛ\ˆZ[ÈX^H›Ý]™H\ÙH›Ü\Y\Ë‚ˆÈY[H^XÚ]H[œÝXYÙˆ\ÜÚYÛš[™ÈÈHZ\ÜÚ[™ÈÐÝ\ÝÛSØš™XÝ›Ü\K‚ˆ	Ø]H	ÉÂˆžHÈ	Ø]H›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IØ‹˜Ø]YÛÜžJH
+ÜÝš[™×IØ‹™š[S˜[YJHHØ]ÚÈ	Ø]H	ÉÈBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]
+JHÂˆ	˜[YHHÜÝš[™×IØ‹™š[S˜[YBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ	˜[YHHÜÝš[™×IØ‹™\Ü^S˜[YHBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ	˜[YHHÜÝš[™×IØ‹œ™[]]™T]Bˆ	Ø]H›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	ÉÈ	˜[YBˆBˆYˆ
+	[Y\H	Ø‹”ÓØš™XÝ”›Ü\Y\ÖÉØØ]YÛÜžI×H[ÜˆÜÝš[™×IØ‹˜Ø]YÛÜžH[™H	Ø]
+HÈÙ]S›ÝT›Ü\H	Øˆ	ØØ]YÛÜžIÈ	Ø]È	Ú[™ÙYH	YHBˆ›Ü™XXÚ
+	Z\ˆ[ˆ
+ˆÓ˜[YOIÛ\Ý\œ›Ü‰ÎÈ˜[YOIÉßKˆÓ˜[YOIÛ\Ý\œ›Ü•\Ù\‰ÎÈ˜[YOIÉßKˆÓ˜[YOIÛ\Ý\œ›Ü]	ÎÈ˜[YOI[KˆÓ˜[YOIÛ\Ý™[™\][\\Ú	ÎÈ˜[YOIÉßKˆÓ˜[YOIÛ\Ý™[™\“ÙÉÎÈ˜[YOIÉßKˆÓ˜[YOIÜ™[™\”›Ùš[U™\œÚ[Û‰ÎÈ˜[YOLKˆÓ˜[YOIÛ\Ý™[™\™YÚY]ÉÎÈ˜[YOP
+
+_KˆÓ˜[YOIÛ\Ý™[™\™YÚY]š[™Ù\œš[	ÎÈ˜[YOIÉßKˆÓ˜[YOIØÝ\œ™[^Ù[\ÝÜš]U]ÕXÚÜÉÎÈ˜[YOIÉßKˆÓ˜[YOIÝØ\›š[™ÜÉÎÈ˜[YOP
+
+_Bˆ
+JHÂˆYˆ
+	[Y\H	Ø‹”ÓØš™XÝ”›Ü\Y\ÖÉZ\‹“˜[YWJHÈÙ]S›ÝT›Ü\H	Øˆ	Z\‹“˜[YH	Z\‹•˜[YNÈ	Ú[™ÙYH	YHBˆBˆYˆ
+X\šËUÛÜšØ›ÛÚÐÛÛ[Ý[Q›Ü”›Ùš[H	ÝXÝ\™H	ØŠHÈ	Ú[™ÙYH	YHBˆBˆ	\ÙYHßBˆ›Ü™XXÚ
+	[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÊJHÂˆ	YÙRÙ^HH™\ÛÛ™KTYÙRY	ˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	YÙRÙ^JJHÂˆ	˜\ÙHH	YÙRÙ^Bˆ	ˆH‚ˆÚ[H
+	\ÙYÛÛZ[œÒÙ^J	YÙRÙ^JJHÂˆ	YÙRÙ^HH‰˜\ÙKIˆ‚ˆ	ŠÊÂˆBˆ	\ÙYÉYÙRÙ^WHH	YBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IœYÙRY
+H[ÜˆÜÝš[™×IœYÙRY[™H	YÙRÙ^JHÂˆÙ]S›ÝT›Ü\H		ÜYÙRY	È	YÙRÙ^Bˆ	Ú[™ÙYH	YBˆBˆBˆYˆ
+	[Y\H	”ÓØš™XÝ”›Ü\Y\ÖÉÛ[X™\š[™ÓX[X[	×JHÈÙ]S›ÝT›Ü\H		Û[X™\š[™ÓX[X[	È	˜[ÙNÈ	Ú[™ÙYH	YHBˆYˆ
+	[Y\H	”ÓØš™XÝ”›Ü\Y\ÖÉÛ[X™\š[™ÑY˜][	×JHÈÙ]S›ÝT›Ü\H		Û[X™\š[™ÑY˜][	È	Ùš\œÝ\YÙK[›Û™IÎÈ	Ú[™ÙYH	YHBˆYˆ
+	[Y\H	”ÓØš™XÝ”›Ü\Y\ÖÉÙ[˜X›Y	×JHÈÙ]S›ÝT›Ü\H		Ù[˜X›Y	È	YNÈ	Ú[™ÙYH	YHBˆBˆ™]\›ˆ	Ú[™ÙYŸB‚™[˜Ý[Ûˆ\ÝTÝXÝ\™QØÝ[Y[
+	ÝXÝ\™KÜÝš[™×I[™ÝXYÙJHÂˆYˆ
+	[Y\H	ÝXÝ\™JHÈ™]\›ˆ	˜[ÙHBˆžHÂˆ	™\œÚ[ÛˆHÚ[JÙ]Q]T›Ü\H	ÝXÝ\™H	ÜØÚ[XU™\œÚ[Û‰È
+BˆYˆ
+	™\œÚ[Ûˆ[H[Üˆ	™\œÚ[ÛˆYÝŠHÈ™]\›ˆ	˜[ÙHBˆ	ÝÜ™Y[™ÝXYÙHHÜÝš[™×JÙ]Q]T›Ü\H	ÝXÝ\™H	Û[™ÝXYÙIÈ	ÉÊBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÝÜ™Y[™ÝXYÙJHX[™	ÝÜ™Y[™ÝXYÙH[™H	[™ÝXYÙJHÈ™]\›ˆ	˜[ÙHBˆYˆ
+[›Ý
+\ÝPÛÛ™šYÒ\ÒÙ^H	ÝXÝ\™H	ÝÛÜšØ›ÛÚÜÉÊH[Ü‚ˆ[›Ý
+\ÝPÛÛ™šYÒ\ÒÙ^H	ÝXÝ\™H	ÜYÙ\ÉÊJHÈ™]\›ˆ	˜[ÙHBˆ™]\›ˆ	YBˆHØ]ÚÂˆ™]\›ˆ	˜[ÙBˆBŸB‚™[˜Ý[Ûˆ™XYTÝXÝ\™U[›ØÚÙY
+ÜÝš[™×I[™ÝXYÙKÜÝš[™×I]Q\ˆH	ÉÊHÂˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙH	]Q\‚ˆ	]H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‰ÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	]
+JHÈ™]\›ˆ™]ËQ[\TÝXÝ\™H	[™ÝXYÙHBˆ	˜XÚÝ\]H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‹›\ÝYÛÛÙ	Âˆ	ÝXÝ\™HH	[ˆžHÂˆ	ÝXÝ\™HH™XYRœÛÛ‘š[H	]	[ˆYˆ
+[›Ý
+\ÝTÝXÝ\™QØÝ[Y[	ÝXÝ\™H	[™ÝXYÙJJHÈ›ÝÈ	ÜÝXÝ\™KšœÛÛˆ8àk¹a¡yk®xàc9.#yk£9aj8àiøàfxà ‰ÈBˆHØ]ÚÂˆÈ™]™\ˆ™Z[\œ™][ˆ^\Ý[™È][\Ü˜\š[H[œ™XYX›HÚ\™YYš[H\ÂˆÈHœ˜[™[™]È[\HÛÜšÜÜXÙKˆ]Û™Z]š[Üˆ[ÝÙYH™^]]][Û‚ˆÈÈ[œ™YÚ\Ý\ˆ]™\žHÛÜšØ›ÛÚËˆH™\šYšYY\ÝYÛÛÙÛÜH\ÈØY™HÈ\ÙNÂˆÈÚ]Ý]Û™K˜Z[ÛÜÙY[™X]™HHÜšYÚ[˜[š[H[ÝXÚY‚ˆ	š[X\žQ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆ	ÝXÝ\™HH	[ˆžHÂˆYˆ
+\ÝT]S]\˜[]	˜XÚÝ\]
+HÂˆ	Ø[™Y]HH™XYRœÛÛ‘š[H	˜XÚÝ\]	[ˆYˆ
+\ÝTÝXÝ\™QØÝ[Y[	Ø[™Y]H	[™ÝXYÙJHÈ	ÝXÝ\™HH	Ø[™Y]HBˆBˆHØ]ÚÈ	ÝXÝ\™HH	[BˆYˆ
+	[Y\H	ÝXÝ\™JHÂˆ›ÝÈ¹ænúc,¹ áyh,xà¤¹k¢yaj8àjú*«xàoú/¯8à xào¸àføà¤øàiøàeøàgøà œÝXÝ\™KšœÛÛˆ8àkù."¹¦î8àcxàeøài¸àa8ào¸àføà¤øà ¹ë¨yä!¸àåxàªxàêøàà8àk¹£©yí¦¸à¤¹è®º*£xàeøài¹a£z-mùbåxàeøài¸àcøàh8àexàa8à º*lùí,ˆ	š[X\žQ\œ›Üˆ‚ˆBˆBˆ™]\›ˆ›Ü›X[^™KTÝXÝ\™PÛÛXÝ[ÛœÈ	ÝXÝ\™BŸB‚™[˜Ý[ÛˆÜš]KTÝXÝ\™U[›ØÚÙY
+ÜÝš[™×I[™ÝXYÙK	ÝXÝ\™KÜÝš[™×I]Q\ˆH	ÉÊHÂˆ	ÝXÝ\™HH›Ü›X[^™KTÝXÝ\™PÛÛXÝ[ÛœÈ	ÝXÝ\™BˆYˆ
+[›Ý
+\ÝTÝXÝ\™QØÝ[Y[	ÝXÝ\™H	[™ÝXYÙJJHÈ›ÝÈ	ù.#yk£9aj8àj¹ænúc,¹ áyh,xàk¹/çykf8à¤¹¢ä¹d)¸àeøào¸àeøàgøà ‰ÈBˆÙ]S›ÝT›Ü\H	ÝXÝ\™H	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊBˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙH	]Q\‚ˆ	]H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‰Âˆ	˜XÚÝ\]H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‹›\ÝYÛÛÙ	ÂˆYˆ
+\ÝT]S]\˜[]	]
+HÂˆžHÂˆ	^\Ý[™ÈH™XYRœÛÛ‘š[H	]	[ˆYˆ
+\ÝTÝXÝ\™QØÝ[Y[	^\Ý[™È	[™ÝXYÙJHÂˆÜš]KRœÛÛ‘š[H	˜XÚÝ\]	^\Ý[™ÂˆBˆHØ]ÚÂˆÈ™\Ù\™HH™]š[Ý\È\ÝYÛÛÙÛÜHÚ[ˆHš[X\žHØ[››Ý™H™XY‚ˆÈHØ[\‰ÜÈÝXÝ\™HX^H]Ù[ˆ]™H™Y[ˆ™XÛÝ™\™Yœ›ÛH]ÛÜK‚ˆBˆBˆÜš]KRœÛÛ‘š[H	]	ÝXÝ\™Bˆ	Ø]™YH™XYRœÛÛ‘š[H	]	[ˆYˆ
+[›Ý
+\ÝTÝXÝ\™QØÝ[Y[	Ø]™Y	[™ÝXYÙJJHÂˆ›ÝÈ	ùænúc,¹ áyh,xà¤¹/çykf9o£8àjù©':*/8àiøàcxào¸àføà¤øàiøàeøàgøà ¹æí9bcxàk¸àä8ààøà«øà¨¸ààøàåøà¤¹/çy£ xàeøài¸àa8ào¸àfxà ‰ÂˆBŸB‚™[˜Ý[ÛˆÙ]TÝXÝ\™JÜÝš[™×I[™ÝXYÙJHÂˆÈ™XY[Û›HTH]ˆ™\Z\ˆ[™ØÚ[XHZYÜ˜][Ûˆ\™H\™›Ü›YYÛ›HžH[š]X[^™KSÜ‹SZYÜ˜]TÝXÝ\™K‚ˆ™]\›ˆ™XYTÝXÝ\™U[›ØÚÙY	[™ÝXYÙBŸB‚™[˜Ý[Ûˆ\]KTÝXÝ\™SØÚÙY
+ÜÝš[™×I[™ÝXYÙKÜØÜš\›ØÚ×I]]][ÛŠHÂˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙBˆ	ÝXÝ\™SØÚÈH›Ú[‹T]	ÛÜšÜÜXÙH	ÛØÚÜ×ÝXÝ\™K›ØÚÉÂˆ™]\›ˆ[›ÚÙKUÚ]ØÚÈ	ÝXÝ\™SØÚÈÂˆ	ÝXÝ\™HH™XYTÝXÝ\™U[›ØÚÙY	[™ÝXYÙBˆ	™\Ý[H	ˆ	]]][Ûˆ	ÝXÝ\™BˆÜš]KTÝXÝ\™U[›ØÚÙY	[™ÝXYÙH	ÝXÝ\™Bˆ™]\›ˆ	™\Ý[ˆBŸB‚™[˜Ý[ÛˆØ]™KTÝXÝ\™JÜÝš[™×I[™ÝXYÙK	ÝXÝ\™JHÂˆ›ÝÈ	ÔØ]™KTÝXÝ\™xàk¹æí9£©ydo9aî¸àeøàkùé y«h¸àexà£8ài¸àa8ào¸àfxà •\]KTÝXÝ\™SØÚÙY8à¤¹/oùå*8àeøài¸àcøàh8àexàa8à ‰ÂŸB‚™[˜Ý[ÛˆÙ]QY™™XÝ]™S[™ÝXYÙHÂˆYˆ
+	[ÙHY\H	Ù[‰ÊHÈ™]\›ˆ	Ù[‰ÈBˆ™]\›ˆ	Ú˜IÂŸB‚™[˜Ý[ÛˆÙ]U›Û[YS\Ý
+ÜÝš[™×I[™ÝXYÙJHÂˆYˆ
+	[™ÝXYÙHY\H	Ú˜IÊHÈ™]\›ˆ
+	Ú˜K[XZ[‰Ë	Ú˜KX\[™^	Ë	Û›Û™IÊHBˆ™]\›ˆ
+	Ù[‹[XZ[‰Ë	Ù[‹X\[™^	Ë	Û›Û™IÊBŸB‚™[˜Ý[ÛˆÙ]QY˜][›Û[YJÜÝš[™×I[™ÝXYÙJHÂˆYˆ
+	[™ÝXYÙHY\H	Ú˜IÊHÈ™]\›ˆ	Ú˜K[XZ[‰ÈBˆ™]\›ˆ	Ù[‹[XZ[‰ÂŸB‚™[˜Ý[ÛˆÙ]S[™ÝXYÙQœ›ÛQš[S˜[YJÜÝš[™×Iš[S˜[YJHÂˆ	˜[YHHÜÝš[™×Iš[S˜[YBˆYˆ
+	˜[YH[X]Ú	ÊŸ×ËWJJŸ_”ŠJ×ËW_	
+IÊHÈ™]\›ˆ	Ú˜IÈBˆYˆ
+	˜[YH[X]Ú	ÊŸ×ËWJJ_SŸS‘ÊJ×ËW_	
+IÊHÈ™]\›ˆ	Ù[‰ÈBˆ™]\›ˆ	[ŸB‚™[˜Ý[Ûˆ›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžJÜÝš[™×IØ]YÛÜžKÜÝš[™×Iš[S˜[YHH	ÉÊHÂˆ	Ø]H
+ÜÝš[™×IØ]YÛÜžJK•š[J
+K•ÓÝÙ\’[˜\šX[
+
+BˆYˆ
+
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊHXÛÛZ[œÈ	Ø]
+HÈ™]\›ˆ	Ø]Bˆ	\\ˆH
+ÜÝš[™×Iš[S˜[YJK•Õ\\’[˜\šX[
+
+BˆYˆ
+	\\ˆ[X]Ú	ÊŸ×ËWJQPÓJ×ËW_	
+IÈ[Üˆ	\\‹ÛÛZ[œÊ	ÑPÓIÊJHÈ™]\›ˆ	ÙXÛIÈBˆYˆ
+	\\ˆ[X]Ú	ÊŸ×ËWJP“Ñ
+×ËW_	
+IÈ[Üˆ	\\‹ÛÛZ[œÊ	Ð“Ñ	ÊJHÈ™]\›ˆ	Ø›Ù	ÈBˆYˆ
+	\\ˆ[X]Ú	ÊŸ×ËWJQSJ×ËW_	
+IÈ[Üˆ	\\‹ÛÛZ[œÊ	ÑSIÊJHÈ™]\›ˆ	Ù[IÈBˆ™]\›ˆ	ÉÂŸB‚™[˜Ý[Ûˆ™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžJÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžH	ÉÂˆYˆ
+
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊH[›ÝÛÛZ[œÈ	Ø]
+HÂˆ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ØØ]YÛÜžxàjøàkÈXÛHÈ›ÙÈ[H8àk¸àa8àf¸à£8àbøà¤¹£!ùk¦¸àeøài¸àcøàh8àexàa8à ‰ÊBˆBˆ™]\›ˆ	Ø]ŸB‚™[˜Ý[ÛˆÙ]TYÙPØ]YÛÜžJ	ÝXÝ\™K	YÙJHÂˆYˆ
+	[Y\H	YÙJHÈ™]\›ˆ	ÉÈBˆ	ØˆH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\HÜÝš[™×IYÙKÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	Ø‹ÛÝ[Y\H
+HÈ™]\›ˆ	ÉÈBˆ™]\›ˆ›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IØ–ÌK˜Ø]YÛÜžJH
+ÜÝš[™×IØ–ÌK™š[S˜[YJBŸB‚™[˜Ý[Ûˆ\ÝUÛÜšØ›ÛÚÐØ]YÛÜžJ	ÛÜšØ›ÛÚËÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžH	ÉÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]
+JHÈ™]\›ˆ	YHBˆ	ÝÜ™YH›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IÛÜšØ›ÛÚË˜Ø]YÛÜžJH	ÉÂˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÝÜ™Y
+JHÈ™]\›ˆ	ÝÜ™YY\H	Ø]Bˆ	˜[YHH
+ÜÝš[™×IÛÜšØ›ÛÚË™š[S˜[YJBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ	˜[YHHÜÝš[™×IÛÜšØ›ÛÚË™\Ü^S˜[YHBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ	˜[YHHÜÝš[™×IÛÜšØ›ÛÚËœ™[]]™T]Bˆ™]\›ˆ
+
+›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	ÉÈ	˜[YJHY\H	Ø]
+BŸB‚™[˜Ý[ÛˆÙ]T›Ú™XÝYœ›ÛUÛÜšØ›ÛÚÜÊ	ÛÜšØ›ÛÚÜÊHÂˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÛÜšØ›ÛÚÜÊJHÂˆ	˜[YHHÜÝš[™×IØ‹™š[S˜[YBˆYˆ
+	˜[YH[X]Ú	×ŠÏ‹ŠÊWÊŸJWÉÊHÈ™]\›ˆ	X]Ú\ÖÉÜ	×HBˆBˆ™]\›ˆ	Ô™\Üš[™\‰ÂŸB‚™[˜Ý[ÛˆÙ]PØ]YÛÜžT›Ú™XÝY
+ÜÝš[™×I›Ú™XÝYÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ	Ø]YÛÜžSX™[H	Ø]•Õ\\’[˜\šX[
+
+Bˆ	˜\ÙHH
+ÜÝš[™×I›Ú™XÝY
+K•š[J
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜\ÙJJHÈ	˜\ÙHH	Ô™\Üš[™\‰ÈBˆYˆ
+	˜\ÙH[X]Ú	×ŠÏ™Yš^‹ŠÊJÎ–×ËWJÎ‘PÓ_“ÑSJJI	ÊHÂˆ	™Yš^H
+
+ÜÝš[™×IX]Ú\ÖÉÜ™Yš^	×JH\™\XÙH	Ö×ËWJÉ	Ë	ÉÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™Yš^
+JHÈ™]\›ˆ	Ø]YÛÜžSX™[Bˆ™]\›ˆ‰Ü™Yš^WÉØØ]YÛÜžSX™[H‚ˆBˆ™]\›ˆ‰Ø˜\Ù_WÉØØ]YÛÜžSX™[H‚ŸB‚™[˜Ý[ÛˆÙ]SÝ]]š[S˜[YJÜÝš[™×I›Û[YKÜÝš[™×I›Ú™XÝYÜÝš[™×IØ]YÛÜžJHÂˆ	˜[YY›Ú™XÝYHÙ]PØ]YÛÜžT›Ú™XÝY	›Ú™XÝY	Ø]YÛÜžBˆÝÚ]Ú
+	›Û[YJHÂˆ	Ú˜K[XZ[‰ÈÈ™]\›ˆ‰Û˜[YY›Ú™XÝYWÒ—ù§+9/dËœˆˆBˆ	Ú˜KX\[™^	ÈÈ™]\›ˆ‰Û˜[YY›Ú™XÝYWÒ—ú(ç:-¬ËœˆˆBˆ	Ù[‹[XZ[‰ÈÈ™]\›ˆ‰Û˜[YY›Ú™XÝYWÑWÓXZ[‹œˆˆBˆ	Ù[‹X\[™^	ÈÈ™]\›ˆ‰Û˜[YY›Ú™XÝYWÑWÐ\[™^œˆˆBˆY˜][È›ÝÈ¹§*¹çéxàk¹¢$9§§9âjNˆ	›Û[YHˆBˆBŸB‚™[˜Ý[ÛˆÙ]TÚY]Ü™\“[X™\ŠÜÝš[™×IÚY]˜[YJHÂˆ	ÚY][HHˆYˆ
+Ú[NŽ•žT\œÙJ	ÚY]˜[YKÜ™Y—IÚY][JJHÈ™]\›ˆ	ÚY][HBˆ™]\›ˆNNNNNBŸB‚™[˜Ý[ÛˆÙ]Qš[SÜ™\“[X™\ŠÜÝš[™×Iš[S˜[YJHÂˆYˆ
+	š[S˜[YH[X]Ú	×ÊÏ[O—ÌKJWÉÊHÈ™]\›ˆÚ[IX]Ú\ÖÉÛ[I×HBˆ™]\›ˆNNNNNBŸB‚™[˜Ý[ÛˆÙ]SÜ™\’[
+ÜÝš[™×Iš[S˜[YKÜÝš[™×IÚY]˜[YJHÂˆÈY˜][YÙH[œÙ\[ÛˆÜ™\ˆ\Èš[X\š[HH[Y\šXÈÛÜšÜÚY]˜[YK‚ˆÈš[HÜ™\ˆ\ÈÛ›HHYHœ™XZÙ\ˆÚ[ˆÙ]™\˜[ÛÜšØ›ÛÚÜÈ]™HHØ[YHÚY][X™\‹‚ˆ™]\›ˆ
+
+Ù]TÚY]Ü™\“[X™\ˆ	ÚY]˜[YJH
+ˆL
+H
+È
+Ù]Qš[SÜ™\“[X™\ˆ	š[S˜[YJBŸB‚™[˜Ý[ÛˆÙ]Q^Ù[š[\Ò[”ÝX›Z\ÜÚ[ÛˆÂˆ	]ÈHÙ]T]ÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠH[Üˆ[›Ý
+\ÝT]S]\˜[]
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠJJHÈ™]\›ˆ
+
+HB‚ˆÈÛ›HÚÝÈ^Ù[š[\È\™XÝH[™\ˆHÝX›Z\ÜÚ[Ûˆ›Û\‹‚ˆÈHY˜][]KÛÝ]]Ú[›Û\œÈ\™H[[[Û˜[HYÛ›Ü™Y‚ˆ	^Ù[^ÈH
+	ËžÞ	ÊBˆ	š[\ÈHÙ]PÚ[][HS]\˜[]
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠHQš[HQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHˆÚ\™KSØš™XÝÈ	^Ù[^ÈXÛÛZ[œÈ	Ë‘^[œÚ[Û‹•ÓÝÙ\’[˜\šX[
+
+HX[™	Ë“˜[YH[›ÝZÙH	ß‰
+‰ÈHˆÛÜSØš™XÝ˜[YB‚ˆ	™\Ý[H
+
+Bˆ›Ü™XXÚ
+	[žH[ˆ	š[\ÊHÂˆÈ™]ÛÜšÈÚ\™\ÈX^HœšYY›H™]Z[ˆ\™XÝÜžKY[[Y\˜][ÛˆY]Y]Kˆ™K\™XY[™™Yœ™\ÚˆÈXXÚš[R[™›ÈÛÈHRHÚÝÜÈH™]Ù\ÝØ]™H[YH]˜Z[X›Hœ›ÛHHš[HÙ\™\‹‚ˆžHÂˆ	ˆHÙ]R][HS]\˜[]	[žK‘[˜[YHQ›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÝÜˆ	‹”™Yœ™\Ú
+
+BˆHØ]ÚÂˆ	ˆH	[žBˆBˆ	™[HÙ]T™[]]™T]ÛÛ\]
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠH	‹‘[˜[YBˆÈØY™]Nˆ\™XÝÚ[™[ˆÛ›KˆÈ›ÝXØÙ\[žH™[]]™H]ÛÛZ[š[™ÈHÙ\\˜]Ü‹‚ˆYˆ
+	™[[X]Ú	Ö××IÊHÈÛÛ[YHBˆÈ^Ü™\ˆ[™H\]\ÝÚÝÈHØ[YHZ[]Kˆ™XYH[Y\Ý[\œ›ÛH[‚ˆÈÜ[ˆš[H[™H
+ÚXÚž\\ÜÙ\ÈÝ[HÓPˆ\™XÝÜžHY]Y]JKÛÛ™\]ÛˆBˆÈÙ\™\ˆË[™™]\›ˆHš[˜[\Ü^HÝš[™ÈÚ]Ý]œ›ÝÜÙ\ˆ[Y^›Û™HÛÛ™\œÚ[Û‹‚ˆ	[ÙYšYYÛ˜\ÚÝHÙ]Qš[S\ÝÜš]TÛ˜\ÚÝ	‹‘[˜[YBˆ	™\Ý[
+ÏHÛÜ™\™YPÂˆš[S˜[YHH	‹“˜[YBˆ™[]]™T]H	™[ˆÚ^™HH	‹“[™Ýˆ[ÙYšYY]\Ü^HHÜÝš[™×I[ÙYšYYÛ˜\ÚÝ™\Ü^Bˆ[ÙYšYY]H
+Ñ]U[YWI[ÙYšYYÛ˜\ÚÝ›ØØ[
+K•ÔÝš[™Ê	Þ^^^KSSKY›[NœÜÞžž‰ÊBˆ[ÙYšYY]]ÈH
+Ñ]U[YWI[ÙYšYYÛ˜\ÚÝ]ÊK•ÔÝš[™Ê	ÛÉÊBˆ[ÙYšYY][š^\ÈHÚ[I[ÙYšYYÛ˜\ÚÝ[š^\Âˆ[ÙYšYY]]ÕXÚÜÈHÜÝš[™×JÑ]U[YWI[ÙYšYYÛ˜\ÚÝ]ÊK•XÚÜÂˆ]XÝY[™ÝXYÙHH
+Ù]S[™ÝXYÙQœ›ÛQš[S˜[YH	‹“˜[YJBˆBˆBˆ™]\›ˆ	™\Ý[ŸB‚™[˜Ý[Ûˆ™]ËUÛÜšØ›ÛÚÓØš™XÝ
+ÜÝš[™×I™[]]™T]ÜÝš[™×I[™ÝXYÙKÜÝš[™×IØ]YÛÜžHH	ÉÊHÂˆ	]ÈHÙ]T]Âˆ	[H›Ú[‹TØY™H
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠH	™[]]™T]ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[
+JHÈ›ÝÈ¹£ä9aî¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	™[]]™T]ˆBˆ	][HHÙ]R][HS]\˜[]	[ˆ	\ÚH™]ËTÝX›R\Ú	[ˆ	Ø]YÛÜžS›Ü›X[^™YH›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžH	][K“˜[YBˆ	˜\ÙRYH™]ËTÛYÈ	][K“˜[YBˆÈPÓHÈ“ÑÈSH\™H[™\[™[ÛÜšÈÙ]ËˆHÚ[™ÛH^Ù[š[HX^H™H™YÚ\Ý\™YˆÈ[ˆ[Ü™H[ˆÛ™HØ]YÛÜžKÛÈ™]ÈÛÜšØ›ÛÚÈQÈ[˜ÛYHHØ]YÛÜžH™Yš^‚ˆ	YH	
+Yˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]YÛÜžS›Ü›X[^™Y
+JHÈ‰Ø]YÛÜžS›Ü›X[^™YI˜\ÙRYˆH[ÙHÈ	˜\ÙRYJBˆ™]\›ˆÛÜ™\™YPÂˆÛÜšØ›ÛÚÒYH	Yˆ[™ÝXYÙHH	[™ÝXYÙBˆš[S˜[YHH	][K“˜[YBˆ™[]]™T]H	™[]]™T]ˆ\Ü^S˜[YHH	][K“˜[YBˆØ]YÛÜžHH	Ø]YÛÜžS›Ü›X[^™YˆÝ\œ™[^Ù[[ÙYšYY]H	][K“\ÝÜš]U[YK•ÔÝš[™Ê	Þ^^^KSSKY›[NœÜÞžž‰ÊBˆÝ\œ™[^Ù[\ÝÜš]U]ÕXÚÜÈHÜÝš[™×I][K“\ÝÜš]U[YU]Ë•XÚÜÂˆÝ\œ™[^Ù[Ú^™HH	][K“[™ÝˆÝ\œ™[^Ù[\ÚH	\Úˆ\Ý™[™\™Y™\œÚ[Û’YH	[ˆ\Ý™[™\™Y^Ù[\ÚH	[ˆ\Ý™[™\™Y]H	[ˆ\Ý™[™\™YÚY]ÈH
+
+Bˆ\Ý™[™\™YÚY]š[™Ù\œš[H	ÉÂˆÝ]\ÈH	Û™]ÉÂˆØ\›š[™ÜÈH
+
+Bˆ\Ý\œ›ÜˆH	ÉÂˆ\Ý\œ›Ü•\Ù\ˆH	ÉÂˆ\Ý\œ›Ü]H	[ˆ\Ý™[™\][\\ÚH	ÉÂˆ\Ý™[™\“ÙÈH	ÉÂˆ™[™\”›Ùš[U™\œÚ[ÛˆHˆ™YÚ\Ý\™Y]H™]ËS›ÝÒ\ÛÂˆBŸB‚™[˜Ý[Ûˆ[›ÚÙKPÛÛT™[X\ÙJ	ØšŠHÂˆYˆ
+	[[™H	ØšŠHÂˆžHÈÔÞ\Ý[K”[[YK’[\›ÜÙ\šXÙ\Ë“X\œÚ[NŽ”™[X\ÙPÛÛSØš™XÝ
+	ØšŠHÝ]S[HØ]ÚÈBˆBŸB‚‚™[˜Ý[ÛˆÜ[‹Q^Ù[ÛÜšØ›ÛÚÔØY™J	^Ù[ÜÝš[™×I[]Ø›ÛÛI™XYÛ›JHÂˆ	Z\ÜÚ[™ÈHÕ\WNŽ“Z\ÜÚ[™Â‚ˆÈX\šÈÙˆHÙXˆ
+›Û™K’Y[YšY\ŠH8àc9.æ8àa8àgøàåxà¨xà©8àêøàkù/çz+møàäøàéxàï9kïº,hxàj8àj¸à¢¸à BˆÈÓÓxàkˆÛÜšØ›ÛÚÜË“Ü[ˆ8àc8à#ÛÜšØ›ÛÚÜÈ8à«øàêxà®xàkˆÜ[ˆ8àåøàëxàäxàá¸à¨øà¤¹cå¹o¥øàiøàcxào¸àføà¤øà#xàiùi,y¥eøàfxà¢øà ‚ˆÈ9.¢ùbcxàjÖ›Û™K’Y[YšY\¸à¤ºfi9c®øàfxà¢ûï"9a¡yk®xàîù¦í9¥¬9¥éy¦`¸àkùi"xà£øà¢xàj¸àa;ï"xà ‚ˆžHÈ[˜›ØÚËQš[HS]\˜[]	[]Q\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHHØ]ÚÈB‚ˆ	Ü[‘\œ›ÜˆH	[ˆžHÂˆÈ\ÙH^XÚ]Ü[Û˜[\™Ý[Y[Ëˆ\È]›ÚYÈ^Ù[[\œ™][™ÈHÚÜÜ[Š
+HØ[Y™™\™[BˆÈÛˆÛÛYHÙ™šXÙHZ[Ë[™™]™[È[šÈÈ™XY[Û›H›Û\Ë‚ˆ™]\›ˆ	^Ù[•ÛÜšØ›ÛÚÜË“Ü[Š	[]	™XYÛ›K	Z\ÜÚ[™Ë	Z\ÜÚ[™Ë	Z\ÜÚ[™Ë	YK	Z\ÜÚ[™Ë	Z\ÜÚ[™Ë	˜[ÙK	˜[ÙK	Z\ÜÚ[™Ë	˜[ÙK	YK	Z\ÜÚ[™ÊBˆHØ]ÚÂˆ	Ü[‘\œ›ÜˆH	ÂˆBˆžHÂˆÈÛÛ\]Xš[]H˜[˜XÚÈ›ÜˆÛ\ˆÓÓH\Ü]Ú\œË‚ˆ™]\›ˆ	^Ù[•ÛÜšØ›ÛÚÜË“Ü[Š	[]	™XYÛ›JBˆHØ]ÚÂˆ	Ü[‘\œ›ÜˆH	ÂˆBˆÈ9§ 9í`¸àåxàªxàï8àêøàä8ààøà«Îˆ9/çz+møàäøàéxàï9íc9å,xàiúe¢øàa8ài¹íê:fá¸àè¸àï8àâxàn9¦!ù¨/8àexàføà¢øà ‚ˆÈ[˜›ØÚËQš[xàc9b®xàbøàj¸àa9ä¬9h ûï"8à¬8àêøàï8àåøàçxàê¸à­øàï8àiù/çz+møàäøàéxàï9o-ùb-¹ëb{ï"yd$xàdxà ‚ˆžHÂˆ	ÈH	^Ù[”›ÝXÝYšY]ÕÚ[™ÝÜË“Ü[Š	[]
+BˆYˆ
+	[[™H	ÊHÂˆ	›ÛÚÈH	Ë‘Y]
+
+BˆYˆ
+	[[™H	›ÛÚÊHÈ™]\›ˆ	›ÛÚÈBˆBˆHØ]ÚÈBˆ›ÝÈ	Ü[‘\œ›Ü‚ŸB‚™[˜Ý[Ûˆ[œÜXÝQ^Ù[ÛÜšØ›ÛÚÊÜÝš[™×I[]
+HÂˆ	^Ù[H	[ˆ	›ÛÚÈH	[ˆ	ÚY]ÈH
+
+BˆžHÂˆ	^Ù[H™]ËSØš™XÝPÛÛSØš™XÝ^Ù[\XØ][Û‚ˆ	^Ù[•š\ÚX›HH	˜[ÙBˆ	^Ù[‘\Ü^P[\ÈH	˜[ÙBˆ	^Ù[‘[˜X›Q]™[ÈH	˜[ÙBˆ	^Ù[”ØÜ™Y[•\][™ÈH	˜[ÙBˆžHÈ	^Ù[\ÚÕÕ\]S[šÜÈH	˜[ÙHHØ]ÚÈBˆžHÈ	^Ù[]]ÛX][Û”ÙXÝ\š]HHÈHØ]ÚÈBˆ	›ÛÚÈHÜ[‹Q^Ù[ÛÜšØ›ÛÚÔØY™H	^Ù[	[]	YBˆ	ÚY]ÛÝ[HˆžHÈ	ÚY]ÛÝ[HÚ[I›ÛÚË•ÛÜšÜÚY]ËÛÝ[HØ]ÚÈ	ÚY]ÛÝ[HBˆ›Üˆ
+	HHNÈ	H[H	ÚY]ÛÝ[È	JÊÊHÂˆ	ÜÈH	[ˆžHÂˆ	ÜÈH	›ÛÚË•ÛÜšÜÚY]Ë’][J	JBˆ	ÚY]˜[YHHÜÝš[™×IÜË“˜[YBˆ	š\ÚX›HH
+Ú[IÜË•š\ÚX›HY\HLJBˆYˆ
+	š\ÚX›HX[™	ÚY]˜[YH[X]Ú	×–ÌNWJÉ	ÊHÂˆ	LHH	ÉÂˆžHÈ	LHHÜÝš[™×IÜË”˜[™ÙJ	ÐLIÊK•^HØ]ÚÈ	LHH	ÉÈBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	LJJHÈ	LHH	ÉÈBˆ	›ÛÛHH	[ˆžHÈ	›ÛÛHH	ÜË”YÙTÙ]\–›ÛÛHHØ]ÚÈBˆ	š[\™XHH	ÉÂˆžHÈ	š[\™XHHÜÝš[™×IÜË”YÙTÙ]\”š[\™XHHØ]ÚÈBˆ	ÚY]È
+ÏHÛÜ™\™YPÂˆÚY]˜[YHH	ÚY]˜[YBˆ]TÛÝ\˜ÙHH	ÐLIÂˆ]XÝY]HH	LBˆ›ÛÛHH	›ÛÛBˆš[\™XHH	š[\™XBˆBˆBˆHš[˜[HÂˆ[›ÚÙKPÛÛT™[X\ÙH	ÜÂˆBˆBˆHš[˜[HÂˆYˆ
+	›ÛÚÊHÈžHÈ	›ÛÚËÛÜÙJ	˜[ÙJHHØ]ÚÈHÈ[›ÚÙKPÛÛT™[X\ÙH	›ÛÚÈBˆYˆ
+	^Ù[
+HÈžHÈ	^Ù[”]Z]
+
+HHØ]ÚÈHÈ[›ÚÙKPÛÛT™[X\ÙH	^Ù[BˆÑÐ×NŽÛÛXÝ
+
+NÈÑÐ×NŽ•ØZ]›Ü”[™[™Ñš[˜[^™\œÊ
+BˆBˆ™]\›ˆ	ÚY]ÂŸB‚™[˜Ý[ÛˆYS›ÝT›Ü\RY“Z\ÜÚ[™Ê	Øš™XÝÜÝš[™×I˜[YK	˜[YJHÂˆYˆ
+	[Y\H	Øš™XÝ
+HÈ™]\›ˆBˆYˆ
+	Øš™XÝZ\ÈÔÞ\Ý[KÛÛXÝ[ÛœË’QXÝ[Û˜\žWJHÂˆYˆ
+[›Ý	Øš™XÝÛÛZ[œÊ	˜[YJJHÈ	Øš™XÝÉ˜[YWHH	˜[YHBˆ™]\›‚ˆBˆYˆ
+	[Y\H	Øš™XÝ”ÓØš™XÝ”›Ü\Y\ÖÉ˜[YWJHÂˆ	Øš™XÝYSY[X™\ˆS›ÝT›Ü\S˜[YH	˜[YHS›ÝT›Ü\U˜[YH	˜[YHQ›Ü˜ÙBˆBŸB‚‚™[˜Ý[Ûˆ™[[X™\‹U›Û[YSÜ™\Š	ÝXÝ\™KÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ	Ø’YÈHßBˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈ\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]JJHÈ	Ø’YÖÖÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYHH	YHBˆ	YÙ\ÈH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÂˆ	Ø’YËÛÛZ[œÒÙ^JÜÝš[™×IËÛÜšØ›ÛÚÒY
+HX[™
+ˆ
+	›Û[YHY\H	Û›Û™IÈX[™
+ÜÝš[™×IË›Û[YHY\H	Û›Û™IÈ[Üˆ	Ë™[˜X›YY\H	˜[ÙJJH[Ü‚ˆ
+	›Û[YH[™H	Û›Û™IÈX[™ÜÝš[™×IË›Û[YHY\H	›Û[YHX[™	Ë™[˜X›Y[™H	˜[ÙJBˆ
+BˆHÛÜSØš™XÝÖÙÝX›WJÙ]Q]T›Ü\H	È	ÛÜ™\‰È
+_KÖÜÝš[™×J™\ÛÛ™KTYÙRY	Ê_JBˆ›Üˆ
+	OLÈ	H[	YÙ\ËÛÝ[È	JÊÊHÈÙ]S›ÝT›Ü\H	YÙ\ÖÉWH	ÛÜ™\‰È
+
+	JÌJJŒL
+HBˆ™]\›ˆ	YÙ\ÂŸB‚™[˜Ý[Ûˆ[œÙ\TYÙR[”ÚY]Ü™\Š	ÝXÝ\™K	™]ÔYÙKÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ	^\Ý[™ÈH
+™[[X™\‹U›Û[YSÜ™\ˆ	ÝXÝ\™H	›Û[YH	Ø]
+Bˆ	X[X[H
+	^\Ý[™ÈÚ\™KSØš™XÝÈØ›ÛÛJÙ]Q]T›Ü\H	È	ÛÜ™\“X[X[	È	˜[ÙJHJKÛÝ[YÝˆ	Ü™\™YH™]ËSØš™XÝÞ\Ý[KÛÛXÝ[ÛœË‘Ù[™\šXË“\ÝÛØš™XÝBˆ›Ü™XXÚ
+	[ˆ	^\Ý[™ÊHÈÝ›ÚYIÜ™\™YY
+	
+HBˆ	[œÙ\Y][™H	X[X[ˆYˆ
+	X[X[[Üˆ	^\Ý[™ËÛÝ[Y\H
+HÂˆÝ›ÚYIÜ™\™YY
+	™]ÔYÙJBˆH[ÙHÂˆ	™]ÕØˆH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\HÜÝš[™×I™]ÔYÙKÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆ	™]Ñš[HHYˆ
+	™]ÕØ‹ÛÝ[
+HÈÜÝš[™×I™]ÕØ–ÌK™š[S˜[YHH[ÙHÈ	ÉÈBˆ	™]ÔÚY]HÙ]TÚY]Ü™\“[X™\ˆ
+ÜÝš[™×I™]ÔYÙKœÚY]˜[YJBˆ	™]Ñš[SÜ™\ˆHÙ]Qš[SÜ™\“[X™\ˆ	™]Ñš[Bˆ	]H	^\Ý[™ËÛÝ[ˆ›Üˆ
+	OLÈ	H[	^\Ý[™ËÛÝ[È	JÊÊHÂˆ	H	^\Ý[™ÖÉWBˆ	ØˆH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\HÜÝš[™×IÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆ	š[HHYˆ
+	Ø‹ÛÝ[
+HÈÜÝš[™×IØ–ÌK™š[S˜[YHH[ÙHÈ	ÉÈBˆ	ÚY]HÙ]TÚY]Ü™\“[X™\ˆ
+ÜÝš[™×IœÚY]˜[YJBˆ	š[SÜ™\ˆHÙ]Qš[SÜ™\“[X™\ˆ	š[BˆYˆ
+	ÚY]YÝ	™]ÔÚY][Üˆ
+	ÚY]Y\H	™]ÔÚY]X[™	š[SÜ™\ˆYÝ	™]Ñš[SÜ™\ŠH[Üˆ
+	ÚY]Y\H	™]ÔÚY]X[™	š[SÜ™\ˆY\H	™]Ñš[SÜ™\ˆX[™ÔÝš[™ÐÛÛ\\™\—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙKÛÛ\\™J	š[K	™]Ñš[JHYÝ
+JHÈ	]INÈœ™XZÈBˆBˆ	Ü™\™Y’[œÙ\
+	]	™]ÔYÙJBˆBˆ›Üˆ
+	OLÈ	H[	Ü™\™YÛÝ[È	JÊÊHÈÙ]S›ÝT›Ü\H	Ü™\™YÉWH	ÛÜ™\‰È
+
+	JÌJJŒL
+HBˆÈÚ[™ÝÜÈÝÙ\”Ú[KŒHØ[ˆ›ÝÈ\™Ý[Y[\\ÈÈ›ÝX]ÚˆÚ[‚ˆÈ
+
+H\™XÝHÛÛ™\È\ÝÛØš™XÝH›ÝYÚÕÓØš™XÝ\œ˜^Pš[™\‹‚ˆ™]\›ˆÛÜ™\™YPÈ[œÙ\Y][™I[œÙ\Y][™ÈYÙ\ÏIÜ™\™Y•Ð\œ˜^J
+HBŸB‚™[˜Ý[Ûˆ[š]X[^™KSÜ‹SZYÜ˜]TÝXÝ\™JÜÝš[™×I[™ÝXYÙKÜÝš[™×I]Q\ˆH	ÉÊHÂˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙH	]Q\‚ˆ	ØÚÔ]H›Ú[‹T]	ÛÜšÜÜXÙH	ÛØÚÜ×ÝXÝ\™K›ØÚÉÂˆ™]\›ˆ[›ÚÙKUÚ]ØÚÈ	ØÚÔ]Âˆ	]H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‰ÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	]
+JHÈÜš]KTÝXÝ\™U[›ØÚÙY	[™ÝXYÙH
+™]ËQ[\TÝXÝ\™H	[™ÝXYÙJH	]Q\ŽÈ™]\›ˆÛÜ™\™YPÈÜ™X]YIYNÈZYÜ˜]YI˜[ÙHHBˆ	ÝXÝ\™HH™XYTÝXÝ\™U[›ØÚÙY	[™ÝXYÙH	]Q\‚ˆ	™\œÚ[ÛˆHBˆžHÈ	™\œÚ[ÛVÚ[JÙ]Q]T›Ü\H	ÝXÝ\™H	ÜØÚ[XU™\œÚ[Û‰ÈJHHØ]ÚÈ	™\œÚ[ÛLHBˆYˆ
+	™\œÚ[ÛˆYÝŠHÈ›ÝÈ¸àdøàk¹ë¨yä!¸àáøàï8à¯øàkù¥¬8àeøàaØÚ[XU™\œÚ[ÛI™\œÚ[Û¸àiøàfxà ¹kï¹oç8àfxà¢Ô™\Üš[™\¸à¤¹/oùå*8àeøài¸àcøàh8àexàa8à ˆˆBˆYˆ
+	™\œÚ[ÛˆY\HŠHÂˆ	\ÝÛÛÙH›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‹›\ÝYÛÛÙ	ÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\ÝÛÛÙ
+JHÈÜš]KRœÛÛ‘š[H	\ÝÛÛÙ	ÝXÝ\™HBˆ™]\›ˆÛÜ™\™YPÈÜ™X]YI˜[ÙNÈZYÜ˜]YI˜[ÙHBˆBˆ	˜XÚÝ\H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝXÝ\™KšœÛÛ‹ŒK˜˜ZÉÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	˜XÚÝ\
+JHÂˆÛÜKR][HS]\˜[]	]Q\Ý[˜][Ûˆ	˜XÚÝ\Q\œ›ÜXÝ[ÛˆÝÜˆYˆ
+
+Ù]R][H	˜XÚÝ\
+K“[™Ý[™H
+Ù]R][H	]
+K“[™Ý[Üˆ
+™]ËTÝX›R\Ú	˜XÚÝ\
+H[™H
+™]ËTÝX›R\Ú	]
+JHÈ›ÝÈ	ÜÝXÝ\™KšœÛÛ‹ŒK˜˜Zøàk¹©':*/8àjùi,y¥eøàeøào¸àeøàgøà ‰ÈBˆBˆ	ÝXÝ\™HH›Ü›X[^™KTÝXÝ\™PÛÛXÝ[ÛœÈ	ÝXÝ\™BˆÝ›ÚYJ™\Z\‹TÝXÝ\™TYÙ\È	ÝXÝ\™JBˆ	Û›Û[Y\ÈHÙ]Q]T›Ü\H	ÝXÝ\™H	Ý›Û[Y\ÉÈ	[ˆ	™]Õ›Û[Y\ÈHÛÜ™\™YPßBˆ›Ü™XXÚ
+	›Û[YH[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJJHÂˆ›Ü™XXÚ
+	Ø][ˆ
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊJHÂˆ	œ™\ÚH™]ËQ[\U›Û[YTÝ]BˆYˆ
+	Ø]Y\H	ÙXÛIÈX[™	[[™H	Û›Û[Y\ÊHÂˆ	ÛHÙ]Q]T›Ü\H	Û›Û[Y\È	›Û[YH	[ˆYˆ
+	[Y\H	Û
+HÈ	ÛHÙ]Q]T›Ü\H	Û›Û[Y\È
+Ù]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]
+H	[BˆYˆ
+	[[™H	Û
+HÂˆ›Ü™XXÚ
+	˜[YH[ˆ
+	ÜÝ]\ÉË	Û\ÝZ[]	Ë	ÛÝ]]‰Ë	ÛY\ÜØYÙIË	ØZ[š[™Ù\œš[	Ë	ÜÝ[T™X\ÛÛœÉÊJHÂˆ	˜[YOQÙ]Q]T›Ü\H	Û	˜[YH	[ˆYˆ
+	[[™H	˜[YJHÈÙ]S›ÝT›Ü\H	œ™\Ú	˜[YH	˜[YHBˆBˆBˆBˆ	™]Õ›Û[Y\ÖÊÙ]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]
+WHH	œ™\ÚˆBˆBˆÙ]S›ÝT›Ü\H	ÝXÝ\™H	Ý›Û[Y\ÉÈ	™]Õ›Û[Y\ÂˆÙ]S›ÝT›Ü\H	ÝXÝ\™H	ÜØÚ[XU™\œÚ[Û‰È‚ˆ›Ü™XXÚ
+	Ø][ˆ
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊJHÈ›Ü™XXÚ
+	›Û[YH[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙJJHÈÝ›ÚYJ™[[X™\‹U›Û[YSÜ™\ˆ	ÝXÝ\™H	›Û[YH	Ø]
+HHBˆÜš]KTÝXÝ\™U[›ØÚÙY	[™ÝXYÙH	ÝXÝ\™H	]Q\‚ˆÜš]KRœÛÛ‘š[H
+›Ú[‹T]	ÛÜšÜÜXÙH	ÜØÚ[XK]™\œÚ[Û‹šœÛÛ‰ÊH
+ÛÜ™\™YPÈØÚ[XU™\œÚ[ÛLŽÈZYÜ˜]Y]J™]ËS›ÝÒ\ÛÊNÈ˜XÚÝ\I˜XÚÝ\JBˆ™]\›ˆÛÜ™\™YPÈÜ™X]YI˜[ÙNÈZYÜ˜]YIYNÈ˜XÚÝ\I˜XÚÝ\BˆBŸB‚™[˜Ý[Ûˆ\KQY˜][[X™\š[™Ô\•›Û[YJÜÝš[™×I[™ÝXYÙK	ÝXÝ\™KÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ	Ø’YÈHßBˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈ\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]JJHÈ	Ø’YÖÖÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYHH	YHBˆ›Ü™XXÚ
+	›Û[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJJHÂˆ	Ù]YÙ\ÈH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈ	Ø’YËÛÛZ[œÒÙ^JÜÝš[™×IËÛÜšØ›ÛÚÒY
+HX[™	Ë™[˜X›YY\H	YHX[™ÜÝš[™×IË›Û[YHY\H	›ÛHÛÜSØš™XÝÖÙÝX›WJÙ]Q]T›Ü\H	È	ÛÜ™\‰È
+_KÖÜÝš[™×J™\ÛÛ™KTYÙRY	Ê_JBˆ›Üˆ
+	OLÈ	H[	Ù]YÙ\ËÛÝ[È	JÊÊHÂˆ	IÙ]YÙ\ÖÉWBˆYS›ÝT›Ü\RY“Z\ÜÚ[™È		Û[X™\š[™ÓX[X[	È	˜[ÙBˆYS›ÝT›Ü\RY“Z\ÜÚ[™È		Û[X™\š[™ÑY˜][	È	Ùš\œÝ\YÙK[›Û™IÂˆYˆ
+[›ÝØ›ÛÛI›[X™\š[™ÓX[X[
+HÂˆÙ]S›ÝT›Ü\H		Û[X™\š[™Ó[ÙIÈ	
+Yˆ
+	HY\H
+HÈ	Û›Û™IÈH[ÙHÈ	Ýš\ÚX›IÈJBˆÙ]S›ÝT›Ü\H		Û[X™\š[™ÑY˜][	È	Ùš\œÝ\YÙK[›Û™IÂˆBˆBˆBŸB‚™[˜Ý[ÛˆÛÛ™\ËU\Ù\”™[™\‘\œ›ÜŠÜÝš[™×IY\ÜØYÙJHÂˆ	^HÜÝš[™×IY\ÜØYÙBˆ	˜]ÕZ[HYˆ
+	^“[™ÝYÝL
+HÈ	È
+9a`øàk¸àª8àêxàïˆ	È
+È	^”ÝXœÝš[™ÊL
+H
+È	ø )ŠIÈH[ÙHÈ	È
+9a`øàk¸àª8àêxàïˆ	È
+È	^
+È	ÊIÈBˆYˆ
+	^[X]Ú	ÓÜ[ˆ8àåøàëxàäxàá¸à¨øà¤¹cå¹o¥øàiøàcxào¸àføà¤ß[˜X›HÈÙ]HÜ[ˆ›Ü\IÊHÈ™]\›ˆ	Ñ^Ù[8àc8àdøàk¸àåxà¨xà©8àêøà¤ºe¢øàdxào¸àføà¤øàiøàeøàgøà ¸àåxà¨xà©8àêøàc9/çz+møàäøàéxàï9kïº,h{ï"8à©8àìøà¯øàï8àãxààøàâ9å,y§i{ï"xàîù¦¥ùcíùc%»ï"9éæ9ká¹n©¸àêxàæxàêËÒT“{ï"xàîùè-9¤#xàk¸àa8àf¸à£8àbøàk¹cëú ïy )øàc8à`¸à¢¸ào¸àfxà ¸àåxà¨xà©8àêøà¤¹cìøà«øàê¸ààøà«ø¡¤¸àåøàëxàäxàá¸à¨ø¡¤¸à#:*,ycëøàfxà¢øà#xàjøààxà©øààøà«ùo£8à xà ¸àa¹. 9n©”¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ÈBˆYˆ
+	^[X]Ú	øàdøàk¸àª¸àå¸à®8à©øà«øàâ8àjøàåøàëxàäxàá¸à¨ßÝ]TØ]™Y]8àåøàëxàäxàá¸à¨ËŠº)¢øài8àbøà¢¸ào¸àføà¤ß›Ü\KŠ››Ý›Ý[™Ù\È›ÝÛÛZ[ˆH›Ü\IÊHÈ™]\›ˆ	Ô¹/g9¢$8àkº`,¹£eùâ­¹¡bøà¤¹¦í9¥¬8àiøàcxào¸àføà¤øàiøàeøàgøà ”™\Üš[™\¸à¤¹¦í9¥¬8àeøài¸àbøà¢xà xà ¸àa¹. 9n©”¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ÈBˆYˆ
+	^[X]Ú	Ô¹c%¹kïº,hxàk¸à­øàï8àâ9cbº)ä¹¥l9keÉÊHÈ™]\›ˆ	Ô¹c%¹kïº,hxàk¸à­øàï8àâ8àc8à`¸à¢¸ào¸àføà¤øà ¸à­øàï8àâ9d#xà¤¹cbº)ä¹¥l9keøàh8àdxàjøàeøài¸àcøàh8àexàa8à ¹/¢ÎˆK‹ÉÈBˆYˆ
+	^[X]Ú	ù£ä9aî¸àåxà¨xà©8àêß8àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤ß8àå¸ààøà«øàc:)¢øài8àbøà¢¸ào¸àføà¤ß›Ý›Ý[™Z\ÜÚ[™ÉÊHÈ™]\›ˆ	ù£ä9aî¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤øà ¹bbºfi8àîùéîùbåxàîùd#ybcyi"y¦í8àexà£8ài¸àa8àj¸àa8àbùè®º*£xàeøài¸àcøàh8àexàa8à ‰ÈBˆYˆ
+	^[X]Ú	øà¬øàå8àï9bcyo£9£ä9aî¹.+_9/oùå*9.+_ØÚÙYØÚß8àëxààøà«ÉÊHÈ™]\›ˆ
+	Ñ^Ù[8àc9/çykf9.+xào¸àgøàkù.å¸àk¹aé¹ä!¹.+xàiøàfxà ¹/çykf8àc9í`¸à£øàhøài¸àbøà¢ya£yn©¹è®º*£xàeøào¸àfxà ‰È
+È	˜]ÕZ[
+HBˆYˆ
+	^[X]Ú	Ñ^Ù[ÓÓ_‘TÕS^Ü\Ñš^Y›Ü›X]”ÉÊHÈ™]\›ˆ
+	Ñ^Ù[8àiÔ¹c%¸àiøàcxào¸àføà¤øàiøàeøàgøà ‰È
+È	˜]ÕZ[
+HBˆYˆ
+	^[X]Ú	Ô¸à¤¹/g9¢$8àiøàcxào¸àføà¤ß¸àc9/g9¢$8àexà£8ào¸àføà¤ß9ên¸àk”Ÿž]\ÉÊHÈ™]\›ˆ
+	Ñ^Ù[8àbøà¢T¸àc9aî¹b¦øàexà£8ào¸àføà¤øàiøàeøàgøà ¹cl9b-ùëá9fì¸àj8à­øàï8àâ:*+yk¦¸à¤¹è®º*£xàeøài¸àcøàh8àexàa8à ‰È
+È	˜]ÕZ[
+HBˆYˆ
+	^“[™ÝYÝLŒ
+HÈ™]\›ˆ	^”ÝXœÝš[™ÊLŒ
+H
+È	ø )‰ÈBˆ™]\›ˆ	^ŸB‚™[˜Ý[ÛˆÙ]TÚY]˜[YS\Ýœ›ÛR[œÜXÝ[ÛŠ	ÚY]ÊHÂˆ	˜[Y\ÈH
+
+Bˆ›Ü™XXÚ
+	È[ˆ
+Ù]P\œ˜^H	ÚY]ÊJHÂˆ	˜[YHHÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÚY]˜[YIÈ	ÉÊBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ	˜[Y\È
+ÏH	˜[YHBˆBˆ™]\›ˆ
+	˜[Y\ÊBŸB‚™[˜Ý[ÛˆÙ]TÚY]š[™Ù\œš[œ›ÛS˜[Y\Ê	ÚY]˜[Y\ÊHÂˆ	˜[Y\ÈH
+	ÚY]˜[Y\È›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈHÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÊHJBˆYˆ
+	˜[Y\ËÛÝ[Y\H
+HÈ™]\›ˆ	ÉÈBˆ™]\›ˆ
+ÜÝš[™×NŽ’›Ú[Š	ß	Ë
+	˜[Y\ÈÛÜSØš™XÝÈÙ]TÚY]Ü™\“[X™\ˆ	ÈKÈÜÝš[™×IÈJJJBŸB‚™[˜Ý[ÛˆÙ]UÛÜšØ›ÛÚÔ™[™\™YÚY]Û˜\ÚÝ
+	ÛÜšØ›ÛÚË	ÚY]˜[Y\ÊHÂˆ	˜[Y\ÈH
+	ÚY]˜[Y\È›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈHÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÊHJBˆÙ]S›ÝT›Ü\H	ÛÜšØ›ÛÚÈ	Û\Ý™[™\™YÚY]ÉÈ
+	˜[Y\ÊBˆÙ]S›ÝT›Ü\H	ÛÜšØ›ÛÚÈ	Û\Ý™[™\™YÚY]š[™Ù\œš[	È
+Ù]TÚY]š[™Ù\œš[œ›ÛS˜[Y\È	˜[Y\ÊBŸB‚™[˜Ý[Ûˆ\ÝUÛÜšØ›ÛÚÔ™[™\™YÚY]ÛÛZ[œÊ	ÛÜšØ›ÛÚËÜÝš[™×IÚY]˜[YJHÂˆYˆ
+	[Y\H	ÛÜšØ›ÛÚÊHÈ™]\›ˆ	˜[ÙHBˆ	\ÝÚY]ÈH
+Ù]P\œ˜^H
+Ù]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	Û\Ý™[™\™YÚY]ÉÈ
+
+JH›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈJBˆYˆ
+	\ÝÚY]ËÛÝ[Y\H
+HÈ™]\›ˆ	YHHÈÛÛ\]Xš[]HÚ]ÛÜšØ›ÛÚÜÈ™[™\™YžHÛ\ˆZ[Ë‚ˆ™]\›ˆ
+
+	\ÝÚY]ÈÚ\™KSØš™XÝÈ	ÈY\HÜÝš[™×IÚY]˜[YHJKÛÝ[YÝ
+BŸB‚™[˜Ý[Ûˆ\ÝTYÙPÛÛ[X]Ú\ÕÛÜšØ›ÛÚÕ™\œÚ[ÛŠ	YÙK	ÛÜšØ›ÛÚÊHÂˆYˆ
+	[Y\H	YÙH[Üˆ	[Y\H	ÛÜšØ›ÛÚÊHÈ™]\›ˆ	˜[ÙHBˆ	™\œÚ[Û’YHÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	Û\Ý™[™\™Y™\œÚ[Û’Y	È	ÉÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™\œÚ[Û’Y
+JHÈ™]\›ˆ	YHHÈÛ\ˆ]Nˆ˜[˜XÚÈÈš[H^\Ý[˜ÙH[™\ÚÚXÚÜË‚ˆ	ÛÜšØ›ÛÚÒYHÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	ÝÛÜšØ›ÛÚÒY	È	ÉÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÜšØ›ÛÚÒY
+JHÈ™]\›ˆ	˜[ÙHBˆ	™[H›Ü›X[^™KT™[]]™Q›ÜÛÛ\\™H
+ÜÝš[™×JÙ]Q]T›Ü\H	YÙH	ØÛÛ[‰È	ÉÊJBˆ	^XÝY™Yš^H›Ü›X[^™KT™[]]™Q›ÜÛÛ\\™H
+˜ÛÛ[\—	ÛÜšØ›ÛÚÒY	™\œÚ[Û’YŠBˆ™]\›ˆ
+	™[”Ý\ÕÚ]
+	^XÝY™Yš^
+JBŸB‚™[˜Ý[ÛˆYTÝ[T™X\ÛÛŠ	›Û[YTÝ]KÜÝš[™×I\KÜÝš[™×I]Z[
+HÂˆYˆ
+	[Y\H	›Û[YTÝ]JHÈ™]\›ˆBˆ	™X\ÛÛœÈH
+Ù]P\œ˜^H
+Ù]Q]T›Ü\H	›Û[YTÝ]H	ÜÝ[T™X\ÛÛœÉÈ
+
+JJBˆ	^\Ý[™ÈH
+	™X\ÛÛœÈÚ\™KSØš™XÝÈÜÝš[™×IË\HY\H	\HHÙ[XÝSØš™XÝQš\œÝJBˆ	Ý\œÈH
+	™X\ÛÛœÈÚ\™KSØš™XÝÈÜÝš[™×IË\H[™H	\HJBˆ	ÛÝ[HBˆ	]Z[^HÜÝš[™×I]Z[ˆYˆ
+	]Z[^[X]Ú	ÊÏ—
+Êy.í‰ÊHÈ	ÛÝ[HÚ[IX]Ú\ÖÉÛ‰×HBˆYˆ
+	^\Ý[™ËÛÝ[YÝ
+HÂˆ	ÛÛÝ[HÙ]R[]T›Ü\H	^\Ý[™ÖÌH	ØÛÝ[	ÈˆYˆ
+	ÛÛÝ[[H
+HÂˆ	Û]Z[HÜÝš[™×JÙ]Q]T›Ü\H	^\Ý[™ÖÌH	Ù]Z[	È	ÉÊBˆYˆ
+	Û]Z[[X]Ú	ÊÏ—
+Êy.í‰ÊHÈ	ÛÛÝ[HÚ[IX]Ú\ÖÉÛ‰×HH[ÙHÈ	ÛÛÝ[HHBˆBˆ	ÛÝ[
+ÏH	ÛÛÝ[ˆYˆ
+	]Z[^[X]Ú	×
+ù.í‰ÊHÈ	]Z[^HÜ™YÙ^NŽ”™\XÙJ	]Z[^	×
+ù.í‰Ë‰ÛÝ[9.íˆ‹JHBˆBˆ	™X\ÛÛˆHÛÜ™\™YPÈ\OI\NÈ]J™]ËS›ÝÒ\ÛÊNÈ]Z[I]Z[^ÈÛÝ[IÛÝ[Bˆ	™^™X\ÛÛœÈH
+	™X\ÛÛŠH
+È
+	Ý\œÊBˆÙ]S›ÝT›Ü\H	›Û[YTÝ]H	ÜÝ[T™X\ÛÛœÉÈ
+	™^™X\ÛÛœÈÙ[XÝSØš™XÝQš\œÝL
+BŸB‚™[˜Ý[ÛˆX\šËU›Û[YS™YYÔ™XZ[
+	ÝXÝ\™KÜÝš[™×I[™ÝXYÙKÜÝš[™×IØ]YÛÜžKÜÝš[™Ö×WI›Û[Y\ËÜÝš[™×I\KÜÝš[™×I]Z[
+HÂˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ›Ü™XXÚ
+	›Û[YH[ˆ
+	›Û[Y\ÈÙ[XÝSØš™XÝU[š\]YJJHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	›Û[YJH[Üˆ	›Û[YHY\H	Û›Û™IÊHÈÛÛ[YHBˆ	Ù^OQÙ]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]ˆ	QÙ]Q]T›Ü\H	ÝXÝ\™K›Û[Y\È	Ù^H	[ˆYˆ
+	[Y\H	ŠHÈÛÛ[YHBˆ	Z[VÜÝš[™×JÙ]Q]T›Ü\H	ˆ	ØZ[š[™Ù\œš[	È	ÉÊBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Z[
+JHÂˆÙ]S›ÝT›Ü\H	ˆ	ÜÝ]\ÉÈ	Û™YYË\™XZ[	ÂˆYTÝ[T™X\ÛÛˆ	ˆ	\H	]Z[ˆBˆBŸB‚™[˜Ý[ÛˆX\šËTÝXÝ\™U›Û[Y\Ó™YY™XZ[
+	ÝXÝ\™JHÂˆÈYØXÞHÛÛ\]Xš[]HÛ›Kˆ™]ÈÛÙH]\ÝØ[X\šËU›Û[YS™YYÔ™XZ[Ú]^XÚ]Ø]YÛÜžH[™›Û[Y\Ë‚ŸB‚™[˜Ý[Ûˆ™[[Ý™KPÛÛ[‘š[TØY™JÜÝš[™×IÛÜšÜÜXÙKÜÝš[™×I™[]]™TŠHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[]]™TŠJHÈ™]\›ˆBˆžHÂˆ	ÛÜšÜÜXÙQ[HÒSË”]NŽ‘Ù][]
+	ÛÜšÜÜXÙJBˆYˆ
+[›Ý	ÛÜšÜÜXÙQ[‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	ÛÜšÜÜXÙQ[
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆ	ÛÛ[›ÛÝHÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	ÛÜšÜÜXÙH	ØÛÛ[\‰ÊJBˆYˆ
+[›Ý	ÛÛ[›ÛÝ‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	ÛÛ[›ÛÝ
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆ	[HÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	ÛÜšÜÜXÙH	™[]]™TŠJBˆYˆ
+[›Ý	[”Ý\ÕÚ]
+	ÛÜšÜÜXÙQ[ÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈ™]\›ˆBˆYˆ
+[›Ý	[”Ý\ÕÚ]
+	ÛÛ[›ÛÝÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈ™]\›ˆBˆYˆ
+\ÝT]S]\˜[]	[
+HÈ™[[Ý™KR][HS]\˜[]	[Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHBˆ	\ˆHÜ]T]T\™[	[ˆÚ[H
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\ŠJHÂˆ	\‘[HÒSË”]NŽ‘Ù][]
+	\ŠBˆYˆ
+[›Ý	\‘[”Ý\ÕÚ]
+	ÛÛ[›ÛÝÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈœ™XZÈBˆ	Ú[™[ˆH
+Ù]PÚ[][HS]\˜[]	\‘[Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YJBˆYˆ
+	Ú[™[‹ÛÝ[YÝ
+HÈœ™XZÈBˆ™[[Ý™KR][HS]\˜[]	\‘[Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YBˆ	\ˆHÜ]T]T\™[	\‘[ˆBˆHØ]ÚÈBŸB‚™[˜Ý[Ûˆ\]KUÛÜšØ›ÛÚÔYÙ\Ñœ›ÛR[œÜXÝ[ÛŠÜÝš[™×I[™ÝXYÙK	ÝXÝ\™K	ÛÜšØ›ÛÚË	ÚY]ÊHÂˆ	ÛÜšØ›ÛÚÒYVÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	ÝÛÜšØ›ÛÚÒY	È	ÉÊBˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×JÙ]Q]T›Ü\H	ÛÜšØ›ÛÚÈ	ØØ]YÛÜžIÈ	ÉÊJBˆ	YÙ\ÏP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÊBˆ	ÛÜYÚY]ÏP
+Ù]P\œ˜^H	ÚY]ÈÛÜSØš™XÝÑ^™\ÜÚ[Û^ÑÙ]TÚY]Ü™\“[X™\ˆ
+ÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÚY]˜[YIÈ	ÉÊJ_NÐ\ØÙ[™[™ÏIY_KÑ^™\ÜÚ[Û^ÖÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÚY]˜[YIÈ	ÉÊ_NÐ\ØÙ[™[™ÏIY_JBˆ	Ý\œ™[PßNÈ›Ü™XXÚ
+	È[ˆ	ÛÜYÚY]Ê^ÉVÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÚY]˜[YIÈ	ÉÊNÚYŠ	Š^ÉÝ\œ™[É—OIY__Bˆ	™[[Ý™YP
+
+NÈ	Ù\P
+
+Bˆ›Ü™XXÚ
+	[ˆ	YÙ\Ê^ÈYŠÜÝš[™×IÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYX[™
+[›Ý	Ý\œ™[ÛÛZ[œÒÙ^JÜÝš[™×IœÚY]˜[YJJJ^É™[[Ý™Y
+ÏH	Y[Ù^ÉÙ\
+ÏIHBˆ	YÙ\ÏP
+	Ù\
+NÈ	ÝXÝ\™KœYÙ\ÏIYÙ\Âˆ	Û›ÝÛPßNÈ›Ü™XXÚ
+	[ˆ	YÙ\Ê^ÉÛ›ÝÛ–Ê™\ÛÛ™KTYÙRY	
+WOIBˆ	YYP
+
+NÉ\]YP
+
+NÉ][™P
+
+NÉ[“Ü™\Lˆ›Ü™XXÚ
+	È[ˆ	ÛÜYÚY]Ê^Âˆ	ÚY]VÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÚY]˜[YIÈ	ÉÊNÈYŠ[›Ý	ÚY]
+^ØÛÛ[Y_Bˆ	YÙRYH‰ÛÜšØ›ÛÚÒYI
+Ü™YÙ^NŽ”™\XÙJ	ÚY]	Ö×ŒNPKV˜K^—JÉË	ËIÊJH‚ˆ	]OVÜÝš[™×JÙ]Q]T›Ü\H	È	Ù]XÝY]IÈ	ÉÊNÚYŠ[›Ý	]J^É]OH‰
+ÜÝš[™×IÛÜšØ›ÛÚË™š[S˜[YJHÈ	ÚY]ŸBˆYŠ	Û›ÝÛ‹ÛÛZ[œÒÙ^J	YÙRY
+J^Âˆ	IÛ›ÝÛ–ÉYÙRYNÔÙ]S›ÝT›Ü\H		ÜÚY]˜[YIÈ	ÚY]ÔÙ]S›ÝT›Ü\H		Ù]XÝY]IÈ	]NÚYŠ[›ÝÜÝš[™×I]J^ÔÙ]S›ÝT›Ü\H		Ý]IÈ	]_NÉ\]Y
+ÏIYÙRYˆY[Ù^ÂˆÈKTÎˆYÙ\È8àkÈ”ÓÓˆ9å,y§ixàkˆÐÝ\ÝÛSØš™XÝ8àiù©âù¢$8àexà£8à¢øà ¹¥¬:)£øàæ¸àï8à®8àh8àdHÜ™\™YXÝ[Û˜\žH8àjøàfxà¢øàjˆÈÚ[™ÝÜÈÝÙ\”Ú[KŒH8àcÛÜSØš™XÝ9ëbxàk¹g¢ù«å:/ øàiøà#9o%y¥l8àk¹g¢øàc9. :!í8àeøào¸àføà¤øà#xà¤¹¢¥xàd¸à¢øàdøàj8àc8à`¸à¢øà ‚ˆÈ8à¬øàë8à«øà­øàéøàìøàkº) yí(9g¢øà¤¹oáxàf¹£àøàb8à¢øà ‚ˆ	VÜØÝ\ÝÛ[Øš™XÝVÛÜ™\™YPÜYÙRYIYÙRYÝÛÜšØ›ÛÚÒYIÛÜšØ›ÛÚÒYÜÚY]˜[YOIÚY]Ý]TÛÝ\˜ÙOIÐLIÎÙ]XÝY]OI]NÝ]OI]NÝ›Û[YOJÙ]QY˜][›Û[YH	[™ÝXYÙJNÛÜ™\LÛÜ™\“X[X[I˜[ÙNÛ[X™\š[™Ó[ÙOIÝš\ÚX›IÎÛ[X™\š[™ÓX[X[I˜[ÙNÛ[X™\š[™ÑY˜][IÙš\œÝ\YÙK[›Û™IÎÙ[˜X›YIYNØÛÛ[I[ÜÝ]\ÏIÛ›Ý\™[™\™Y	ÎÝØ\›š[™ÜÏP
+
+NÝ\]Y]S™]ËS›ÝÒ\ÛßBˆ	[œÏR[œÙ\TYÙR[”ÚY]Ü™\ˆ	ÝXÝ\™H	
+ÜÝš[™×I›Û[YJH	Ø]ˆ	ÝXÝ\™KœYÙ\ÏP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÊJÐ
+	
+BˆYŠ	[œËš[œÙ\Y][™
+^É][™
+ÏIYÙRYY[Ù^É[“Ü™\ŠÊßBˆ	YY
+ÏIYÙRYÉÛ›ÝÛ–ÉYÙRYOIˆBˆBˆ›Ü™XXÚ
+	›Û[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙJJ^ÖÝ›ÚYJ™[[X™\‹U›Û[YSÜ™\ˆ	ÝXÝ\™H	›Û	Ø]
+_BˆYŠ	™[[Ý™YÛÝ[YÝ[Üˆ	YYÛÝ[YÝ
+^Âˆ	Y™™XÝYP
+	™[[Ý™Y›Ü‘XXÚSØš™XÝÖÜÝš[™×IË›Û[Y_JBˆYŠ	YYÛÝ[YÝ
+^ÉY™™XÝY
+ÏP
+
+Ù]QY˜][›Û[YH	[™ÝXYÙJJ_BˆX\šËU›Û[YS™YYÔ™XZ[	ÝXÝ\™H	[™ÝXYÙH	Ø]
+	Y™™XÝYÚ\™KSØš™XÝÉÈX[™	È[™H	Û›Û™Iß_Ù[XÝSØš™XÝU[š\]YJH	Ü™[™\‰È	Ñ^Ù[8àk¸à­øàï8àâ9©âù¢$8àc9i"y¦í8àexà£8ào¸àeøàgÉÂˆBˆ\KQY˜][[X™\š[™Ô\•›Û[YH	[™ÝXYÙH	ÝXÝ\™H	Ø]ˆ	˜[Y\ÏP
+	ÛÜYÚY]ß›Ü‘XXÚSØš™XÝÖÜÝš[™×IËœÚY]˜[Y_JBˆ™]\›ˆÛÜ™\™YPØYYYÙRYÏP
+	YY
+NÝ\]YYÙRYÏP
+	\]Y
+NÜ™[[Ý™YYÙ\ÏP
+	™[[Ý™Y
+NÜÚY]˜[Y\ÏI˜[Y\ÎÜÚY]š[™Ù\œš[JÙ]TÚY]š[™Ù\œš[œ›ÛS˜[Y\È	˜[Y\ÊNØYYÛÝ[IYYÛÝ[Ú[œÙ\Y[“Ü™\ÛÝ[I[“Ü™\ŽÚ[œÙ\Y][™ÛÝ[I][™ÛÝ[Ú[œÙ\Y][™YÙRYÏP
+	][™
+_BŸB‚™[˜Ý[ÛˆÛX\‹Q^Ù[XY\‘›ÛÝ\”\Ê	\™Ù]
+HÂˆYˆ
+	[Y\H	\™Ù]
+HÈ™]\›ˆBˆ›Ü™XXÚ
+	\[ˆ
+	ÓYXY\‰Ë	ÐÙ[\’XY\‰Ë	ÔšYÚXY\‰Ë	ÓY›ÛÝ\‰Ë	ÐÙ[\‘›ÛÝ\‰Ë	ÔšYÚ›ÛÝ\‰ÊJHÂˆžHÈ	\™Ù]‰\H	ÉÈHØ]ÚÈBˆžHÈ	\™Ù]‰\•^H	ÉÈHØ]ÚÈBˆBŸB‚™[˜Ý[ÛˆÛX\‹Q^Ù[XY\‘›ÛÝ\”XÝ\™\Ê	YÙTÙ]\
+HÂˆYˆ
+	[Y\H	YÙTÙ]\
+HÈ™]\›ˆBˆ›Ü™XXÚ
+	\[ˆ
+ˆ	ÓYXY\”XÝ\™IË	ÐÙ[\’XY\”XÝ\™IË	ÔšYÚXY\”XÝ\™IËˆ	ÓY›ÛÝ\”XÝ\™IË	ÐÙ[\‘›ÛÝ\”XÝ\™IË	ÔšYÚ›ÛÝ\”XÝ\™IÂˆ
+JHÂˆžHÈ	YÙTÙ]\‰\‘š[S˜[YHH	ÉÈHØ]ÚÈBˆžHÈ	YÙTÙ]\‰\‘š[[˜[YHH	ÉÈHØ]ÚÈBˆBŸB‚™[˜Ý[Ûˆ™[[Ý™KVÞXY\‘›ÛÝ\–[
+ÜÝš[™×IÞ]
+HÂˆÈ™[[Ý™H^Ù[XY\‹Ù›ÛÝ\ˆYš[š][ÛœÈœ›ÛHH[\Ü˜\žHÖXÚØYÙH™Y›Ü™H^Ù[Ü[œÈ]‚ˆÈ\È]›ÚYÈ™[Z[™ÈÛˆÛÝËÙœ˜YÚ[HÓÓHš\œÝYÙKÑ]™[”YÙHYÙTÙ]\Ø[È[™™]™[ÂˆÈ›ÛÝ\ˆYÙH[X™\œÈÝXÚ\È	”œ›ÛH™Z[™È^ÜY[ÈHÛÛ[‹‚ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Þ]
+JHÈ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÚ[™ÙYHÈÚÚ\YH	YHHBˆ	^HÒSË”]NŽ‘Ù]^[œÚ[ÛŠ	Þ]
+K•ÓÝÙ\’[˜\šX[
+
+BˆYˆ
+
+	ËžÞ	Ë	ËžÛIË	Ëž	Ë	ËžIÊH[›ÝÛÛZ[œÈ	^
+HÈ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÚ[™ÙYHÈÚÚ\YH	YHHBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	Þ]
+JHÈ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÚ[™ÙYHÈÚÚ\YH	YHHB‚ˆžHÂˆYU\HP\ÜÙ[X›S˜[YHÞ\Ý[K’SËÛÛ\™\ÜÚ[ÛˆQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHÝ]S[ˆYU\HP\ÜÙ[X›S˜[YHÞ\Ý[K’SËÛÛ\™\ÜÚ[Û‹‘š[TÞ\Ý[HQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHÝ]S[ˆHØ]ÚÈB‚ˆ	š\H	[ˆ	Ú[™ÙYHˆžHÂˆ	š\HÔÞ\Ý[K’SËÛÛ\™\ÜÚ[Û‹–š\š[WNŽ“Ü[Š	Þ]ÔÞ\Ý[K’SËÛÛ\™\ÜÚ[Û‹–š\\˜Ú]™S[ÙWNŽ•\]JBˆ	\™Ù]ÈH
+	š\‘[šY\ÈÚ\™KSØš™XÝÈÜÝš[™×IË‘[˜[YH[X]Ú	×žÊÛÜšÜÚY]ßÚ\ÚY]ÊKÖ×‹×J×ž[		ÈJBˆ	]ŽH™]ËSØš™XÝÞ\Ý[K•^•UŽ[˜ÛÙ[™ÈP\™Ý[Y[\Ý	˜[ÙBˆ›Ü™XXÚ
+	[žH[ˆ	\™Ù]ÊHÂˆ	˜[YHHÜÝš[™×I[žK‘[˜[YBˆ	[H	ÉÂˆ	™XY\ˆH	[ˆžHÂˆ	™XY\ˆH™]ËSØš™XÝSË”Ý™X[T™XY\Š	[žK“Ü[Š
+KÕ^‘[˜ÛÙ[™×NŽ•UŽ	YJBˆ	[H	™XY\‹”™XYÑ[™
+
+BˆHš[˜[HÂˆYˆ
+	™XY\ŠHÈ	™XY\‹‘\ÜÜÙJ
+HBˆBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	[
+JHÈÛÛ[YHB‚ˆ	\ÒXY\‘›ÛÝ\ˆH
+Ü™YÙ^NŽ’\ÓX]Ú
+	[	ÊÚ\ÊO
+Î—ÊÎŠOÚXY\‘›ÛÝ\—‰ÊJBˆYˆ
+[›Ý	\ÒXY\‘›ÛÝ\ŠHÈÛÛ[YHB‚ˆ	™]Ö[HÜ™YÙ^NŽ”™\XÙJ	[	ÊÚ\ÊO
+Î—ÊÎŠOÚXY\‘›ÛÝ\—–×—JŠÎ‹ÏŸ‹ŠÏÊÎ—ÊÎŠOÚXY\‘›ÛÝ\ŠIË	ÉÊBˆÈÛ›HÝXÚYÙSX\™Ú[œÈÚ[ˆHÚY]XÝX[HYXY\‹Ù›ÛÝ\ˆÛÛ[ˆ™]Üš][™È]™\žBˆÈÚY]S\ÝÈÚ[™ÙH›[šÈXY\‹Ù›ÛÝ\ˆX\™Ú[œÈ\ÈÛÝÈ[™Ù\È›ÝY™™XÝYÙH[X™\œË‚ˆ	™]Ö[HÜ™YÙ^NŽ”™\XÙJ	™]Ö[	ÊÚ\ÊO
+Î—ÊÎŠOÜYÙSX\™Ú[œ×–×—J‰ËÔÞ\Ý[K•^”™YÝ[\‘^™\ÜÚ[ÛœË“X]Ú]˜[X]Ü—^Âˆ\˜[J	JBˆ	YÈHÜÝš[™×IK•˜[YBˆYˆ
+	YÈ[›ÝX]Ú	×ÚXY\IÊHÈ	YÈH	YÈ\™\XÙH	ËÏÏ‰	Ë	ÈXY\HŒ‰	ÈBˆ[ÙHÈ	YÈHÜ™YÙ^NŽ”™\XÙJ	YË	ÚXY\H–×ˆ—Jˆ‰Ë	ÚXY\HŒ‰ÊHBˆYˆ
+	YÈ[›ÝX]Ú	×Ù›ÛÝ\IÊHÈ	YÈH	YÈ\™\XÙH	ËÏÏ‰	Ë	È›ÛÝ\HŒ‰	ÈBˆ[ÙHÈ	YÈHÜ™YÙ^NŽ”™\XÙJ	YË	Ù›ÛÝ\H–×ˆ—Jˆ‰Ë	Ù›ÛÝ\HŒ‰ÊHBˆ™]\›ˆ	YÂˆJB‚ˆYˆ
+	™]Ö[[™H	[
+HÂˆ	[žK‘[]J
+Bˆ	™]Ñ[žHH	š\Ü™X]Q[žJ	˜[YKÔÞ\Ý[K’SËÛÛ\™\ÜÚ[Û‹ÛÛ\™\ÜÚ[Û“]™[NŽ“Ü[X[
+Bˆ	Üš]\ˆH	[ˆžHÂˆ	Üš]\ˆH™]ËSØš™XÝSË”Ý™X[UÜš]\Š	™]Ñ[žK“Ü[Š
+K	]Ž
+Bˆ	Üš]\‹•Üš]J	™]Ö[
+BˆHš[˜[HÂˆYˆ
+	Üš]\ŠHÈ	Üš]\‹‘\ÜÜÙJ
+HBˆBˆ	Ú[™ÙY
+ÊÂˆBˆBˆ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÚ[™ÙYH	Ú[™ÙYÈÚÚ\YH	˜[ÙHBˆHš[˜[HÂˆYˆ
+	š\
+HÈ	š\‘\ÜÜÙJ
+HBˆBŸB‚™[˜Ý[ÛˆÛX\‹Q^Ù[YÙTÙ]\XY\œÐ[™›ÛÝ\œÊ	YÙTÙ]\
+HÂˆYˆ
+	[Y\H	YÙTÙ]\
+HÈ™]\›ˆB‚ˆÈÙY\ÓÓHØ[ÈZ[š[X[ˆš\œÝ\YÙKÙ]™[‹\YÙHXY\‹Ù›ÛÝ\ˆS\ÈÝš\Yœ›ÛHBˆÈ[\Ü˜\žHÖXÚØYÙH™Y›Ü™HÜ[š[™ËÛÈ›Ü›X[YÙTÙ]\ÛX[\\È[›ÝYÚ\™K‚ˆÈÙÙÛ[™ÈY™™\™[š\œÝYÙRXY\‘›ÛÝ\‹ÓÙ[™]™[”YÙ\ÒXY\‘›ÛÝ\ˆÛˆÛÛYH^Ù[Z[ÂˆÈØ[ˆ™H™\žHÛÝÈÜˆ[™ÈÛˆHš\œÝÚY]‚ˆÛX\‹Q^Ù[XY\‘›ÛÝ\”\È	YÙTÙ]\ˆÛX\‹Q^Ù[XY\‘›ÛÝ\”XÝ\™\È	YÙTÙ]\ˆžHÈ	YÙTÙ]\‘Y™™\™[š\œÝYÙRXY\‘›ÛÝ\ˆH	˜[ÙHHØ]ÚÈBˆžHÈ	YÙTÙ]\“Ù[™]™[”YÙ\ÒXY\‘›ÛÝ\ˆH	˜[ÙHHØ]ÚÈBˆžHÈ	YÙTÙ]\”ØØ[UÚ]ØÒXY\‘›ÛÝ\ˆH	˜[ÙHHØ]ÚÈBˆžHÈ	YÙTÙ]\[YÛ“X\™Ú[œÒXY\‘›ÛÝ\ˆH	˜[ÙHHØ]ÚÈBˆžHÈ	YÙTÙ]\’XY\“X\™Ú[ˆHHØ]ÚÈBˆžHÈ	YÙTÙ]\‘›ÛÝ\“X\™Ú[ˆHHØ]ÚÈBŸB‚™[˜Ý[ÛˆÛX\‹Q^Ù[ÛÜšÜÚY]XY\œÐ[™›ÛÝ\œÊ	ÛÜšÜÚY]	^Ù[H	[
+HÂˆYˆ
+	[Y\H	ÛÜšÜÚY]
+HÈ™]\›ˆBˆÈ›\Ú]Y]YYYÙTÙ]\Ú[™Ù\Èš\œÝˆÛÛYH^Ù[™\œÚ[ÛœÈÙY\XY\‹Ù›ÛÝ\ˆÚ[™Ù\È]Y]YYˆÈÚ[Hš[ÛÛ[][šXØ][Ûˆ\È˜[ÙKÚXÚØ[ˆXZÙH^Ü\Ñš^Y›Ü›X]ÙYHÛ›ÛÝ\ˆ^‚ˆžHÈYˆ
+	[[™H	^Ù[
+HÈ	^Ù[”š[ÛÛ[][šXØ][ÛˆH	YHHHØ]ÚÈBˆžHÈÛX\‹Q^Ù[YÙTÙ]\XY\œÐ[™›ÛÝ\œÈ	ÛÜšÜÚY]”YÙTÙ]\HØ]ÚÈBˆžHÈYˆ
+	[[™H	^Ù[
+HÈ	^Ù[”š[ÛÛ[][šXØ][ÛˆH	YHHHØ]ÚÈBŸB‚™[˜Ý[ÛˆÙ]Q^Ù[š[ÛÛ[][šXØ][Û”ØY™J	^Ù[Ø›ÛÛI[˜X›Y
+HÂˆYˆ
+	[Y\H	^Ù[
+HÈ™]\›ˆ	˜[ÙHBˆžHÂˆ	^Ù[”š[ÛÛ[][šXØ][ÛˆH	[˜X›Yˆ™]\›ˆ	YBˆHØ]ÚÈ™]\›ˆ	˜[ÙHBŸB‚™[˜Ý[Ûˆ\KTÝ[™\™š[Ù][™ÜÊ	ÛÜšÜÚY]	^Ù[H	[Ø›ÛÛIY™\”š[ÛÛ[][šXØ][ÛˆH	˜[ÙJHÂˆ	š[ÛÛ[][šXØ][ÛÚ[™ÙYH	˜[ÙBˆ	ÈH	[ˆžHÂˆÈYÙTÙ]\8àkÑ^Ù[ÓÓxàk¹.+xàiøà ¹ânxàjúaãxàa8à º)!ù¥l8à­øàï8àâ8àk”¹/g9¢$9¦`¸àkøà ydo8àlùaî¸àeùa`øàiÂˆÈš[ÛÛ[][šXØ][Ûˆ8à¤¹. 9¦`¹`g9«h¸àeøài¸àbøà¢xào¸àj8à xài¹cãy¦(8àfxà¢øàdøàj8àiøà xà­øàï8àâ8àe8àj8àk¹o¡xàhy¦`ºe¤øà¤¹®&øà¢xàfxà ‚ˆYˆ
+[›Ý	Y™\”š[ÛÛ[][šXØ][ÛŠHÂˆ	š[ÛÛ[][šXØ][ÛÚ[™ÙYHÙ]Q^Ù[š[ÛÛ[][šXØ][Û”ØY™H	^Ù[	˜[ÙBˆB‚ˆžHÈ	ÛÜšÜÚY]‘\Ü^TYÙPœ™XZÜÈH	˜[ÙHHØ]ÚÈBˆ	ÈH	ÛÜšÜÚY]”YÙTÙ]\ˆÈ9¦ªùk¦”¸àkùmé¹cìÌKŒ˜Ûxà¤¹gî¹®¥¸àjøàfxà¢øà ¹§ 9í`”¸àiøàkùiaù¥lù`m¹¥l8àæ¸àï8à®8à¤ŒŒ˜Ûxàh8àdya¡y`m8àn9ká8àføà¢Ê8àäxàìøàày`mKÛKùi%¹`mKŒÛJxà ‚ˆ	Ë•ÜX\™Ú[ˆHÛÛ™\PÛUÔŽˆ	Ë›ÝÛSX\™Ú[ˆHÛÛ™\PÛUÔŽˆ	Ë“YX\™Ú[ˆHÛÛ™\PÛUÔKŒ‚ˆ	Ë”šYÚX\™Ú[ˆHÛÛ™\PÛUÔKŒ‚ˆÈ9cl9b-ùëá9fì¸àcxàæ¸àï8à®9naxàjù® 8àgøàj¸àa8à­øàï8àâ8àc9mé¹ká8à¢¸àjú)¢øàb8àj¸àa8à¢8àa¸à y¬-9nlù¥®yd$xàk¸àoù.+yi+¹£àøàb8àjøàfxà¢øà ‚ˆÈ9naxàa8àhøàlxàa8àk¸à­øàï8àâ8àkù/fyæoxàjù£©xàfxà¢øàgøà xà xà®øàìøà¯øàê¸àìøà¬8àeøài¸à ¹/cyïk¸àkùi"xà£øà¢xàj¸àa8à ‚ˆ	ËÙ[\’Üš^›Û[HH	YBˆ	ËÙ[\•™\XØ[HH	˜[ÙBˆÈ9cl9b-ùëá9fì¸àkùl"ºaãxàeøài8ài8à y`#yã¡øàkÑ^Ù[:*+yk¦¸à¤¹á(z)¥¸àeøàiŒxàæ¸àï8à®8àjùcã¸à xà¢øà ‚ˆ	Ë–›ÛÛHH	˜[ÙBˆ	Ë‘š]ÔYÙ\ÕÚYHHBˆ	Ë‘š]ÔYÙ\Õ[HBˆÛX\‹Q^Ù[YÙTÙ]\XY\œÐ[™›ÛÝ\œÈ	ÂˆHš[˜[HÂˆYˆ
+	š[ÛÛ[][šXØ][ÛÚ[™ÙYX[™	[[™H	^Ù[
+HÂˆÝ›ÚYJÙ]Q^Ù[š[ÛÛ[][šXØ][Û”ØY™H	^Ù[	YJBˆBˆB‚ˆYˆ
+	[Y\H	ÊHÂˆžHÈÛX\‹Q^Ù[ÛÜšÜÚY]XY\œÐ[™›ÛÝ\œÈ	ÛÜšÜÚY]	^Ù[HØ]ÚÈBˆBŸB‚™[˜Ý[ÛˆÙ]T˜]ÚÛÛ[™›ÈÂˆ	ÛÛ\ÜÙ\’˜\ˆH›Ú[‹T]	ØÜš\\›ÛÝ	ÛX—˜›Þ™\ÜÛÛ\ÜÙ\‹š˜\‰Âˆ	˜›Þ˜\ˆH›Ú[‹T]	ØÜš\\›ÛÝ	ÛX—˜›Þ˜›ÞX\š˜\‰ÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	ÛÛ\ÜÙ\’˜\ŠJHÈ™]\›ˆ	[BˆYˆ
+[›Ý
+\ÝT]S]\˜[]	˜›Þ˜\ŠJHÈ™]\›ˆ	[BˆžHÈ	˜]˜Q^HH™\ÛÛ™KR˜]˜Q^HHØ]ÚÈ™]\›ˆ	[Bˆ™]\›ˆÛÜ™\™YPÈ˜]˜Q^HH	˜]˜Q^NÈÛ\ÜÔ]H‰ÛÛ\ÜÙ\’˜\ŽÉ˜›Þ˜\ˆˆBŸB‚™[˜Ý[ÛˆÜ]P˜]Ú•ÔÚY]ÊÜÝš[™×I˜]Ú‹	ÚY][™›ÜËÜÝš[™×I\\ŠHÂˆ	ÛÛHÙ]T˜]ÚÛÛ[™›ÂˆYˆ
+	[Y\H	ÛÛ
+HÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	Ü˜›Þ][˜]˜Z[X›IÎÈY\ÜØYÙHH	Ô›ÞÒ˜]˜xàc8àj¸àa8àgøà y. 9¢ë¹b!¹bl¸à¤¹/oøàa8ào¸àføà¤øà ‰ÈHBˆ	X\]H›Ú[‹T]	\\ˆ	Ø˜]Ú\Ü][X\Ý‰Âˆ	[™\ÈH™]ËSØš™XÝÞ\Ý[KÛÛXÝ[ÛœË‘Ù[™\šXË“\ÝÜÝš[™×Bˆ	YÙS›ÈHBˆ›Ü™XXÚ
+	[™›È[ˆ
+	ÚY][™›ÜÊJHÂˆ	Ý]HÜÝš[™×I[™›Ë›Ý]‚ˆ	Ý]\™[HÜ]T]T\™[	Ý]ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	Ý]\™[
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	Ý]\™[Q›Ü˜ÙHÝ]S[Bˆ	[™\ËY
+
+žÌXÌ_XHˆYˆ	Ý]	YÙS›ÊJBˆ	YÙS›ÊÊÂˆBˆÜš]KU]Ž›Ð›ÛQš[H	X\]
+ÜÝš[™×NŽ’›Ú[Š˜ˆ‹	[™\ÊJBˆ	[ˆH[›ÚÙKS˜]]™PØ\\™H
+ÜÝš[™×IÛÛš˜]˜Q^JH
+	ËXÜ	ËÜÝš[™×IÛÛ˜Û\ÜÔ]	Ð˜]Ú”Ü]\‰Ë	ËK\ÛÝ\˜ÙIË	˜]Ú‹	ËK[X\	Ë	X\]
+Bˆ	Ý]]H
+	[‹›Ý]]
+Bˆ	ÛØ˜[“TÕVUÓÑHHÚ[I[‹™^]ÛÙBˆ	^]H	TÕVUÓÑBˆ	Ý]]^H
+	Ý]]Z›Ú[ˆ˜ˆŠBˆYˆ
+	^][™H
+HÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	ÜÜ]Y˜Z[Y	ÎÈY\ÜØYÙHH	Ý]]^HBˆ›Ü™XXÚ
+	[™›È[ˆ
+	ÚY][™›ÜÊJHÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]
+ÜÝš[™×I[™›Ë›Ý]ŠJJHÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	ÜÜ][Z\ÜÚ[™Ë[Ý]]	ÎÈY\ÜØYÙHH¹b!¹bl¹o£¸àc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	
+	[™›Ë›Ý]ŠHˆHBˆžHÂˆYˆ
+
+Ù]R][HS]\˜[]
+ÜÝš[™×I[™›Ë›Ý]ŠJK“[™Ý[H
+HÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	ÜÜ]Y[\K[Ý]]	ÎÈY\ÜØYÙHH¹b!¹bl¹o£¸àc9ên¸àiøàfNˆ	
+	[™›Ë›Ý]ŠHˆHBˆHØ]ÚÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	ÜÜ]XÚXÚËY˜Z[Y	ÎÈY\ÜØYÙHH	Ë‘^Ù\[Û‹“Y\ÜØYÙHHBˆBˆ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈY\ÜØYÙHH	Ý]]^BŸB‚™[˜Ý[Ûˆ^ÜUÛÜšØ›ÛÚÔÚY]ÕÔ˜]Ú
+	^Ù[	ÛÜšØ›ÛÚË	ÚY][™›ÜËÜÝš[™×I\\ŠHÂˆ	[™›ÜÈH
+	ÚY][™›ÜÊBˆYˆ
+	[™›ÜËÛÝ[[HJHÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	ÜÚ[™ÛK\ÚY]	ÎÈY\ÜØYÙHH	Ìxà­øàï8àâ8àk¸àgøà y. 9¢ë¹c%¸àeøào¸àføà¤øà ‰ÈHBˆYˆ
+	[Y\H
+Ù]T˜]ÚÛÛ[™›ÊJHÈ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	Ü˜›Þ][˜]˜Z[X›IÎÈY\ÜØYÙHH	Ô›ÞÒ˜]˜xàc8àj¸àa8àgøà yo¤ù§iy¥®yo#øàiÔ¹c%¸àeøào¸àfxà ‰ÈHB‚ˆ	˜]ÚˆH›Ú[‹T]	\\ˆ	Ø˜]Ú]ÛÜšØ›ÛÚËœ‰ÂˆYˆ
+\ÝT]S]\˜[]	˜]ÚŠHÈ™[[Ý™KR][HS]\˜[]	˜]ÚˆQ›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHBˆ	Z\ÜÚ[™ÈHÕ\WNŽ“Z\ÜÚ[™Âˆ	Ù[XÝYH	˜[ÙBˆžHÂˆ	š\œÝH	YBˆ›Ü™XXÚ
+	[™›È[ˆ	[™›ÜÊHÂˆ	ÜÈH	[ˆžHÂˆ	ÜÈH	ÛÜšØ›ÛÚË•ÛÜšÜÚY]Ë’][JÜÝš[™×I[™›ËœÚY]˜[YJBˆYˆ
+	š\œÝ
+HÈ	ÜË”Ù[XÝ
+	YJHÝ]S[È	š\œÝH	˜[ÙHBˆ[ÙHÈ	ÜË”Ù[XÝ
+	˜[ÙJHÝ]S[BˆHš[˜[HÂˆ[›ÚÙKPÛÛT™[X\ÙH	ÜÂˆBˆBˆ	Ù[XÝYH	YBˆ	XÝ]™HH	ÛÜšØ›ÛÚËXÝ]™TÚY]ˆžHÂˆÈ:`n9¢§¸àeøàgú)!ù¥l8à­øàï8àâ8à¤Œyfç¸àiÔ¹c%¸àfxà¢øà ¸à­øàï8àâ8àe8àj8àk‘^Ü\Ñš^Y›Ü›X]9fç¹¥l8à¤¹®&øà¢xàfxàk¸àc9âæxàa8à ‚ˆ	XÝ]™K‘^Ü\Ñš^Y›Ü›X]
+	˜]Ú‹	YK	˜[ÙK	Z\ÜÚ[™Ë	Z\ÜÚ[™Ë	˜[ÙK	Z\ÜÚ[™ÊBˆHš[˜[HÂˆ[›ÚÙKPÛÛT™[X\ÙH	XÝ]™BˆBˆÝ›ÚYJØZ]Q›Ü”“Ý]]	˜]Úˆ	ù. 9¢ë‰ÊBˆ	YÙPÛÝ[HÙ]T”YÙPÛÝ[	˜]Ú‚ˆYˆ
+	YÙPÛÝ[[™H	[™›ÜËÛÝ[
+HÂˆ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	ÜYÙKXÛÝ[[Z\ÛX]Ú	ÎÈY\ÜØYÙHH¹. 9¢ë¸àk¸àæ¸àï8à®9¥l8àc9 ìùk¦¸àj9ål8àj¸à¢¸ào¸àfxà ¹ ìùk¦I
+	[™›ÜËÛÝ[
+H9k§úf¦ÏIYÙPÛÝ[ˆBˆBˆ™]\›ˆ
+Ü]P˜]Ú•ÔÚY]È	˜]Úˆ	[™›ÜÈ	\\ŠBˆHØ]ÚÂˆ™]\›ˆÛÜ™\™YPÈÚÈH	˜[ÙNÈ™X\ÛÛˆH	Ø˜]ÚY^ÜY˜Z[Y	ÎÈY\ÜØYÙHH	Ë‘^Ù\[Û‹“Y\ÜØYÙHBˆHš[˜[HÂˆYˆ
+	Ù[XÝYX[™	[™›ÜËÛÝ[YÝ
+HÂˆžHÈ	ÛÜšØ›ÛÚË•ÛÜšÜÚY]Ë’][JÜÝš[™×I[™›ÜÖÌKœÚY]˜[YJK”Ù[XÝ
+	YJHÝ]S[HØ]ÚÈBˆBˆBŸB‚‚™[˜Ý[ÛˆØZ]Q›Ü”“Ý]]
+ÜÝš[™×I”]ÜÝš[™×IÚY]˜[YJHÂˆ›Üˆ
+	HHÈ	H[È	JÊÊHÂˆYˆ
+\ÝT]S]\˜[]	”]
+HÂˆžHÂˆ	][HHÙ]R][HS]\˜[]	”]ˆYˆ
+	][K“[™ÝYÝ
+HÈ™]\›ˆ	][HBˆHØ]ÚÈBˆBˆÝ\TÛY\SZ[\ÙXÛÛ™ÈLˆBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	”]
+JHÈ›ÝÈ‘^Ù[8àbøà¢T¸àc9aî¹b¦øàexà£8ào¸àføà¤øàiøàeøàgÎˆ8à­øàï8àâ	ÚY]˜[YHˆBˆ	][LˆHÙ]R][HS]\˜[]	”]ˆYˆ
+	][L‹“[™Ý[H
+HÈ›ÝÈ‘^Ù[8àbøà¢yên¸àk”¸àc9aî¹b¦øàexà£8ào¸àeøàgÎˆ8à­øàï8àâ	ÚY]˜[YHˆBˆ™]\›ˆ	][L‚ŸB‚™[˜Ý[Ûˆ^ÜUÛÜšÜÚY]Ô”ØY™J	^Ù[	ÛÜšØ›ÛÚË	ÛÜšÜÚY]ÜÝš[™×IÝ]‹ÜÝš[™×IÚY]˜[YKØ›ÛÛI[™XYT™\\™YH	˜[ÙJHÂˆ	Z\ÜÚ[™ÈHÕ\WNŽ“Z\ÜÚ[™Âˆ	\™[HÜ]T]T\™[	Ý]‚ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\™[
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	\™[Q›Ü˜ÙHÝ]S[BˆYˆ
+\ÝT]S]\˜[]	Ý]ŠHÈ™[[Ý™KR][HS]\˜[]	Ý]ˆQ›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHB‚ˆÈ^ÜHÛX[™YÛÜšÜÚY]\™XÝKˆH™]š[Ý\ÈÛ™K\ÚY]XÛÜHY]ÙØ[ˆ[™ÈÛ‚ˆÈÛÝ™\ˆÛÜšØ›ÛÚÜÈÚ]Ú\\ÈÜˆ[X™YYØš™XÝËˆXY\‹Ù›ÛÝ\ˆYš[š][ÛœÈ\™H[™XYBˆÈ™[[Ý™Yœ›ÛHH[\Ü˜\žHÖXÚØYÙKÛÈH\™XÝ^Ü\Ñš^Y›Ü›X]\ÈØY™\ˆ[™˜\Ý\‹‚ˆžHÂˆYˆ
+[›Ý	[™XYT™\\™Y
+HÈ\KTÝ[™\™š[Ù][™ÜÈ	ÛÜšÜÚY]	^Ù[BˆžHÈ	ÛÜšØ›ÛÚËXÝ]˜]J
+HÝ]S[HØ]ÚÈBˆžHÈ	ÛÜšÜÚY]XÝ]˜]J
+HÝ]S[HØ]ÚÈBˆžHÈ	ÛÜšÜÚY]”Ù[XÝ
+	YJHÝ]S[HØ]ÚÈBˆÈ\OL\T‹]X[]OL]X[]TÝ[™\™YÛ›Ü™Tš[\™X\ÏY˜[ÙK‚ˆ	ÛÜšÜÚY]‘^Ü\Ñš^Y›Ü›X]
+	Ý]‹	YK	˜[ÙK	Z\ÜÚ[™Ë	Z\ÜÚ[™Ë	˜[ÙK	Z\ÜÚ[™ÊBˆ™]\›ˆ
+ØZ]Q›Ü”“Ý]]	Ý]ˆ	ÚY]˜[YJBˆHØ]ÚÂˆ	\™XÝ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆ›ÝÈ‘^Ù[8àiÔ¹c%¸àiøàcxào¸àføà¤øàiøàeøàgÎˆ8à­øàï8àâ	ÚY]˜[YHÈ9æí9£©yaî¹b¦ÏVÉ\™XÝ\œ›Ü—H‚ˆHš[˜[HÂˆžHÈ	ÛÜšØ›ÛÚËXÝ]˜]J
+HÝ]S[HØ]ÚÈBˆBŸB‚™[˜Ý[ÛˆÙ]T”YÙPÛÝ[
+ÜÝš[™×I”]
+HÂˆžHÂˆ	ž]\ÈHÒSË‘š[WNŽ”™XY[ž]\Ê	”]
+Bˆ	^HÕ^‘[˜ÛÙ[™×NŽTÐÒRK‘Ù]Ýš[™Ê	ž]\ÊBˆ	ÛÝ[H
+Ü™YÙ^NŽ“X]Ú\Ê	^	ËÕ\WÊ‹ÔYÙJÈ\ÊW‰ÊJKÛÝ[ˆYˆ
+	ÛÝ[[JHÈ™]\›ˆHBˆ™]\›ˆ	ÛÝ[ˆHØ]ÚÈ™]\›ˆHBŸB‚‚™[˜Ý[Ûˆ™]ËQ^Ù[\XØ][Û‘›Ü”™[™\ˆÂˆ	^Ù[H™]ËSØš™XÝPÛÛSØš™XÝ^Ù[\XØ][Û‚ˆ	^Ù[•š\ÚX›HH	˜[ÙBˆ	^Ù[‘\Ü^P[\ÈH	˜[ÙBˆ	^Ù[‘[˜X›Q]™[ÈH	˜[ÙBˆ	^Ù[”ØÜ™Y[•\][™ÈH	˜[ÙBˆžHÈ	^Ù[\ÚÕÕ\]S[šÜÈH	˜[ÙHHØ]ÚÈBˆžHÈ	^Ù[]]ÛX][Û”ÙXÝ\š]HHÈHØ]ÚÈBˆžHÈ	^Ù[Ø[Ý[]P™Y›Ü™TØ]™HH	˜[ÙHHØ]ÚÈBˆÈÜYY[ÜšY[YÙ][™ÜËˆÝX›Z]YÛÜšØ›ÛÚÜÈ\™H^XÝYÈ™HØ]™YÚ]Ø[Ý[]Y˜[Y\Ë‚ˆÈˆ™[™\š[™ÈÙ\È›Ý™YYRH[š[X][Û‹Ý]\È˜\ˆ\]\ËÜˆ]]ÛX]XÈ™XØ[Ý[][Û‹‚ˆžHÈ	^Ù[‘\Ü^TÝ]\Ð˜\ˆH	˜[ÙHHØ]ÚÈBˆžHÈ	^Ù[‘[˜X›P[š[X][ÛœÈH	˜[ÙHHØ]ÚÈBˆžHÈ	^Ù[•\Ù\ÛÛ›ÛH	˜[ÙHHØ]ÚÈBˆžHÈ	^Ù[Ø[Ý[][ÛˆHMLÍHHØ]ÚÈHÈØ[Ý[][Û“X[X[ˆ™]\›ˆ	^Ù[ŸB‚™[˜Ý[ÛˆÛÜÙKQ^Ù[\XØ][Û‘›Ü”™[™\Š	^Ù[
+HÂˆYˆ
+	^Ù[
+HÂˆžHÈ	^Ù[”]Z]
+
+HHØ]ÚÈBˆ[›ÚÙKPÛÛT™[X\ÙH	^Ù[ˆBŸB‚™[˜Ý[ÛˆÙ]T™[™\‘[š\›Û›Y[
+	^Ù[
+HÂˆ	›Û\šX[H\ÝT]S]\˜[]	ÐÎ—Ú[™ÝÜ×›Û×\šX[‰Âˆ	›Û\ÙÛÝXÈH
+\ÝT]S]\˜[]	ÐÎ—Ú[™ÝÜ×›Û×\ÙÛÝXËÉÊH[Üˆ
+\ÝT]S]\˜[]	ÐÎ—Ú[™ÝÜ×›Û×\ÙÛÝXË‰ÊBˆ	XÝ]™Tš[\ˆH	ÉÂˆžHÈ	XÝ]™Tš[\ˆHÜÝš[™×I^Ù[XÝ]™Tš[\ˆHØ]ÚÈBˆ™]\›ˆÛÜ™\™YPÂˆÓ˜[YHH	[ŽÓÓTUT“SQBˆ\Ù\“˜[YHH‰[Ž•TÑT‘ÓPRS—	[Ž•TÑT“SQH‚ˆ^Ù[™\œÚ[ÛˆHÜÝš[™×I^Ù[•™\œÚ[Û‚ˆÜÕ™\œÚ[ÛˆHÑ[š\›Û›Y[NŽ“ÔÕ™\œÚ[Û‹•™\œÚ[Û”Ýš[™ÂˆXÝ]™Tš[\ˆH	XÝ]™Tš[\‚ˆ\Ð\šX[H	›Û\šX[ˆ\Ó\ÙÛÝXÈH	›Û\ÙÛÝXÂˆØ\\™Y]H™]ËS›ÝÒ\ÛÂˆBŸB‚™[˜Ý[ÛˆÙ]PØXÚY™[™\‘[š\›Û›Y[
+	^Ù[
+HÂˆYˆ
+	[Y\H	ØÜš\”™[™\‘[š\›Û›Y[ØXÚJHÂˆ	ØÜš\”™[™\‘[š\›Û›Y[ØXÚHHÙ]T™[™\‘[š\›Û›Y[	^Ù[ˆBˆ™]\›ˆ	ØÜš\”™[™\‘[š\›Û›Y[ØXÚBŸB‚™[˜Ý[ÛˆÙ]T™[™\‘[š\›Û›Y[š[™Ù\œš[
+	[’[™›ÊHÂˆÈKp©Í‹ˆ9å.ù`ãøàãøààøà­øàéxàk¹«å:/ ùcëùd)¸à¤¹mé¹cìøàfxà¢ú) yí(8àh8àdxà¤¹£!ùí"øàjøàfxà¢øà ‚ˆÈÓ˜[YHÈ\Ù\“˜[YH8àkú*.¹¥«y áyh,xàiøà`¸à¢¸à y«å:/ øàk¹..ùb)9k¦¸àjøàkùd*øà xàj¸àaˆÈ
+9b)Tøàiøà ¹ä¬9h øàc9d#9ëbxàj¸à¢yd#8àf¸àjøàj¸à¢¸àa¸à¢øàgøà Jxà ‚ˆYˆ
+	[Y\H	[’[™›ÊHÈ™]\›ˆ	ÉÈBˆ	\ÈH
+ˆ	Ù^Ù[™\œÚ[ÛIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	[’[™›È	Ù^Ù[™\œÚ[Û‰È	ÉÊBˆ	ÛÜÕ™\œÚ[ÛIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	[’[™›È	ÛÜÕ™\œÚ[Û‰È	ÉÊBˆ	Üš[\IÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	[’[™›È	ØXÝ]™Tš[\‰È	ÉÊBˆ	Ø\šX[IÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	[’[™›È	Ú\Ð\šX[	È	˜[ÙJBˆ	Û\ÙÛÝXÏIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	[’[™›È	Ú\Ó\ÙÛÝXÉÈ	˜[ÙJBˆ	Üš[›Ùš[OIÈ
+ÈÜÝš[™×IØÜš\‘^Ù[š[›Ùš[U™\œÚ[Û‚ˆ
+BˆÈKTNˆ9å.ù`ãøàãøààøà­øàéxàkÈ›ÞÈ˜]˜HÈ:)èù§¤9¥®yo#ÈÈHÈ:"l¸àjøà ¹/§ykf8àfxà¢øà ‚ˆÈ8àdøà£8à¢xà¤¹d*øà xàj¸àa8àj8à y¥®yo#øà¤¹i"xàb8ài¸à ¹£!ùí"øàc9. :!í8àeøài¹.¤¹£æù )øàk¸àj¸àa8àãøààøà­øàéxà¤¹æí9£©y«å:/ øàeøài¸àeøào¸àa¸à ‚ˆžHÂˆ	œHÙ]Uš\ÝX[\Ú›Ùš[Bˆ	\È
+ÏH
+	Ü›ÞIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	œ	Ü›Þ™\œÚ[Û‰È	ÉÊJBˆ	\È
+ÏH
+	ÙOIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	œ	ÙIÈ	ÉÊJBˆ	\È
+ÏH
+	ØÛÛÜIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	œ	ØÛÛÜ“[ÙIÈ	ÉÊJBˆ	\È
+ÏH
+	Ü›Ùš[OIÈ
+ÈÜÝš[™×JÙ]Q]T›Ü\H	œ	Ü›Ùš[U™\œÚ[Û‰È	ÉÊJBˆ	\È
+ÏH
+	Ø[˜[^™\IÈ
+ÈÜÝš[™×IØÜš\””YÙP[˜[^™\•™\œÚ[ÛŠBˆÈKTJÌLJNˆ˜]˜H8àk¹âb8à¤¹k§úf¦øàjù£¨ycå¸àeøài¹£!ùí"øàn9d*øà xà¢Ê9ên¸àk¸ào¸ào¸àh8àj˜]˜H9¦í9¥¬9o£8à ¹£!ùí"øàc9i"xà£øà¢xàf¸à BˆÈ9.¤¹£æù )øàk¸àj¸àa9å.ù`ãøàãøààøà­øàéxà¤¹æí9£©y«å:/ øàeøài¸àeøào¸àaŠxà ‚ˆ	\È
+ÏH
+	Ú˜]˜OIÈ
+ÈÜÝš[™×JÙ]R˜]˜T[[YTÚYÛ˜]\™JJBˆHØ]ÚÈBˆ™]\›ˆ
+Ù]TÚLM•^
+	\ÈZ›Ú[ˆ	ß	ÊJBŸB‚™[˜Ý[Ûˆ™\Ù]T™[™\‘[š\›Û›Y[›Ü’›ØˆÂˆÈKp©Í‹ˆ9ä¬9h øàkøà­xàï8àä8àï9ê/9`ãy.+xàjùi"xà£øà¢¸àa¸à¢Ê:`&¹n.9/oøàa¸àåøàê¸àìøà¯øàk¹i"y¦í8àj¸àjJxà ‚ˆÈ8àë8àìøàà8àê¸àìøà¬8à®8àéøàå¸àkºe¢ùiâøàe8àj8àjùcå¸à¢¹æí8àfxà ¸àëxà¬9aî¹b¦øàkŒyfç¹b-ºfd8àj8àkùb!¸àdxà¢øà ‚ˆ	ØÜš\”™[™\‘[š\›Û›Y[ØXÚHH	[ˆ	ØÜš\”™[™\‘[š\›Û›Y[ÛÛ\\™YH	˜[ÙBˆ	ØÜš\Ý\œ™[™[™\‘[‘š[™Ù\œš[H	ÉÂŸB‚™[˜Ý[ÛˆÛÛ\\™KP[™TØ]™Q[š\›Û›Y[
+ÜÝš[™×I[™ÝXYÙK	[’[™›ÊHÂˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙBˆ	]H›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝ]W™[™\‹Y[‹šœÛÛ‰Âˆ	Ø\›š[™ÜÈH
+
+BˆYˆ
+\ÝT]S]\˜[]	]
+HÂˆ	ÛH™XYRœÛÛ‘š[H	]	[ˆ›Ü™XXÚ
+	Ù^H[ˆ
+	ÜÓ˜[YIË	Ù^Ù[™\œÚ[Û‰Ë	ÛÜÕ™\œÚ[Û‰Ë	ØXÝ]™Tš[\‰Ë	Ú\Ð\šX[	Ë	Ú\Ó\ÙÛÝXÉÊJHÂˆYˆ
+ÜÝš[™×IÛ‰Ù^H[™HÜÝš[™×I[’[™›Ë‰Ù^JHÂˆ	Ø\›š[™ÜÈ
+ÏH”¹c%¹ä¬9h øàc9bcyfç¸àj9ål8àj¸à¢¸ào¸àfNˆ	Ù^H9bcyfçVÉ
+	Û‰Ù^JWH9.â¹fçVÉ
+	[’[™›Ë‰Ù^JWH‚ˆBˆBˆBˆÜš]KRœÛÛ‘š[H	]	[’[™›Âˆ™]\›ˆ	Ø\›š[™ÜÂŸB‚‚™[˜Ý[ÛˆÝXÚPÛY[XÝ]š]JÜÝš[™×IÛY[Y
+HÂˆ	ØÜš\ÛY[]XÚYH	YBˆ	ØÜš\“\ÝX\™X]]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ	ØÜš\ÛY[ÛÜÙS›ÝYšYY]ÈHÑ]U[YWNŽ“Z[•˜[YBˆ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÛY[YH	ÛY[YÈ]H™]ËS›ÝÒ\ÛÈBŸB‚™[˜Ý[Ûˆ›ÝYžKPÛY[ÛÜÚ[™ÊÜÝš[™×IÛY[Y
+HÂˆ	ØÜš\ÛY[]XÚYH	YBˆ	ØÜš\ÛY[ÛÜÙS›ÝYšYY]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÛY[YH	ÛY[YÈÛÜÚ[™ÈH	YNÈ]H™]ËS›ÝÒ\ÛÈBŸB‚™[˜Ý[Ûˆ™\]Y\ÝTÙ\™\”Ú]ÝÛŠÜÝš[™×I™X\ÛÛŠHÂˆ	ØÜš\”Ú]ÝÛ”™\]Y\ÝYH	YBˆ™]\›ˆÛÜ™\™YPÈÚÈH	YNÈÚ]ÝÛˆH	YNÈ™X\ÛÛˆH	™X\ÛÛŽÈ]H™]ËS›ÝÒ\ÛÈBŸB‚™[˜Ý[Ûˆ\ÝPXÝ]™T™[™\’›ØœÊÜÝš[™×I[™ÝXYÙJHÂˆžHÂˆ	\ˆHÙ]T™[™\’›Ø‘\ˆ	[™ÝXYÙBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\ŠJHÈ™]\›ˆ	˜[ÙHBˆ	Ý]Ù™ˆHÑ]U[YWNŽ•]Ó›ÝËYÝ\œÊLLŠBˆ	\›Z[˜[H
+	ØÛÛ\]Y	Ë	ØÛÛ\]Y]Ú]Y\œ›ÜœÉË	Ù˜Z[Y	Ë	ÛZ\ÜÚ[™ÉË	ØØ[˜Ù[Y	ÊBˆ	›ÝÈHÑ]U[YWNŽ•]Ó›ÝÂˆ›Ü™XXÚ
+	š[H[ˆ
+Ù]PÚ[][HS]\˜[]	\ˆQš[\ˆ	Ê‹œÝ]\ËšœÛÛ‰ÈQš[HQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHÛÜSØš™XÝ\ÝÜš]U[YU]ÈQ\ØÙ[™[™ÈÙ[XÝSØš™XÝQš\œÝÌ
+JHÂˆYˆ
+	š[K“\ÝÜš]U[YU]È[	Ý]Ù™ŠHÈÛÛ[YHBˆ	›ØˆH™XYRœÛÛ‘š[H	š[K‘[˜[YH	[ˆYˆ
+	[Y\H	›ØŠHÈÛÛ[YHBˆ	Ý]\ÈH
+ÜÝš[™×I›Ø‹œÝ]\ÊK•ÓÝÙ\’[˜\šX[
+
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý]\ÊJHÈÛÛ[YHBˆYˆ
+	\›Z[˜[XÛÛZ[œÈ	Ý]\ÊHÈÛÛ[YHBˆ	›ØÙ\ÜÒYHÙ]R[]T›Ü\H	›Øˆ	Ü›ØÙ\ÜÒY	ÈˆYˆ
+	›ØÙ\ÜÒYYÝ
+HÂˆžHÈYˆ
+	[[™H
+Ù]T›ØÙ\ÜÈRY	›ØÙ\ÜÒYQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YJJHÈ™]\›ˆ	YHHHØ]ÚÈBˆÛÛ[YBˆBˆYˆ
+
+	›ÝÈH	š[K“\ÝÜš]U[YU]ÊK•Ý[ÙXÛÛ™È[Œ
+HÈ™]\›ˆ	YHBˆBˆHØ]ÚÂˆ™]\›ˆ	˜[ÙBˆBˆ™]\›ˆ	˜[ÙBŸB‚™[˜Ý[ÛˆžKPXÜ]Z\™SØÚÒ[™JÜÝš[™×IØÚÔ]
+HÂˆÈNˆ[›ÚÙKUÚ]ØÚÈ8àkÈ›ÙH9í`¹.¡¸àiøàãøàìøàâxàêøà¤ºe¢xàf8à¢øàgøà xà ]XÚÈ8à¤¸ào¸àgøàa8àiøàëxààøà«øà¤¹/çy£ xàiøàcxàj¸àa8à ‚ˆÈ:!ê¹båxà®xà¬xà®8àéxàï8àêxàï8àc:)!ù¥l8àå¸ààøà«øàk¹¢`9§"yª*xà¤¹£ xàhyí¦¸àdxà¢øàgøà xàk¹cå¹o¥ùl ¹å*8àæ8àêøàäxà ‚ˆÈ9cå¹o¥øàiøàcxàj¸àa9h-9d"8àkÈ	[8à¤º/å8àfJ8àª8àêxàï8àjøàeøàj¸àa8à ¹.å¸à­xàï8àä8àï8àc9¢áyodøàeøài¸àa8à¢øàh8àdJxà ‚ˆžHÂˆ	\™[HÜ]T]T\™[	ØÚÔ]ˆYˆ
+	\™[X[™[›Ý
+\ÝT]S]\˜[]	\™[
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	\™[Q›Ü˜ÙHÝ]S[Bˆ	œÈHÒSË‘š[WNŽ“Ü[Š	ØÚÔ]ÒSË‘š[S[ÙWNŽ“Ü[“ÜÜ™X]KÒSË‘š[PXØÙ\Ü×NŽ”™XYÜš]KÒSË‘š[TÚ\™WNŽ“›Û™JBˆžHÂˆ	œË”Ù][™Ý
+
+Bˆ	ž]\ÈHÕ^‘[˜ÛÙ[™×NŽ•UŽ‘Ù]ž]\Ê‰[ŽÓÓTUT“SQW	[Ž•TÑT“SQH	
+™]ËS›ÝÒ\ÛÊHŠBˆ	œË•Üš]J	ž]\Ë	ž]\Ë“[™Ý
+Bˆ	œË‘›\Ú
+
+BˆHØ]ÚÈBˆ™]\›ˆÜØÝ\ÝÛ[Øš™XÝPÈ]H	ØÚÔ]ÈÝ™X[HH	œÈBˆHØ]ÚÂˆ™]\›ˆ	[ˆBŸB‚™[˜Ý[Ûˆ™[X\ÙKSØÚÒ[™J	[™JHÂˆYˆ
+	[Y\H	[™JHÈ™]\›ˆBˆžHÈYˆ
+	[™K”Ý™X[JHÈ	[™K”Ý™X[KÛÜÙJ
+NÈ	[™K”Ý™X[K‘\ÜÜÙJ
+HHHØ]ÚÈBˆžHÈYˆ
+	[™K”]X[™
+\ÝT]S]\˜[]	[™K”]
+JHÈ™[[Ý™KR][HS]\˜[]	[™K”]Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHHHØ]ÚÈBŸB‚™[˜Ý[ÛˆÙ]T™[™\‘[™Ú[™SØÚÔ]
+ÜÝš[™×I[™ÝXYÙJHÂˆ™]\›ˆ
+›Ú[‹T]
+Ù]UÛÜšÜÜXÙT]	[™ÝXYÙJH	ÛØÚÜ×™[™\‹Y[™Ú[™K›ØÚÉÊBŸB‚™[˜Ý[ÛˆÙ]UÛÜšØ›ÛÚÔ™[™\“ØÚÔ]
+ÜÝš[™×I[™ÝXYÙKÜÝš[™×IÛÜšØ›ÛÚÒY
+HÂˆ™]\›ˆ
+›Ú[‹T]
+Ù]UÛÜšÜÜXÙT]	[™ÝXYÙJH
+›ØÚÜ×™[™\—ÞÌK›ØÚÈˆYˆ	ÛÜšØ›ÛÚÒY
+JBŸB‚™[˜Ý[Ûˆ[›ÚÙKUÚ]™[™\“ØÚÊÜÝš[™×I[™ÝXYÙKÜÝš[™×IÛÜšØ›ÛÚÒYÜØÜš\›ØÚ×I›ÙJHÂˆÈKQNˆ^Ù[ÓÓH8àkú* :*§¸àe8àj8àjÌxà®8àéøàå¸àn9b-ºfd8àfxà¢øà ‚ˆÈ8àáøààøàâxàëxààøà«øà¤º`oøàdxà¢øàgøà xà ycå¹o¥úh!¹n£øà¤¹aj9íc:-ëøàiÈ™[™\‹Y[™Ú[™HOˆ™[™\—ÏÛÜšØ›ÛÚÒYˆ8àjùíly. 8àfxà¢øà ‚ˆ	[™Ú[™T]HÙ]T™[™\‘[™Ú[™SØÚÔ]	[™ÝXYÙBˆ	›ÛÚÔ]HÙ]UÛÜšØ›ÛÚÔ™[™\“ØÚÔ]	[™ÝXYÙH	ÛÜšØ›ÛÚÒYˆÈ[›ÚÙKUÚ]ØÚÈ[X™\˜][H˜[Y\È]ÈØÜš\›ØÚÈ\˜[Y]\ˆ	XÝ[Û‹‚ˆÈYˆ›Ý[˜Ý[ÛœÈ\ÙH	›ÙKÝÙ\”Ú[	ÜÈ[˜[ZXÈØÛÜHXZÙ\È\ÈÜ˜\\‚ˆÈÙYH]Ù[ˆ[™™XÝ\œÚ]™[H™XXÜ]Z\™HHÛÜšØ›ÛÚÈØÚË‚ˆ™]\›ˆ[›ÚÙKUÚ]ØÚÈ	[™Ú[™T]Âˆ[›ÚÙKUÚ]ØÚÈ	›ÛÚÔ]	›ÙBˆBŸB‚™[˜Ý[Ûˆ[›ÚÙKUÚ]ØÚÊÜÝš[™×IØÚÔ]ÜØÜš\›ØÚ×IXÝ[ÛŠHÂˆ	\™[HÜ]T]T\™[	ØÚÔ]ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\™[
+JHÈ™]ËR][HR][U\H\™XÝÜžHT]	\™[Q›Ü˜ÙHÝ]S[Bˆ	œÈH	[ˆÈÜ[“ÜÜ™X]H
+Èš[TÚ\™K“›Û™Nˆ9£¤¹.å¸àkøà#:e¢øàa8ài¸àa8à¢øàãøàìøàâxàêøà#xàiù¢áy/çxàfxà¢øà ‚ˆÈ9.éybcxàkˆÜ™X]S™]È9¥®yo#øàkøà xàåøàëxà®øà®yo-ùb-¹í`¹.¡¸à¡:fîù®¤9¥«xàiøàëxààøà«øàåxà¨xà©8àêøàc9«¢øà¢øàjˆÈ9¢bùbåybbºfi8àfxà¢øào¸àiù¬.9.axàjøà#9.å¸àk¹aé¹ä!¸àc8àëxààøà«ù.+xà#xàjøàj¸àhøài¸àa8àgøà ‚ˆÈ9o-ùb-¹í`¹.¡¹æí9o£8àkÔÓP¹`m8àiøàãøàìøàâxàêú)èù¥/¸àc:`axà£8à¢øàdøàj8àc8à`¸à¢øàgøà xà yçëxàa8àê¸àâ8àêxà©8à¤¹aixà£8à¢øà ‚ˆ›Üˆ
+	ØÚÐ][\HNÈ	ØÚÐ][\[HÎÈ	ØÚÐ][\
+ÊÊHÂˆžHÂˆ	œÈHÒSË‘š[WNŽ“Ü[Š	ØÚÔ]ÒSË‘š[S[ÙWNŽ“Ü[“ÜÜ™X]KÒSË‘š[PXØÙ\Ü×NŽ”™XYÜš]KÒSË‘š[TÚ\™WNŽ“›Û™JBˆœ™XZÂˆHØ]ÚÂˆ	œÈH	[ˆYˆ
+	ØÚÐ][\[ÊHÈÝ\TÛY\TÙXÛÛ™ÈˆBˆBˆBˆYˆ
+	[Y\H	œÊHÂˆ›ÝÈ¹.å¸àk¹aé¹ä!¸àc8àëxààøà«ù.+xàiøàfxà º*¬8àbøàc9d#8àf9aé¹ä!¸à¤¹k§ú(c9.+xàbøà yo-ùb-¹í`¹.¡¸àeøàgøàåøàëxà®øà®xàk¸àãøàìøàâxàêøàc9«¢øàhøài¸àa8ào¸àfxà ¹¦`ºe¤øà¤¸àb¸àa8ài¹a£yk§ú(c8àeøài¸àcøàh8àexàa8à º)èù¥/¹o£8àjù/çy£ z !xà¤¹è®º*£xàfxà¢øàjøàkù«(xàk¸àåxà¨xà©8àêøà¤ºe¢øàa8ài¸àcøàh8àexàaˆ	ØÚÔ]‚ˆBˆžHÂˆ	œË”Ù][™Ý
+
+Bˆ	ž]\ÈHÕ^‘[˜ÛÙ[™×NŽ•UŽ‘Ù]ž]\Ê‰[ŽÓÓTUT“SQW	[Ž•TÑT“SQH	
+™]ËS›ÝÒ\ÛÊHŠBˆ	œË•Üš]J	ž]\Ë	ž]\Ë“[™Ý
+Bˆ™]\›ˆ	ˆ	XÝ[Û‚ˆHš[˜[HÂˆYˆ
+	œÊHÈ	œËÛÜÙJ
+NÈ	œË‘\ÜÜÙJ
+HBˆYˆ
+\ÝT]S]\˜[]	ØÚÔ]
+HÈ™[[Ý™KR][HS]\˜[]	ØÚÔ]Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHBˆBŸB‚™[˜Ý[Ûˆ™YÚ\Ý\‹UÛÜšØ›ÛÚÊÜÝš[™×I[™ÝXYÙKÜÝš[™×I™[]]™T]ÜÝš[™×IØ]YÛÜžHH	ÉÊHÂˆ\ÝQ\™XÝ^Ù[™[]]™T]	™[]]™T]Ý]S[ˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ	]ÏQÙ]T]Âˆ	[R›Ú[‹TØY™H
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠH	™[]]™T]ˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[
+JHÈ›ÝÈ¹£ä9aî¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	™[]]™T]ˆBˆ	Ø[™Y]OS™]ËUÛÜšØ›ÛÚÓØš™XÝ	™[]]™T]	[™ÝXYÙH	Ø]ˆ™]\›ˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	ÝXÝ\™JBˆ	›Ü›X[^™YJÜÝš[™×I™[]]™T]\™\XÙH	×	Ë	ËÉÊK•ÓÝÙ\’[˜\šX[
+
+Bˆ	^\Ý[™ÏP
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÂˆ
+ÜÝš[™×IËÛÜšØ›ÛÚÒYY\HÜÝš[™×IØ[™Y]KÛÜšØ›ÛÚÒY
+H[Üˆ
+
+
+ÜÝš[™×IËœ™[]]™T]\™\XÙH	×	Ë	ËÉÊK•ÓÝÙ\’[˜\šX[
+
+HY\H	›Ü›X[^™Y
+HX[™
+\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]
+JBˆHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	^\Ý[™ËÛÝ[YÝ
+HÂˆ	ÛI^\Ý[™ÖÌBˆÙ]S›ÝT›Ü\H	Ø[™Y]H	ÝÛÜšØ›ÛÚÒY	È
+ÜÝš[™×IÛÛÜšØ›ÛÚÒY
+Bˆ›Ü™XXÚ
+	˜[YH[ˆ
+	Û\Ý™[™\™Y™\œÚ[Û’Y	Ë	Û\Ý™[™\™Y^Ù[\Ú	Ë	Û\Ý™[™\™Y]	Ë	Û\Ý™[™\™YÚY]ÉË	Û\Ý™[™\™YÚY]š[™Ù\œš[	Ë	Û\Ý™[™\“ÙÉË	Ü™[™\”›Ùš[U™\œÚ[Û‰Ë	Û\Ý\œ›Ü‰Ë	Û\Ý\œ›Ü•\Ù\‰Ë	Û\Ý\œ›Ü]	Ë	Û\Ý™[™\][\\Ú	ÊJHÂˆÙ]S›ÝT›Ü\H	Ø[™Y]H	˜[YH
+Ù]Q]T›Ü\H	Û	˜[YH	[
+BˆBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IØ[™Y]K›\Ý™[™\™Y^Ù[\Ú
+JHÈÙ]S›ÝT›Ü\H	Ø[™Y]H	ÜÝ]\ÉÈ	
+Yˆ
+	Ø[™Y]K˜Ý\œ™[^Ù[\Ú[™H	Ø[™Y]K›\Ý™[™\™Y^Ù[\Ú
+HÉÙ^Ù[]\]Y	ßH[ÙHÖÜÝš[™×IÛœÝ]\ßJHBˆBˆ	ÝXÝ\™KÛÜšØ›ÛÚÜÏP
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒY[™HÜÝš[™×IØ[™Y]KÛÜšØ›ÛÚÒYJH
+È
+	Ø[™Y]JBˆX\šËU›Û[YS™YYÔ™XZ[	ÝXÝ\™H	[™ÝXYÙH	Ø]
+
+Ù]QY˜][›Û[YH	[™ÝXYÙJJH	Ü™YÚ\Ý\‰È	Ñ^Ù[8à¤Œy.í¹ænúc,¸àeøào¸àeøàgÉÂˆ™]\›ˆÛÜ™\™YPÈÛÜšØ›ÛÚÏIØ[™Y]NÈÚY]ÏP
+
+NÈ™YÚ\Ý\™YIYNÈ[œÜXÝYI˜[ÙHBˆBŸB‚™[˜Ý[Ûˆ™YÚ\Ý\‹UÛÜšØ›ÛÚÜÐ˜]Ú
+ÜÝš[™×I[™ÝXYÙK	™[]]™T]ËÜÝš[™×IØ]YÛÜžHH	ÉÊHÂˆ	™YÚ\Ý\™YH
+
+Bˆ	\œ›ÜœÈH
+
+Bˆ	ÙY[ˆHßBˆ›Ü™XXÚ
+	˜]È[ˆ
+Ù]P\œ˜^H	™[]]™T]ÊJHÂˆ	™[HÜÝš[™×I˜]ÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[
+JHÈÛÛ[YHBˆ	Ù^HH
+	™[\™\XÙH	×	Ë	ËÉÊK•ÓÝÙ\’[˜\šX[
+
+BˆYˆ
+	ÙY[‹ÛÛZ[œÒÙ^J	Ù^JJHÈÛÛ[YHBˆ	ÙY[–ÉÙ^WHH	YBˆžHÂˆ	ˆH™YÚ\Ý\‹UÛÜšØ›ÛÚÈ	[™ÝXYÙH	™[	Ø]YÛÜžBˆ	ØˆH	‹ÛÜšØ›ÛÚÂˆ	™YÚ\Ý\™Y
+ÏHÛÜ™\™YPÂˆ™[]]™T]H	™[ˆÛÜšØ›ÛÚÒYHÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYˆš[S˜[YHHÜÝš[™×IØ‹™š[S˜[YBˆ\Ü^S˜[YHHÜÝš[™×IØ‹™\Ü^S˜[YBˆÝ]\ÈHÜÝš[™×IØ‹œÝ]\ÂˆØ]YÛÜžHHÜÝš[™×IØ‹˜Ø]YÛÜžBˆBˆHØ]ÚÂˆ	\œ›ÜœÈ
+ÏHÛÜ™\™YPÈ™[]]™T]H	™[È\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙNÈ]Z[HÜÝš[™×IÈBˆBˆBˆ™]\›ˆÛÜ™\™YPÂˆ™\]Y\ÝYÛÝ[H
+Ù]P\œ˜^H	™[]]™T]ÊKÛÝ[ˆ™YÚ\Ý\™YH
+	™YÚ\Ý\™Y
+Bˆ\œ›ÜœÈH
+	\œ›ÜœÊBˆ™YÚ\Ý\™YÛÝ[H
+	™YÚ\Ý\™Y
+KÛÝ[ˆ\œ›ÜÛÝ[H
+	\œ›ÜœÊKÛÝ[ˆBŸB‚‚™[˜Ý[ÛˆÙ]S\Ý™[™\][\›ÜŠÜÝš[™×IÛÜšØ›ÛÚÒY
+HÂˆ	HH	ØÜš\“\Ý™[™\][\ˆYˆ
+	[Y\H	JHÈ™]\›ˆÛÜ™\™YPÈÛ˜\ÚÝYH	ÉÎÈ\ÚH	ÉÈHBˆYˆ
+ÜÝš[™×JÙ]Q]T›Ü\H	H	ÝÛÜšØ›ÛÚÒY	È	ÉÊH[™HÜÝš[™×IÛÜšØ›ÛÚÒY
+HÈ™]\›ˆÛÜ™\™YPÈÛ˜\ÚÝYH	ÉÎÈ\ÚH	ÉÈHBˆ™]\›ˆÛÜ™\™YPÈÛ˜\ÚÝYHÜÝš[™×JÙ]Q]T›Ü\H	H	ÜÛ˜\ÚÝY	È	ÉÊNÈ\ÚHÜÝš[™×JÙ]Q]T›Ü\H	H	Ú\Ú	È	ÉÊHBŸB‚™[˜Ý[ÛˆÙ]UÛÜšØ›ÛÚÔ™[™\‘\œ›ÜŠÜÝš[™×I[™ÝXYÙKÜÝš[™×IÛÜšØ›ÛÚÒYÜÝš[™×IY\ÜØYÙKÜÝš[™×I]Z[H	ÉËˆÜÝš[™×I][\YÛ˜\ÚÝYH	ÉËÜÝš[™×I][\Y\ÚH	ÉÊHÂˆžHÂˆ	\Ù\“Y\ÜØYÙOPÛÛ™\ËU\Ù\”™[™\‘\œ›Üˆ	Y\ÜØYÙBˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	ÝXÝ\™JBˆ	ØP
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	Ø‹ÛÝ[YÝ
+HÂˆÈKp©Í‹ŒØNˆ9i,y¥eøàeøàgøàk¸àkøà#:*iº(c8àeøàgùâb8à#xàiøà`¸àhøài¸à yãï¹g*8àk¹âb8àj8àkúfd8à¢xàj¸àa8à ‚ˆÈ9¥è¸àjù¥¬8àeøàa9âb8àc9©'9çéxàexà£8ài¸àa8à¢øàj¸à¢H™[™\‹Y\œ›Üˆ8àjøàføàfˆ^Ù[]\]Y8àk¸ào¸ào¸àjøàfxà¢øà ‚ˆ	][\YH›Ü›X[^™KQš[R\Ú	][\Y\Úˆ	]\ÝH›Ü›X[^™KQš[R\Ú
+ÜÝš[™×JÙ]Q]T›Ü\H	Ø–ÌH	ØÝ\œ™[^Ù[\Ú	È	ÉÊJBˆ	Ø[YU™\œÚ[ÛˆH
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	][\Y
+JH[Üˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	]\Ý
+JH[Üˆ
+	][\YY\H	]\Ý
+BˆYˆ
+	Ø[YU™\œÚ[ÛŠHÂˆÙ]S›ÝT›Ü\H	Ø–ÌH	ÜÝ]\ÉÈ	Ü™[™\‹Y\œ›Ü‰Âˆ›Ü™XXÚ
+	[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYX[™ÜÝš[™×IËœÝ]\È[™H	ØÛÛ™š\›YY	ÈJJHÈÙ]S›ÝT›Ü\H		ÜÝ]\ÉÈ	Ü™[™\‹Y\œ›Ü‰ÎÈÙ]S›ÝT›Ü\H		ÝØ\›š[™ÜÉÈ
+	\Ù\“Y\ÜØYÙJNÈÙ]S›ÝT›Ü\H		Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊHBˆH[ÙHÂˆÙ]S›ÝT›Ü\H	Ø–ÌH	ÜÝ]\ÉÈ	Ù^Ù[]\]Y	ÂˆÈ8àæ¸àï8à®8àkˆÝ]\È8àkù."¹¦î8àcxàeøàj¸àa
+9¥¬8àeøàa9âb8àk¹â­¹¡bøà¤¹hâ¸àexàj¸àa8àgøà JBˆBˆÈ9i,y¥eù áyh,xàkùâ­¹¡bøàj9b!øà¢ºfè¸àeøài¹oáxàf¹«¢øàfBˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Ø–ÌH	Û\Ý™[™\‘\œ›Ü”Û˜\ÚÝY	È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Ø–ÌH	Û\Ý™[™\‘\œ›Ü’\Ú	È	ÉÂˆÙ]S›ÝT›Ü\H	Ø–ÌH	Û\Ý™[™\‘\œ›Ü”Û˜\ÚÝY	È
+ÜÝš[™×I][\YÛ˜\ÚÝY
+BˆÙ]S›ÝT›Ü\H	Ø–ÌH	Û\Ý™[™\‘\œ›Ü’\Ú	È
+ÜÝš[™×I][\Y\Ú
+BˆÙ]S›ÝT›Ü\H	Ø–ÌH	Û\Ý\œ›Ü‰È	Y\ÜØYÙNÈÙ]S›ÝT›Ü\H	Ø–ÌH	Û\Ý\œ›Ü•\Ù\‰È	\Ù\“Y\ÜØYÙNÈÙ]S›ÝT›Ü\H	Ø–ÌH	Û\Ý\œ›Ü]	È
+™]ËS›ÝÒ\ÛÊBˆBˆHÝ]S[ˆ	ÛÜšÜÜXÙOQÙ]UÛÜšÜÜXÙT]	[™ÝXYÙBˆ	ØY™RYVÜ™YÙ^NŽ”™\XÙJ	ÛÜšØ›ÛÚÒY	Ö×KV˜K^ŒNWË‹WJÉË	×ÉÊBˆ	ÙÔ™[R›Ú[‹T]	ÛÙÜÉÈ
+œ™[™\‹Y\œ›Ü—ÞÌWÞÌ_KšœÛÛˆˆYˆ	ØY™RY
+™]ËT˜’Y
+JBˆÜš]KRœÛÛ‘š[H
+›Ú[‹T]	ÛÜšÜÜXÙH	ÙÔ™[
+H
+ÛÜ™\™YPÝÛÜšØ›ÛÚÒYIÛÜšØ›ÛÚÒYÛY\ÜØYÙOIY\ÜØYÙNÝ\Ù\“Y\ÜØYÙOI\Ù\“Y\ÜØYÙNÙ]Z[I]Z[Ø]S™]ËS›ÝÒ\ÛßJBˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÈ\˜[J	ÝXÝ\™JH	ØP
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒY_Ù[XÝSØš™XÝQš\œÝJNÈYŠ	Ø‹ÛÝ[
+^ÔÙ]S›ÝT›Ü\H	Ø–ÌH	Û\Ý™[™\“ÙÉÈ	ÙÔ™[HHÝ]S[ˆHØ]ÚÈBŸB‚™[˜Ý[ÛˆÙ]PÛÛ[“XZ[[˜[˜ÙSØÚÔ]
+ÜÝš[™×IÛÜšÜÜXÙKÜÝš[™×IÛÜšØ›ÛÚÒY
+HÂˆ	ØY™UÛÜšØ›ÛÚÒYH\ÜÙ\TØY™TÝÜ˜YÙTÙYÛY[	ÛÜšØ›ÛÚÒY	ÝÛÜšØ›ÛÚÒY	Âˆ™]\›ˆ
+›Ú[‹T]	ÛÜšÜÜXÙH
+›ØÚÜ×ÛÛ[\—ÞÌK›ØÚÈˆYˆ	ØY™UÛÜšØ›ÛÚÒY
+JBŸB‚™[˜Ý[Ûˆ™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÊÜÝš[™×IÛÜšÜÜXÙKÜÝš[™×IÛÜšØ›ÛÚÒYÜÝš[™×IÙY\™\œÚ[Û’Y
+HÂˆ	ØÚÔ]HÙ]PÛÛ[“XZ[[˜[˜ÙSØÚÔ]	ÛÜšÜÜXÙH	ÛÜšØ›ÛÚÒYˆžHÂˆ[›ÚÙKUÚ]ØÚÈ	ØÚÔ]È™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÐÛÜ™H	ÛÜšÜÜXÙH	ÛÜšØ›ÛÚÒY	ÙY\™\œÚ[Û’YHÝ]S[ˆHØ]ÚÂˆÈ9/çy£ y¥m9ä!¸àk¹êí¹d"8àîùi,y¥eøàiøà yk£9¢$9®"8àoÔ¹/g9¢$8àgxàk¸à ¸àk¸à¤¹i,y¥eù¢lxàa8àjøàeøàj¸àa8à ‚ˆÜš]KUØ\›š[™È
+	ØÛÛ[¸àk¹.%¹.èù¥m9ä!¸à¤º)¢ú` xà¢¸ào¸àeøàgÎˆ	È
+È	Ë‘^Ù\[Û‹“Y\ÜØYÙJBˆBŸB‚™[˜Ý[Ûˆ™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÐÛÜ™JÜÝš[™×IÛÜšÜÜXÙKÜÝš[™×IÛÜšØ›ÛÚÒYÜÝš[™×IÙY\™\œÚ[Û’Y
+HÂˆÈKp©ÌËÎˆ9/çy£ y.%¹.èù¥l8àj[œËÛX\Ù\È8àjøà¢8à¢ù/çz+møà¤¹l"ºaãxàfxà¢øà ‚ˆÈ9cf9í%8àjÈÙY\™\œÚ[Û’Y9.éyi%¸à¤¹aj9bbºfi8àfxà¢øàj8à ymë¹b!¹«å:/ øàk¹gî¹®¥¸à¡9«hùo#Ô¸àc9cà¹áiøàfxà¢ù.%¹.èøào¸àiù­¢8àb8à¢øà ‚ˆžHÂˆÈKTˆ9¢oú*£ybcxàkøàáøà¨øà®xà«ù/oùå*:aãøà¤¹h¥øà¡8àexàj¸àa8à •ŒH8àj9d#8àf8à#9§ 9¥¬9.éyi%¸à¤¹bbºfi8à#xàjù¢.øàfxà ‚ˆYˆ
+[›Ý
+\ÝR[œ]\ÝÜžQ[˜X›Y
+JHÈ™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÐ[	ÛÜšÜÜXÙH	ÛÜšØ›ÛÚÒY	ÙY\™\œÚ[Û’YÈ™]\›ˆBˆ	ÙY\ÛÝ[HÂˆžHÈ	ÙY\ÛÝ[HÚ[JÙ]R[œ]\ÝÜžTÙ][™ÜÊKœ™]Z[ÛÛ[•™\œÚ[ÛœÈHØ]ÚÈBˆYˆ
+	ÙY\ÛÝ[[JHÈ	ÙY\ÛÝ[HHBˆ	›ÛÚÑ\ŒH›Ú[‹T]	ÛÜšÜÜXÙH
+›Ú[‹T]	ØÛÛ[\‰È	ÛÜšØ›ÛÚÒY
+BˆYˆ
+\ÝT]S]\˜[]	›ÛÚÑ\Œ
+HÂˆ	\œÈH
+Ù]PÚ[][HS]\˜[]	›ÛÚÑ\ŒQ\™XÝÜžHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHÛÜSØš™XÝ˜[YJBˆ	ÙY\H
+
+BˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÙY\™\œÚ[Û’Y
+JHÈ	ÙY\
+ÏH	ÙY\™\œÚ[Û’YBˆ	ÙY\
+ÏH
+	\œÈÙ[XÝSØš™XÝS\Ý	ÙY\ÛÝ[›Ü‘XXÚSØš™XÝÈÜÝš[™×IË“˜[YHJBˆ›Ü™XXÚ
+	[ˆ	\œÊHÂˆ	˜[YHHÜÝš[™×I“˜[YBˆYˆ
+	ÙY\XÛÛZ[œÈ	˜[YJHÈÛÛ[YHBˆYˆ
+\ÝPÛÛ[”›ÝXÝY	ÛÜšÜÜXÙH	ÛÜšØ›ÛÚÒY	˜[YJHÈÛÛ[YHBˆ™[[Ý™KR][HS]\˜[]	‘[˜[YHT™XÝ\œÙHQ›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YBˆBˆBˆ™]\›‚ˆHØ]ÚÈBŸB‚™[˜Ý[Ûˆ™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÐ[
+ÜÝš[™×IÛÜšÜÜXÙKÜÝš[™×IÛÜšØ›ÛÚÒYÜÝš[™×IÙY\™\œÚ[Û’Y
+HÂˆžHÂˆ	›ÛÚÑ\ˆH›Ú[‹T]	ÛÜšÜÜXÙH
+›Ú[‹T]	ØÛÛ[\‰È	ÛÜšØ›ÛÚÒY
+BˆYˆ
+[›Ý
+\ÝT]S]\˜[]	›ÛÚÑ\ŠJHÈ™]\›ˆBˆ›Ü™XXÚ
+	\ˆ[ˆ
+Ù]PÚ[][HS]\˜[]	›ÛÚÑ\ˆQ\™XÝÜžHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YJJHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÙY\™\œÚ[Û’Y
+H[ÜˆÜÝš[™×I\‹“˜[YH[™H	ÙY\™\œÚ[Û’Y
+HÂˆ™[[Ý™KR][HS]\˜[]	\‹‘[˜[YHT™XÝ\œÙHQ›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YBˆBˆBˆHØ]ÚÈBŸB‚™[˜Ý[Ûˆ[œ™YÚ\Ý\‹UÛÜšØ›ÛÚÊÜÝš[™×I[™ÝXYÙKÜÝš[™×IÛÜšØ›ÛÚÒY
+HÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÜšØ›ÛÚÒY
+JHÈ›ÝÈ	ÝÛÜšØ›ÛÚÒY8àc9oáz) xàiøàfxà ‰ÈBˆ	™\Ý[U\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	ÝXÝ\™JBˆ	›Ý[™P
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	›Ý[™ÛÝ[Y\H
+HÈ›ÝÈ¹ænúc,¹®"8àoÑ^Ù[8àc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	ÛÜšØ›ÛÚÒYˆBˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×I›Ý[™ÌK˜Ø]YÛÜžJBˆ	™[[Ý™YYÙ\ÏP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYJBˆ	Y™™XÝYP
+	™[[Ý™YYÙ\È›Ü‘XXÚSØš™XÝÖÜÝš[™×IË›Û[Y_HÚ\™KSØš™XÝÉÈX[™	È[™H	Û›Û™IßHÙ[XÝSØš™XÝU[š\]YJBˆ	ÝXÝ\™KÛÜšØ›ÛÚÜÏP
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒY[™H	ÛÜšØ›ÛÚÒYJBˆ	ÝXÝ\™KœYÙ\ÏP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒY[™H	ÛÜšØ›ÛÚÒYJBˆX\šËU›Û[YS™YYÔ™XZ[	ÝXÝ\™H	[™ÝXYÙH	Ø]	Y™™XÝY	Ý[œ™YÚ\Ý\‰È	Ñ^Ù[8à¤Œy.í¹ænúc,º)èúfi8àeøào¸àeøàgÉÂˆ™]\›ˆÛÜ™\™YPÝÛÜšØ›ÛÚÒYIÛÜšØ›ÛÚÒYÙš[S˜[YOVÜÝš[™×I›Ý[™ÌK™š[S˜[YNÜ™[[Ý™YYÙ\ÏI™[[Ý™YYÙ\ßBˆBˆÈKp©ÌËŽˆ9ænúc,º)èúfi8àj9liy«m9bbºfi8àkùb)y¤ãy/g8à ¹liy«m8àc9§"yb®xàj¸à¢HÛÛ[\ˆ8à ¹«¢øàfBˆÈ
+9«hùo#Ô¸à¨¸àï8àªøà©8àå¸àc:`c¹c®øàk¹.%¹.èøà¤¹cà¹áiøàeøài¸àa8à¢ùcëú ïy )øàc8à`¸à¢øàgøà Jxà ‚ˆžHÂˆYˆ
+[›Ý
+\ÝR[œ]\ÝÜžQ[˜X›Y
+JHÈ™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÐ[
+Ù]UÛÜšÜÜXÙT]	[™ÝXYÙJH	ÛÜšØ›ÛÚÒY	ÉÈBˆHØ]ÚÈBˆ™]\›ˆ	™\Ý[ŸB‚™[˜Ý[Ûˆ™[™\‹UÛÜšØ›ÛÚÊÜÝš[™×I[™ÝXYÙKÜÝš[™×IÛÜšØ›ÛÚÒY	Ú\™Y^Ù[H	[Ø›ÛÛIÙY\^Ù[Ü[ˆH	˜[ÙKÜØÜš\›ØÚ×I›ÙÜ™\ÜÐØ[˜XÚÈH	[ˆÜÝš[™×IÛÝ\˜ÙSÝ™\œšYT]H	ÉËÜÝš[™×IÛÝ\˜ÙTÛ˜\ÚÝYH	ÉËÜÝš[™×I^XÝYÛÝ\˜ÙR\ÚH	ÉÊHÂˆ	]ÈHÙ]T]Âˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙBˆ	ÝXÝ\™HHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	ÛÜšØ›ÛÚÈH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	ÛÜšØ›ÛÚËÛÝ[Y\H
+HÈ›ÝÈ•ÛÜšØ›ÛÚøàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	ÛÜšØ›ÛÚÒYˆBˆ	ØˆH	ÛÜšØ›ÛÚÖÌBˆ	ÛÝ\˜ÙT]H›Ú[‹TØY™H
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠH
+ÜÝš[™×IØ‹œ™[]]™T]
+BˆÈNˆ9/çykf9®"8àoù©'9çéyâb8àbøà¢xàë8àìøàà8àê¸àìøà¬8àfxà¢ùh-9d"8àkøà y£ä9aî¸àåxàªxàêøàà8àk¹ãï¹âjxàc9­¢8àb8ài¸àa8ài¸à ¹í¦º(c8àiøàcxà¢øà ‚ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙSÝ™\œšYT]
+HX[™[›Ý
+\ÝT]S]\˜[]	ÛÝ\˜ÙT]
+JHÂˆ	\ÔÛ˜\ÚÝ[œ]H	˜[ÙBˆžHÈ	›Ø™HHØ\\™KT™[™\’[œ]	[™ÝXYÙH	ÛÜšØ›ÛÚÒY	ÛÝ\˜ÙTÛ˜\ÚÝY	ÉÎÈ	\ÔÛ˜\ÚÝ[œ]H
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I›Ø™Kœ]
+JHHØ]ÚÈBˆYˆ
+[›Ý	\ÔÛ˜\ÚÝ[œ]
+HÂˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÈ\˜[J	Ý
+H	P
+Ù]P\œ˜^H	ÝÛÜšØ›ÛÚÜßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒY_Ù[XÝSØš™XÝQš\œÝJNÚYŠ	ÛÝ[
+^ÔÙ]S›ÝT›Ü\H	ÌH	ÜÝ]\ÉÈ	ÛZ\ÜÚ[™ÉßHHÝ]S[ˆ›ÝÈ¹£ä9aî¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	
+	Ø‹œ™[]]™T]
+H‚ˆBˆBˆÈKQNˆ™[™\‹Y[™Ú[™HOˆ™[™\—ÏÛÜšØ›ÛÚÒYˆ8àkºh!¸àiùcå¹o¥øàfxà¢øà ‚ˆ	ØÜš\”[™[™Ð[˜[\Ú\ÈH	[ˆ	™[™\”™\Ý[H[›ÚÙKUÚ]™[™\“ØÚÈ	[™ÝXYÙH	ÛÜšØ›ÛÚÒYÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý\œ›Ü‰È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý\œ›Ü•\Ù\‰È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý\œ›Ü]	È	[ˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý™[™\][\\Ú	È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý™[™\“ÙÉÈ	ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	ÜÝ]\ÉÈ	Ü™[™\š[™ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý\œ›Ü‰È	ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý\œ›Ü•\Ù\‰È	ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý\œ›Ü]	È	[ˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÈ\˜[J	Ý
+H	P
+Ù]P\œ˜^H	ÝÛÜšØ›ÛÚÜßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒY_Ù[XÝSØš™XÝQš\œÝJNÚYŠ	ÛÝ[
+^ÔÙ]S›ÝT›Ü\H	ÌH	ÜÝ]\ÉÈ	Ü™[™\š[™ÉÎÔÙ]S›ÝT›Ü\H	ÌH	Û\Ý\œ›Ü‰È	ÉÎÔÙ]S›ÝT›Ü\H	ÌH	Û\Ý\œ›Ü•\Ù\‰È	ÉÎÔÙ]S›ÝT›Ü\H	ÌH	Û\Ý\œ›Ü]	È	[HHÝ]S[‚ˆÈ:*¬8àbøàc9/çykf8àeøàgùæí9o£8à¡8à©¸à©8àêøà®xà®xà«xàèøàìù.+xàkú*«xàoùcå¸à¢¸àc9. 9¦`¹æ¡8àjùi,y¥eøàfxà¢øàgøà xà yl$xàeùo¡xàhøài¸àê¸àâ8àêxà©8àfxà¢øà ‚ˆÈKp©Í‹ŒKð©ÐÎˆ9ab8àjøàë8àìøàà8àê¸àìøà¬9aiyb¦øà¤¹è®¹k¦¸àexàføà¢øà ‚ˆÈ8àãøààøà­øàéxàkøà#9k§úf¦øàjúe¢øàcøàåxà¨xà©8àêøà#xàjùkï¸àeøàiº*"9ë¥øàeøàj¸àdxà£8àl8àj¸à¢xàj¸àa8à ‚ˆÈ9ãïº(c^Ù[8àk¸àãøààøà­øàéxà¤¹/oøàa¸àj8à y©'9çéyâb8àbøà¢xàë8àìøàà8àê¸àìøà¬8àeøàgøàk¸àjù§ 9¥¬9¢lxàa8àjøàj¸à¢ÐTøàc9hâ¸à£8à¢øà ‚ˆ	[œ][™›ÈH	[ˆ	\[Y\˜[Ø\\™RYH	ÉÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙSÝ™\œšYT]
+JHÂˆžHÈ	[œ][™›ÈHØ\\™KT™[™\’[œ]	[™ÝXYÙH	ÛÜšØ›ÛÚÒY	ÛÝ\˜ÙTÛ˜\ÚÝY	ÉÈHØ]ÚÈ	[œ][™›ÈH	[BˆYˆ
+	[[™H	[œ][™›ÈX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×I[œ][™›Ëœ]
+JHÂˆ	ÛÝ\˜ÙSÝ™\œšYT]HÜÝš[™×I[œ][™›Ëœ]ˆ	ÛÝ\˜ÙTÛ˜\ÚÝYHÜÝš[™×I[œ][™›ËœÛ˜\ÚÝYˆ	^XÝYÛÝ\˜ÙR\ÚHÜÝš[™×I[œ][™›Ëš\ÚˆYˆ
+Ø›ÛÛI[œ][™›Ë™\[Y\˜[
+HÈ	\[Y\˜[Ø\\™RYHÜÝš[™×I[œ][™›Ë˜Ø\\™RYBˆBˆBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙSÝ™\œšYT]
+JHÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	ÛÝ\˜ÙSÝ™\œšYT]
+JHÈ›ÝÈ¸àë8àìøàà8àê¸àìøà¬9aiyb¦øàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	ÛÝ\˜ÙSÝ™\œšYT]ˆBˆ	ÛÝ\˜ÙT]H	ÛÝ\˜ÙSÝ™\œšYT]ˆ	][HHÙ]R][HS]\˜[]	ÛÝ\˜ÙT]Q\œ›ÜXÝ[ÛˆÝÜˆBˆ	ÛÝ\˜ÙR\ÚH	ÉÂˆ	\Ý™XY\œ›ÜˆH	ÉÂˆ›Üˆ
+	™XY][\HNÈ	™XY][\[HÎÈ	™XY][\
+ÊÊHÂˆžHÂˆ	ÛÝ\˜ÙR\ÚH™]ËTÝX›R\Ú	ÛÝ\˜ÙT]ˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙR\Ú
+JHÈœ™XZÈBˆHØ]ÚÈ	\Ý™XY\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙHBˆYˆ
+	™XY][\[ÊHÈÝ\TÛY\TÙXÛÛ™ÈˆBˆBˆÈKp©Í‹ŒØNˆØ]Ú9íc:-ëøàc8à#8àjxàk¹âb8à¤º*iº(c8àeøàgøàbøà#xà¤¹çéxà¢øàgøà xàjú*&:c,¸àfxà¢øà ‚ˆÈ9d#9. 8àåøàëxà®øà®ya¡xàk¸àë8àìøàà8àê¸àìøà¬8àkÈ™[™\‹Y[™Ú[™H8àëxààøà«øàiùæí9b%ùc%¸àexà£8ài¸àa8à¢øàgøà yk¢yaj8à ‚ˆÈKT
+ÌÊNˆ9fî¹k¦¹âb
+[Šxàk¹£!ùk¦¸àc8à`¸à¢ùh-9d"8à z*iº(c8àeøàgùâb8àkøà#9¡#ùfìøàeøàgÈ^XÝYÛÝ\˜ÙR\Ú8à#xàiøà`¸àhøài‚ˆÈ9ãï¹âjxàåxà¨xà©8àêÊ	ÛÝ\˜ÙR\Úyãï¹g*9âb
+xàiøàkøàj¸àa8à ¹ãï¹âjxàk¸àãøààøà­øàéxà¤º*&:c,¸àfxà¢øàj8à yâb8àf¸à£9i,y¥eù¦`¸àjÂˆÈÙ]UÛÜšØ›ÛÚÔ™[™\‘\œ›Üˆ8àkˆØ[YU™\œÚ[Ûˆ9b)9k¦¸àc:*©8àhøài¹ãï¹g*9âb8à¤ˆ™[™\‹Y\œ›Üˆ9c%¸àeøài¸àeøào¸àa¸à ‚ˆ	][\\Ú›Ü”™XÛÜ™HYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^XÝYÛÝ\˜ÙR\Ú
+JHÈÜÝš[™×I^XÝYÛÝ\˜ÙR\ÚH[ÙHÈÜÝš[™×IÛÝ\˜ÙR\ÚBˆ	ØÜš\“\Ý™[™\][\HÛÜ™\™YPÈÛÜšØ›ÛÚÒYH	ÛÜšØ›ÛÚÒYÈÛ˜\ÚÝYHÜÝš[™×IÛÝ\˜ÙTÛ˜\ÚÝYÈ\ÚHÜÝš[™×I][\\Ú›Ü”™XÛÜ™BˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^XÝYÛÝ\˜ÙR\Ú
+HX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙR\Ú
+JHÂˆYˆ
+
+›Ü›X[^™KQš[R\Ú	ÛÝ\˜ÙR\Ú
+H[™H
+›Ü›X[^™KQš[R\Ú	^XÝYÛÝ\˜ÙR\Ú
+JHÂˆ›ÝÈ	øàë8àìøàà8àê¸àìøà¬9aiyb¦øàc9 ìùk¦¸àeøàgùâb8àj9. :!í8àeøào¸àføà¤øà ¸à ¸àa¹. 9n©”¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ÂˆBˆBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙR\Ú
+JHÂˆ›ÝÈ¹£ä9aî‘^Ù[8à¤º*«xàoùcå¸à£8ào¸àføà¤øàiøàeøàgÊùfçº*iº(c
+xà º*¬8àbøàc9/çykf9.+xàbøà y£¤¹.å¸àè¸àï8àâxàiúe¢øàbøà£8ài¸àa8à¢ùcëú ïy )øàc8à`¸à¢¸ào¸àfxà ¹l$xàeùo¡xàhøài¸àbøà¢xà ¸àa¹. 9n©”¹/g9¢$8àeøài¸àcøàh8àexàa8à ˆ	\Ý™XY\œ›Üˆ‚ˆBˆ	][HHÙ]R][HS]\˜[]	ÛÝ\˜ÙT]ˆÈNˆ9éä¹cf9/cxàh8àj9d#9. 9éä¸àkŒ¹fç¹aé¹ä!¸àiùd#8àf9.%¹.èøàåxàªxàêøàà8à¤¹aly§"xàeøài¸àeøào¸àa¸à ¸àçøàê¹éäŠÑÕRQ8àjøàfxà¢øà ‚ˆ	™\œÚ[Û’YH™]ËT˜•™\œÚ[Û’Yˆ	ÛÛ[\ˆH›Ú[‹T]	ÛÜšÜÜXÙH
+›Ú[‹T]	ØÛÛ[\‰È
+›Ú[‹T]	ÛÜšØ›ÛÚÒY	™\œÚ[Û’Y
+JBˆ™]ËR][HR][U\H\™XÝÜžHT]	ÛÛ[\ˆQ›Ü˜ÙHÝ]S[ˆ	\\ˆH›Ú[‹T]
+ÜÝš[™×I]Ë™]Q\ŠH
+›Ú[‹T]	ØÛÛ[[Û—\	È
+ÑÝZYNŽ“™]ÑÝZY
+
+K•ÔÝš[™Ê	Ó‰ÊJJBˆ™]ËR][HR][U\H\™XÝÜžHT]	\\ˆQ›Ü˜ÙHÝ]S[ˆ	\]H›Ú[‹T]	\\ˆ
+ÒSË”]NŽ‘Ù]š[S˜[YJ	ÛÝ\˜ÙT]
+JBˆ	\ÝÛÜQ\œ›ÜˆH	ÉÂˆ	ÛÜYYH	˜[ÙBˆ›Üˆ
+	ÛÜP][\HNÈ	ÛÜP][\[HÎÈ	ÛÜP][\
+ÊÊHÂˆžHÂˆÛÜKQš[TÚ\™Y™XY	ÛÝ\˜ÙT]	\]ˆ	ÛÜYYH	YBˆœ™XZÂˆHØ]ÚÈ	\ÝÛÜQ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙHBˆYˆ
+	ÛÜP][\[ÊHÈÝ\TÛY\TÙXÛÛ™ÈˆBˆBˆYˆ
+[›Ý	ÛÜYY
+HÂˆ›ÝÈ¹£ä9aî‘^Ù[8à¤¸à¬øàå8àï8àiøàcxào¸àføà¤øàiøàeøàgÊùfçº*iº(c
+xà º*¬8àbøàc9/çykf9.+xàk¹cëú ïy )øàc8à`¸à¢¸ào¸àfxà ¹l$xàeùo¡xàhøài¸àbøà¢xà ¸àa¹. 9n©”¹/g9¢$8àeøài¸àcøàh8àexàa8à ˆ	\ÝÛÜQ\œ›Üˆ‚ˆBˆÈÛÜKR][xàkÖ›Û™K’Y[YšY\»ï"X\šÈÙˆHÙX»ï"xà¤¹. 9¦`¸à¬øàå8àï8àn9o%xàcyí¦xàd8àgøà xà BˆÈ9/çz+møàäøàéxàï8àjøà¢8à¢ÕÛÜšØ›ÛÚÜË“Ü[¹i,y¥eøà¤ºf,¸àd9æë¹æ¡8àiù¦#¹é.¹æ¡8àjúfi9c®øàfxà¢øà ‚ˆžHÈ[˜›ØÚËQš[HS]\˜[]	\]Q\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHHØ]ÚÈBˆÈ[ÒKLMˆÚXÙH\ˆÛÜšØ›ÛÚÈØ\È^[œÚ]™KˆHÛÝ\˜ÙH\È[™XYH™Y[ˆ\ÚYÂˆÈY\ˆÛÜZ[™ËÛÛ™š\›HÚ^™H[™ÛÝ\˜ÙH[Y\Ý[\ÜÚ^™HÝXš[]H[œÝXYÙˆ\Ú[™ÈHÛÜHYØZ[‹‚ˆ	ÛÜR][HHÙ]R][HS]\˜[]	\]Q\œ›ÜXÝ[ÛˆÝÜˆ	ÛÝ\˜ÙPY\ÛÜHHÙ]R][HS]\˜[]	ÛÝ\˜ÙT]Q\œ›ÜXÝ[ÛˆÝÜˆYˆ
+	ÛÜR][K“[™Ý[™H	][K“[™Ý[Üˆ	ÛÝ\˜ÙPY\ÛÜK“[™Ý[™H	][K“[™Ý[Üˆ	ÛÝ\˜ÙPY\ÛÜK“\ÝÜš]U[YU]È[™H	][K“\ÝÜš]U[YU]ÊHÂˆ›ÝÈ	øà¬øàå8àï9.+xàjù£ä9aî‘^Ù[8àc9¦í9¥¬8àexà£8ào¸àeøàgøà ¹/çykf8àc9í`¸à£øàhøài¸àbøà¢xà ¸àa¹. 9n©”¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ÂˆBˆÈKp©ÌËŒKð©Í‹ŒŽˆ9£ä9aî¸àåxàªxàêøàà8àk¹ãï¹âjxàbøà¢xàë8àìøàà8àê¸àìøà¬8àfxà¢ùh-9d"8àkøà BˆÈ8àæ8ààøàà8àïøàåxààøà¯øàïS8à¤¹b¨9méxàfxà¢ùbcJ9æí9o£
+xàjù§*¹b¨9méxàk¹©'9çéyâb8à¤¹/çykf8àfxà¢øà ‚ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÝ\˜ÙTÛ˜\ÚÝY
+HX[™
+\ÝR[œ]\ÝÜžQ[˜X›Y
+JHÂˆžHÂˆ	Ø\Y]HH[œÝ\™KTÛ˜\ÚÝY]Y]H	[™ÝXYÙH	ÛÜšØ›ÛÚÒY
+ÜÝš[™×IØ‹œ™[]]™T]
+H
+ÜÝš[™×IØ‹˜Ø]YÛÜžJH	ÛÝ\˜ÙT]	ÛÝ\˜ÙR\Ú	Ü™[™\‰ÂˆYˆ
+Ø›ÛÛIØ\Y]K›ÚÊHÂˆ	Ø\YHÜÝš[™×IØ\Y]KœÛ˜\ÚÝYˆ	Ø\ÚÈH	YBˆYˆ
+Ø›ÛÛJÙ]Q]T›Ü\H	Ø\Y]H	Ü[™[™ÉÈ	˜[ÙJJHÂˆYˆ
+\ÝTÛÝ\˜ÙT™][[Û‘[˜X›Y
+HÂˆ	Ø]™YHØ]™KTÛ˜\ÚÝÛÝ\˜ÙQš[H	[™ÝXYÙH	ÛÜšØ›ÛÚÒY	Ø\Y	ÛÝ\˜ÙT]	ÛÝ\˜ÙR\ÚˆYˆ
+[›ÝØ›ÛÛIØ]™Y›ÚÊHÈ	Ø\ÚÈH	˜[ÙHBˆBˆYˆ
+	Ø\ÚÊHÈ	Ø\ÚÈHÛÛ\]KTÛ˜\ÚÝ	[™ÝXYÙH	ÛÜšØ›ÛÚÒY	Ø\YBˆBˆYˆ
+	Ø\ÚÊHÂˆ	ÛÝ\˜ÙTÛ˜\ÚÝYH	Ø\Yˆ	ØÜš\“\Ý™[™\][\HÛÜ™\™YPÈÛÜšØ›ÛÚÒYH	ÛÜšØ›ÛÚÒYÈÛ˜\ÚÝYH	ÛÝ\˜ÙTÛ˜\ÚÝYÈ\ÚHÜÝš[™×IÛÝ\˜ÙR\ÚBˆBˆBˆHØ]ÚÈBˆB‚ˆ	^Ù[XÚØYÙTØÜXˆH	[ˆžHÈ	^Ù[XÚØYÙTØÜXˆH™[[Ý™KVÞXY\‘›ÛÝ\–[	\]HØ]ÚÈ	^Ù[XÚØYÙTØÜXˆHÛÜ™\™YPÈÚÈH	˜[ÙNÈ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙHHB‚ˆ	^Ù[H	Ú\™Y^Ù[ˆ	ÝÛœÑ^Ù[H	˜[ÙBˆ	›ÛÚÈH	[ˆ	™[™\™YH
+
+Bˆ	Ø\›š[™ÜÈH
+
+Bˆ	Ý\ÈH
+
+BˆžHÂˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	Ü™\\™IÈ	ÛÜšØ›ÛÚÒY	ÉÈBˆYˆ
+	[Y\H	^Ù[
+HÂˆ	Ý\È
+ÏH	Ñ^Ù[ÓÓxà¤º-mùbåIÂˆ	^Ù[H™]ËQ^Ù[\XØ][Û‘›Ü”™[™\‚ˆ	ÝÛœÑ^Ù[H	YBˆH[ÙHÂˆ	Ý\È
+ÏH	ù¥è¹kf8àk‘^Ù[ÓÓxà¤¹/oùå*	ÂˆžHÈ	^Ù[‘\Ü^P[\ÈH	˜[ÙNÈ	^Ù[‘[˜X›Q]™[ÈH	˜[ÙNÈ	^Ù[”ØÜ™Y[•\][™ÈH	˜[ÙHHØ]ÚÈBˆBˆ	[’[™›ÈHÙ]PØXÚY™[™\‘[š\›Û›Y[	^Ù[ˆ	ØÜš\Ý\œ™[™[™\‘[‘š[™Ù\œš[HÙ]T™[™\‘[š\›Û›Y[š[™Ù\œš[	[’[™›Âˆ	ØÜš\Ý\œ™[™[™\‘[’[™›ÈH	[’[™›ÂˆYˆ
+[›Ý	ØÜš\”™[™\‘[š\›Û›Y[ÛÛ\\™Y
+HÂˆ	Ø\›š[™ÜÈ
+ÏHÛÛ\\™KP[™TØ]™Q[š\›Û›Y[	[™ÝXYÙH	[’[™›ÂˆÜš]KRœÛÛ‘š[H
+›Ú[‹T]	ÛÜšÜÜXÙH›ÙÜ×™[™\‹Y[—É™\œÚ[Û’YšœÛÛˆŠH	[’[™›Âˆ	ØÜš\”™[™\‘[š\›Û›Y[ÛÛ\\™YH	YBˆB‚ˆYˆ
+	^Ù[XÚØYÙTØÜXˆX[™	^Ù[XÚØYÙTØÜX‹›ÚÈY\H	YHX[™Ú[JÙ]Q]T›Ü\H	^Ù[XÚØYÙTØÜXˆ	ØÚ[™ÙY	È
+HYÝ
+HÂˆ	Ý\È
+ÏH‘^Ù[9a¡z`ê8àk¸àæ8ààøàà8àïøàåxààøà¯øàïS8à¤¹bbºfiˆ	
+Ú[JÙ]Q]T›Ü\H	^Ù[XÚØYÙTØÜXˆ	ØÚ[™ÙY	È
+JH9.íˆ‚ˆH[ÙZYˆ
+	^Ù[XÚØYÙTØÜXˆX[™	^Ù[XÚØYÙTØÜX‹›ÚÈY\H	˜[ÙJHÂˆ	Ø\›š[™ÜÈ
+ÏH‘^Ù[9a¡z`ê8àæ8ààøàà8àïøàåxààøà¯øàïS8àk¹.¢ùbcybbºfi8àjùi,y¥eøàeøào¸àeøàgøà ÓÓz*+yk¦¸àiùbbºfi8à¤¹í¦º(c8àeøào¸àfNˆ	
+ÜÝš[™×JÙ]Q]T›Ü\H	^Ù[XÚØYÙTØÜXˆ	Ù\œ›Ü‰È	ÉÊJH‚ˆBˆ	Ý\È
+ÏH	ù. 9¦`¸à¬øàå8àï8à¤ºe¢øàcÉÂˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	ÛÜ[‰È	ÛÜšØ›ÛÚÒY	ÉÈBˆ	›ÛÚÈHÜ[‹Q^Ù[ÛÜšØ›ÛÚÔØY™H	^Ù[	\]	YBˆžHÈ	›ÛÚËÚXÚÐÛÛ\]Xš[]HH	˜[ÙHHØ]ÚÈB‚ˆ	[œÜXÝYH
+
+Bˆ	\™Ù]ÚY]˜[Y\ÈH
+
+Bˆ	ÚY]™[™\’[™›ÜÈH
+
+Bˆ	ÚY]ÛÝ[HˆžHÈ	ÚY]ÛÝ[HÚ[I›ÛÚË•ÛÜšÜÚY]ËÛÝ[HØ]ÚÈ	ÚY]ÛÝ[HBˆ	Y™\œ™Yš[ÛÛ[][šXØ][ÛˆHÙ]Q^Ù[š[ÛÛ[][šXØ][Û”ØY™H	^Ù[	˜[ÙBˆžHÂˆ›Üˆ
+	HHNÈ	H[H	ÚY]ÛÝ[È	JÊÊHÂˆ	ÜÈH	[ˆžHÂˆ	ÜÈH	›ÛÚË•ÛÜšÜÚY]Ë’][J	JBˆ	ÚY]˜[YHHÜÝš[™×IÜË“˜[YBˆ	š\ÚX›HH
+Ú[IÜË•š\ÚX›HY\HLJBˆYˆ
+	š\ÚX›HX[™	ÚY]˜[YH[X]Ú	×–ÌNWJÉ	ÊHÂˆ	\™Ù]ÚY]˜[Y\È
+ÏH	ÚY]˜[YBˆ	LHH	ÉÂˆžHÈ	LHHÜÝš[™×IÜË”˜[™ÙJ	ÐLIÊK•^HØ]ÚÈBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	LJJHÈ	LHH‰
+	Ø‹™š[S˜[YJHÈ	ÚY]˜[YHˆBˆÈ™XY[™ÈYÙTÙ]\”š[\™XH\È[›Ý\ˆÛÝÈÓÓHØ[[™\ÈÛ›HXYÛ›ÜÝXË‚ˆÈÙY\]›[šÈ[ˆ™[™\ˆÙÜÈÈ]›ÚY[^Z[™È¹/g9¢$‚ˆ	š[\™XHH	ÉÂˆ	[œÜXÝY
+ÏHÛÜ™\™YPÈÚY]˜[YHH	ÚY]˜[YNÈ]TÛÝ\˜ÙHH	ÐLIÎÈ]XÝY]HH	LNÈš[\™XHH	š[\™XHB‚ˆ	Ý\È
+ÏH¸à­øàï8àâ	ÚY]˜[YH8àk¹cl9b-ú*+yk¦¸à¤º*¯ù¥m‚ˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	ÜÚY]\Ù]\	È	ÛÜšØ›ÛÚÒY	ÚY]˜[YHBˆ\KTÝ[™\™š[Ù][™ÜÈ	ÜÈ	^Ù[	Y™\œ™Yš[ÛÛ[][šXØ][Û‚ˆ	Ý]ˆH›Ú[‹T]	ÛÛ[\ˆ‰ÚY]˜[YKœˆ‚ˆ	ÚY]™[™\’[™›ÜÈ
+ÏHÛÜ™\™YPÈÚY]˜[YHH	ÚY]˜[YNÈÝ]ˆH	Ý]ŽÈ]TÛÝ\˜ÙHH	ÐLIÎÈ]XÝY]HH	LNÈš[\™XHH	š[\™XHBˆBˆHš[˜[HÂˆ[›ÚÙKPÛÛT™[X\ÙH	ÜÂˆBˆBˆHš[˜[HÂˆYˆ
+	Y™\œ™Yš[ÛÛ[][šXØ][ÛŠHÈÝ›ÚYJÙ]Q^Ù[š[ÛÛ[][šXØ][Û”ØY™H	^Ù[	YJHBˆBˆYˆ
+	\™Ù]ÚY]˜[Y\ËÛÝ[Y\H
+HÂˆ	[\TYÙTÞ[˜ÈH\]KUÛÜšØ›ÛÚÔYÙ\Ñœ›ÛR[œÜXÝ[Ûˆ	[™ÝXYÙH	ÝXÝ\™H	Øˆ
+
+BˆÈKp©ÌËÎˆ9¥éù.%¹.èøàk¹`"ùb)ybbºfi8àkùnàù«h¸à ¹.%¹.èùcf9/cxàk¹£ úfi
+™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÊxàjù. 9§+9c%¸àfxà¢øà ‚ˆÈ9`"ùb)xàjù­¢8àfxàj8à y/çy£ xàeøài¸àa8à¢øàkøàf¸àk¹.%¹.èøàåxàªxàêøàà8àk¹.+z.ªøàc9«(9¤#xàfxà¢øà ‚ˆÙ]UÛÜšØ›ÛÚÔ™[™\™YÚY]Û˜\ÚÝ	Øˆ
+
+Bˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÈ\˜[J	Ý
+H	P
+Ù]P\œ˜^H	ÝÛÜšØ›ÛÚÜßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒY_Ù[XÝSØš™XÝQš\œÝJNÚYŠ	ÛÝ[
+^ÖÝ›ÚYJ\]KUÛÜšØ›ÛÚÔYÙ\Ñœ›ÛR[œÜXÝ[Ûˆ	[™ÝXYÙH	Ý	ÌH
+
+JNÔÙ]UÛÜšØ›ÛÚÔ™[™\™YÚY]Û˜\ÚÝ	ÌH
+
+_HHÝ]S[ˆ›ÝÈ	Ô¹c%¹kïº,hxàk¸à­øàï8àâ8àc8à`¸à¢¸ào¸àføà¤øà ¸à­øàï8àâ9d#xàc9cbº)ä¹¥l9keøàk¸àoûï"9/¢ÎˆK‹ûï"xàk¸à­øàï8àâ8à¤¹å*9¡#øàeøài¸àcøàh8àexàa8à ‰ÂˆB‚ˆ	˜]Ú™\Ý[H	[ˆYˆ
+
+	ÚY]™[™\’[™›ÜÊKÛÝ[YÝJHÂˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	Ø˜]Ú	È	ÛÜšØ›ÛÚÒY	ÉÈBˆ	Ý\È
+ÏHº)!ù¥l8à­øàï8àâ8à¤¹. 9¢ë¹c%Žˆ	
+
+	ÚY]™[™\’[™›ÜÊKÛÝ[
+H8à­øàï8àâ‚ˆ	˜]Ú™\Ý[H^ÜUÛÜšØ›ÛÚÔÚY]ÕÔ˜]Ú	^Ù[	›ÛÚÈ	ÚY]™[™\’[™›ÜÈ	\\‚ˆYˆ
+	˜]Ú™\Ý[X[™	˜]Ú™\Ý[›ÚÈY\H	YJHÂˆ	Ý\È
+ÏH	ù. 9¢ë¸à¤¸à­øàï8àâ9b)T¸àn9b!¹bl‰ÂˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	ÜÜ]	È	ÛÜšØ›ÛÚÒY	ÉÈBˆH[ÙHÂˆ	™X\ÛÛˆHÜÝš[™×JÙ]Q]T›Ü\H	˜]Ú™\Ý[	Ü™X\ÛÛ‰È	ÉÊBˆ	\ÙÈHÜÝš[™×JÙ]Q]T›Ü\H	˜]Ú™\Ý[	ÛY\ÜØYÙIÈ	ÉÊBˆYˆ
+	™X\ÛÛˆ[™H	ÜÚ[™ÛK\ÚY]	ÈX[™	™X\ÛÛˆ[™H	Ü˜›Þ][˜]˜Z[X›IÊHÂˆ	Ø\›š[™ÜÈ
+ÏH¹. 9¢ë¹c%¸à¤¹/oøàb8àj¸àbøàhøàgøàgøà yo¤ù§iy¥®yo#øàiùí¦º(c8àeøào¸àfNˆ	\ÙÈ‚ˆBˆBˆB‚ˆYˆ
+[›Ý
+	˜]Ú™\Ý[X[™	˜]Ú™\Ý[›ÚÈY\H	YJJHÂˆ›Ü™XXÚ
+	[™›È[ˆ
+	ÚY]™[™\’[™›ÜÊJHÂˆ	ÜÈH	[ˆžHÂˆ	ÚY]˜[YHHÜÝš[™×I[™›ËœÚY]˜[YBˆ	Ý\È
+ÏH¸à­øàï8àâ	ÚY]˜[YH8à¤”¹c%ˆ‚ˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	ÜÚY]	È	ÛÜšØ›ÛÚÒY	ÚY]˜[YHBˆ	ÜÈH	›ÛÚË•ÛÜšÜÚY]Ë’][J	ÚY]˜[YJBˆÝ›ÚYJ^ÜUÛÜšÜÚY]Ô”ØY™H	^Ù[	›ÛÚÈ	ÜÈ
+ÜÝš[™×I[™›Ë›Ý]ŠH	ÚY]˜[YH	YJBˆHš[˜[HÂˆ[›ÚÙKPÛÛT™[X\ÙH	ÜÂˆBˆBˆB‚ˆ	\ÙY˜]ÚÝ]]H
+	˜]Ú™\Ý[X[™	˜]Ú™\Ý[›ÚÈY\H	YJBˆ›Ü™XXÚ
+	[™›È[ˆ
+	ÚY]™[™\’[™›ÜÊJHÂˆ	ÚY]˜[YHHÜÝš[™×I[™›ËœÚY]˜[YBˆ	Ý]ˆHÜÝš[™×I[™›Ë›Ý]‚ˆÈ˜]Ú^Ü\ÈXØÙ\YÛ›HÚ[ˆÝ[YÙ\È\]X[È\™Ù]ÚY]ÛÝ[[™HÜ]\‚ˆÈÜš]\ÈÛ™HYÙH\ˆ\™Ù]ˆ]›ÚY™\™XY[™È]™\žHÜ]ˆ\ÝÈÛÝ[YÙ\Ë‚ˆ	YÙPÛÝ[HYˆ
+	\ÙY˜]ÚÝ]]
+HÈHH[ÙHÈÙ]T”YÙPÛÝ[	Ý]ˆBˆ	YÙUØ\›š[™ÜÈH
+
+BˆYˆ
+	YÙPÛÝ[YÝJHÈ	YÙUØ\›š[™ÜÈ
+ÏH¸àdøàk¸à­øàï8àâ8àk”¸àkÈ	YÙPÛÝ[8àæ¸àï8à®8àiøàfxà ‘^Ù[8àk¹cl9b-ùëá9fì¸àîù¥.xàæ¸àï8à®8àîù`#yã¡øà¤¹è®º*£xàeøài¸àcøàh8àexàa8à ˆˆBˆ	™[™\™Y
+ÏHÛÜ™\™YPÈÚY]˜[YHH	ÚY]˜[YNÈˆH	Ý]ŽÈYÙPÛÝ[H	YÙPÛÝ[ÈØ\›š[™ÜÈH	YÙUØ\›š[™ÜÈBˆBˆYˆ
+	™[™\™YÛÝ[Y\H
+HÂˆ›ÝÈ	Ô¸à¤¹/g9¢$8àiøàcxào¸àføà¤øàiøàeøàgøà ‘^Ù[8àk¹cl9b-ú*+yk¦¸ào¸àgøàkùkïº,hxà­øàï8àâ8à¤¹è®º*£xàeøài¸àcøàh8àexàa8à ‰ÂˆB‚ˆ	YÙTÞ[˜ÈH\]KUÛÜšØ›ÛÚÔYÙ\Ñœ›ÛR[œÜXÝ[Ûˆ	[™ÝXYÙH	ÝXÝ\™H	Øˆ	[œÜXÝYˆ	™[[Ý™YYÙ\ÈH
+Ù]P\œ˜^H
+Ù]Q]T›Ü\H	YÙTÞ[˜È	Ü™[[Ý™YYÙ\ÉÈ
+
+JJBˆYˆ
+	™[[Ý™YYÙ\ËÛÝ[YÝ
+HÂˆ	™[[Ý™Y˜[Y\ÈH
+	™[[Ý™YYÙ\È›Ü‘XXÚSØš™XÝÈÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÚY]˜[YIÈ	ÉÊHHÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÊHJBˆ	™[[Ý™YX™[HÜÝš[™×NŽ’›Ú[Š	øà IË	™[[Ý™Y˜[Y\ÊBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[[Ý™YX™[
+JHÈ	™[[Ý™YX™[H‰
+	™[[Ý™YYÙ\ËÛÝ[
+H8àæ¸àï8à®ˆBˆ	Ø\›š[™ÜÈ
+ÏH¹ãï¹g*8àk‘^Ù[8àjùkf9g*8àeøàj¸àa8à­øàï8àâ8à¤¸àæ¸àï8à®9©âù¢$8àbøà¢yi%¸àeøào¸àeøàgÎˆ	™[[Ý™YX™[‚ˆ	Ý\È
+ÏH¹kf9g*8àeøàj¸àa8à­øàï8àâ8àk¹cé8àa8àæ¸àï8à®8à¤¹bbºfiˆ	™[[Ý™YX™[‚ˆÈKp©ÌËÎˆ9¥éù.%¹.èøàk¹`"ùb)ybbºfi8àkùnàù«hŠ9."º*&8àj9d#8àf9ä!¹å,Jxà ‚ˆBˆÙ]UÛÜšØ›ÛÚÔ™[™\™YÚY]Û˜\ÚÝ	Øˆ
+Ù]Q]T›Ü\H	YÙTÞ[˜È	ÜÚY]˜[Y\ÉÈ
+
+JBˆ	YÙ\ÈH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÊBˆ›Ü™XXÚ
+	ˆ[ˆ	™[™\™Y
+HÂˆ	YÙRYH‰ÛÜšØ›ÛÚÒYI
+Ü™YÙ^NŽ”™\XÙJÜÝš[™×I‹œÚY]˜[YK	Ö×ŒNPKV˜K^—JÉË	ËIÊJH‚ˆ	H
+	YÙ\ÈÚ\™KSØš™XÝÈ
+™\ÛÛ™KTYÙRY	ÊHY\H	YÙRY[Üˆ
+ÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYX[™ÜÝš[™×IËœÚY]˜[YHY\HÜÝš[™×I‹œÚY]˜[YJHHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	ÛÝ[YÝ
+HÂˆ	™[HÙ]T™[]]™T]ÛÛ\]	ÛÜšÜÜXÙH
+ÜÝš[™×I‹œŠBˆÙ]S›ÝT›Ü\H
+	ÌJH	ØÛÛ[‰È	™[ˆÙ]S›ÝT›Ü\H
+	ÌJH	ÜÝ]\ÉÈ	Ü™[™\™Y	ÂˆÙ]S›ÝT›Ü\H
+	ÌJH	ÝØ\›š[™ÜÉÈ
+	‹Ø\›š[™ÜÊBˆÙ]S›ÝT›Ü\H
+	ÌJH	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊBˆBˆBˆ›Ü™XXÚ
+	[ˆ
+	YÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYX[™ÜÝš[™×IË˜ÛÛ[ˆX[™ÜÝš[™×IËœÝ]\ÈY\H	ØÛÛ™š\›YY	ÈJJHÂˆYˆ
+	ÛÝ\˜ÙR\Ú[™HÜÝš[™×IØ‹›\Ý™[™\™Y^Ù[\Ú
+HÈÙ]S›ÝT›Ü\H		ÜÝ]\ÉÈ	ÜÝ[IÈBˆBˆÈKp©Ì‹ˆÝ\œ™[^Ù[
+ˆ8àkÈØØ[‹U\]\È8àk¹l ¹§"xà ¸àë8àìøàà8àê¸àìøà¬8àkù¦î8àbøàj¸àa8à ‚ˆÈ8àë8àìøàà8àê¸àìøà¬9.+xàjùb)xàåøàëxà®øà®xàc9©'9çéxàeøàgù¥¬8àeøàa9âb8à¤¸à ycé8àa9âb8àk¸àãøààøà­øàéxàiù."¹¦î8àcxàeøàj¸àa8àgøà xà ‚ˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý™[™\™Y™\œÚ[Û’Y	È	™\œÚ[Û’YˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý™[™\™Y^Ù[\Ú	È	ÛÝ\˜ÙR\ÚˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý™[™\™Y]	È
+™]ËS›ÝÒ\ÛÊBˆÙ]UÛÜšØ›ÛÚÔ™[™\™YÚY]Û˜\ÚÝ	Øˆ
+Ù]Q]T›Ü\H	YÙTÞ[˜È	ÜÚY]˜[Y\ÉÈ
+
+JBˆÙ]S›ÝT›Ü\H	Øˆ	Ü™[™\”›Ùš[U™\œÚ[Û‰È	ØÜš\‘^Ù[š[›Ùš[U™\œÚ[Û‚ˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý\œ›Ü‰È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý\œ›Ü•\Ù\‰È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý\œ›Ü]	È	[ˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý™[™\][\\Ú	È	ÉÂˆYS›ÝT›Ü\RY“Z\ÜÚ[™È	Øˆ	Û\Ý™[™\“ÙÉÈ	ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	ÜÝ]\ÉÈ	Ü™[™\™Y][˜ÚXÚÙY	ÂˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý\œ›Ü‰È	ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý\œ›Ü•\Ù\‰È	ÉÂˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý\œ›Ü]	È	[ˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý™[™\][\\Ú	È	ÛÝ\˜ÙR\ÚˆÙ]S›ÝT›Ü\H	Øˆ	ÝØ\›š[™ÜÉÈ
+	Ø\›š[™ÜÊBˆ	ÙÔ™[H›ÙÜ×™[™\—ÉÛÜšØ›ÛÚÒYÉ™\œÚ[Û’YšœÛÛˆ‚ˆÙ]S›ÝT›Ü\H	Øˆ	Û\Ý™[™\“ÙÉÈ	ÙÔ™[ˆ	YÙTÞ[˜ÈH\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	Ý
+Bˆ	]\ÝP
+Ù]P\œ˜^H	ÝÛÜšØ›ÛÚÜßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒY_Ù[XÝSØš™XÝQš\œÝJBˆYŠ[›Ý	]\ÝÛÝ[
+^Ý›ÝÈ•ÛÜšØ›ÛÚøàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	ÛÜšØ›ÛÚÒYŸBˆ	ÏI]\ÝÌNÉÞ[˜ÏU\]KUÛÜšØ›ÛÚÔYÙ\Ñœ›ÛR[œÜXÝ[Ûˆ	[™ÝXYÙH	Ý	È	[œÜXÝYˆ›Ü™XXÚ
+	ˆ[ˆ	™[™\™Y
+^ÉYÙRYH‰ÛÜšØ›ÛÚÒYI
+Ü™YÙ^NŽ”™\XÙJÜÝš[™×I‹œÚY]˜[YK	Ö×ŒNPKV˜K^—JÉË	ËIÊJHŽÉÏP
+Ù]P\œ˜^H	ÝœYÙ\ßÚ\™KSØš™XÝÊ™\ÛÛ™KTYÙRY	ÊKY\H	YÙRY_Ù[XÝSØš™XÝQš\œÝJNÚYŠ	ËÛÝ[
+^ÔÙ]S›ÝT›Ü\H	ÖÌH	ØÛÛ[‰È
+Ù]T™[]]™T]ÛÛ\]	ÛÜšÜÜXÙH
+ÜÝš[™×I‹œŠJNÔÙ]S›ÝT›Ü\H	ÖÌH	ÜÝ]\ÉÈ	Ü™[™\™Y	ÎÔÙ]S›ÝT›Ü\H	ÖÌH	ÝØ\›š[™ÜÉÈ
+	‹Ø\›š[™ÜÊNÔÙ]S›ÝT›Ü\H	ÖÌH	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊ__BˆÈKp©Ì‹ˆÝ\œ™[^Ù[
+ˆ8àkøà¬øàå8àï8àeøàj¸àa
+ØØ[‹U\]\È8àk¹l ¹§"Jxà ‚ˆ›Ü™XXÚ
+	˜[YH[ˆ
+	Û\Ý™[™\™Y™\œÚ[Û’Y	Ë	Û\Ý™[™\™Y^Ù[\Ú	Ë	Û\Ý™[™\™Y]	Ë	Ü™[™\”›Ùš[U™\œÚ[Û‰Ë	Û\Ý\œ›Ü‰Ë	Û\Ý\œ›Ü•\Ù\‰Ë	Û\Ý\œ›Ü]	Ë	Û\Ý™[™\][\\Ú	Ë	ÝØ\›š[™ÜÉË	Û\Ý™[™\“ÙÉÊJ^ÔÙ]S›ÝT›Ü\H	È	˜[YH
+Ù]Q]T›Ü\H	Øˆ	˜[YH	[
+_BˆÙ]S›ÝT›Ü\H	È	Û\Ý™[™\™YÛ˜\ÚÝY	È
+ÜÝš[™×IÛÝ\˜ÙTÛ˜\ÚÝY
+BˆÙ]S›ÝT›Ü\H	È	Ü™[™\‘[š\›Û›Y[š[™Ù\œš[	È
+ÜÝš[™×IØÜš\Ý\œ™[™[™\‘[‘š[™Ù\œš[
+BˆÈKp©Í‹ŒÎˆ8àëxààøà«ùa¡xàiù§ 9¥¬8àkˆÝ\œ™[^Ù[\Ú8àj9ê xàcyd"8à£øàføàiˆÝ]\È8à¤¹¬n¸à xà¢øà ‚ˆÈ8àë8àìøàà8àê¸àìøà¬9.+xàjùa`Ñ^Ù[8àc9¦í9¥¬8àexà£8ài¸àa8à£8àl8à T¸àkù/çykf8àeøài8ài^Ù[]\]Y8àjù¢.øàfxà ‚ˆ	]\ÝÝ\œ™[\ÚH›Ü›X[^™KQš[R\Ú
+ÜÝš[™×JÙ]Q]T›Ü\H	È	ØÝ\œ™[^Ù[\Ú	È	ÉÊJBˆ	™[™\™Y\ÚH›Ü›X[^™KQš[R\Ú	ÛÝ\˜ÙR\ÚˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	]\ÝÝ\œ™[\Ú
+H[Üˆ	]\ÝÝ\œ™[\ÚY\H	™[™\™Y\Ú
+HÂˆÙ]S›ÝT›Ü\H	È	ÜÝ]\ÉÈ	Ü™[™\™Y][˜ÚXÚÙY	ÂˆH[ÙHÂˆÙ]S›ÝT›Ü\H	È	ÜÝ]\ÉÈ	Ù^Ù[]\]Y	Âˆ›Ü™XXÚ
+	Ìˆ[ˆ
+Ù]P\œ˜^H	ÝœYÙ\ßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYX[™ÜÝš[™×IËœÝ]\ÈY\H	Ü™[™\™Y	ßJJ^ÈÙ]S›ÝT›Ü\H	Ìˆ	ÜÝ]\ÉÈ	ÜÝ[IÈBˆBˆÙ]UÛÜšØ›ÛÚÔ™[™\™YÚY]Û˜\ÚÝ	È
+Ù]Q]T›Ü\H	Þ[˜È	ÜÚY]˜[Y\ÉÈ
+
+JBˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IË˜Ø]YÛÜžJNÉ›ÛÏP
+Ù]P\œ˜^H	ÝœYÙ\ßÚ\™KSØš™XÝÖÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒY_›Ü‘XXÚSØš™XÝÖÜÝš[™×IË›Û[Y__Ú\™KSØš™XÝÉÈX[™	È[™H	Û›Û™Iß_Ù[XÝSØš™XÝU[š\]YJNÓX\šËU›Û[YS™YYÔ™XZ[	Ý	[™ÝXYÙH	Ø]	›ÛÈ	Ü™[™\‰È	Ñ^Ù[8à¤Œy.í”¹/g9¢$8àeøào¸àeøàgÉÂˆ™]\›ˆ	Þ[˜ÂˆBˆÜš]KRœÛÛ‘š[H
+›Ú[‹T]	ÛÜšÜÜXÙH	ÙÔ™[
+H
+ÛÜ™\™YPÈÛÜšØ›ÛÚÒYH	ÛÜšØ›ÛÚÒYÈ™[™\™YH	™[™\™YÈØ\›š[™ÜÈH	Ø\›š[™ÜÎÈÝ\ÈH	Ý\ÎÈÚY]Þ[˜ÈH	YÙTÞ[˜ÎÈ]H™]ËS›ÝÒ\ÛÈJBˆÈKTNˆ:)èù§¤8àkøàdøàdøàiøàkùk§ú(c8àeøàj¸àa8à ‚ˆÈ8àë8àìøàà8àê¸àìøà¬9å*^Ù[8à¤ºe¢øàa8àgøào¸ào¸à xàë8àìøàà8àê¸àìøà¬8àëxààøà«øà¤¹/çy£ xàeøàgøào¸àoº)èù§¤8àfxà¢øàj8à BˆÈ9«å:/ ùå*8àk¹a£xàë8àìøàà8àê¸àìøà¬8àc¸ài9æë¸àk‘^Ù[ÓÓxà¤º-mùbåxàeøài¸àeøào¸àaŠxà®8àéøàå¹b-ºfd8àjùcãxàfxà¢Êxà ‚ˆÈ8àëxààøà«ú)èù¥/¹o£8àjùk§ú(c8àfxà¢øàgøà xà ykïº,hxàh8àdxà¤º*&:c,¸àeøài¸àb¸àcøà ‚ˆ	ØÜš\”[™[™Ð[˜[\Ú\ÈHÛÜ™\™YPÈ[™ÝXYÙHH	[™ÝXYÙNÈÛÜšØ›ÛÚÒYH	ÛÜšØ›ÛÚÒYÈÛ˜\ÚÝYHÜÝš[™×IÛÝ\˜ÙTÛ˜\ÚÝYÈ™\œÚ[Û’YH	™\œÚ[Û’YÈ™[™\™YH	™[™\™YBˆ™[[Ý™KUÛÜšØ›ÛÚÐÛÛ[œÈ	ÛÜšÜÜXÙH	ÛÜšØ›ÛÚÒY	™\œÚ[Û’YˆHš[˜[HÂˆYˆ
+	›ÛÚÊHÈžHÈ	›ÛÚËÛÜÙJ	˜[ÙJHHØ]ÚÈHÈ[›ÚÙKPÛÛT™[X\ÙH	›ÛÚÈBˆYˆ
+	ÝÛœÑ^Ù[X[™	^Ù[
+HÈÛÜÙKQ^Ù[\XØ][Û‘›Ü”™[™\ˆ	^Ù[BˆYˆ
+\ÝT]S]\˜[]	\\ŠHÈ™[[Ý™KR][HS]\˜[]	\\ˆT™XÝ\œÙHQ›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\[Y\˜[Ø\\™RY
+JHÈ™[[Ý™KQ\[Y\˜[ÛÜH	[™ÝXYÙH	\[Y\˜[Ø\\™RYBˆYˆ
+	ÝÛœÑ^Ù[[Üˆ[›Ý	ÙY\^Ù[Ü[ŠHÈÑÐ×NŽÛÛXÝ
+
+NÈÑÐ×NŽ•ØZ]›Ü”[™[™Ñš[˜[^™\œÊ
+HBˆBˆ™]\›ˆÛÜ™\™YPÈÛÜšØ›ÛÚÒYH	ÛÜšØ›ÛÚÒYÈ™\œÚ[Û’YH	™\œÚ[Û’YÈ™[™\™YH	™[™\™YÈØ\›š[™ÜÈH	Ø\›š[™ÜÎÈÝ\ÈH	Ý\ÎÈÚY]Þ[˜ÈH	YÙTÞ[˜ÈBˆB‚ˆÈKTNˆ8àdøàdøàiøàkøàë8àìøàà8àê¸àìøà¬8àëxààøà«øà ‘^Ù[8à º)èù¥/¹®"8àoøà ‚ˆÈ9«å:/ ùå*8àk¹a£xàë8àìøàà8àê¸àìøà¬8àc9oáz) xàjøàj¸àhøài¸à ¸à y¥.xà xài¹alz`&¸àëxààøà«øà¤¹cå¸à¢¹æí8àføà¢øà ‚ˆÈ:)èù§¤8àk¹i,y¥eøàkÔ¹/g9¢$8àk¹i,y¥eøàjøàeøàj¸àa
+9b)9k¦¸àkÈ[šÛ›ÝÛˆ8àjøàj¸à¢Êxà ‚ˆÈKTÎˆÙY\^Ù[Ü[ˆ8àk¸àj8àcJ	ØÜš\”[™[™Ð[˜[\Ú\È8à¤¹do9aî¹a`øàc9fç¹cã¸àfxà¢ù. 9¢ë8à®8àéøàåŠxàkÂˆÈ8àdøàdøàiù­¢8àeøài¸àkøàj¸à¢xàj¸àa8à ¹.éybcxàkùá(y§hy.í¸àjÈ	[8à¤¹.èùaixàeøài¸àa8àgøàgøà xà BˆÈ[›ÚÙKT™[™\’›Ø‘œ›ÛQš[H8àkˆ	Y™\œ™Y[˜[\Ù\È8àc9n.8àjùên¸àjøàj¸à¢¸à BˆÈ9å.ù`ãøàãøààøà­øàéxàkº)èù§¤8àc9. 9n©¸à ¹k§ú(c8àexà£8ài¸àa8àj¸àbøàhøàgÊ™[™\œÈ8àåxàªxàêøàà8àc9/g8à¢xà£8àj¸àa
+xà ‚ˆYˆ
+	ÙY\^Ù[Ü[ŠHÈ™]\›ˆ	™[™\”™\Ý[Bˆ	[™[™ÈH	ØÜš\”[™[™Ð[˜[\Ú\Âˆ	ØÜš\”[™[™Ð[˜[\Ú\ÈH	[ˆYˆ
+	[[™H	[™[™ÊHÂˆžHÈÝ›ÚYJ[›ÚÙKTÜÝ™[™\[˜[\Ú\È
+ÜÝš[™×I[™[™Ë›[™ÝXYÙJH
+ÜÝš[™×I[™[™ËÛÜšØ›ÛÚÒY
+H
+ÜÝš[™×I[™[™ËœÛ˜\ÚÝY
+H
+ÜÝš[™×I[™[™Ë™\œÚ[Û’Y
+H	[™[™Ëœ™[™\™Y
+HBˆØ]ÚÈÜš]KUØ\›š[™È
+	ùå.ù`ãøàãøààøà­øàéxàkº)èù§¤8àjùi,y¥eøàeøào¸àeøàgÎˆ	È
+È	Ë‘^Ù\[Û‹“Y\ÜØYÙJHBˆBˆ™]\›ˆ	™[™\”™\Ý[ŸB‚™[˜Ý[ÛˆØØ[‹U\]\ÊÜÝš[™×I[™ÝXYÙKÜØÜš\›ØÚ×I›ÙÜ™\ÜÐØ[˜XÚÈH	[Ø›ÛÛI›Ü˜ÙR\ÚH	˜[ÙJHÂˆ	]ÈHÙ]T]Âˆ	Û˜\ÚÝHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	Ú[™ÙYH
+
+Bˆ	ØØ[›™YHÈ	\ÚYHÈ	Y]Y]SÛ›HHˆ	\ÝH
+Ù]P\œ˜^H	Û˜\ÚÝÛÜšØ›ÛÚÜÊBˆ	[™^Hˆ›Ü™XXÚ
+	Û˜\[ˆ	\Ý
+HÂˆ	[™^
+ÊÂˆYˆ
+	›ÙÜ™\ÜÐØ[˜XÚÊHÈ	ˆ	›ÙÜ™\ÜÐØ[˜XÚÈ	[™^	\ÝÛÝ[
+ÜÝš[™×IÛ˜\ÛÜšØ›ÛÚÒY
+H
+ÜÝš[™×IÛ˜\™\Ü^S˜[YJHBˆ	YHÜÝš[™×IÛ˜\ÛÜšØ›ÛÚÒYˆžHÈ	[H›Ú[‹TØY™H
+ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ŠH
+ÜÝš[™×IÛ˜\œ™[]]™T]
+HHØ]ÚÈÛÛ[YHBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[
+JHÂˆ	YZ\ÜÚ[™ÈH\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	Ý
+Bˆ	›Ý[™H
+Ù]P\œ˜^H	ÝÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	YHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	›Ý[™ÛÝ[Y\H
+HÈ™]\›ˆ	˜[ÙHBˆ	ÈH	›Ý[™ÌBˆ	Ø\ÓZ\ÜÚ[™ÈH
+ÜÝš[™×IËœÝ]\ÈY\H	ÛZ\ÜÚ[™ÉÊBˆÙ]S›ÝT›Ü\H	È	ÜÝ]\ÉÈ	ÛZ\ÜÚ[™ÉÂˆYˆ
+[›Ý	Ø\ÓZ\ÜÚ[™ÊHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IË˜Ø]YÛÜžJBˆ	›ÛÈH
+Ù]P\œ˜^H	ÝœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	YH›Ü‘XXÚSØš™XÝÈÜÝš[™×IË›Û[YHHÚ\™KSØš™XÝÈ	ÈX[™	È[™H	Û›Û™IÈHÙ[XÝSØš™XÝU[š\]YJBˆX\šËU›Û[YS™YYÔ™XZ[	Ý	[™ÝXYÙH	Ø]	›ÛÈ	Ù^Ù[]\]Y	È	ùa`Ñ^Ù[8àc:)¢øài8àbøà¢¸ào¸àføà¤ÉÂˆBˆ™]\›ˆ
+[›Ý	Ø\ÓZ\ÜÚ[™ÊBˆBˆYˆ
+	YZ\ÜÚ[™ÊHÈ	Ú[™ÙY
+ÏH	YBˆÛÛ[YBˆBˆ	][HHÙ]R][HS]\˜[]	[ˆ	ØØ[›™Y
+ÊÂˆ	XÚÜÈHÜÝš[™×I][K“\ÝÜš]U[YU]Ë•XÚÜÂˆ	Ú^™HHÚ[I][K“[™Ýˆ	[ÙYšYYH	][K“\ÝÜš]U[YK•ÔÝš[™Ê	Þ^^^KSSKY›[NœÜÞžž‰ÊBˆ	Û›ÝÛ•XÚÜÈHÜÝš[™×JÙ]Q]T›Ü\H	Û˜\	ØÝ\œ™[^Ù[\ÝÜš]U]ÕXÚÜÉÈ	ÉÊBˆ	Û›ÝÛ”Ú^™HHÚ[JÙ]Q]T›Ü\H	Û˜\	ØÝ\œ™[^Ù[Ú^™IÈLJBˆ	\ÚHÜÝš[™×JÙ]Q]T›Ü\H	Û˜\	ØÝ\œ™[^Ù[\Ú	È	ÉÊBˆ	]\Ý\ÚH	›Ü˜ÙR\Ú[Üˆ	Û›ÝÛ•XÚÜÈ[™H	XÚÜÈ[Üˆ	Û›ÝÛ”Ú^™H[™H	Ú^™H[ÜˆÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ú
+BˆYˆ
+	]\Ý\Ú
+HÈžHÈ	\ÚH™]ËTÝX›R\Ú	[È	\ÚY
+ÊÈHØ]ÚÈ	\ÚH	ÉÈHH[ÙHÈ	Y]Y]SÛ›JÊÈBˆ	YH\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	Ý
+Bˆ	›Ý[™H
+Ù]P\œ˜^H	ÝÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	YHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	›Ý[™ÛÝ[Y\H
+HÈ™]\›ˆ	˜[ÙHBˆ	ÈH	›Ý[™ÌBˆ	™]š[Ý\Ò\ÚHÜÝš[™×JÙ]Q]T›Ü\H	È	ØÝ\œ™[^Ù[\Ú	È	ÉÊBˆ	™]š[Ý\ÔÝ]\ÈHÜÝš[™×JÙ]Q]T›Ü\H	È	ÜÝ]\ÉÈ	ÉÊBˆ	\Ý™[™\™YHÜÝš[™×JÙ]Q]T›Ü\H	È	Û\Ý™[™\™Y^Ù[\Ú	È	ÉÊBˆÙ]S›ÝT›Ü\H	È	ØÝ\œ™[^Ù[[ÙYšYY]	È	[ÙYšYYˆÙ]S›ÝT›Ü\H	È	ØÝ\œ™[^Ù[\ÝÜš]U]ÕXÚÜÉÈ	XÚÜÂˆÙ]S›ÝT›Ü\H	È	ØÝ\œ™[^Ù[Ú^™IÈ	Ú^™BˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ú
+JHÈÙ]S›ÝT›Ü\H	È	ØÝ\œ™[^Ù[\Ú	È	\ÚBˆ	›Ùš[SÛH
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y
+JHX[™
+
+Ù]R[]T›Ü\H	È	Ü™[™\”›Ùš[U™\œÚ[Û‰È
+H[	ØÜš\‘^Ù[š[›Ùš[U™\œÚ[ÛŠBˆ	Ý[HH
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y
+JHX[™
+
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ú
+JH[Üˆ	\Ú[™H	\Ý™[™\™Y[Üˆ	›Ùš[SÛ
+BˆYˆ
+	Ý[JHÂˆÙ]S›ÝT›Ü\H	È	ÜÝ]\ÉÈ	Ù^Ù[]\]Y	Âˆ›Ü™XXÚ
+	YÙH[ˆ
+Ù]P\œ˜^H	ÝœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	YX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IË˜ÛÛ[ŠHJJHÈÙ]S›ÝT›Ü\H	YÙH	ÜÝ]\ÉÈ	ÜÝ[IÈBˆ	™]ÛQ]XÝYH
+	™]š[Ý\ÔÝ]\È[™H	Ù^Ù[]\]Y	ÊH[Üˆ
+	™]š[Ý\Ò\Ú[™H	\Ú
+BˆYˆ
+	™]ÛQ]XÝY
+HÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IË˜Ø]YÛÜžJBˆ	›ÛÈH
+Ù]P\œ˜^H	ÝœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	YH›Ü‘XXÚSØš™XÝÈÜÝš[™×IË›Û[YHHÚ\™KSØš™XÝÈ	ÈX[™	È[™H	Û›Û™IÈHÙ[XÝSØš™XÝU[š\]YJBˆX\šËU›Û[YS™YYÔ™XZ[	Ý	[™ÝXYÙH	Ø]	›ÛÈ	Ù^Ù[]\]Y	È	ùa`Ñ^Ù[8àcy.í¹¦í9¥¬8àexà£8ào¸àeøàgÉÂˆBˆ™]\›ˆ	™]ÛQ]XÝYˆBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y
+JHÂˆYˆ
+ÜÝš[™×IËœÝ]\È[™H	Ü™[™\‹Y\œ›Ü‰ÊHÈÙ]S›ÝT›Ü\H	È	ÜÝ]\ÉÈ	Û™]ÉÈBˆH[ÙHÈÙ]S›ÝT›Ü\H	È	ÜÝ]\ÉÈ	Ü™[™\™Y][˜ÚXÚÙY	ÈBˆ™]\›ˆ	˜[ÙBˆBˆYˆ
+	Y
+HÈ	Ú[™ÙY
+ÏH	YBˆBˆ™]\›ˆÛÜ™\™YPÈÚ[™ÙYÛÜšØ›ÛÚÒYÏP
+	Ú[™ÙYÙ[XÝSØš™XÝU[š\]YJNÈØØ[›™YIØØ[›™YÈ\ÚYI\ÚYÈY]Y]SÛ›OIY]Y]SÛ›NÈ›Ü˜ÙR\ÚVØ›ÛÛI›Ü˜ÙR\ÚBŸB‚™[˜Ý[ÛˆÙ]P]]Ô™[™\•ÛÜšØ›ÛÚÒYÊÜÝš[™×I[™ÝXYÙKÜÝš[™Ö×WI™Y™\œ™YYËÜÝš[™×IØ]YÛÜžHH	ÉÊHÂˆ	ÝXÝ\™HHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	™Y™\œ™YH
+	™Y™\œ™YYÈÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÊHJBˆ	\ÙT™Y™\œ™YH
+	™Y™\œ™YÛÝ[YÝ
+Bˆ	Ø]YÛÜžS›Ü›X[^™YH›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžH	ÉÂˆ	YÈH
+
+Bˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÊJHÂˆ	YHÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]YÛÜžS›Ü›X[^™Y
+HX[™[›Ý
+\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	Øˆ	Ø]YÛÜžS›Ü›X[^™Y
+JHÈÛÛ[YHBˆYˆ
+	\ÙT™Y™\œ™YX[™
+
+	™Y™\œ™YÚ\™KSØš™XÝÈ	ÈY\H	YJKÛÝ[Y\H
+JHÈÛÛ[YHBˆYˆ
+ÜÝš[™×IØ‹œÝ]\ÈY\H	ÛZ\ÜÚ[™ÉÊHÈÛÛ[YHBˆ	™YYÈH	˜[ÙBˆ	Ý]\ÈHÜÝš[™×IØ‹œÝ]\Âˆ	Ý\œ™[\ÚHÜÝš[™×IØ‹˜Ý\œ™[^Ù[\Úˆ	\Ý™[™\™Y\ÚHÜÝš[™×IØ‹›\Ý™[™\™Y^Ù[\Úˆ	\Ý][\\ÚHÜÝš[™×IØ‹›\Ý™[™\][\\Úˆ	™[™\”›Ùš[SÝ]]YH
+
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y\Ú
+JHX[™
+
+Ù]R[]T›Ü\H	Øˆ	Ü™[™\”›Ùš[U™\œÚ[Û‰È
+H[	ØÜš\‘^Ù[š[›Ùš[U™\œÚ[ÛŠJBˆYˆ
+	Ý]\ÈY\H	Ü™[™\‹Y\œ›Ü‰ÊHÂˆÈHˆ]Ûˆ\È[ˆ^XÚ]™]žKˆH™]š[Ý\È™[™\‹Y\œ›Üˆ]\Ý›ÝXZÙBˆÈH]ÛˆÛÚÈYH\Ý™XØ]\ÙHHØ[YHš[H\Ú[™XYH˜Z[YÛ˜ÙK‚ˆ	™YYÈH	YBˆH[ÙHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	\Ý™[™\™Y\Ú
+JHÈ	™YYÈH	YHBˆYˆ
+	Ý]\ÈZ[ˆ
+	Û™]ÉË	Ù^Ù[]\]Y	ÊJHÈ	™YYÈH	YHBˆYˆ
+	™[™\”›Ùš[SÝ]]Y
+HÈ	™YYÈH	YHBˆYˆ
+
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý\œ™[\Ú
+JHX[™
+	Ý\œ™[\Ú[™H	\Ý™[™\™Y\Ú
+JHÈ	™YYÈH	YHBˆYˆ
+	\ÙT™Y™\œ™Y
+HÈ	™YYÈH	YHBˆBˆYˆ
+	™YYÊHÈ	YÈ
+ÏH	YBˆBˆ™]\›ˆ
+	YÈÙ[XÝSØš™XÝU[š\]YJBŸB‚™[˜Ý[Ûˆ[›ÚÙKP]]Ô™[™\ŠÜÝš[™×I[™ÝXYÙKÜÝš[™Ö×WIÛÜšØ›ÛÚÒYÊHÂˆYˆ
+	ØÜš\]]Ô™[™\’[”›ÙÜ™\ÜÊHÂˆ™]\›ˆÛÜ™\™YPÈÚÚ\YH	YNÈ™X\ÛÛˆH	Ø]]Ë\™[™\‹X\ÞIÎÈ™\Ý[ÈH
+
+NÈ]H™]ËS›ÝÒ\ÛÈBˆBˆ	ØÜš\]]Ô™[™\’[”›ÙÜ™\ÜÈH	YBˆžHÂˆ™\Ù]T™[™\‘[š\›Û›Y[›Ü’›ØˆÈKp©Í‹ˆ8à®8àéøàåºe¢ùiâøàe8àj8àjùä¬9h øà¤¹cå¸à¢¹æí8àfBˆ	ØØ[ˆHØØ[‹U\]\È	[™ÝXYÙH	[	˜[ÙBˆ	YÈHÙ]P]]Ô™[™\•ÛÜšØ›ÛÚÒYÈ	[™ÝXYÙH	ÛÜšØ›ÛÚÒYÈ	ÉÂˆ	™\Ý[ÈH
+
+Bˆ›Ü™XXÚ
+	Y[ˆ	YÊHÂˆžHÂˆ	ˆH™[™\‹UÛÜšØ›ÛÚÈ	[™ÝXYÙH	Yˆ	–ÉÛÚÉ×HH	YBˆ	™\Ý[È
+ÏH	‚ˆHØ]ÚÂˆ	\ÙÈH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆ	\Ù\“\ÙÈHÛÛ™\ËU\Ù\”™[™\‘\œ›Üˆ	\ÙÂˆ	]HÙ]S\Ý™[™\][\›Üˆ	Yˆ	\œ›Ü‘]Z[HÙ]Q\œ›Ü‘]Z[	ÂˆÙ]UÛÜšØ›ÛÚÔ™[™\‘\œ›Üˆ	[™ÝXYÙH	Y	\ÙÈ	\œ›Ü‘]Z[
+ÜÝš[™×I]œÛ˜\ÚÝY
+H
+ÜÝš[™×I]š\Ú
+Bˆ	™\Ý[È
+ÏHÛÜ™\™YPÈÚÈH	˜[ÙNÈÛÜšØ›ÛÚÒYH	YÈ\œ›ÜˆH	\ÙÎÈ\Ù\‘\œ›ÜˆH	\Ù\“\ÙÎÈ]Z[H	\œ›Ü‘]Z[BˆBˆBˆ	\Ñ\œ›ÜœÈH	˜[ÙBˆ›Ü™XXÚ
+	œˆ[ˆ	™\Ý[ÊHÈžHÈYˆ
+	œ‹ÛÛZ[œÊ	ÛÚÉÊHX[™	œ–ÉÛÚÉ×HY\H	˜[ÙJHÈ	\Ñ\œ›ÜœÈH	YHHHØ]ÚÈHBˆ™]\›ˆÛÜ™\™YPÈÚÚ\YH	˜[ÙNÈØØ[›™YH	ØØ[ŽÈÛÜšØ›ÛÚÒYÈH	YÎÈ™\Ý[ÈH	™\Ý[ÎÈ\Ñ\œ›ÜœÈH	\Ñ\œ›ÜœÎÈ]H™]ËS›ÝÒ\ÛÈBˆHš[˜[HÂˆ	ØÜš\“\ÝX\™X]]ÈHÑ]U[YWNŽ•]Ó›ÝÂˆ	ØÜš\]]Ô™[™\’[”›ÙÜ™\ÜÈH	˜[ÙBˆBŸB‚‚™[˜Ý[ÛˆÙ]T™[™\’›Ø‘\ŠÜÝš[™×I[™ÝXYÙJHÂˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙBˆ	\ˆH›Ú[‹T]	ÛÜšÜÜXÙH	ÜÝ]W›ØœÉÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\ŠJHÈ™]ËR][HR][U\H\™XÝÜžHT]	\ˆQ›Ü˜ÙHÝ]S[Bˆ™]\›ˆ	\‚ŸB‚™[˜Ý[ÛˆÜš]KT™[™\’›Ø”Ý]\ÊÜÝš[™×IÝ]\Ô]	Ý]\ÊHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý]\Ô]
+JHÈ™]\›ˆBˆžHÂˆÙ]S›ÝT›Ü\H	Ý]\È	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊBˆ	œÛÛˆHÛÛ™\ËRœÛÛˆR[œ]Øš™XÝ	Ý]\ÈQ\LˆÜš]KU]Ž›Ð›ÛQš[TÚ\™Y	Ý]\Ô]	œÛÛ‚ˆHØ]ÚÂˆÈ›ÙÜ™\ÜÈ”ÓÓˆ\È™XYœ™\]Y[HžHHœ›ÝÜÙ\ˆÚ[HH˜XÚÙÜ›Ý[™ÝÙ\”Ú[›ØˆÜš]\È]‚ˆÈYˆÚ\™YÜš]H˜Z[Ë˜[˜XÚÈÈHÙ[™\šXÈÜš]\ˆ[™ÙÈH˜Z[\™K]È›ÝÝÜ^Ù[‚ˆžHÈÜš]KRœÛÛ‘š[H	Ý]\Ô]	Ý]\ÈHØ]ÚÈBˆžHÂˆ	\œ”]H‰Ý]\Ô]Üš]KY\œ›Ü‹›ÙÈ‚ˆYPÛÛ[S]\˜[]	\œ”]Q[˜ÛÙ[™ÈUŽU˜[YH
+žÌHÌ_HˆYˆ
+™]ËS›ÝÒ\ÛÊK	Ë‘^Ù\[Û‹“Y\ÜØYÙJBˆHØ]ÚÈBˆBŸB‚™[˜Ý[Ûˆ›Ü›X[^™KT™[™\’›Ø’Y
+ÜÝš[™×I›Ø’Y
+HÂˆ	˜[YHH
+ÜÝš[™×I›Ø’Y
+K•š[J
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ™]\›ˆ	ÉÈBˆžHÈ	˜[YHHÕ\šWNŽ•[™\ØØ\Q]TÝš[™Ê	˜[YJK•š[J
+HHØ]ÚÈB‚ˆÈœ›ÝÜÙ\ˆÈ™]ÚÈ›ÞHY™™\™[˜Ù\ÈÚÝ[›Ý™HX›HÈœ™XZÈ›ÙÜ™\ÜÈÛ[™Ë‚ˆÈXØÙ\H^XÝ›ØˆY[™[ÛÈ™XÛÝ™\ˆ]Yˆ]Ø\ÈXØÚY[[HÝš[™ÚYšYYˆÈÙÙ]\ˆÚ][›Ý\ˆ]Y\žHÝš[™ÈÜˆHÛX[Ü˜\\ˆØš™XÝ‚ˆYˆ
+	˜[YH[X]Ú	ÊÚJJ›Ø—ÖÌNW^ÎWÖÌNW^ÍŸWÖÌNXKY—^ÎJIÊHÂˆ™]\›ˆ	X]Ú\ÖÌWK•ÓÝÙ\’[˜\šX[
+
+BˆBˆ™]\›ˆ	ÉÂŸB‚™[˜Ý[Ûˆ™XYT™[™\’›Ø”Ý]\ÊÜÝš[™×I[™ÝXYÙKÜÝš[™×I›Ø’Y
+HÂˆ	›Ü›X[^™Y›Ø’YH›Ü›X[^™KT™[™\’›Ø’Y	›Ø’YˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	›Ü›X[^™Y›Ø’Y
+JHÂˆ›ÝÈ	Ô¹/g9¢$8à®8àéøàå¸àk¹ áyh,xà¤¹cåøàdycå¸à£8ào¸àføà¤øàiøàeøàgøà ¸à ¸àa¹. 9n©¸à#¹/g9¢$8à#xà¤¹¢¯8àeøài¸àcøàh8àexàa8à ‰ÂˆBˆ	›Ø‘\ˆHÙ]T™[™\’›Ø‘\ˆ	[™ÝXYÙBˆ	]H›Ú[‹T]	›Ø‘\ˆ‰›Ü›X[^™Y›Ø’YœÝ]\ËšœÛÛˆ‚ˆ›Üˆ
+	][\HÈ	][\[È	][\
+ÊÊHÂˆYˆ
+\ÝT]S]\˜[]	]
+HÂˆžHÂˆ	›ØˆH™XYRœÛÛ‘š[H	]	[ˆYˆ
+	[[™H	›ØŠHÂˆžHÂˆ	Ý]\Õ^H
+ÜÝš[™×I›Ø‹œÝ]\ÊK•ÓÝÙ\’[˜\šX[
+
+Bˆ	\›Z[˜[H
+	ØÛÛ\]Y	Ë	ØÛÛ\]Y]Ú]Y\œ›ÜœÉË	Ù˜Z[Y	Ë	ÛZ\ÜÚ[™ÉË	ØØ[˜Ù[Y	ÊBˆYˆ
+	\›Z[˜[[›ÝÛÛZ[œÈ	Ý]\Õ^
+HÂˆ	][HHÙ]R][HS]\˜[]	]Q\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YBˆ	YÙTÙXÛÛ™ÈHYˆ
+	][JHÈ
+Ñ]U[YWNŽ•]Ó›ÝÈH	][K“\ÝÜš]U[YU]ÊK•Ý[ÙXÛÛ™ÈH[ÙHÈBˆ	›ØÙ\ÜÒYHÙ]R[]T›Ü\H	›Øˆ	Ü›ØÙ\ÜÒY	ÈˆYˆ
+	›ØÙ\ÜÒYYÝ
+HÂˆ	[]™HH	˜[ÙBˆžHÈ	[]™HH	[[™H
+Ù]T›ØÙ\ÜÈRY	›ØÙ\ÜÒYQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YJHHØ]ÚÈ	[]™HH	˜[ÙHBˆYˆ
+
+[›Ý	[]™JHX[™	YÙTÙXÛÛ™ÈYÝL
+HÂˆ	›ØˆHÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[H	]	›Øˆ	Ô¹/g9¢$8àåøàëxà®øà®xàc9í`¹.¡¸àeøài¸àa8àgøàgøà y`g9«h¸àeøào¸àeøàgøà ¸à ¸àa¹. 9n©”¹/g9¢$8à¤¹¢¯8àeøài¸àcøàh8àexàa8à ‰ÂˆH[ÙZYˆ
+	[]™HX[™
+	Ý]\Õ^Y\H	Ü]Y]YY	È[Üˆ	Ý]\Õ^Y\H	Û][˜Ú[™ÉÊHX[™	YÙTÙXÛÛ™ÈYÝL
+HÂˆÈHX[HÚ[›ØÙ\ÜÈ™]Üš]\È]Y]YYÛ][˜Ú[™ÈOˆ[›š[™ËˆÚ]™HÝÙ\”Ú[Ñ^Ù[Ý\\ˆÈ[›ÝYÚ›ÛÛK]È›ÝX]™HHRH]H[š]X[\˜Ù[›Ü™]™\‹‚ˆ	›ØˆHÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[H	]	›Øˆ	Ô¹/g9¢$8àåøàëxà®øà®xàkú-mùbåxàeøào¸àeøàgøàc8à xà®8àéøàå¹aé¹ä!¸àjùaixà£8ào¸àføà¤øàiøàeøàgøà ‘^Ù[8à¤ºe¢xàf8ài¸àbøà¢xà xà ¸àa¹. 9n©”¹/g9¢$8à¤¹¢¯8àeøài¸àcøàh8àexàa8à ‰ÂˆBˆH[ÙZYˆ
+	YÙTÙXÛÛ™ÈYÝL
+HÂˆ	›ØˆHÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[H	]	›Øˆ	Ô¹/g9¢$8à®8àéøàå¸àc9.+y¥«xàexà£8ài¸àa8ào¸àeøàgøà ¸à ¸àa¹. 9n©”¹/g9¢$8à¤¹¢¯8àeøài¸àcøàh8àexàa8à ‰ÂˆBˆBˆHØ]ÚÈBˆ™]\›ˆ	›Ø‚ˆBˆHØ]ÚÔÞ\Ý[K’SË’SÑ^Ù\[Û—HÂˆÝ\TÛY\SZ[\ÙXÛÛ™È
+Ì
+È
+ÍH
+ˆ	][\
+JBˆHØ]ÚÔÞ\Ý[K•[˜]]Üš^™YXØÙ\ÜÑ^Ù\[Û—HÂˆÝ\TÛY\SZ[\ÙXÛÛ™È
+Ì
+È
+ÍH
+ˆ	][\
+JBˆBˆH[ÙHÂˆÝ\TÛY\SZ[\ÙXÛÛ™È
+Ì
+È
+ÍH
+ˆ	][\
+JBˆBˆB‚ˆ	[œ]]H›Ú[‹T]	›Ø‘\ˆ‰›Ü›X[^™Y›Ø’Yš[œ]šœÛÛˆ‚ˆ	Ý[HˆžHÂˆ	[œ]H™XYRœÛÛ‘š[H	[œ]]	[ˆYˆ
+	[œ]X[™	[œ]ÛÜšØ›ÛÚÒYÊHÈ	Ý[H
+Ù]P\œ˜^H	[œ]ÛÜšØ›ÛÚÒYÊKÛÝ[BˆHØ]ÚÈBˆ™]\›ˆÛÜ™\™YPÂˆÚÈH	YBˆ›Ø’YH	›Ü›X[^™Y›Ø’YˆÝ]\ÈH	Ü]Y]YY	ÂˆÝ[H	Ý[ˆÛÛ\]YHˆ˜Z[YHˆ\˜Ù[HˆY\ÜØYÙHH	Ô¹/g9¢$8à®8àéøàå¸à¤¹®¥¹`¦xàeøài¸àa8ào¸àfxà ‰ÂˆÝ\œ™[ÛÜšØ›ÛÚÒYH	ÉÂˆÝ\œ™[ÛÜšØ›ÛÚÓ˜[YHH	ÉÂˆÝ\œ™[ÚY]H	ÉÂˆ™\Ý[ÈH
+
+Bˆ\œ›ÜœÈH
+
+Bˆ\]Y]H	ÝØZ][™ËY›Ü‹\Ý]\ËYš[IÂˆÝ]TØ]™Y]H	ÉÂˆ˜[œÚY[Z\ÜÚ[™ÈH	YBˆBŸB‚™[˜Ý[ÛˆÙ]UÛÜšØ›ÛÚÑ\Ü^Q›Ü”Ý]\ÊÜÝš[™×I[™ÝXYÙKÜÝš[™×IÛÜšØ›ÛÚÒY
+HÂˆžHÂˆ	ÈHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	ÈH
+Ù]P\œ˜^H	ËÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYHÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	ËÛÝ[YÝ
+HÂˆ	˜[YHHÜÝš[™×IÖÌK™\Ü^S˜[YBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ	˜[YHHÜÝš[™×IÖÌK™š[S˜[YHBˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	˜[YJJHÈ™]\›ˆ	˜[YHBˆBˆHØ]ÚÈBˆ™]\›ˆ	ÛÜšØ›ÛÚÒYŸB‚‚™[˜Ý[ÛˆÙ]PXÝ]™T™[™\’›Ø”Ý]\ÊÜÝš[™×I[™ÝXYÙJHÂˆžHÂˆ	\ˆHÙ]T™[™\’›Ø‘\ˆ	[™ÝXYÙBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	\ŠJHÈ™]\›ˆ	[Bˆ	\›Z[˜[H
+	ØÛÛ\]Y	Ë	ØÛÛ\]Y]Ú]Y\œ›ÜœÉË	Ù˜Z[Y	Ë	ÛZ\ÜÚ[™ÉË	ØØ[˜Ù[Y	ÊBˆ	Ý]Ù™ˆHÑ]U[YWNŽ•]Ó›ÝËYÝ\œÊM
+Bˆ	›ÝÈHÑ]U[YWNŽ•]Ó›ÝÂˆ›Ü™XXÚ
+	š[H[ˆ
+Ù]PÚ[][HS]\˜[]	\ˆQš[\ˆ	Ê‹œÝ]\ËšœÛÛ‰ÈQš[HQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHÛÜSØš™XÝ\ÝÜš]U[YU]ÈQ\ØÙ[™[™ÈÙ[XÝSØš™XÝQš\œÝŒ
+JHÂˆYˆ
+	š[K“\ÝÜš]U[YU]È[	Ý]Ù™ŠHÈÛÛ[YHBˆ	›ØˆH™XYRœÛÛ‘š[H	š[K‘[˜[YH	[ˆYˆ
+	[Y\H	›ØŠHÈÛÛ[YHBˆ	Ý]\ÈH
+ÜÝš[™×I›Ø‹œÝ]\ÊK•ÓÝÙ\’[˜\šX[
+
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý]\ÊJHÈÛÛ[YHBˆYˆ
+	\›Z[˜[XÛÛZ[œÈ	Ý]\ÊHÈÛÛ[YHB‚ˆ	YÙTÙXÛÛ™ÈH
+	›ÝÈH	š[K“\ÝÜš]U[YU]ÊK•Ý[ÙXÛÛ™Âˆ	›ØÙ\ÜÒYHÙ]R[]T›Ü\H	›Øˆ	Ü›ØÙ\ÜÒY	ÈˆYˆ
+	›ØÙ\ÜÒYYÝ
+HÂˆ	[]™HH	˜[ÙBˆžHÈ	[]™HH	[[™H
+Ù]T›ØÙ\ÜÈRY	›ØÙ\ÜÒYQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YJHHØ]ÚÈ	[]™HH	˜[ÙHBˆYˆ
+	[]™JHÂˆYˆ
+
+	Ý]\ÈY\H	Ü]Y]YY	È[Üˆ	Ý]\ÈY\H	Û][˜Ú[™ÉÊHX[™	YÙTÙXÛÛ™ÈYÝL
+HÂˆÝ›ÚYJÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[H	š[K‘[˜[YH	›Øˆ	ùbcyfç¸àk”¹/g9¢$8àåøàëxà®øà®xàc8à®8àéøàå¹aé¹ä!¸àjùaixà¢xàf¹`g9«h¹¢lxàa8àjøàj¸à¢¸ào¸àeøàgøà ¹¥¬8àeøàcÔ¹/g9¢$8àiøàcxào¸àfxà ‰ÊBˆÛÛ[YBˆBˆ™]\›ˆ	›Ø‚ˆBˆÈ[[YYX][HY\ˆÝ\T›ØÙ\ÜÈ\™HØ[ˆ™HHÚÜ˜XÙH™Y›Ü™HHÚ[›ØÙ\ÜÈ\Èš\ÚX›K‚ˆYˆ
+	YÙTÙXÛÛ™È[L
+HÈ™]\›ˆ	›ØˆBˆÝ›ÚYJÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[H	š[K‘[˜[YH	›Øˆ	ùbcyfç¸àk”¹/g9¢$8àåøàëxà®øà®xàc9í`¹.¡¸àeøài¸àa8àgøàgøà xà y¥¬8àeøàa¹/g9¢$8à¤ºe¢ùiâøàiøàcxào¸àfxà ‰ÊBˆÛÛ[YBˆB‚ˆÈÛ\ˆZ[ÈY›ÝÜš]H›ØÙ\ÜÒYˆÈ›Ý]ÜÙHÝ[H]Y]YYÜ[›š[™Èš[\È›ØÚÈHˆ]Û‹‚ˆYˆ
+	YÙTÙXÛÛ™È[JHÈ™]\›ˆ	›ØˆBˆÝ›ÚYJÙ]T™[™\’›Ø‘˜Z[Yœ›ÛTÝ\\›Ø›[H	š[K‘[˜[YH	›Øˆ	ùcé8àa¹/g9¢$8à®8àéøàå¸à¤¹í`¹.¡¹¢lxàa8àjøàeøào¸àeøàgøà ¸à ¸àa¹. 9n©”¹/g9¢$8àiøàcxào¸àfxà ‰ÊBˆBˆHØ]ÚÈBˆ™]\›ˆ	[ŸB‚™[˜Ý[ÛˆÝ\RY[”ÝÙ\”Ú[Ú[
+ÜÝš[™×IÝÙ\”Ú[^KÜÝš[™×IÛÛ[X[™ÜÝš[™×IÝÝ]]ÜÝš[™×IÝ\œ”]
+HÂˆ	[˜ÛÙYÛÛ[X[™HÐÛÛ™\NŽ•Ð˜\ÙMÝš[™ÊÕ^‘[˜ÛÙ[™×NŽ•[šXÛÙK‘Ù]ž]\Ê	ÛÛ[X[™
+JBˆ	\™ÜÈH
+	ËS›Ô›Ùš[IË	ËTÕIË	ËS›Û’[\˜XÝ]™IË	ËQ^XÝ][Û”ÛXÞIË	Ðž\\ÜÉË	ËQ[˜ÛÙYÛÛ[X[™	Ë	[˜ÛÙYÛÛ[X[™
+HZ›Ú[ˆ	È	ÂˆžHÂˆ™]\›ˆ
+Ý\T›ØÙ\ÜÈQš[T]	ÝÙ\”Ú[^HP\™Ý[Y[\Ý	\™ÜÈUÚ[™ÝÔÝ[HY[ˆT™Y\™XÝÝ[™\™Ý]]	ÝÝ]]T™Y\™XÝÝ[™\™\œ›Üˆ	Ý\œ”]T\ÜÕJBˆHØ]ÚÂˆÈÛÛYHX[˜YÙY][˜Ú[š\›Û›Y[È^ÜÙH›Ý][™UˆÚ[™ÝÜÂˆÈÝÙ\”Ú[	ÜÈÝ\T›ØÙ\ÜÈšY\ÈÈÛÜH[H[ÈHØ\ÙKZ[œÙ[œÚ]]™BˆÈXÝ[Û˜\žH[™˜Z[È™Y›Ü™HHÚ[Ý\ËˆÚ[^XÝ]H]›ÚYÈ]ˆÈ[[Y\˜][ÛŽÈ™Y\™XÝ[œÚYHH[˜ÛÙYÚ[ÛÛ[X[™[œÝXY‚ˆ	Ý]\ØØ\YH
+ÒSË”]NŽ‘Ù][]
+	ÝÝ]]
+JK”™\XÙJ‰È‹‰ÉÈŠBˆ	\œ‘\ØØ\YH
+ÒSË”]NŽ‘Ù][]
+	Ý\œ”]
+JK”™\XÙJ‰È‹‰ÉÈŠBˆ	™Y\™XÝYH‰ˆÈ	ÛÛ[X[™HOˆ	ÉÝ]\ØØ\Y	Èˆ	É\œ‘\ØØ\Y	È‚ˆ	[˜ÛÙY˜[˜XÚÈHÐÛÛ™\NŽ•Ð˜\ÙMÝš[™ÊÕ^‘[˜ÛÙ[™×NŽ•[šXÛÙK‘Ù]ž]\Ê	™Y\™XÝY
+JBˆ	ÚHH™]ËSØš™XÝÞ\Ý[K‘XYÛ›ÜÝXÜË”›ØÙ\ÜÔÝ\[™›Âˆ	ÚK‘š[S˜[YHH	ÝÙ\”Ú[^Bˆ	ÚK\™Ý[Y[ÈH
+	ËS›Ô›Ùš[IË	ËTÕIË	ËS›Û’[\˜XÝ]™IË	ËQ^XÝ][Û”ÛXÞIË	Ðž\\ÜÉË	ËQ[˜ÛÙYÛÛ[X[™	Ë	[˜ÛÙY˜[˜XÚÊHZ›Ú[ˆ	È	Âˆ	ÚK•ÛÜšÚ[™Ñ\™XÝÜžHH	ØÜš\\›ÛÝˆ	ÚK•\ÙTÚ[^XÝ]HH	YBˆ	ÚK•Ú[™ÝÔÝ[HHÔÞ\Ý[K‘XYÛ›ÜÝXÜË”›ØÙ\ÜÕÚ[™ÝÔÝ[WNŽ’Y[‚ˆ™]\›ˆÔÞ\Ý[K‘XYÛ›ÜÝXÜË”›ØÙ\Ü×NŽ”Ý\
+	ÚJBˆBŸB‚™[˜Ý[ÛˆÝ\T™[™\’›ØŠÜÝš[™×I[™ÝXYÙKÜÝš[™Ö×WIÛÜšØ›ÛÚÒYËØ›ÛÛIÛ›U\]YÜÝš[™×IØ]YÛÜžHH	ÉË	Û˜\ÚÝ[œÈH	[
+HÂˆÈ™]\›ˆH›Øˆ[[YYX][Kˆ^[œÚ]™H\]HØØ[›š[™È[œÈ[œÚYHH˜XÚÙÜ›Ý[™›Ø‹ˆÈÛÈHˆ]ÛˆÙ\È›Ý\X\ˆÈÈ›Ý[™ÈÛˆ\™ÙH›Û\œË‚ˆ	XÝ]™R›ØˆHÙ]PXÝ]™T™[™\’›Ø”Ý]\È	[™ÝXYÙBˆYˆ
+	[[™H	XÝ]™R›ØŠHÂˆ	XÝ]™S\ÙÈHÜÝš[™×IXÝ]™R›Ø‹›Y\ÜØYÙBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	XÝ]™S\ÙÊJHÈ	XÝ]™S\ÙÈH	Ô¹/g9¢$9.+xàiøàfxà ‰ÈBˆ[ÙHÈ	XÝ]™S\ÙÈH”¹/g9¢$9.+xàiøàfxà ˆ	XÝ]™S\ÙÈˆBˆÙ]S›ÝT›Ü\H	XÝ]™R›Øˆ	ÛY\ÜØYÙIÈ	XÝ]™S\ÙÂˆYˆ
+	[Y\H	XÝ]™R›Ø‹”ÓØš™XÝ”›Ü\Y\ÖÉÛÚÉ×JHÈÙ]S›ÝT›Ü\H	XÝ]™R›Øˆ	ÛÚÉÈ	YHBˆ™]\›ˆ
+ÜØÝ\ÝÛ[Øš™XÝIXÝ]™R›ØŠBˆBˆ	ÝXÝ\™HHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	Ø]YÛÜžS›Ü›X[^™YH›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžH	ÉÂˆ	^XÚ]YÈH
+	ÛÜšØ›ÛÚÒYÈ›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈHÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÊHHÙ[XÝSØš™XÝU[š\]YJBˆ	YÈH
+
+BˆYˆ
+	^XÚ]YËÛÝ[YÝ
+HÂˆ	Û›ÝÛˆH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÂˆ	YHÜÝš[™×IËÛÜšØ›ÛÚÒYˆ
+	^XÚ]YÈXÛÛZ[œÈ	Y
+HX[™
+ÜÝš[™×IËœÝ]\È[™H	ÛZ\ÜÚ[™ÉÊHX[™
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]YÛÜžS›Ü›X[^™Y
+H[Üˆ
+\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]YÛÜžS›Ü›X[^™Y
+JBˆH›Ü‘XXÚSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYJBˆ	YÈH
+	Û›ÝÛˆÙ[XÝSØš™XÝU[š\]YJBˆH[ÙZYˆ
+[›Ý	Û›U\]Y
+HÂˆ	YÈH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÂˆ
+ÜÝš[™×IËœÝ]\È[™H	ÛZ\ÜÚ[™ÉÊHX[™
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]YÛÜžS›Ü›X[^™Y
+H[Üˆ
+\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]YÛÜžS›Ü›X[^™Y
+JBˆH›Ü‘XXÚSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYJBˆB‚ˆ	™YÚ\Ý\™YÛÝ[H
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈ
+ÜÝš[™×IËœÝ]\È[™H	ÛZ\ÜÚ[™ÉÊHX[™
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ø]YÛÜžS›Ü›X[^™Y
+H[Üˆ
+\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]YÛÜžS›Ü›X[^™Y
+JHJKÛÝ[ˆYˆ
+	™YÚ\Ý\™YÛÝ[Y\H
+HÈ	Û›U\]YH	˜[ÙHB‚ˆ	›Ø’YH	Ú›Ø—ÉÈ
+È
+Ù]Q]JK•ÔÝš[™Ê	Þ^^^SSYÒ[\ÜÉÊH
+È	×ÉÈ
+È
+ÑÝZYNŽ“™]ÑÝZY
+
+K•ÔÝš[™Ê	Ó‰ÊK”ÝXœÝš[™Ê
+JBˆ	›Ø‘\ˆHÙ]T™[™\’›Ø‘\ˆ	[™ÝXYÙBˆ	[œ]]H›Ú[‹T]	›Ø‘\ˆ‰›Ø’Yš[œ]šœÛÛˆ‚ˆ	Ý]\Ô]H›Ú[‹T]	›Ø‘\ˆ‰›Ø’YœÝ]\ËšœÛÛˆ‚ˆ	ÝÝ]]H›Ú[‹T]	›Ø‘\ˆ‰›Ø’Y›Ý]›ÙÈ‚ˆ	Ý\œ”]H›Ú[‹T]	›Ø‘\ˆ‰›Ø’Y™\œ‹›ÙÈ‚ˆ	[š]X[Ý[HYˆ
+	Û›U\]YX[™	YËÛÝ[Y\H
+HÈ	™YÚ\Ý\™YÛÝ[H[ÙHÈ	YËÛÝ[Bˆ	[š]X[Y\ÜØYÙHH	Ô¹/g9¢$8àc9oáz) xàj‘^Ù[8àkøà`¸à¢¸ào¸àføà¤øà ‰ÂˆYˆ
+	™YÚ\Ý\™YÛÝ[Y\H
+HÈ	[š]X[Y\ÜØYÙHH	ùænúc,¹®"8àoÑ^Ù[8àc8à`¸à¢¸ào¸àføà¤øà ‰ÈBˆ[ÙZYˆ
+	Û›U\]YX[™	YËÛÝ[Y\H
+HÈ	[š]X[Y\ÜØYÙHH	Ô¹/g9¢$9kïº,hxà¤¹è®º*£xàeøài¸àa8ào¸àfxà ‰ÈBˆ[ÙZYˆ
+	YËÛÝ[YÝ
+HÈ	[š]X[Y\ÜØYÙHH	Ô¹/g9¢$8à¤ºe¢ùiâøàeøào¸àfxà ‰ÈBˆ	[š]X[HÜØÝ\ÝÛ[Øš™XÝVÛÜ™\™YPÂˆÚÈH	YNÈ›Ø’YH	›Ø’YÈÝ]\ÈH	Ü]Y]YY	ÎÈÝ[H	[š]X[Ý[ÈÛÛ\]YHÈ˜Z[YHÈ\˜Ù[HNÂˆY\ÜØYÙHH	[š]X[Y\ÜØYÙNÂˆÝ\œ™[ÛÜšØ›ÛÚÒYH	ÉÎÈÝ\œ™[ÛÜšØ›ÛÚÓ˜[YHH	ÉÎÈÝ\œ™[ÚY]H	ÉÎÈ›ØÙ\ÜÒYHÈÝÝ]]H	ÝÝ]]ÈÝ\œ”]H	Ý\œ”]È™\Ý[ÈH
+
+NÈ\œ›ÜœÈH
+
+NÈÝ\Y]H™]ËS›ÝÒ\ÛÎÈ\]Y]H™]ËS›ÝÒ\ÛÎÈÝ]TØ]™Y]H	ÉÂˆBˆÜš]KRœÛÛ‘š[H	Ý]\Ô]	[š]X[ˆ	[œÓÝ]HÛÜ™\™YPßBˆYˆ
+	[[™H	Û˜\ÚÝ[œÊHÈ›Ü™XXÚ
+	È[ˆ
+	Û˜\ÚÝ[œË’Ù^\ÊJHÈ	[œÓÝ]ÖÜÝš[™×I×HH	Û˜\ÚÝ[œÖÉ×HHBˆÜš]KRœÛÛ‘š[H	[œ]]
+ÛÜ™\™YPÈ›Ø’YH	›Ø’YÈ[ÙHH	[™ÝXYÙNÈÛÜšØ›ÛÚÒYÈH
+	YÊNÈÛ›U\]YH	Û›U\]YÈØ]YÛÜžHH	Ø]YÛÜžS›Ü›X[^™YÈÛ˜\ÚÝ[œÈH	[œÓÝ]ÈÝ]\Ô]H	Ý]\Ô]ÈÝÝ]]H	ÝÝ]]ÈÝ\œ”]H	Ý\œ”]JBˆYˆ
+	™YÚ\Ý\™YÛÝ[Y\H[Üˆ
+	YËÛÝ[Y\HX[™[›Ý	Û›U\]Y
+JHÂˆ	[š]X[œÝ]\ÈH	ØÛÛ\]Y	ÎÈ	[š]X[œ\˜Ù[HLˆYˆ
+	™YÚ\Ý\™YÛÝ[Y\H
+HÈ	[š]X[›Y\ÜØYÙHH	ùænúc,¹®"8àoÑ^Ù[8àc8à`¸à¢¸ào¸àføà¤øà ‰ÈH[ÙHÈ	[š]X[›Y\ÜØYÙHH	Ô¹/g9¢$8àc9oáz) xàj‘^Ù[8àkøà`¸à¢¸ào¸àføà¤øà ‰ÈBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	[š]X[ˆ™]\›ˆ
+ÜØÝ\ÝÛ[Øš™XÝI[š]X[
+BˆB‚ˆ	Ñ^HH›Ú[‹T]	[Ž”Þ\Ý[T›ÛÝ	ÔÞ\Ý[LÌ—Ú[™ÝÜÔÝÙ\”Ú[ŒKŒÝÙ\œÚ[™^IÂˆYˆ
+[›Ý
+\ÝT]S]\˜[]	Ñ^JJHÈ	Ñ^HH	ÜÝÙ\œÚ[™^IÈBˆ	ØÜš\H›Ú[‹T]	ØÜš\\›ÛÝ	ÜÙ\™\‹œÌIÂˆÈ\ÙHQ[˜ÛÙYÛÛ[X[™[œÝXYÙˆH][ÝYQš[HÛÛ[X[™[™Kˆ\È]›ÚYÈÚ[™ÝÜÈ][Ý[™ÈYÙHØ\Ù\ÂˆÈÚ\™HHÚ[ÝÙ\”Ú[Ø[ˆÝ\Ú]Ý]š[™[™ÈT™[™\’›Ø”]X]š[™ÈHRHÝXÚÈ]	K‚ˆ	›ØÛÛ[X[™H‰ˆ	É
+	ØÜš\”™\XÙJ‰È‹‰ÉÈŠJIÈS[ÙH	É
+	[™ÝXYÙK”™\XÙJ‰È‹‰ÉÈŠJIÈT™[™\’›Ø”]	É
+	[œ]]”™\XÙJ‰È‹‰ÉÈŠJIÈ‚ˆÙ]S›ÝT›Ü\H	[š]X[	Û][˜ÚÛÛ[X[™Ú[™	È	Ñ[˜ÛÙYÛÛ[X[™TÕIÂˆÙ]S›ÝT›Ü\H	[š]X[	ÜÝ]\ÉÈ	Û][˜Ú[™ÉÂˆÙ]S›ÝT›Ü\H	[š]X[	ÛY\ÜØYÙIÈ	Ô¹/g9¢$8àåøàëxà®øà®xà¤º-mùbåxàeøài¸àa8ào¸àfxà ‰ÂˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	[š]X[ˆžHÂˆ	›ØÈHÝ\RY[”ÝÙ\”Ú[Ú[	Ñ^H	›ØÛÛ[X[™	ÝÝ]]	Ý\œ”]ˆYˆ
+	›ØÈX[™	›ØË’Y
+HÂˆ	[š]X[œ›ØÙ\ÜÒYHÚ[I›ØË’Yˆ	Ý]\ÕÕ\]HH	[š]X[ˆžHÂˆ	^\Ý[™ÔÝ]\ÈH™XYRœÛÛ‘š[H	Ý]\Ô]	[ˆYˆ
+	[[™H	^\Ý[™ÔÝ]\ÊHÈ	Ý]\ÕÕ\]HH	^\Ý[™ÔÝ]\ÈBˆHØ]ÚÈBˆÙ]S›ÝT›Ü\H	Ý]\ÕÕ\]H	Ü›ØÙ\ÜÒY	È
+Ú[I›ØË’Y
+BˆÙ]S›ÝT›Ü\H	Ý]\ÕÕ\]H	ÜÝ]\ÉÈ	Û][˜Ú[™ÉÂˆÙ]S›ÝT›Ü\H	Ý]\ÕÕ\]H	Ü\˜Ù[	È
+ÓX]NŽ“X^
+‹
+Ù]R[]T›Ü\H	Ý]\ÕÕ\]H	Ü\˜Ù[	È
+JJBˆÙ]S›ÝT›Ü\H	Ý]\ÕÕ\]H	ÛY\ÜØYÙIÈ	Ô¹/g9¢$8àåøàëxà®øà®xà¤º-mùbåxàeøào¸àeøàgøà ‘^Ù[8à¤¹®¥¹`¦xàeøài¸àa8ào¸àfxà ‰ÂˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÕÕ\]BˆBˆHØ]ÚÂˆ	[š]X[œÝ]\ÈH	Ù˜Z[Y	Âˆ	[š]X[œ\˜Ù[HLˆ	[š]X[›Y\ÜØYÙHH”¹/g9¢$8àåøàëxà®øà®xà¤º-mùbåxàiøàcxào¸àføà¤øàiøàeøàgÎˆ	
+	Ë‘^Ù\[Û‹“Y\ÜØYÙJH‚ˆ	[š]X[™\œ›ÜœÈH
+ÛÜ™\™YPÈ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙNÈ\Ù\‘\œ›ÜˆH
+ÛÛ™\ËU\Ù\”™[™\‘\œ›Üˆ	Ë‘^Ù\[Û‹“Y\ÜØYÙJNÈ]Z[HÜÝš[™×IÈJBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	[š]X[ˆ›ÝÂˆBˆ™]\›ˆ
+ÜØÝ\ÝÛ[Øš™XÝI[š]X[
+BŸB‚™[˜Ý[Ûˆ[›ÚÙKT™[™\’›Ø‘œ›ÛQš[JÜÝš[™×I›Ø”]
+HÂˆ	›ØˆH™XYRœÛÛ‘š[H	›Ø”]	[ˆYˆ
+	[Y\H	›ØŠHÈ›ÝÈ”™[™\ˆ›Øˆš[H\È›Ý™XYX›Nˆ	›Ø”]ˆBˆ	[™ÝXYÙHHÜÝš[™×I›Ø‹›[ÙBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	[™ÝXYÙJJHÈ	[™ÝXYÙHH	[ÙHBˆ	YÈH
+Ù]P\œ˜^H	›Ø‹ÛÜšØ›ÛÚÒYÈ›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈHÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÊHJBˆ	^XÚ]YÈH
+	YËÛÝ[YÝ
+Bˆ	Û›U\]YHØ›ÛÛJÙ]Q]T›Ü\H	›Øˆ	ÛÛ›U\]Y	È	˜[ÙJBˆ	Ø]YÛÜžHH›Ü›X[^™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×JÙ]Q]T›Ü\H	›Øˆ	ØØ]YÛÜžIÈ	ÉÊJH	ÉÂˆ	Ý]\Ô]HÜÝš[™×I›Ø‹œÝ]\Ô]ˆ	ÝÝ]]HÜÝš[™×JÙ]Q]T›Ü\H	›Øˆ	ÜÝÝ]]	È	ÉÊBˆ	Ý\œ”]HÜÝš[™×JÙ]Q]T›Ü\H	›Øˆ	ÜÝ\œ”]	È	ÉÊBˆ	›Ø’YHÜÝš[™×I›Ø‹š›Ø’Yˆ	›ØÙ\ÜÒYHˆžHÂˆ	^\Ý[™ÔÝ]\ÈH™XYRœÛÛ‘š[H	Ý]\Ô]	[ˆYˆ
+	[[™H	^\Ý[™ÔÝ]\ÊHÈ	›ØÙ\ÜÒYHÙ]R[]T›Ü\H	^\Ý[™ÔÝ]\È	Ü›ØÙ\ÜÒY	ÈBˆHØ]ÚÈBˆYˆ
+	›ØÙ\ÜÒY[H
+HÈžHÈ	›ØÙ\ÜÒYHÔÞ\Ý[K‘XYÛ›ÜÝXÜË”›ØÙ\Ü×NŽ‘Ù]Ý\œ™[›ØÙ\ÜÊ
+K’YHØ]ÚÈ	›ØÙ\ÜÒYHHBˆ	Ý[H	YËÛÝ[ˆ	Ý]\ÓY\ÜØYÙHH	Ñ^Ù[8à¤¹®¥¹`¦xàeøài¸àa8ào¸àfxà ‰ÂˆYˆ
+	Û›U\]YX[™[›Ý	^XÚ]YÊHÈ	Ý]\ÓY\ÜØYÙHH	Ô¹/g9¢$9kïº,hxà¤¹è®º*£xàeøài¸àa8ào¸àfxà ‰ÈBˆ	Ý]\ÈHÜØÝ\ÝÛ[Øš™XÝVÛÜ™\™YPÈÚÈH	YNÈ›Ø’YH	›Ø’YÈÝ]\ÈH	Ü[›š[™ÉÎÈÝ[H	Ý[ÈÛÛ\]YHÈ˜Z[YHÈ\˜Ù[HÎÈY\ÜØYÙHH	Ý]\ÓY\ÜØYÙNÈÝ\œ™[ÛÜšØ›ÛÚÒYH	ÉÎÈÝ\œ™[ÛÜšØ›ÛÚÓ˜[YHH	ÉÎÈÝ\œ™[ÚY]H	ÉÎÈ›ØÙ\ÜÒYH	›ØÙ\ÜÒYÈÝÝ]]H	ÝÝ]]ÈÝ\œ”]H	Ý\œ”]È™\Ý[ÈH
+
+NÈ\œ›ÜœÈH
+
+NÈÝ\Y]H™]ËS›ÝÒ\ÛÎÈ\]Y]H™]ËS›ÝÒ\ÛÎÈÝ]TØ]™Y]H	ÉÈBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\Âˆ	^Ù[H	[ˆžHÂˆYˆ
+	Û›U\]YX[™[›Ý	^XÚ]YÊHÂˆ	Ý]\ËœÝ]\ÈH	ÜØØ[›š[™ÉÂˆ	Ý]\Ë›Y\ÜØYÙHH	Ô¹/g9¢$8àc9oáz) xàj‘^Ù[8à¤¹è®º*£xàeøài¸àa8ào¸àfxà ‰Âˆ	Ý]\Ëœ\˜Ù[HBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆÝ›ÚYJØØ[‹U\]\È	[™ÝXYÙHÂˆ\˜[J	ØØ[’[™^	ØØ[•Ý[	ØØ[•ÛÜšØ›ÛÚÒY	ØØ[“˜[YJBˆ	Ý]\ËœÝ]\ÈH	ÜØØ[›š[™ÉÂˆ	Ý]\Ë˜Ý\œ™[ÛÜšØ›ÛÚÒYHÜÝš[™×IØØ[•ÛÜšØ›ÛÚÒYˆ	Ý]\Ë˜Ý\œ™[ÛÜšØ›ÛÚÓ˜[YHHÜÝš[™×IØØ[“˜[YBˆ	Ý]\Ë˜Ý\œ™[ÚY]H	ÉÂˆ	Ý]\ËÝ[HÓX]NŽ“X^
+Ú[IØØ[•Ý[JBˆ	Ý]\Ë˜ÛÛ\]YHÓX]NŽ“X^
+Ú[IØØ[’[™^HK
+Bˆ	Ý]\Ë™˜Z[YHˆ	Ý]\Ëœ\˜Ù[HÚ[VÓX]NŽ“X^
+KÓX]NŽ“Z[ŠMKÓX]NŽ‘›ÛÜŠ
+ÙÝX›WIØØ[’[™^ÈÓX]NŽ“X^
+KÚ[IØØ[•Ý[
+JH
+ˆMJJJBˆ	Ý]\Ë›Y\ÜØYÙHH”¹/g9¢$9kïº,hxà¤¹è®º*£xàeøài¸àa8ào¸àfNˆ	ØØ[’[™^È	ØØ[•Ý[9.í¹æëˆ	ØØ[“˜[YH‚ˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆJBˆ	YÈH
+Ù]P]]Ô™[™\•ÛÜšØ›ÛÚÒYÈ	[™ÝXYÙH
+
+H	Ø]YÛÜžJBˆ	Ý[H	YËÛÝ[ˆ	Ý]\ËÝ[H	Ý[ˆ	Ý]\Ë˜ÛÛ\]YHˆ	Ý]\Ë™˜Z[YHˆ	Ý]\Ëœ\˜Ù[HYˆ
+	Ý[YÝ
+HÈÓX]NŽ“X^
+Ú[IÝ]\Ëœ\˜Ù[MJHH[ÙHÈLBˆYˆ
+	Ý[Y\H
+HÂˆ	Ý]\ËœÝ]\ÈH	ØÛÛ\]Y	Âˆ	Ý]\Ë›Y\ÜØYÙHH	Ô¹/g9¢$8àc9oáz) xàj‘^Ù[8àkøà`¸à¢¸ào¸àføà¤øà ‰ÂˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\Âˆ™]\›‚ˆBˆ	Ý]\Ë›Y\ÜØYÙHH‰Ý[9.í¸àk”¹/g9¢$8à¤ºe¢ùiâøàeøào¸àfxà ˆ‚ˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆH[ÙZYˆ
+	Ý[Y\H
+HÂˆ	Ý]\ËœÝ]\ÈH	ØÛÛ\]Y	Âˆ	Ý]\Ëœ\˜Ù[HLˆ	Ý]\Ë›Y\ÜØYÙHH	Ô¹/g9¢$8àc9oáz) xàj‘^Ù[8àkøà`¸à¢¸ào¸àføà¤øà ‰ÂˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\Âˆ™]\›‚ˆBˆYˆ
+	Ý[YÝ
+HÂˆ™\Ù]T™[™\‘[š\›Û›Y[›Ü’›ØˆÈKp©Í‹ˆ8à®8àéøàåºe¢ùiâøàe8àj8àjùä¬9h øà¤¹cå¸à¢¹æí8àfBˆ	Ý]\Ë›Y\ÜØYÙHH	Ñ^Ù[8à¤º-mùbåxàeøài¸àa8ào¸àfxà ‰Âˆ	Ý]\Ëœ\˜Ù[HÓX]NŽ“X^
+Ú[IÝ]\Ëœ\˜Ù[
+BˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\Âˆ	^Ù[H™]ËQ^Ù[\XØ][Û‘›Ü”™[™\‚ˆ	Ý]\Ë›Y\ÜØYÙHH	Ñ^Ù[8àkº-mùbåxàc9k£9.¡¸àeøào¸àeøàgøà ”¹c%¸à¤ºe¢ùiâøàeøào¸àfxà ‰Âˆ	Ý]\Ëœ\˜Ù[HÓX]NŽ“X^
+Ú[IÝ]\Ëœ\˜Ù[L
+BˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆBˆ	[™^Hˆ	Y™\œ™Y[˜[\Ù\ÈH
+
+Bˆ›Ü™XXÚ
+	Y[ˆ	YÊHÂˆ	[™^
+ÊÂˆ	˜[YHHÙ]UÛÜšØ›ÛÚÑ\Ü^Q›Ü”Ý]\È	[™ÝXYÙH	Yˆ	Ý]\Ë˜Ý\œ™[ÛÜšØ›ÛÚÒYH	Yˆ	Ý]\Ë˜Ý\œ™[ÛÜšØ›ÛÚÓ˜[YHH	˜[YBˆ	Ý]\Ë˜Ý\œ™[ÚY]H	ÉÂˆ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YH8à¤”¹c%¸àeøài¸àa8ào¸àfxà ˆ‚ˆ	Ý]\Ëœ\˜Ù[HÚ[VÓX]NŽ“X^
+LÓX]NŽ‘›ÛÜŠ
+
+	[™^HJHÈÓX]NŽ“X^
+K	Ý[
+JH
+ˆL
+JBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\Âˆ	Ø[˜XÚÈHÂˆ\˜[J	ÝYÙK	ÛÜšØ›ÛÚÒY	ÚY]˜[YJBˆ	Ý]\Ë˜Ý\œ™[ÛÜšØ›ÛÚÒYHÜÝš[™×IÛÜšØ›ÛÚÒYˆ	Ý]\Ë˜Ý\œ™[ÛÜšØ›ÛÚÓ˜[YHH	˜[YBˆ	Ý]\Ë˜Ý\œ™[ÚY]HÜÝš[™×IÚY]˜[YBˆYˆ
+	ÝYÙHY\H	ÛÜ[‰ÊHÈ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YH8à¤ºe¢øàa8ài¸àa8ào¸àfxà ˆˆBˆ[ÙZYˆ
+	ÝYÙHY\H	ÜÚY]\Ù]\	ÊHÈ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YHÈ8à­øàï8àâ	ÚY]˜[YH8àk¹cl9b-ú*+yk¦¸à¤º*¯ù¥m8àeøài¸àa8ào¸àfxà ˆˆBˆ[ÙZYˆ
+	ÝYÙHY\H	Ø˜]Ú	ÊHÈ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YH8àkº)!ù¥l8à­øàï8àâ8à¤¸ào¸àj8à xài”¹c%¸àeøài¸àa8ào¸àfxà ˆˆBˆ[ÙZYˆ
+	ÝYÙHY\H	ÜÜ]	ÊHÈ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YH8àk”¸à¤¸à­øàï8àâ9b)xàjùb!¸àdxài¸àa8ào¸àfxà ˆˆBˆ[ÙZYˆ
+	ÝYÙHY\H	ÜÚY]	ÊHÈ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YHÈ8à­øàï8àâ	ÚY]˜[YH8à¤”¹c%¸àeøài¸àa8ào¸àfxà ˆˆBˆ[ÙHÈ	Ý]\Ë›Y\ÜØYÙHH‰[™^È	Ý[9.í¹æëŽˆ	˜[YH8à¤¹®¥¹`¦xàeøài¸àa8ào¸àfxà ˆˆBˆ	Ý]\Ëœ\˜Ù[HÚ[VÓX]NŽ‘›ÛÜŠ
+
+	[™^HH
+ÈŒÍJHÈÓX]NŽ“X^
+K	Ý[
+JH
+ˆL
+BˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆBˆžHÂˆÈKTˆ:!ê¹båyaé¹ä!¸àc9fî¹k¦¸àeøàgù©'9çéyâb8àc8à`¸à£8àl8à xàgxàk¹âb8àiøàë8àìøàà8àê¸àìøà¬8àfxà¢øà ‚ˆ	[ˆHÙ]Q]T›Ü\H
+Ù]Q]T›Ü\H	›Øˆ	ÜÛ˜\ÚÝ[œÉÈ	[
+H	Y	[ˆ	[”Û˜\ÚÝHÜÝš[™×JÙ]Q]T›Ü\H	[ˆ	ÜÛ˜\ÚÝY	È	ÉÊBˆ	[’\ÚHÜÝš[™×JÙ]Q]T›Ü\H	[ˆ	Ù^XÝY\Ú	È	ÉÊBˆ	ˆH™[™\‹UÛÜšØ›ÛÚÈ	[™ÝXYÙH	Y	^Ù[	YH	Ø[˜XÚÈ	ÉÈ	[”Û˜\ÚÝ	[’\Úˆ	Y™\œ™Y[˜[\Ù\È
+ÏH	ØÜš\”[™[™Ð[˜[\Ú\Âˆ	ØÜš\”[™[™Ð[˜[\Ú\ÈH	[ˆ	–ÉÛÚÉ×HH	YBˆ	Ý]\Ëœ™\Ý[ÈH
+	Ý]\Ëœ™\Ý[ÊH
+È
+	ŠBˆ	Ý]\Ë˜ÛÛ\]YHÚ[IÝ]\Ë˜ÛÛ\]Y
+ÈBˆHØ]ÚÂˆ	\ÙÈH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆ	\Ù\“\ÙÈHÛÛ™\ËU\Ù\”™[™\‘\œ›Üˆ	\ÙÂˆ	]HÙ]S\Ý™[™\][\›Üˆ	Yˆ	\œ›Ü‘]Z[HÙ]Q\œ›Ü‘]Z[	ÂˆÙ]UÛÜšØ›ÛÚÔ™[™\‘\œ›Üˆ	[™ÝXYÙH	Y	\ÙÈ	\œ›Ü‘]Z[
+ÜÝš[™×I]œÛ˜\ÚÝY
+H
+ÜÝš[™×I]š\Ú
+Bˆ	\œˆHÛÜ™\™YPÈÚÈH	˜[ÙNÈÛÜšØ›ÛÚÒYH	YÈÛÜšØ›ÛÚÓ˜[YHH	˜[YNÈ\œ›ÜˆH	\ÙÎÈ\Ù\‘\œ›ÜˆH	\Ù\“\ÙÎÈ]Z[H	\œ›Ü‘]Z[Bˆ	Ý]\Ë™\œ›ÜœÈH
+	Ý]\Ë™\œ›ÜœÊH
+È
+	\œŠBˆ	Ý]\Ëœ™\Ý[ÈH
+	Ý]\Ëœ™\Ý[ÊH
+È
+	\œŠBˆ	Ý]\Ë™˜Z[YHÚ[IÝ]\Ë™˜Z[Y
+ÈBˆBˆ	Ý]\Ë˜Ý\œ™[ÚY]H	ÉÂˆ	Ý]\Ëœ\˜Ù[HÚ[VÓX]NŽ‘›ÛÜŠ
+
+Ú[IÝ]\Ë˜ÛÛ\]Y
+ÈÚ[IÝ]\Ë™˜Z[Y
+HÈÓX]NŽ“X^
+K	Ý[
+JH
+ˆL
+BˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆBˆYˆ
+Ú[IÝ]\Ë™˜Z[YYÝ
+HÂˆ	Ý]\ËœÝ]\ÈH	ØÛÛ\]Y]Ú]Y\œ›ÜœÉÂˆ	Ý]\Ë›Y\ÜØYÙHH‰
+	Ý]\Ë™˜Z[Y
+H9.í¸àiøàª8àêxàï8àc9æn¹å'øàeøào¸àeøàgøà º-i8àa8àª8àêxàï:(j9é.¸à¤¹è®º*£xàeøài¸àcøàh8àexàa8à ˆ‚ˆH[ÙHÂˆ	Ý]\ËœÝ]\ÈH	ØÛÛ\]Y	Âˆ	Ý]\Ë›Y\ÜØYÙHH‰
+	Ý]\Ë˜ÛÛ\]Y
+H9.í¸àk”¹/g9¢$8àc9k£9.¡¸àeøào¸àeøàgøà ˆ‚ˆBˆ	Ý]\Ëœ\˜Ù[HLˆÙ]S›ÝT›Ü\H	Ý]\È	ÜÝ]TØ]™Y]	È
+™]ËS›ÝÒ\ÛÊBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\ÂˆHØ]ÚÂˆ	Ý]\ËœÝ]\ÈH	Ù˜Z[Y	Âˆ	Ý]\Ë›Y\ÜØYÙHH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆ	Ý]\Ë™\œ›ÜœÈH
+	Ý]\Ë™\œ›ÜœÊH
+È
+ÛÜ™\™YPÈ\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙNÈ\Ù\‘\œ›ÜˆH
+ÛÛ™\ËU\Ù\”™[™\‘\œ›Üˆ	Ë‘^Ù\[Û‹“Y\ÜØYÙJNÈ]Z[HÜÝš[™×IÈJBˆÜš]KT™[™\’›Ø”Ý]\È	Ý]\Ô]	Ý]\Âˆ›ÝÂˆHš[˜[HÂˆÛÜÙKQ^Ù[\XØ][Û‘›Ü”™[™\ˆ	^Ù[ˆÑÐ×NŽÛÛXÝ
+
+NÈÑÐ×NŽ•ØZ]›Ü”[™[™Ñš[˜[^™\œÊ
+BˆÈKTNˆ^Ù[8à¤ºe¢xàf8à xàë8àìøàà8àê¸àìøà¬8àëxààøà«øà º)èù¥/¸àeøài¸àbøà¢z)èù§¤8àfxà¢øà ‚ˆÈ9«å:/ ùå*8àk¹a£xàë8àìøàà8àê¸àìøà¬8àc9oáz) xàjøàj¸àhøài¸à ¸à y¥.xà xài¹alz`&¸àëxààøà«øà¤¹cå¸à¢¹æí8àføà¢øà ‚ˆ›Ü™XXÚ
+	[™[™È[ˆ
+	Y™\œ™Y[˜[\Ù\ÈÚ\™KSØš™XÝÈ	[[™H	ÈJJHÂˆžHÈÝ›ÚYJ[›ÚÙKTÜÝ™[™\[˜[\Ú\È
+ÜÝš[™×I[™[™Ë›[™ÝXYÙJH
+ÜÝš[™×I[™[™ËÛÜšØ›ÛÚÒY
+H
+ÜÝš[™×I[™[™ËœÛ˜\ÚÝY
+H
+ÜÝš[™×I[™[™Ë™\œÚ[Û’Y
+H	[™[™Ëœ™[™\™Y
+HBˆØ]ÚÈÜš]KUØ\›š[™È
+	ùå.ù`ãøàãøààøà­øàéxàkº)èù§¤8àjùi,y¥eøàeøào¸àeøàgÎˆ	È
+È	Ë‘^Ù\[Û‹“Y\ÜØYÙJHBˆBˆBŸB‚‚™[˜Ý[Ûˆ™[Ü™\‹TYÙ\ÊÜÝš[™×I[™ÝXYÙK	›ÙJHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×I›ÙK˜Ø]YÛÜžJBˆ™]\›ˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	ÝXÝ\™JBˆ	[ÝÙYH
+Ù]U›Û[YS\Ý	[™ÝXYÙJBˆ	›Û[YSØš™XÝH	›ÙK›Û[Y\ÂˆYˆ
+	[Y\H	›Û[YSØš™XÝ
+HÈ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê	Ý›Û[Y\È8àc9oáz) xàiøàfxà ‰ÊHBˆ	ÛÜšØ›ÛÚÒYÈHßBˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈ\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]JJHÈ	ÛÜšØ›ÛÚÒYÖÖÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYHH	YHBˆ	YÙSX\HßBˆ›Ü™XXÚ
+	YÙH[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈ	ÛÜšØ›ÛÚÒYËÛÛZ[œÒÙ^JÜÝš[™×IËÛÜšØ›ÛÚÒY
+HJJHÈ	YÙSX\Ê™\ÛÛ™KTYÙRY	YÙJWHH	YÙHBˆ	Y™™XÝYH™]ËSØš™XÝÞ\Ý[KÛÛXÝ[ÛœË‘Ù[™\šXË’\ÚÙ]ÜÝš[™×Bˆ›Ü™XXÚ
+	›Ü\H[ˆ	›Û[YSØš™XÝ”ÓØš™XÝ”›Ü\Y\ÊHÂˆ	›Û[YHHÜÝš[™×I›Ü\K“˜[YBˆYˆ
+	[ÝÙY[›ÝÛÛZ[œÈ	›Û[YJHÈ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê¹.#y«høàj›Û[YxàiøàfNˆ	›Û[YHŠHBˆ	\Ú\™YYÈH
+Ù]P\œ˜^H	›Ü\K•˜[YH›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈJBˆ	Ý\œ™[YÈH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÂˆ	ÛÜšØ›ÛÚÒYËÛÛZ[œÒÙ^JÜÝš[™×IËÛÜšØ›ÛÚÒY
+HX[™
+ˆ
+	›Û[YHY\H	Û›Û™IÈX[™
+ÜÝš[™×IË›Û[YHY\H	Û›Û™IÈ[Üˆ	Ë™[˜X›YY\H	˜[ÙJJH[Ü‚ˆ
+	›Û[YH[™H	Û›Û™IÈX[™ÜÝš[™×IË›Û[YHY\H	›Û[YHX[™	Ë™[˜X›Y[™H	˜[ÙJBˆ
+BˆHÛÜSØš™XÝÖÙÝX›WJÙ]Q]T›Ü\H	È	ÛÜ™\‰È
+_KÔ™\ÛÛ™KTYÙRY	ßH›Ü‘XXÚSØš™XÝÈ™\ÛÛ™KTYÙRY	ÈJBˆ	Ø[YTÙ\]Y[˜ÙHH
+
+	Ý\œ™[YÈZ›Ú[ˆ˜ˆŠHY\H
+	\Ú\™YYÈZ›Ú[ˆ˜ˆŠJBˆYˆ
+	Ø[YTÙ\]Y[˜ÙJHÈÛÛ[YHBˆYˆ
+	›Û[YH[™H	Û›Û™IÊHÈÝ›ÚYIY™™XÝYY
+	›Û[YJHBˆ›Üˆ
+	OLÈ	H[	\Ú\™YYËÛÝ[È	JÊÊHÂˆ	YH	\Ú\™YYÖÉWBˆYˆ
+[›Ý	YÙSX\ÛÛZ[œÒÙ^J	Y
+JHÈÛÛ[YHBˆ	YÙHH	YÙSX\ÉYBˆ	Û›Û[YHHÜÝš[™×JÙ]Q]T›Ü\H	YÙH	Ý›Û[YIÈ	Û›Û™IÊBˆYˆ
+	Û›Û[YH[™H	Û›Û™IÊHÈÝ›ÚYIY™™XÝYY
+	Û›Û[YJHBˆÙ]S›ÝT›Ü\H	YÙH	Ý›Û[YIÈ	›Û[YBˆÙ]S›ÝT›Ü\H	YÙH	Ù[˜X›Y	È
+	›Û[YH[™H	Û›Û™IÊBˆÙ]S›ÝT›Ü\H	YÙH	ÛÜ™\‰È
+
+	JÌJJŒL
+BˆÙ]S›ÝT›Ü\H	YÙH	ÛÜ™\“X[X[	È	YBˆÙ]S›ÝT›Ü\H	YÙH	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊBˆBˆBˆ›Ü™XXÚ
+	›Û[YH[ˆ	[ÝÙY
+HÈÝ›ÚYJ™[[X™\‹U›Û[YSÜ™\ˆ	ÝXÝ\™H	›Û[YH	Ø]
+HBˆ\KQY˜][[X™\š[™Ô\•›Û[YH	[™ÝXYÙH	ÝXÝ\™H	Ø]ˆYˆ
+	Y™™XÝYÛÝ[YÝ
+HÈX\šËU›Û[YS™YYÔ™XZ[	ÝXÝ\™H	[™ÝXYÙH	Ø]
+	Y™™XÝY
+H	Ü™[Ü™\‰È	øàæ¸àï8à®9©âù¢$8à¤¹i"y¦í8àeøào¸àeøàgÉÈBˆ™]\›ˆÛÜ™\™YPÈYÙ\ÏIÝXÝ\™KœYÙ\ÎÈY™™XÝY›Û[Y\ÏP
+	Y™™XÝY
+NÈ\]Y]J™]ËS›ÝÒ\ÛÊHBˆBŸB‚™[˜Ý[Ûˆ\]KTYÙJÜÝš[™×I[™ÝXYÙK	›ÙJHÂˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×I›ÙK˜Ø]YÛÜžJBˆ™]\›ˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	ÝXÝ\™JBˆ	YÙOP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ßÚ\™KSØš™XÝÊ™\ÛÛ™KTYÙRY	ÊKY\HÜÝš[™×I›ÙKœYÙRY_Ù[XÝSØš™XÝQš\œÝJNÚYŠ	YÙKÛÝ[Y\H
+^Ý›ÝÈ”YÙxàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	
+	›ÙKœYÙRY
+HŸNÉIYÙVÌBˆYŠ
+Ù]TYÙPØ]YÛÜžH	ÝXÝ\™H	
+H[™H	Ø]
+^Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ù£!ùk¦¸àªøàá¸à­8àê¸àk¸àæ¸àï8à®8àiøàkøà`¸à¢¸ào¸àføà¤øà ‰Ê_Bˆ	™Y›Ü™U›ÛVÜÝš[™×I›Û[YNÉ™Y›Ü™Q[˜X›YVØ›ÛÛJÙ]Q]T›Ü\H		Ù[˜X›Y	È	YJNÉ™Y›Ü™S[OVÜÝš[™×I›[X™\š[™Ó[ÙNÉÝXÝ\˜[I˜[ÙBˆYŠ	[[™H	›ÙK]J^ÔÙ]S›ÝT›Ü\H		Ý]IÈ
+ÜÝš[™×I›ÙK]J_BˆYŠ	[[™H	›ÙK›Û[YJ^ÚYŠ
+Ù]U›Û[YS\Ý	[™ÝXYÙJK[›ÝÛÛZ[œÈÜÝš[™×I›ÙK›Û[YJ^Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ù.#y«høàj›Û[Yxàiøàfxà ‰Ê_NÔÙ]S›ÝT›Ü\H		Ý›Û[YIÈ
+ÜÝš[™×I›ÙK›Û[YJNÉÝXÝ\˜[IY_BˆYŠ	[[™H	›ÙK›[X™\š[™Ó[ÙJ^ÚYŠ
+	Û›Û™IË	Ýš\ÚX›IÊK[›ÝÛÛZ[œÈÜÝš[™×I›ÙK›[X™\š[™Ó[ÙJ^Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ù.#y«høàj›[X™\š[™Ó[Ùxàiøàfxà ‰Ê_NÔÙ]S›ÝT›Ü\H		Û[X™\š[™Ó[ÙIÈ
+ÜÝš[™×I›ÙK›[X™\š[™Ó[ÙJNÔÙ]S›ÝT›Ü\H		Û[X™\š[™ÓX[X[	È	YNÉÝXÝ\˜[IY_BˆYŠ	[[™H	›ÙK›[X™\š[™ÓX[X[
+^ÔÙ]S›ÝT›Ü\H		Û[X™\š[™ÓX[X[	È
+Ø›ÛÛI›ÙK›[X™\š[™ÓX[X[
+NÉÝXÝ\˜[IY_BˆYŠ	[[™H	›ÙKœ™\Ù][X™\š[™ÈX[™Ø›ÛÛI›ÙKœ™\Ù][X™\š[™Ê^ÔÙ]S›ÝT›Ü\H		Û[X™\š[™ÓX[X[	È	˜[ÙNÉÝXÝ\˜[IY_BˆYŠ	[[™H	›ÙK™[˜X›Y
+^ÔÙ]S›ÝT›Ü\H		Ù[˜X›Y	È
+Ø›ÛÛI›ÙK™[˜X›Y
+NÉÝXÝ\˜[IY_BˆÙ]S›ÝT›Ü\H		Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊNÙ›Ü™XXÚ
+	›Û[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙJJ^ÖÝ›ÚYJ™[[X™\‹U›Û[YSÜ™\ˆ	ÝXÝ\™H	›Û	Ø]
+_NÐ\KQY˜][[X™\š[™Ô\•›Û[YH	[™ÝXYÙH	ÝXÝ\™H	Ø]ˆYŠ	ÝXÝ\˜[
+^ÉY™™XÝYP
+	™Y›Ü™U›ÛÜÝš[™×I›Û[YJ_Ú\™KSØš™XÝÉÈX[™	È[™H	Û›Û™Iß_Ù[XÝSØš™XÝU[š\]YNÓX\šËU›Û[YS™YYÔ™XZ[	ÝXÝ\™H	[™ÝXYÙH	Ø]
+	Y™™XÝY
+H	Ü™[Ü™\‰È	øàæ¸àï8à®9©âù¢$8à¤¹i"y¦í8àeøào¸àeøàgÉßBˆ™]\›ˆ	ˆBŸB‚™[˜Ý[ÛˆÛÛ™š\›KTYÙJÜÝš[™×I[™ÝXYÙK	›ÙJHÂˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×I›ÙK˜Ø]YÛÜžJBˆ™]\›ˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÈ\˜[J	ÝXÝ\™JH	YÙOP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ßÚ\™KSØš™XÝÊ™\ÛÛ™KTYÙRY	ÊKY\HÜÝš[™×I›ÙKœYÙRY_Ù[XÝSØš™XÝQš\œÝJNÚYŠ	YÙKÛÝ[Y\H
+^Ý›ÝÈ”YÙxàc:)¢øài8àbøà¢¸ào¸àføà¤Îˆ	
+	›ÙKœYÙRY
+HŸNÚYŠ
+Ù]TYÙPØ]YÛÜžH	ÝXÝ\™H	YÙVÌJH[™H	Ø]
+^Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ù£!ùk¦¸àªøàá¸à­8àê¸àk¸àæ¸àï8à®8àiøàkøà`¸à¢¸ào¸àføà¤øà ‰Ê_NÜÝÚ]Ú
+ÜÝš[™×I›ÙK˜XÝ[ÛŠ^ÉØÛÛ™š\›IÞÔÙ]S›ÝT›Ü\H	YÙVÌH	ÜÝ]\ÉÈ	ØÛÛ™š\›YY	ßIÜ™Z™XÝ	ÞÔÙ]S›ÝT›Ü\H	YÙVÌH	ÜÝ]\ÉÈ	Ü™Z™XÝY	ßYY˜][Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ØXÝ[Ûˆ8àkÈÛÛ™š\›H8ào¸àgøàkÈ™Z™XÝ8à¤¹£!ùk¦¸àeøài¸àcøàh8àexàa8à ‰Ê__NÔÙ]S›ÝT›Ü\H	YÙVÌH	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊNÜ™]\›ˆ	YÙVÌHBŸB‚™[˜Ý[ÛˆÛÜTYÙ\ÐžTÚY]
+ÜÝš[™×I[™ÝXYÙK	›ÙJHÂˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×I›ÙK˜Ø]YÛÜžJBˆ™]\›ˆ\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÂˆ\˜[J	ÝXÝ\™JBˆ	›Û[Y\ÈH
+
+BˆYˆ
+	›ÙK›Û[Y\ÊHÂˆ	›Û[Y\ÈH
+Ù]P\œ˜^H	›ÙK›Û[Y\È›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈJBˆH[ÙHÂˆ	›Û[Y\ÈH
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJBˆBˆ	Ø“X\HßBˆ›Ü™XXÚ
+	Øˆ[ˆ
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈ\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]JJHÂˆ	Ø“X\ÖÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYHH	Ø‚ˆBˆ	Y™™XÝYH™]ËSØš™XÝÞ\Ý[KÛÛXÝ[ÛœË‘Ù[™\šXË’\ÚÙ]ÜÝš[™×Bˆ›Ü™XXÚ
+	›Û[YH[ˆ
+	›Û[Y\ÈÙ[XÝSØš™XÝU[š\]YJJHÂˆYˆ
+
+Ù]U›Û[YS\Ý	[™ÝXYÙJH[›ÝÛÛZ[œÈ	›Û[YJHÈ›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê¹.#y«høàj›Û[YxàiøàfNˆ	›Û[YHŠHBˆ	Ý\œ™[H
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÂˆ	Ø“X\ÛÛZ[œÒÙ^JÜÝš[™×IËÛÜšØ›ÛÚÒY
+HX[™
+ˆ
+	›Û[YHY\H	Û›Û™IÈX[™
+ÜÝš[™×IË›Û[YHY\H	Û›Û™IÈ[Üˆ	Ë™[˜X›YY\H	˜[ÙJJH[Ü‚ˆ
+	›Û[YH[™H	Û›Û™IÈX[™ÜÝš[™×IË›Û[YHY\H	›Û[YHX[™	Ë™[˜X›Y[™H	˜[ÙJBˆ
+BˆHÛÜSØš™XÝÖÙÝX›WJÙ]Q]T›Ü\H	È	ÛÜ™\‰È
+_KÔ™\ÛÛ™KTYÙRY	ßJBˆ	ÛÜYH
+	Ý\œ™[ÛÜSØš™XÝˆÑ^™\ÜÚ[Û^ÑÙ]TÚY]Ü™\“[X™\ˆ
+ÜÝš[™×IËœÚY]˜[YJ_NÐ\ØÙ[™[™ÏIY_KˆÑ^™\ÜÚ[Û^ÑÙ]Qš[SÜ™\“[X™\ˆ
+ÜÝš[™×IØ“X\ÖÜÝš[™×IËÛÜšØ›ÛÚÒYK™š[S˜[YJ_NÐ\ØÙ[™[™ÏIY_KˆÑ^™\ÜÚ[Û^ÖÜÝš[™×IØ“X\ÖÜÝš[™×IËÛÜšØ›ÛÚÒYK™š[S˜[Y_NÐ\ØÙ[™[™ÏIY_KˆÑ^™\ÜÚ[Û^Ô™\ÛÛ™KTYÙRY	ßNÐ\ØÙ[™[™ÏIY_JBˆ	™Y›Ü™RYÈH
+	Ý\œ™[›Ü‘XXÚSØš™XÝÈ™\ÛÛ™KTYÙRY	ÈJBˆ	Y\’YÈH
+	ÛÜY›Ü‘XXÚSØš™XÝÈ™\ÛÛ™KTYÙRY	ÈJBˆ	[œ]Ú[™ÙYH
+
+	™Y›Ü™RYÈZ›Ú[ˆ˜ˆŠH[™H
+	Y\’YÈZ›Ú[ˆ˜ˆŠJBˆ›Üˆ
+	OLÈ	H[	ÛÜYÛÝ[È	JÊÊHÂˆ	^XÝYH
+	H
+ÈJH
+ˆLˆYˆ
+ÙÝX›WJÙ]Q]T›Ü\H	ÛÜYÉWH	ÛÜ™\‰È
+H[™H	^XÝY
+HÈ	[œ]Ú[™ÙYH	YHBˆÙ]S›ÝT›Ü\H	ÛÜYÉWH	ÛÜ™\‰È	^XÝYˆÙ]S›ÝT›Ü\H	ÛÜYÉWH	ÛÜ™\“X[X[	È	˜[ÙBˆÙ]S›ÝT›Ü\H	ÛÜYÉWH	Ý\]Y]	È
+™]ËS›ÝÒ\ÛÊBˆBˆYˆ
+	[œ]Ú[™ÙYX[™	›Û[YH[™H	Û›Û™IÊHÈÝ›ÚYIY™™XÝYY
+	›Û[YJHBˆBˆ\KQY˜][[X™\š[™Ô\•›Û[YH	[™ÝXYÙH	ÝXÝ\™H	Ø]ˆYˆ
+	Y™™XÝYÛÝ[YÝ
+HÂˆX\šËU›Û[YS™YYÔ™XZ[	ÝXÝ\™H	[™ÝXYÙH	Ø]
+	Y™™XÝY
+H	Ü™[Ü™\‰È	øàæ¸àï8à®8à¤¸à­øàï8àâ9d#zh!¸àjù.)¸àny¦ïøàb8ào¸àeøàgÉÂˆBˆ™]\›ˆÛÜ™\™YPÈYÙ\ÏIÝXÝ\™KœYÙ\ÎÈØ]YÛÜžOIØ]ÈY™™XÝY›Û[Y\ÏP
+	Y™™XÝY
+HBˆBŸB‚™[˜Ý[Ûˆ™\ÛÛ™KR˜]˜Q^HÂˆÈ9. 9n©º)¢øài8àbøàhøàgøàäxà®xàkøà«xàèøààøà­øàéxàfxà¢Ê9aly§"xàåxàªxàêøàà9."¸àk•\ÝT]8àk¹ç«9¥«ykï¹ëe¸à ¹ao8àkxà¢Êxà ‚ˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ØÜš\ØXÚY˜]˜Q^JJHÈ™]\›ˆ	ØÜš\ØXÚY˜]˜Q^HBˆÈ™Y™\ˆHØØ[ÜX›H[[YH[œÝ[YžH\ÛÛ×[œÝ[]\™\K˜ÛY‚ˆ	\™XÝH›Ú[‹T]	ØÜš\\›ÛÝ	ÛX—˜]˜Wš[—˜]˜K™^IÂˆÈ8àãxààøàâ8àëøàï8à«ùaly§"xàiøàkÈ\ÝT]8àc8à©¸à©8àêøà®xà®xà«xàèøàìùëbxàiù. 9¦`¹æ¡8àjÈ˜[ÙH8àjøàj¸à¢øàdøàj8àc8à`¸à¢øàgøà xàê¸àâ8àêxà©8àfxà¢øà ‚ˆ›Üˆ
+	˜]˜P][\HNÈ	˜]˜P][\[HÎÈ	˜]˜P][\
+ÊÊHÂˆYˆ
+\ÝT]S]\˜[]	\™XÝ
+HÈ	ØÜš\ØXÚY˜]˜Q^HH	\™XÝÈ™]\›ˆ	\™XÝBˆYˆ
+	˜]˜P][\[ÊHÈÝ\TÛY\TÙXÛÛ™ÈˆBˆBˆ	˜]˜T›ÛÝH›Ú[‹T]	ØÜš\\›ÛÝ	ÛX—˜]˜IÂˆYˆ
+\ÝT]S]\˜[]	˜]˜T›ÛÝ
+HÂˆ	›Ý[™H
+Ù]PÚ[][HS]\˜[]	˜]˜T›ÛÝQš[\ˆ˜]˜K™^HT™XÝ\œÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YHˆÚ\™KSØš™XÝÈ	Ë‘[˜[YH[X]Ú	Ö××Xš[–××Z˜]˜W™^I	ÈHˆÛÜSØš™XÝ[˜[YHˆÙ[XÝSØš™XÝQš\œÝJBˆYˆ
+	›Ý[™ÛÝ[YÝ
+HÈ™]\›ˆÜÝš[™×I›Ý[™ÌK‘[˜[YHBˆBˆ	ÛYHÙ]PÛÛ[X[™˜]˜K™^HQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YBˆYˆ
+	ÛY
+HÈ™]\›ˆÜÝš[™×IÛY”ÛÝ\˜ÙHBˆ	ÛYˆHÙ]PÛÛ[X[™˜]˜HQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YBˆYˆ
+	ÛYŠHÈ™]\›ˆÜÝš[™×IÛY‹”ÛÝ\˜ÙHBˆ›ÝÈ
+¹§ 9í`”¸àk¹/g9¢$8àjùoáz) xàj’˜]˜H[[Yxàc:)¢øài8àbøà¢¸ào¸àføà¤Ê9£¨¸àeøàgùh-9¢`ˆÌJxà ¸àdøàk¹h-9¢`8àjÚ˜]˜K™^xàc8à`¸à¢øàk¸àjøàdøàk¸àª8àêxàï8àc9aî¸à¢ùh-9d"8àkøà \Ù\™\‹œÌxàk¹ïk¸àcyh-9¢`
+\›ÛÝ
+xàc8àf¸à£8ài¸àa8ào¸àfxà ˜\ÙÜ×Ý\\J‹[]\Ý›ÙÈ8àkˆ\›ÛÝ:(c8à¤¹è®º*£xàeøài¸àcøàh8àexàa8à š˜]˜K™^z!ê¹/døàc8àj¸àa9h-9d"8àkÈ\ÛÛ×[œÝ[]\™\K˜ÛY8à¤¹k§ú(c8àeøài¸àbøà¢xà xà ¸àa¹. 9n©”¸à¤¹aî¹b¦øàeøài¸àcøàh8àexàa8à ˆˆYˆ	\™XÝ
+BŸB‚™[˜Ý[ÛˆÙ]R˜]˜T[[YTÚYÛ˜]\™HÂˆÈKTJÌLJNˆ9å.ù`ãøàãøààøà­øàéxàk¹ä¬9h ù£!ùí"øàjùd*øà xà¢È˜]˜H9âb8àk¹ïl¹d#xà ‚ˆÈ˜]˜H]™\œÚ[Û˜8àk¹aî¹b¦Ê8àä8àï8à®8àéøàìÊøàäøàêøàâJxà¤¹£¨ycå¸àeøài¸àãøààøà­øàéyc%¸àeøà R˜]˜H9¦í9¥¬8àiùoáxàf¹`)8àc9i"xà£øà¢øà¢8àa¸àjøàfxà¢øà ‚ˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ØÜš\’˜]˜T[[YTÚYÛ˜]\™JJHÈ™]\›ˆ	ØÜš\’˜]˜T[[YTÚYÛ˜]\™HBˆ	ÚYÈH	Ý[šÛ›ÝÛ‰ÂˆžHÂˆ	˜]˜HH™\ÛÛ™KR˜]˜Q^BˆÈ˜]˜H]™\œÚ[Û˜8àkøàä8àï8à®8àéøàìù áyh,xà¤ˆÝ\œˆ8àjùaî¸àfxàgøà H‰ŒH8àiùcå¸à¢º/¯8à 8à ‚ˆ	Ý]HÜÝš[™×J[›ÚÙKS˜]]™PØ\\™H	˜]˜H
+	Ë]™\œÚ[Û‰ÊJK^ˆ	›Ü›HH
+	Ý]\™\XÙH	×ÊÉË	È	ÊK•š[J
+BˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	›Ü›JJHÈ	ÚYÈH
+Ù]TÚLM•^	›Ü›JK”ÝXœÝš[™ÊMŠHBˆHØ]ÚÈ	ÚYÈH	Ý[šÛ›ÝÛ‰ÈBˆ	ØÜš\’˜]˜T[[YTÚYÛ˜]\™HH	ÚYÂˆ™]\›ˆ	ÚYÂŸB‚™[˜Ý[ÛˆÙ]TÚLM•^
+ÜÝš[™×I^
+HÂˆ	ÚOVÔÙXÝ\š]KÜž\ÙÜ˜\K”ÒLM—NŽÜ™X]J
+NÝž^Éž]\ÏVÕ^‘[˜ÛÙ[™×NŽ•UŽ‘Ù]ž]\Ê	^
+NÜ™]\›ˆ	ÜÚLMŽ‰ÊÊÐš]ÛÛ™\\—NŽ•ÔÝš[™Ê	ÚKÛÛ\]R\Ú
+	ž]\ÊJK”™\XÙJ	ËIË	ÉÊK•ÓÝÙ\’[˜\šX[
+
+J_Yš[˜[^ÉÚK‘\ÜÜÙJ
+_BŸB‚™[˜Ý[ÛˆÙ]Qš[˜[Z[[œ]Û˜\ÚÝ
+	ÝXÝ\™KÜÝš[™×I[™ÝXYÙKÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆYŠ
+Ù]U›Û[YS\Ý	[™ÝXYÙ_Ú\™KSØš™XÝÉÈ[™H	Û›Û™IßJH[›ÝÛÛZ[œÈ	›Û[YJ^Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê¹.#y«høàj¹¢$9§§9âjxàiøàfNˆ	›Û[YHŠ_Bˆ	ÛÜšÜÜXÙOQÙ]UÛÜšÜÜXÙT]	[™ÝXYÙNÉØ“X\PßNÉ\™Ù]ÏP
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜßÚ\™KSØš™XÝÕ\ÝUÛÜšØ›ÛÚÐØ]YÛÜžH	È	Ø]JNÙ›Ü™XXÚ
+	Øˆ[ˆ	\™Ù]Ê^ÉØ“X\ÖÜÝš[™×IØ‹ÛÜšØ›ÛÚÒYOIØŸBˆ	YÙ\ÏP
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ßÚ\™KSØš™XÝÉË™[˜X›YY\H	YHX[™ÜÝš[™×IË›Û[YHY\H	›Û[YHX[™	Ø“X\ÛÛZ[œÒÙ^JÜÝš[™×IËÛÜšØ›ÛÚÒY
+__ÛÜSØš™XÝÖÙÝX›WIË›Ü™\ŸKÔ™\ÛÛ™KTYÙRY	ßJBˆ	›ØÚÙ\œÏP
+
+NÉX[šY™\ÝP
+
+NÉœYÙ\ÏP
+
+BˆYŠ	YÙ\ËÛÝ[Y\H
+^É›ØÚÙ\œÊÏHÛÜ™\™YPØÛÙOIÛ›Ë\YÙ\ÉÎÜYÙU]OIÉÎÝÛÜšØ›ÛÚÓ˜[YOIÉÎÛY\ÜØYÙOIùkïº,hxàæ¸àï8à®8àc8à`¸à¢¸ào¸àføà¤øà ¸àæ¸àï8à®9©âù¢$8à¤¹è®º*£xàeøài¸àcøàh8àexàa8à ‰ß_Bˆ›Ü™XXÚ
+	[ˆ	YÙ\Ê^ÉØIØ“X\ÖÜÝš[™×IÛÜšØ›ÛÚÒYNÉ]OVÜÝš[™×I]NÉØ“˜[YOVÜÝš[™×IØ‹™š[S˜[YNÉ™[VÜÝš[™×I˜ÛÛ[ŽÉ[IÉÎÉÚ^™OLÉXÚÜÏLˆYŠ[›Ý	™[
+^É›ØÚÙ\œÊÏVÛÜ™\™YPØÛÙOIØÛÛ[[Z\ÜÚ[™ÉÎÜYÙU]OI]NÝÛÜšØ›ÛÚÓ˜[YOIØ“˜[YNÛY\ÜØYÙOIÔ¹§*¹/g9¢$8àk¸àæ¸àï8à®8àc8à`¸à¢¸ào¸àfxà ¹ab8àjÔ¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ß_Bˆ[Ù^Ýž^É[VÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	ÛÜšÜÜXÙH	™[
+JNÉ›ÛÝVÒSË”]NŽ‘Ù][]
+	ÛÜšÜÜXÙJNÚYŠ[›Ý	›ÛÝ‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJ^É›ÛÝ
+ÏVÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŸNÚYŠ[›Ý	[”Ý\ÕÚ]
+	›ÛÝÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJ^Ý›ÝÈ	ÛÝ]ÚYIßNÚYŠ[›Ý
+\ÝT]	[
+J^Ý›ÝÈ	ÛZ\ÜÚ[™ÉßNÉ]QÙ]R][H	[ÉÚ^™OI]“[™ÝÉXÚÜÏI]“\ÝÜš]U[YU]Ë•XÚÜßXØ]ÚÉ›ØÚÙ\œÊÏVÛÜ™\™YPØÛÙOIØÛÛ[Yš[K[Z\ÜÚ[™ÉÎÜYÙU]OI]NÝÛÜšØ›ÛÚÓ˜[YOIØ“˜[YNÛY\ÜØYÙOIøàë8àìøàà8àê¸àìøà¬9®"8àoÔ¸àc:)¢øài8àbøà¢¸ào¸àføà¤øà ¹ab8àjÔ¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ß__BˆYŠ[›Ý
+\ÝUÛÜšØ›ÛÚÔ™[™\’\ÐÝ\œ™[	ØŠJ^É›ØÚÙ\œÊÏVÛÜ™\™YPØÛÙOIÜÝ[KXÛÛ[	ÎÜYÙU]OI]NÝÛÜšØ›ÛÚÓ˜[YOIØ“˜[YNÛY\ÜØYÙOIùa`Ñ^Ù[8àc9¦í9¥¬8àexà£8ài¸àa8ào¸àfxà ¹ab8àjÔ¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ß_Bˆ[ÙZYŠ[›Ý
+\ÝUÛÜšØ›ÛÚÔ™[™\™YÚY]ÛÛZ[œÈ	Øˆ
+ÜÝš[™×IœÚY]˜[YJJJ^É›ØÚÙ\œÊÏVÛÜ™\™YPØÛÙOIÜÚY]XÚ[™ÙY	ÎÜYÙU]OI]NÝÛÜšØ›ÛÚÓ˜[YOIØ“˜[YNÛY\ÜØYÙOIÑ^Ù[8àk¸à­øàï8àâ9©âù¢$8àc9i"xà£øàhøài¸àa8ào¸àfxà ¹ab8àjÔ¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ß_Bˆ[ÙZYŠ[›Ý
+\ÝTYÙPÛÛ[X]Ú\ÕÛÜšØ›ÛÚÕ™\œÚ[Ûˆ		ØŠJ^É›ØÚÙ\œÊÏVÛÜ™\™YPØÛÙOIÛÛXÛÛ[	ÎÜYÙU]OI]NÝÛÜšØ›ÛÚÓ˜[YOIØ“˜[YNÛY\ÜØYÙOIùcé8àa¹cà¹áiøàc9«¢øàhøài¸àa8ào¸àfxà ¹ab8àjÔ¹/g9¢$8àeøài¸àcøàh8àexàa8à ‰ß_Bˆ	›Ü›X[^™YJ	™[\™\XÙH	×	Ë	ËÉÊK•ÓÝÙ\’[˜\šX[
+
+NÉœYÙ\ÊÏVÛÜ™\™YPÜYÙRYJ™\ÛÛ™KTYÙRY	
+NÛÜ™\VÙÝX›WI›Ü™\ŽÙ[˜X›YVØ›ÛÛI™[˜X›YÝ›Û[YOVÜÝš[™×I›Û[YNÛ[X™\š[™Ó[ÙOVÜÝš[™×I›[X™\š[™Ó[ÙNØÛÛ[I›Ü›X[^™YØÛÛ[”Ú^™OIÚ^™NØÛÛ[“\ÝÜš]U]ÕXÚÜÏIXÚÜÎÛ\Ý™[™\™Y™\œÚ[Û’YVÜÝš[™×IØ‹›\Ý™[™\™Y™\œÚ[Û’YBˆYŠ	[
+^ÉX[šY™\Ý
+ÏVÛÜ™\™YPÜYÙRYJ™\ÛÛ™KTYÙRY	
+NÝ]OI]NÜÛÝ\˜ÙTI[Û[X™\š[™Ó[ÙOVÜÝš[™×I›[X™\š[™Ó[ÙNÜ[˜ÚÚYJÛÛ™\PÛUÔŒŠ__BˆBˆ	[œ]VÛÜ™\™YPØÛÛ\ÜÙ\”›Ùš[U™\œÚ[ÛIØÜš\‘š[˜[ÛÛ\ÜÙ\”›Ùš[U™\œÚ[ÛŽÛ[™ÝXYÙOI[™ÝXYÙNØØ]YÛÜžOIØ]Ý›Û[YOI›Û[YNÜYÙ\ÏIœYÙ\ßNÉœÛÛPÛÛ™\ËRœÛÛˆ	[œ]Q\ŒPÛÛ\™\ÜÎÉš[™Ù\œš[QÙ]TÚLM•^	œÛÛ‚ˆ™]\›ˆÛÜ™\™YPÛ[™ÝXYÙOI[™ÝXYÙNØØ]YÛÜžOIØ]Ý›Û[YOI›Û[YNÜYÙ\ÏIYÙ\ÎÛX[šY™\ÝYÙ\ÏIX[šY™\ÝØ›ØÚÙ\œÏP
+	›ØÚÙ\œÊNÜYÙPÛÝ[IYÙ\ËÛÝ[Ü›Ú™XÝYJÙ]T›Ú™XÝYœ›ÛUÛÜšØ›ÛÚÜÈ	\™Ù]ÊNÙš[™Ù\œš[Iš[™Ù\œš[Ùš[™Ù\œš[[œ]I[œ]BŸB‚™[˜Ý[ÛˆÙ]Qš[˜[Z[š[™Ù\œš[
+	Û˜\ÚÝ
+HÈ™]\›ˆÜÝš[™×JÙ]Q]T›Ü\H	Û˜\ÚÝ	Ùš[™Ù\œš[	È	ÉÊHB‚™[˜Ý[ÛˆÙ]Qš[˜[Z[™XY[™\ÜÊ	ÝXÝ\™KÜÝš[™×I[™ÝXYÙKÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžJHÂˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžNÉÛ˜\QÙ]Qš[˜[Z[[œ]Û˜\ÚÝ	ÝXÝ\™H	[™ÝXYÙH	›Û[YH	Ø]ÉÙ^OQÙ]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]ÉQÙ]Q]T›Ü\H	ÝXÝ\™K›Û[Y\È	Ù^H
+™]ËQ[\U›Û[YTÝ]JNÉZ[VÜÝš[™×JÙ]Q]T›Ü\H	ˆ	ØZ[š[™Ù\œš[	È	ÉÊNÉÝ\œ™[VÜÝš[™×IÛ˜\™š[™Ù\œš[ÉÝ]VÜÝš[™×JÙ]Q]T›Ü\H	ˆ	ÛÝ]]‰È	ÉÊNÉ^\ÝÏJ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý]
+JKX[™
+\ÝT]S]\˜[]	Ý]
+NÉÝ]\ÏIÛ›ÝXZ[	ÎÚYŠ	Z[
+^ÚYŠ	Z[[™H	Ý\œ™[[Üˆ	Û˜\˜›ØÚÙ\œËÛÝ[YÝ
+^ÉÝ]\ÏIÛ™YYË\™XZ[	ßY[Ù^ÉÝ]\ÏIØZ[	ß_NÉ\Ü^OZYŠ	Û˜\˜›ØÚÙ\œËÛÝ[YÝ
+^ÉØ›ØÚÙY	ßY[ÙZYŠ[›Ý	Z[
+^ÉÛ›ÝXZ[	ßY[ÙZYŠ	Z[[™H	Ý\œ™[
+^ÉÛ™YYË\™XZ[	ßY[ÙZYŠ[›Ý	^\ÝÊ^ÉÛÝ]][Z\ÜÚ[™ÉßY[Ù^ÉØZ[	ßBˆÙ]S›ÝT›Ü\H	ˆ	ÜÝ]\ÉÈ	Ý]\Âˆ	™X\ÛÛœÏP
+Ù]P\œ˜^H
+Ù]Q]T›Ü\H	ˆ	ÜÝ[T™X\ÛÛœÉÈ
+
+JJNÚYŠ	\Ü^HY\H	Û™YYË\™XZ[	ÈX[™	™X\ÛÛœËÛÝ[Y\H
+^É™X\ÛÛœÏP
+ÛÜ™\™YPÝ\OIÙš[™Ù\œš[	ÎØ]JÙ]Q]T›Ü\H	ÝXÝ\™H	Ý\]Y]	È	[
+NÙ]Z[Iù§ 9í`”¸àk¹aiyb¦øàc9i"y¦í8àexà£8ào¸àeøàgÉßJ_Bˆ™]\›ˆÛÜ™\™YPØØ[Z[J	Û˜\˜›ØÚÙ\œËÛÝ[Y\HX[™	Û˜\œYÙPÛÝ[YÝ
+NÜYÙPÛÝ[IÛ˜\œYÙPÛÝ[ÜÝ]\ÏIÝ]\ÎÙ\Ü^TÝ]OI\Ü^NØZ[š[™Ù\œš[IZ[ØÝ\œ™[š[™Ù\œš[IÝ\œ™[ÛÝ]]IÝ]ÛÝ]]‘^\ÝÏVØ›ÛÛI^\ÝÎÛ\ÝZ[]JÙ]Q]T›Ü\H	ˆ	Û\ÝZ[]	È	[
+NØ›ØÚÙ\œÏP
+	Û˜\˜›ØÚÙ\œÊNÜÝ[T™X\ÛÛœÏP
+	™X\ÛÛœÊNÜÛ˜\ÚÝIÛ˜\BŸB‚™[˜Ý[ÛˆÙ]P[š[˜[™XY[™\ÜÊ	ÝXÝ\™KÜÝš[™×I[™ÝXYÙJHÂˆ	™\Ý[VÛÜ™\™YPßNÙ›Ü™XXÚ
+	Ø][ˆ
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊJ^É›ÛÏVÛÜ™\™YPßNÙ›Ü™XXÚ
+	›Û[YH[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙ_Ú\™KSØš™XÝÉÈ[™H	Û›Û™IßJJ^É›ÛÖÉ›Û[YWOQÙ]Qš[˜[Z[™XY[™\ÜÈ	ÝXÝ\™H	[™ÝXYÙH	›Û[YH	Ø]NÉ™\Ý[ÉØ]OVÛÜ™\™YPÝ›Û[Y\ÏI›Ûß_NÜ™]\›ˆ	™\Ý[ŸB‚™[˜Ý[ÛˆZ[Qš[˜[ŠÜÝš[™×I[™ÝXYÙKÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžOIÉÊHÂˆÈØ]YÛÜžH8àkÈ˜Z[ÛÜÙY8à ¸àdøàdøàiøà ¹¦#¹é.¹æ¡8àjù©':*/8àfxà¢øà ‚ˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆÈKTˆ9¢oú*£ybcxàkù¥¬8àeøàa9aî¹b¦ùíc:-ëøà¤¹. 9b!ú`&¸àexàj¸àa8à •ŒH8àj9d#8àf9£&ybåxàjøàfxà¢øà ‚ˆYˆ
+[›Ý
+\ÝR[œ]\ÝÜžQ[˜X›Y
+JHÈ™]\›ˆZ[Qš[˜[“YØXÞH	[™ÝXYÙH	›Û[YH	Ø]BˆÈKp©ÑNˆ9¢oú*£y®"8àoøàj¸à¢ycf9/dùaî¹b¦øà ¸ào¸àj8à xài¹aî¹b¦øà ¹d#8àf8àâ8àêxàìøà­¸à«øà­øàéøàìøàª8àìøà®8àìøà¤º`&¸àfxà ‚ˆ	ˆH[›ÚÙKQš[˜[Z[˜[œØXÝ[Ûˆ	[™ÝXYÙH	Ø]
+	›Û[YJBˆ	Z[H
+Ù]P\œ˜^H	‹˜Z[
+BˆYˆ
+	Z[ÛÝ[Y\H
+HÈ›ÝÈÒ[˜[YÜ\˜][Û‘^Ù\[Û—NŽ›™]Ê	ùkïº,hxàæ¸àï8à®8àc8à`¸à¢¸ào¸àføà¤øà ¸àæ¸àï8à®9©âù¢$8à¤¹è®º*£xàeøài¸àcøàh8àexàa8à ‰ÊHBˆ™]\›ˆ	Z[ÌBŸB‚™[˜Ý[ÛˆZ[Qš[˜[“YØXÞJÜÝš[™×I[™ÝXYÙKÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžOIÉÊHÂˆYˆ
+
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJH[›ÝÛÛZ[œÈ	›Û[YJHÈ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê	Ý›Û[Yxàjøàkù§+9/døào¸àgøàkú(ç:-¬øà¤¹£!ùk¦¸àeøài¸àcøàh8àexàa8à ‰ÊHBˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžNÉ]ÏQÙ]T]ÎÉÛÜšÜÜXÙOQÙ]UÛÜšÜÜXÙT]	[™ÝXYÙNÝž^ÖÝ›ÚYJØØ[‹U\]\È	[™ÝXYÙH	[	˜[ÙJ_XØ]ÚßBˆ	ØÚÔ]R›Ú[‹T]	ÛÜšÜÜXÙH›ØÚÜ×›Û[YWÉÕ›Û[Y_WÉØØ]K›ØÚÈ‚ˆ™]\›ˆ[›ÚÙKUÚ]ØÚÈ	ØÚÔ]Âˆ	ÛÛ\ÜÙ\’˜\R›Ú[‹T]	ØÜš\\›ÛÝ	ÛX—˜›Þ™\ÜÛÛ\ÜÙ\‹š˜\‰ÎÉ˜›Þ˜\R›Ú[‹T]	ØÜš\\›ÛÝ	ÛX—˜›Þ˜›ÞX\š˜\‰ÎÚYŠ[›Ý
+\ÝT]	ÛÛ\ÜÙ\’˜\ŠJ^Ý›ÝÈ	Ô™\ÜÛÛ\ÜÙ\‹š˜\ˆ8àc8à`¸à¢¸ào¸àføà¤øà ‰ßNÚYŠ[›Ý
+\ÝT]	˜›Þ˜\ŠJ^Ý›ÝÈ	Ü˜›ÞX\š˜\ˆ8àc8à`¸à¢¸ào¸àføà¤øà ‰ßBˆ	Û˜\ÚÝ™Y›Ü™OU\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÜ\˜[J	Ý
+H\KQY˜][[X™\š[™Ô\•›Û[YH	[™ÝXYÙH	Ý	Ø]Ü™]\›ˆÙ]Qš[˜[Z[[œ]Û˜\ÚÝ	Ý	[™ÝXYÙH	›Û[YH	Ø]BˆYŠ	Û˜\ÚÝ™Y›Ü™K˜›ØÚÙ\œËÛÝ[YÝ
+^Ý›ÝÈÒ[˜[YÜ\˜][Û‘^Ù\[Û—NŽ›™]ÊÜÝš[™×IÛ˜\ÚÝ™Y›Ü™K˜›ØÚÙ\œÖÌK›Y\ÜØYÙJ_Bˆ	œ™Y›Ü™OVÜÝš[™×IÛ˜\ÚÝ™Y›Ü™K™š[™Ù\œš[É›Ú™XÝYVÜÝš[™×IÛ˜\ÚÝ™Y›Ü™Kœ›Ú™XÝYÉÝ]˜[YOQÙ]SÝ]]š[S˜[YH	›Û[YH	›Ú™XÝY	Ø]ÉÝ]]R›Ú[‹T]
+ÜÝš[™×I]Ë›Ý]]\ŠH	Ý]˜[YNÉ\R›Ú[‹T]
+ÜÝš[™×I]Ë›Ý]]\ŠHŸ˜Z[[™×ÉÕ›Û[Y_WÉØØ]KœˆŽÚYŠ\ÝT]	\
+^Ô™[[Ý™KR][H	\Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[Y_BˆYŠ\ÝT]	Ý]]
+^ÉI[Ýž^ÉVÒSË‘š[WNŽ“Ü[Š	Ý]]ÒSË‘š[S[ÙWNŽ“Ü[‹ÒSË‘š[PXØÙ\Ü×NŽ”™XYÜš]KÒSË‘š[TÚ\™WNŽ“›Û™J_XØ]ÚÝ›ÝÈ¹aî¹b¦ùab8àk¹§ 9í`”¸àc:e¢øàbøà£8ài¸àa8à¢øàgøà y."¹¦î8àcxàiøàcxào¸àføà¤Îˆ	Ý]˜[YHŸYš[˜[^ÚYŠ	Š^É‹‘\ÜÜÙJ
+___Bˆ	X[šY™\ÝVÛÜ™\™YPÜØÚ[XU™\œÚ[ÛLŽÛ[™ÝXYÙOI[™ÝXYÙNØØ]YÛÜžOIØ]Ý›Û[YOI›Û[YNÜ›Ú™XÝYI›Ú™XÝYÚ[œ]š[™Ù\œš[Iœ™Y›Ü™NÛÝ]]I\ØÜ™X]Y]S™]ËS›ÝÒ\ÛÎÜYÙS[X™\VÛÜ™\™YPÙ›ÛIÐ\šX[	ÎÙ›ÛÚ^™ONØ›ÝÛTLNÙ›Ü›X]IÚ\[˜]Y	ÎØÛÝ[Y[IY_NÜYÙ\ÏIÛ˜\ÚÝ™Y›Ü™K›X[šY™\ÝYÙ\ßNÉX[šY™\Ý]R›Ú[‹T]	ÛÜšÜÜXÙH™^Ü×X[šY™\ÝÉÕ›Û[Y_WÉØØ]KšœÛÛˆŽÕÜš]KRœÛÛ‘š[H	X[šY™\Ý]	X[šY™\Ýˆ	˜]˜OT™\ÛÛ™KR˜]˜Q^NÉ[R[›ÚÙKS˜]]™PØ\\™H	˜]˜H
+	ËXÜ	Ë‰ÛÛ\ÜÙ\’˜\ŽÉ˜›Þ˜\ˆ‹	Ô™\ÜÛÛ\ÜÙ\‰Ë	ËK[X[šY™\Ý	Ë	X[šY™\Ý]
+NÉ^]VÚ[I[‹™^]ÛÙNÉ^VÜÝš[™×I[‹^ÚYŠ	^][™H
+^Ý›ÝÈ”›Þ9ía9âb8àjùi,y¥eøàeøào¸àeøàgøà ™^]I^]‰^ŸNÚYŠ[›Ý
+\ÝT]	\
+K[ÜŠÙ]R][H	\
+K“[™Ý[H
+^Ô™[[Ý™KR][H	\Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YNÝ›ÝÈ	ù§ 9í`”¸à¤¹/g9¢$8àiøàcxào¸àføà¤øàiøàeøàgøà ‰ßBˆ	ÛÛ[Z]U\]KTÝXÝ\™SØÚÙY	[™ÝXYÙHÜ\˜[J	Ý
+IY\QÙ]Qš[˜[Z[[œ]Û˜\ÚÝ	Ý	[™ÝXYÙH	›Û[YH	Ø]ÚYŠÜÝš[™×IY\‹™š[™Ù\œš[[™H	œ™Y›Ü™J^Ü™]\›ˆÛÜ™\™YPØÚ[™ÙYIYNØY\IY\Ÿ_NÓ[Ý™KR][HS]\˜[]	\Q\Ý[˜][Ûˆ	Ý]]Q›Ü˜ÙNÉÙ^OQÙ]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]ÉQÙ]Q]T›Ü\H	Ý›Û[Y\È	Ù^H	[ÚYŠ	[Y\H	Š^ÉS™]ËQ[\U›Û[YTÝ]NÔÙ]S›ÝT›Ü\H	Ý›Û[Y\È	Ù^H	ŸNÔÙ]S›ÝT›Ü\H	ˆ	ØZ[š[™Ù\œš[	È	œ™Y›Ü™NÔÙ]S›ÝT›Ü\H	ˆ	Û\ÝZ[]	È
+™]ËS›ÝÒ\ÛÊNÔÙ]S›ÝT›Ü\H	ˆ	ÛÝ]]‰È	Ý]]ÔÙ]S›ÝT›Ü\H	ˆ	ÜÝ[T™X\ÛÛœÉÈ
+
+NÔÙ]S›ÝT›Ü\H	ˆ	ÛY\ÜØYÙIÈ	^É™XYOQÙ]Qš[˜[Z[™XY[™\ÜÈ	Ý	[™ÝXYÙH	›Û[YH	Ø]ÚYŠ	™XYK˜›ØÚÙ\œËÛÝ[YÝ
+^ÔÙ]S›ÝT›Ü\H	ˆ	ÜÝ]\ÉÈ	Û™YYË\™XZ[	ÎÐYTÝ[T™X\ÛÛˆ	ˆ	Ù^Ù[]\]Y	È	ùa`Ñ^Ù[8àc9¦í9¥¬8àexà£8àgøàgøà xà T¸à¤¹a£y/g9¢$9o£8àjù§ 9í`”¸à¤¹a£yaî¹b¦øàeøài¸àcøàh8àexàa	ßY[Ù^ÔÙ]S›ÝT›Ü\H	ˆ	ÜÝ]\ÉÈ	ØZ[	ßNÜ™]\›ˆÛÜ™\™YPØÚ[™ÙYI˜[ÙNÜ™XY[™\ÜÏI™XY__BˆYŠ	ÛÛ[Z]˜Ú[™ÙY
+^Ô™[[Ý™KR][H	\Q›Ü˜ÙHQ\œ›ÜXÝ[ÛˆÚ[[PÛÛ[YNÝ›ÝÈ	Ô¹/g9¢$9.+xàjøàæ¸àï8à®9©âù¢$8ào¸àgøàkÔ¹aiyb¦øàc9i"y¦í8àexà£8ào¸àeøàgøà ¹§ 9¥¬8àk¹â­¹¡bøàiùa£yn©¹aî¹b¦øàeøài¸àcøàh8àexàa8à ‰ßBˆ™]\›ˆÛÜ™\™YPÝ›Û[YOI›Û[YNØØ]YÛÜžOIØ]ÛÝ]]IÝ]]Ú[œ]š[™Ù\œš[Iœ™Y›Ü™NÛY\ÜØYÙOI^Ü™XY[™\ÜÏIÛÛ[Z]œ™XY[™\ÜßBˆBŸB‚™[˜Ý[Ûˆ[›ÚÙKQš[˜[Z[[YØXÞJÜÝš[™×I[™ÝXYÙKÜÝš[™×IØ]YÛÜžKÜÝš[™Ö×WI›Û[Y\ÊHÂˆÈKT
+ÌŠNˆ9¢oú*£ybcxàk¸à#8ào¸àj8à xài¹aî¹b¦øà#xà ¹¥¬8àeøàa8àâ8àêxàìøà­¸à«øà­øàéøàìËøà®xàâ¸ààøàåøà­øàéøààøàâ9ªgù©âøà¤¹. 9b!ú`&¸àexàf¸à BˆÈ9cf9/dùaî¹b¦øàj9d#8àfŒH9íc:-ëÊZ[Qš[˜[“YØXÞJxà¤¹mîøàe8àj8àjùfç¸àfxà ‚ˆÈ8àâ8àêxàìøà­¸à«øà­øàéøàìùâb8àj9d#9©æ8à xàæ¸àï8à®8àc9á(xàa9mîøàkøà®xà«xààøàåøàeøà y§+9odøàk¸àå¸àëxààøàªøàï8àkÈZ[Qš[˜[“YØXÞH9`m8àiú` yaî¸àfxà¢øà ‚ˆ	Ø]H™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžBˆ	[ÝÙYH
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJBˆ	™\]Y\ÝYH
+	›Û[Y\ÈÚ\™KSØš™XÝÈ	[ÝÙYXÛÛZ[œÈ	ÈJBˆYˆ
+	™\]Y\ÝYÛÝ[Y\H
+HÈ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê	Ý›Û[Yxàjøàkù§+9/døào¸àgøàkú(ç:-¬øà¤¹£!ùk¦¸àeøài¸àcøàh8àexàa8à ‰ÊHBˆ	Z[H
+
+Bˆ	ÚÚ\YH
+
+Bˆ›Ü™XXÚ
+	ˆ[ˆ	™\]Y\ÝY
+HÂˆ	ÝXÝ\™HHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	™HÙ]Qš[˜[Z[™XY[™\ÜÈ	ÝXÝ\™H	[™ÝXYÙH	ˆ	Ø]ˆYˆ
+Ú[I™œYÙPÛÝ[[H
+HÈ	ÚÚ\Y
+ÏH	ŽÈÛÛ[YHBˆ	Z[
+ÏH
+Z[Qš[˜[“YØXÞH	[™ÝXYÙH	ˆ	Ø]
+BˆBˆ™]\›ˆÛÜ™\™YPÈZ[H
+	Z[
+NÈÚÚ\YH
+	ÚÚ\Y
+NÈY\ÜØYÙHH
+Yˆ
+	Z[ÛÝ[Y\H
+HÈ	ùaî¹b¦ùkïº,hxàc8à`¸à¢¸ào¸àføà¤øà ‰ÈH[ÙHÈ	ÉÈJHBŸB‚™[˜Ý[ÛˆÙ]TÝ]T^[ØY
+ÜÝš[™×I[™ÝXYÙJHÂˆ	]ÈHÙ]T]Âˆ	ÛÛ™šYÝ\™YH	˜[ÙBˆYˆ
+	]ÈX[™ÜÝš[™×I]ËœÝX›Z\ÜÚ[Û‘\ˆX[™ÜÝš[™×I]Ë™]Q\ˆX[™ÜÝš[™×I]Ë›Ý]]\ŠHÈ	ÛÛ™šYÝ\™YH	YHBˆ	ÝXÝ\™HH	[ˆ	ÝXÝ\™SØY\œ›ÜˆH	ÉÂˆYˆ
+	ÛÛ™šYÝ\™YX[™
+\ÝT]S]\˜[]
+ÜÝš[™×I]Ë™]Q\ŠJJHÂˆžHÂˆ	ÝXÝ\™HHÙ]TÝXÝ\™H	[™ÝXYÙBˆHØ]ÚÂˆ	ÝXÝ\™SØY\œ›ÜˆH	Ë‘^Ù\[Û‹“Y\ÜØYÙBˆ	ÝXÝ\™HH™]ËQ[\TÝXÝ\™H	[™ÝXYÙBˆBˆH[ÙHÂˆ	ÝXÝ\™HH™]ËQ[\TÝXÝ\™H	[™ÝXYÙBˆBˆ	ÛÜšØ›ÛÚÜÈH
+Ù]P\œ˜^H	ÝXÝ\™KÛÜšØ›ÛÚÜÊBˆ	YÙ\ÈH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÊBˆ	Ý[[X\žHHÛÜ™\™YPÂˆ^Ù[\]YH
+	ÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËœÝ]\ÈY\H	Ù^Ù[]\]Y	ÈJKÛÝ[ˆ[˜ÚXÚÙYYÙ\ÈH
+	YÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËœÝ]\ÈZ[ˆ
+	Ü™[™\™Y	Ë	ÜÝ[IË	Û›Ý\™[™\™Y	ÊHJKÛÝ[ˆÛÛ™š\›YYYÙ\ÈH
+	YÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËœÝ]\ÈY\H	ØÛÛ™š\›YY	ÈJKÛÝ[ˆ™[™\‘\œ›ÜœÈH
+	ÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËœÝ]\ÈY\H	Ü™[™\‹Y\œ›Ü‰ÈJKÛÝ[ˆ”™XYUÛÜšØ›ÛÚÜÈH
+	ÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IË›\Ý™[™\™Y^Ù[\Ú
+HX[™ÜÝš[™×IËœÝ]\È[™H	Ü™[™\‹Y\œ›Ü‰ÈJKÛÝ[ˆ”[™[™ÕÛÜšØ›ÛÚÜÈH
+	ÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IË›\Ý™[™\™Y^Ù[\Ú
+H[ÜˆÜÝš[™×IËœÝ]\ÈZ[ˆ
+	Û™]ÉË	Ù^Ù[]\]Y	Ë	Ü™[™\‹Y\œ›Ü‰ÊHJKÛÝ[ˆ”™XYTYÙ\ÈH
+	YÙ\ÈÚ\™KSØš™XÝÈ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IË˜ÛÛ[ŠHJKÛÝ[ˆÝ[ÛÜšØ›ÛÚÜÈH	ÛÜšØ›ÛÚÜËÛÝ[ˆÝ[YÙ\ÈH	YÙ\ËÛÝ[ˆBˆYˆ
+	ÛÛ™šYÝ\™YX[™[›Ý	ÝXÝ\™SØY\œ›ÜŠHÂˆ›Ü™XXÚ
+	Ø][ˆ
+	ÙXÛIË	Ø›Ù	Ë	Ù[IÊJHÂˆ›Ü™XXÚ
+	›Û[YH[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJJHÂˆ	Ù^OQÙ]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]È	QÙ]Q]T›Ü\H	ÝXÝ\™K›Û[Y\È	Ù^H	[ˆYˆ
+	[[™H	ŠHÈ	Ý]VÜÝš[™×JÙ]Q]T›Ü\H	ˆ	ÛÝ]]‰È	ÉÊNÈÙ]S›ÝT›Ü\H	ˆ	ÛÝ]]‘^\ÝÉÈ
+
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	Ý]
+JHX[™
+\ÝT]S]\˜[]	Ý]
+JHBˆBˆBˆBˆÈNˆ8à­øàï8àâ9cf9/cxàk¹i"y¦í9b)9k¦¸à¤ˆÝ]H8àjú/"xàføà¢Ê9liy«m8àc9¢oú*£xàexà£8ài¸àa8à¢ùh-9d"8àk¸àoÊxà ‚ˆ	Ú[™ÙTÝ[[X\šY\ÈHÛÜ™\™YPßBˆ	[œ]\ÝÜžSÛˆH	˜[ÙBˆžHÈ	[œ]\ÝÜžSÛˆH
+\ÝR[œ]\ÝÜžQ[˜X›Y
+HHØ]ÚÈBˆYˆ
+	ÛÛ™šYÝ\™YX[™[›Ý	ÝXÝ\™SØY\œ›ÜˆX[™	[œ]\ÝÜžSÛŠHÂˆ›Ü™XXÚ
+	È[ˆ	ÛÜšØ›ÛÚÜÊHÂˆžHÂˆ	ÜÈHÙ]UÛÜšØ›ÛÚÐÚ[™ÙTÝ[[X\žH	[™ÝXYÙH
+ÜÝš[™×IËÛÜšØ›ÛÚÒY
+H	ÂˆYˆ
+	[[™H	ÜÊHÈ	Ú[™ÙTÝ[[X\šY\ÖÖÜÝš[™×IËÛÜšØ›ÛÚÒYHH	ÜÈBˆHØ]ÚÈBˆBˆBˆ	]]ÔÝ[[X\žHH	[ˆžHÈYˆ
+	ÛÛ™šYÝ\™Y
+HÈ	]]ÔÝ[[X\žHHÙ]P]]ÔÝ]TÝ[[X\žH	[™ÝXYÙHHHØ]ÚÈB‚ˆ	šœÑ\ˆH›Ú[‹T]	ØÜš\•ÙX”›ÛÝ	ÜšœÉÂˆ	šœÐÛ\ÜÚXÈH
+
+\ÝT]S]\˜[]
+›Ú[‹T]	šœÑ\ˆ	Ü‹›Z[‹šœÉÊJHX[™
+\ÝT]S]\˜[]
+›Ú[‹T]	šœÑ\ˆ	Ü‹ÛÜšÙ\‹›Z[‹šœÉÊJJBˆ	šœÓ[Ù[HH
+
+\ÝT]S]\˜[]
+›Ú[‹T]	šœÑ\ˆ	Ü‹›Z[‹›ZœÉÊJHX[™
+\ÝT]S]\˜[]
+›Ú[‹T]	šœÑ\ˆ	Ü‹ÛÜšÙ\‹›Z[‹›ZœÉÊJJBˆ	šœÓ[ÙHH	Û›Û™IÂˆYˆ
+	šœÓ[Ù[JHÈ	šœÓ[ÙHH	Û[Ù[IÈH[ÙZYˆ
+	šœÐÛ\ÜÚXÊHÈ	šœÓ[ÙHH	ØÛ\ÜÚXÉÈBˆ™]\›ˆÛÜ™\™YPÂˆÚÈH	YBˆ[ÙHH	[ÙBˆ[™ÝXYÙHH	[™ÝXYÙBˆÚÙ[ˆH	ØÜš\•ÚÙ[‚ˆÛÛ™šYÝ\™YH	ÛÛ™šYÝ\™Yˆ]ÈH	]ÂˆÝXÝ\™HH	ÝXÝ\™BˆÝXÝ\™SØY\œ›ÜˆH	ÝXÝ\™SØY\œ›Ü‚ˆš[˜[™XY[™\ÜÈH	
+Yˆ
+	ÛÛ™šYÝ\™YX[™[›Ý	ÝXÝ\™SØY\œ›ÜŠHÈÙ]P[š[˜[™XY[™\ÜÈ	ÝXÝ\™H	[™ÝXYÙHH[ÙHÈÛÜ™\™YPßHJBˆÝ[[X\žHH	Ý[[X\žBˆ™XÙ[\œ›ÜœÈH
+Ù]P\œ˜^H	ÛÜšØ›ÛÚÜÈÚ\™KSØš™XÝÈÜÝš[™×IËœÝ]\ÈY\H	Ü™[™\‹Y\œ›Ü‰È[Üˆ[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJÜÝš[™×IË›\Ý\œ›ÜŠHH›Ü‘XXÚSØš™XÝÈÛÜ™\™YPÈÛÜšØ›ÛÚÒYHÜÝš[™×IËÛÜšØ›ÛÚÒYÈš[S˜[YHHÜÝš[™×IË™š[S˜[YNÈ\Ü^S˜[YHHÜÝš[™×IË™\Ü^S˜[YNÈY\ÜØYÙHHÜÝš[™×IË›\Ý\œ›Ü•\Ù\ŽÈ]Z[HÜÝš[™×IË›\Ý\œ›ÜŽÈ]HÜÝš[™×IË›\Ý\œ›Ü]HJBˆšœÔ™\Ù[H
+	šœÐÛ\ÜÚXÈ[Üˆ	šœÓ[Ù[JBˆšœÓ[ÙHH	šœÓ[ÙBˆ^Ù[š[›Ùš[U™\œÚ[ÛˆH	ØÜš\‘^Ù[š[›Ùš[U™\œÚ[Û‚ˆ[œ]\ÝÜžQ[˜X›YH	[œ]\ÝÜžSÛ‚ˆÚ[™ÙTÝ[[X\šY\ÈH	Ú[™ÙTÝ[[X\šY\Âˆ]]ÈH	]]ÔÝ[[X\žBˆ]]Ô™[™\’[”›ÙÜ™\ÜÈH	ØÜš\]]Ô™[™\’[”›ÙÜ™\ÜÂˆÚ]ÝÛ“Û•XÛÜÙHH	˜[ÙBˆBŸB‚™[˜Ý[Ûˆ™XYP›ÙRœÛÛŠ	™\]Y\Ý
+HÂˆ	™XY\ˆH™]ËSØš™XÝSË”Ý™X[T™XY\Š	™\]Y\Ý’[œ]Ý™X[K	™\]Y\ÝÛÛ[[˜ÛÙ[™ÊBˆ	^H	™XY\‹”™XYÑ[™
+
+BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	^
+JHÈ™]\›ˆÜØÝ\ÝÛ[Øš™XÝPßHBˆ™]\›ˆ	^ÛÛ™\œ›ÛKRœÛÛ‚ŸB‚™[˜Ý[ÛˆÝXÚT™\ÜÛœÙPXÝ]š]HÂˆYˆ
+	ØÜš\ÛY[]XÚYX[™	ØÜš\ÛY[ÛÜÙS›ÝYšYY]ÈY\HÑ]U[YWNŽ“Z[•˜[YJHÈ	ØÜš\“\ÝX\™X]]ÈHÑ]U[YWNŽ•]Ó›ÝÈBŸB‚™[˜Ý[ÛˆÜš]KU^™\ÜÛœÙJ	ÛÛ^Ú[IÝ]\ËÜÝš[™×I›ÙKÜÝš[™×IÛÛ[\KØ›ÛÛI[ÝÐÛÜœÈH	˜[ÙJHÂˆÝXÚT™\ÜÛœÙPXÝ]š]Bˆ	ž]\ÈHÕ^‘[˜ÛÙ[™×NŽ•UŽ‘Ù]ž]\Ê	›ÙJBˆYˆ
+\ÝUÜÛÛ^	ÛÛ^
+HÈÜš]KUÜ™\ÜÛœÙH	ÛÛ^	Ý]\È	ž]\È	ÛÛ[\H	[ÝÐÛÜœÎÈ™]\›ˆBˆ	ÛÛ^”™\ÜÛœÙK”Ý]\ÐÛÙHH	Ý]\Âˆ	ÛÛ^”™\ÜÛœÙKÛÛ[\HH	ÛÛ[\Bˆ	ÛÛ^”™\ÜÛœÙK’XY\œÖÉÐØXÚKPÛÛ›Û	×HH	Û›Ë\ÝÜ™IÂˆYˆ
+	[ÝÐÛÜœÊHÈ	ÛÛ^”™\ÜÛœÙK’XY\œÖÉÐXØÙ\ÜËPÛÛ›ÛP[ÝËSÜšYÚ[‰×HH	Ê‰ÈBˆ	ÛÛ^”™\ÜÛœÙKÛÛ[[™ÝH	ž]\Ë“[™Ýˆ	ÛÛ^”™\ÜÛœÙK“Ý]]Ý™X[K•Üš]J	ž]\Ë	ž]\Ë“[™Ý
+Bˆ	ÛÛ^”™\ÜÛœÙK“Ý]]Ý™X[KÛÜÙJ
+BŸB‚™[˜Ý[ÛˆÜš]KRœÛÛ”™\ÜÛœÙJ	ÛÛ^Ú[IÝ]\Ë	Øš™XÝØ›ÛÛI[ÝÐÛÜœÈH	˜[ÙJHÂˆ	œÛÛˆHÛÛ™\ËRœÛÛˆR[œ]Øš™XÝ	Øš™XÝQ\LˆÜš]KU^™\ÜÛœÙH	ÛÛ^	Ý]\È	œÛÛˆ	Ø\XØ][Û‹ÚœÛÛŽÈÚ\œÙ]]]‹N	È	[ÝÐÛÜœÂŸB‚™[˜Ý[ÛˆÜš]KPž]\Ô™\ÜÛœÙJ	ÛÛ^Ú[IÝ]\ËØž]V×WIž]\ËÜÝš[™×IÛÛ[\KØ›ÛÛI[ÝÐÛÜœÈH	˜[ÙJHÂˆÝXÚT™\ÜÛœÙPXÝ]š]BˆYˆ
+\ÝUÜÛÛ^	ÛÛ^
+HÈÜš]KUÜ™\ÜÛœÙH	ÛÛ^	Ý]\È	ž]\È	ÛÛ[\H	[ÝÐÛÜœÎÈ™]\›ˆBˆ	ÛÛ^”™\ÜÛœÙK”Ý]\ÐÛÙHH	Ý]\Âˆ	ÛÛ^”™\ÜÛœÙKÛÛ[\HH	ÛÛ[\Bˆ	ÛÛ^”™\ÜÛœÙK’XY\œÖÉÐØXÚKPÛÛ›Û	×HH	Û›Ë\ÝÜ™IÂˆYˆ
+	[ÝÐÛÜœÊHÈ	ÛÛ^”™\ÜÛœÙK’XY\œÖÉÐXØÙ\ÜËPÛÛ›ÛP[ÝËSÜšYÚ[‰×HH	Ê‰ÈBˆ	ÛÛ^”™\ÜÛœÙKÛÛ[[™ÝH	ž]\Ë“[™Ýˆ	ÛÛ^”™\ÜÛœÙK“Ý]]Ý™X[K•Üš]J	ž]\Ë	ž]\Ë“[™Ý
+Bˆ	ÛÛ^”™\ÜÛœÙK“Ý]]Ý™X[KÛÜÙJ
+BŸB‚™[˜Ý[ÛˆÙ]SZ[YJÜÝš[™×I]
+HÂˆÝÚ]Ú
+ÒSË”]NŽ‘Ù]^[œÚ[ÛŠ	]
+K•ÓÝÙ\’[˜\šX[
+
+JHÂˆ	Ëš[	ÈÈ™]\›ˆ	Ý^Ú[ÈÚ\œÙ]]]‹N	ÈBˆ	Ë˜ÜÜÉÈÈ™]\›ˆ	Ý^ØÜÜÎÈÚ\œÙ]]]‹N	ÈBˆ	ËšœÉÈÈ™]\›ˆ	Ø\XØ][Û‹Ú˜]˜\ØÜš\ÈÚ\œÙ]]]‹N	ÈBˆ	Ë›ZœÉÈÈ™]\›ˆ	Ø\XØ][Û‹Ú˜]˜\ØÜš\ÈÚ\œÙ]]]‹N	ÈBˆ	ËšœÛÛ‰ÈÈ™]\›ˆ	Ø\XØ][Û‹ÚœÛÛŽÈÚ\œÙ]]]‹N	ÈBˆ	Ëœ‰ÈÈ™]\›ˆ	Ø\XØ][Û‹Ü‰ÈBˆ	Ëœ™ÉÈÈ™]\›ˆ	Ú[XYÙKÜ™ÉÈBˆ	ËœÝ™ÉÈÈ™]\›ˆ	Ú[XYÙKÜÝ™ÊÞ[	ÈBˆY˜][È™]\›ˆ	Ø\XØ][Û‹ÛØÝ]\Ý™X[IÈBˆBŸB‚™[˜Ý[ÛˆÙ]T™\]Y\ÝÛÛÚÚYU˜[YJ	™\]Y\ÝÜÝš[™×I˜[YJHÂˆžHÂˆ	ÛÛÚÚYRXY\ˆHÜÝš[™×I™\]Y\Ý’XY\œÖÉÐÛÛÚÚYI×BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛÚÚYRXY\ŠJHÈ™]\›ˆ	ÉÈBˆ›Ü™XXÚ
+	\[ˆ
+	ÛÛÚÚYRXY\ˆ\Ü]	ÎÉÊJHÂˆ	][HH	\•š[J
+Bˆ	\HH	][K’[™^ÙŠ	ÏIÊBˆYˆ
+	\H[H
+HÈÛÛ[YHBˆ	ˆH	][K”ÝXœÝš[™Ê	\JK•š[J
+BˆYˆ
+	ˆ[™H	˜[YJHÈÛÛ[YHBˆ™]\›ˆÕ\šWNŽ•[™\ØØ\Q]TÝš[™Ê	][K”ÝXœÝš[™Ê	\H
+ÈJJBˆBˆHØ]ÚßBˆ™]\›ˆ	ÉÂŸB‚™[˜Ý[Ûˆ\ÝQš^Y[YUÚÙ[‘\]X[ÊÜÝš[™×IØ[™Y]KÜÝš[™×I^XÝY
+HÂˆYˆ
+	[Y\H	Ø[™Y]JHÈ	Ø[™Y]HH	ÉÈBˆYˆ
+	[Y\H	^XÝY
+HÈ	^XÝYH	ÉÈBˆ	]ŽHÕ^‘[˜ÛÙ[™×NŽ•UŽˆ	ÚHHÔÙXÝ\š]KÜž\ÙÜ˜\K”ÒLM—NŽÜ™X]J
+BˆžHÂˆ	Ø[™Y]R\ÚH	ÚKÛÛ\]R\Ú
+	]Ž‘Ù]ž]\Ê	Ø[™Y]JJBˆ	^XÝY\ÚH	ÚKÛÛ\]R\Ú
+	]Ž‘Ù]ž]\Ê	^XÝY
+JBˆHš[˜[HÂˆ	ÚK‘\ÜÜÙJ
+BˆBˆ	Y™™\™[˜ÙHHˆ›Üˆ
+	HHÈ	H[	Ø[™Y]R\Ú“[™ÝÈ	JÊÊHÂˆ	Y™™\™[˜ÙHH	Y™™\™[˜ÙHX›Üˆ
+	Ø[™Y]R\ÚÉWHXžÜˆ	^XÝY\ÚÉWJBˆBˆ™]\›ˆ
+	Y™™\™[˜ÙHY\HX[™	Ø[™Y]K“[™ÝY\H	^XÝY“[™Ý
+BŸB‚™[˜Ý[Ûˆ\ÝUÚÙ[Š	™\]Y\Ý
+HÂˆ	HHÜÝš[™×I™\]Y\Ý”]Y\žTÝš[™ÖÉÝÚÙ[‰×Bˆ	HÜÝš[™×I™\]Y\Ý”]Y\žTÝš[™ÖÉÝ	×Bˆ	HÜÝš[™×I™\]Y\Ý’XY\œÖÉÖT™\Üš[™\‹UÚÙ[‰×Bˆ	ÈHÙ]T™\]Y\ÝÛÛÚÚYU˜[YH	™\]Y\Ý	Ô™\Üš[™\•ÚÙ[‰Âˆ™]\›ˆ
+
+\ÝQš^Y[YUÚÙ[‘\]X[È	H	ØÜš\•ÚÙ[ŠH[Ü‚ˆ
+\ÝQš^Y[YUÚÙ[‘\]X[È		ØÜš\•ÚÙ[ŠH[Ü‚ˆ
+\ÝQš^Y[YUÚÙ[‘\]X[È		ØÜš\•ÚÙ[ŠH[Ü‚ˆ
+\ÝQš^Y[YUÚÙ[‘\]X[È	È	ØÜš\•ÚÙ[ŠJBŸB‚™[˜Ý[ÛˆÙ\™KTÝ]XÊ	ÛÛ^ÜÝš[™×I]
+HÂˆYˆ
+	]Y\H	ËÉÊHÈ	]H	ËÚ[™^š[	ÈBˆ	™[H	]•š[TÝ\
+	ËÉÊH\™\XÙH	ËÉËÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\‚ˆYˆ
+	™[[X]Ú	ÊŸ××JW—Š	××JIÊHÈÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^
+ÛÜ™\™YPÈÚÈH	˜[ÙNÈ\œ›ÜˆH	Ë‹ˆ\È›Ý[ÝÙY	ÈJNÈ™]\›ˆBˆ	š[HHÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	ØÜš\•ÙX”›ÛÝ	™[
+JBˆ	›ÛÝHÒSË”]NŽ‘Ù][]
+	ØÜš\•ÙX”›ÛÝ
+BˆYˆ
+[›Ý	›ÛÝ‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	›ÛÝ
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆYˆ
+[›Ý	š[K”Ý\ÕÚ]
+	›ÛÝÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJH[Üˆ[›Ý
+\ÝT]S]\˜[]	š[JJHÂˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^
+ÛÜ™\™YPÈÚÈH	˜[ÙNÈ\œ›ÜˆH	Û›Ý›Ý[™	ÈJNÈ™]\›‚ˆBˆÜš]KPž]\Ô™\ÜÛœÙH	ÛÛ^Œ
+ÒSË‘š[WNŽ”™XY[ž]\Ê	š[JJH
+Ù]SZ[YH	š[JBŸB‚‚™[˜Ý[Ûˆ›Ü›X[^™KUÛÜšÜÜXÙT™[]]™T]
+ÜÝš[™×I™[]]™T]
+HÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[]]™T]
+JHÈ™]\›ˆ	ÉÈBˆ	™[H	™[]]™T]•š[J
+BˆYˆ
+	™[Y\H	Ý[™Yš[™Y	È[Üˆ	™[Y\H	Û[	ÊHÈ™]\›ˆ	ÉÈBˆYˆ
+ÒSË”]NŽ’\Ô]›ÛÝY
+	™[
+JHÈ›ÝÈ	Ô¸àäxà®xàc9.#y«høàiøàfxà ‰ÈBˆYˆ
+	™[[X]Ú	ÊŸ××JW—Š	××JIÊHÈ›ÝÈ	Ô¸àäxà®xàc9.#y«høàiøàfxà ‰ÈBˆYˆ
+	™[[X]Ú	Ö×WQ—IÊHÈ›ÝÈ	Ô¸àäxà®xàc9.#y«høàiøàfxà ‰ÈBˆYˆ
+ÒSË”]NŽ‘Ù]^[œÚ[ÛŠ	™[
+K•ÓÝÙ\’[˜\šX[
+
+H[™H	Ëœ‰ÊHÈ›ÝÈ	Ô¸àåxà¨xà©8àêøàh8àdz(j9é.¸àiøàcxào¸àfxà ‰ÈBˆ™]\›ˆ	™[ŸB‚‚™[˜Ý[Ûˆ›Ü›X[^™KT™[]]™Q›ÜÛÛ\\™JÜÝš[™×I™[]]™T]
+HÂˆ™]\›ˆ
+
+ÜÝš[™×I™[]]™T]
+H\™\XÙH	×	Ë	ËÉÊK•š[J
+K•ÓÝÙ\’[˜\šX[
+
+BŸB‚™[˜Ý[ÛˆÙ\™KPÛÛ[žU˜[Y\Ê	ÛÛ^ÜÝš[™×I[™ÝXYÙKÜÝš[™×IYÙRYÜÝš[™×IÛÜšØ›ÛÚÒYÜÝš[™×IÚY]˜[YKÜÝš[™×IÛÛ[ŠHÂˆ	ÛÜšÜÜXÙHHÙ]UÛÜšÜÜXÙT]	[™ÝXYÙBˆ	ÝXÝ\™HHÙ]TÝXÝ\™H	[™ÝXYÙBˆ	YÙRYH
+ÜÝš[™×IYÙRY
+K•š[J
+BˆYˆ
+	YÙRYY\H	Ý[™Yš[™Y	È[Üˆ	YÙRYY\H	Û[	ÊHÈ	YÙRYH	ÉÈBˆ	ÛÜšØ›ÛÚÒYH
+ÜÝš[™×IÛÜšØ›ÛÚÒY
+K•š[J
+BˆYˆ
+	ÛÜšØ›ÛÚÒYY\H	Ý[™Yš[™Y	È[Üˆ	ÛÜšØ›ÛÚÒYY\H	Û[	ÊHÈ	ÛÜšØ›ÛÚÒYH	ÉÈBˆ	ÚY]˜[YHH
+ÜÝš[™×IÚY]˜[YJK•š[J
+BˆYˆ
+	ÚY]˜[YHY\H	Ý[™Yš[™Y	È[Üˆ	ÚY]˜[YHY\H	Û[	ÊHÈ	ÚY]˜[YHH	ÉÈBˆ	ÛÛ[™[H›Ü›X[^™KUÛÜšÜÜXÙT™[]]™T]	ÛÛ[‚ˆ	YÙHH
+
+B‚ˆYˆ
+[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	YÙRY
+JHÂˆ	YÙHH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÂˆ
+™\ÛÛ™KTYÙRY	ÊHY\H	YÙRY[ÜˆÜÝš[™×IËœYÙRYY\H	YÙRY[ÜˆÜÝš[™×IËšYY\H	YÙRYˆHÙ[XÝSØš™XÝQš\œÝJBˆBˆYˆ
+	YÙKÛÝ[Y\HX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÜšØ›ÛÚÒY
+HX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÚY]˜[YJJHÂˆ	YÙHH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈÜÝš[™×IËÛÜšØ›ÛÚÒYY\H	ÛÜšØ›ÛÚÒYX[™ÜÝš[™×IËœÚY]˜[YHY\H	ÚY]˜[YHHÙ[XÝSØš™XÝQš\œÝJBˆBˆYˆ
+	YÙKÛÝ[Y\HX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛ[™[
+JHÂˆ	Û\H›Ü›X[^™KT™[]]™Q›ÜÛÛ\\™H	ÛÛ[™[ˆ	YÙHH
+Ù]P\œ˜^H	ÝXÝ\™KœYÙ\ÈÚ\™KSØš™XÝÈ
+›Ü›X[^™KT™[]]™Q›ÜÛÛ\\™H
+ÜÝš[™×IË˜ÛÛ[ŠJHY\H	Û\HÙ[XÝSØš™XÝQš\œÝJBˆB‚ˆ	™[H	ÉÂˆYˆ
+	YÙKÛÝ[YÝ
+HÈ	™[HÜÝš[™×IYÙVÌK˜ÛÛ[ˆBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[
+HX[™[›ÝÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛ[™[
+JHÈ	™[H	ÛÛ[™[Bˆ	™[H›Ü›X[^™KUÛÜšÜÜXÙT™[]]™T]	™[ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[
+JHÈ›ÝÈ	Ô¹ áyh,xàc9.#z-¬øàeøài¸àa8ào¸àfxà ¸àæ¸àï8à®9©âù¢$8à¤¹¦í9¥¬8àeøài¸àbøà¢T¸à¤ºe¢øàa8ài¸àcøàh8àexàa8à ‰ÈB‚ˆ	[HÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	ÛÜšÜÜXÙH	™[
+JBˆ	ÛÜšÜÜXÙQ[HÒSË”]NŽ‘Ù][]
+	ÛÜšÜÜXÙJBˆYˆ
+[›Ý	ÛÜšÜÜXÙQ[‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	ÛÜšÜÜXÙQ[
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆYˆ
+[›Ý	[”Ý\ÕÚ]
+	ÛÜšÜÜXÙQ[ÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈ›ÝÈ	øàëøàï8à«øà®xàæ¸àï8à®yi%¸àk¸àåxà¨xà©8àêøàkú(j9é.¸àiøàcxào¸àføà¤øà ‰ÈBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[
+JHÈ›ÝÈ	Ô¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤øà ”¹/g9¢$8à¤¸à¡8à¢¹æí8àeøài¸àcøàh8àexàa8à ‰ÈBˆYˆ
+
+Ù]R][HS]\˜[]	[
+K“[™Ý[H
+HÈ›ÝÈ	Ô¸àåxà¨xà©8àêøàc9ên¸àiøàfxà ”¹/g9¢$8à¤¸à¡8à¢¹æí8àeøài¸àcøàh8àexàa8à ‰ÈBˆÜš]KPž]\Ô™\ÜÛœÙH	ÛÛ^Œ
+ÒSË‘š[WNŽ”™XY[ž]\Ê	[
+JH	Ø\XØ][Û‹Ü‰ÂŸB‚™[˜Ý[Ûˆ™\ÛÛ™KPÛÛ[‘[]
+ÜÝš[™×IÛÜšÜÜXÙKÜÝš[™×I™[]]™TŠHÂˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	™[]]™TŠJHÈ›ÝÈ	ØÛÛ[\ˆ8àc9§*¹/g9¢$8àiøàfxà ‰ÈBˆ\ÝT™[]]™T]	™[]]™TˆÝ]S[ˆYˆ
+ÒSË”]NŽ‘Ù]^[œÚ[ÛŠ	™[]]™TŠK•ÓÝÙ\’[˜\šX[
+
+H[™H	Ëœ‰ÊHÈ›ÝÈ	Ô¸àåxà¨xà©8àêøàh8àdz(j9é.¸àiøàcxào¸àfxà ‰ÈBˆ	[HÒSË”]NŽ‘Ù][]
+
+›Ú[‹T]	ÛÜšÜÜXÙH	™[]]™TŠJBˆ	ÛÜšÜÜXÙQ[HÒSË”]NŽ‘Ù][]
+	ÛÜšÜÜXÙJBˆYˆ
+[›Ý	ÛÜšÜÜXÙQ[‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJHÈ	ÛÜšÜÜXÙQ[
+ÏHÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ˆBˆYˆ
+[›Ý	[”Ý\ÕÚ]
+	ÛÜšÜÜXÙQ[ÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJHÈ›ÝÈ	øàëøàï8à«øà®xàæ¸àï8à®yi%¸àk¸àåxà¨xà©8àêøàkú(j9é.¸àiøàcxào¸àføà¤øà ‰ÈBˆYˆ
+[›Ý
+\ÝT]S]\˜[]	[
+JHÈ›ÝÈ	Ô¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤øà ”¹/g9¢$8à¤¸à¡8à¢¹æí8àeøài¸àcøàh8àexàa8à ‰ÈBˆ™]\›ˆ	[ŸB‚™[˜Ý[ÛˆÙ\™KPÛÛ[Š	ÛÛ^ÜÝš[™×I[™ÝXYÙJHÂˆ	YÙRYHÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÜYÙRY	×BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	YÙRY
+JHÈ	YÙRYHÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÚY	×HBˆ	ÛÛ[ˆHÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉØÛÛ[‰×BˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛ[ŠJHÈ	ÛÛ[ˆHÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÜ‰×HBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛ[ŠJHÈ	ÛÛ[ˆHÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÜ]	×HBˆÙ\™KPÛÛ[žU˜[Y\È	ÛÛ^	[™ÝXYÙH	YÙRY
+ÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÝÛÜšØ›ÛÚÒY	×JH
+ÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÜÚY]˜[YI×JH	ÛÛ[‚ŸB‚™[˜Ý[ÛˆÙ\™KPÛÛ[‘œ›ÛP›ÙJ	ÛÛ^ÜÝš[™×I[™ÝXYÙK	›ÙJHÂˆ	YÙRYHÜÝš[™×I›ÙKœYÙRYˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	YÙRY
+JHÈ	YÙRYHÜÝš[™×I›ÙKšYBˆ	ÛÛ[ˆHÜÝš[™×I›ÙK˜ÛÛ[‚ˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛ[ŠJHÈ	ÛÛ[ˆHÜÝš[™×I›ÙKœˆBˆYˆ
+ÜÝš[™×NŽ’\Ó[Ü•Ú]TÜXÙJ	ÛÛ[ŠJHÈ	ÛÛ[ˆHÜÝš[™×I›ÙKœ]BˆÙ\™KPÛÛ[žU˜[Y\È	ÛÛ^	[™ÝXYÙH	YÙRY
+ÜÝš[™×I›ÙKÛÜšØ›ÛÚÒY
+H
+ÜÝš[™×I›ÙKœÚY]˜[YJH	ÛÛ[‚ŸB‚™[˜Ý[ÛˆÙ\™KQš[˜[žU›Û[YJ	ÛÛ^ÜÝš[™×I[™ÝXYÙKÜÝš[™×I›Û[YKÜÝš[™×IØ]YÛÜžJHÂˆYˆ
+
+Ù]U›Û[YS\Ý	[™ÝXYÙHÚ\™KSØš™XÝÈ	È[™H	Û›Û™IÈJH[›ÝÛÛZ[œÈ	›Û[YJHÈ›ÝÈÔÞ\Ý[K\™Ý[Y[^Ù\[Û—NŽ›™]Ê	Ý›Û[Yxàjøàkù§+9/døào¸àgøàkú(ç:-¬øà¤¹£!ùk¦¸àeøài¸àcøàh8àexàa8à ‰ÊHBˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH	Ø]YÛÜžNÉ›Û[YOJÜÝš[™×I›Û[YJK•š[J
+NÚYŠ
+Ù]U›Û[YS\Ý	[™ÝXYÙ_Ú\™KSØš™XÝÉÈ[™H	Û›Û™IßJH[›ÝÛÛZ[œÈ	›Û[YJ^Ý›ÝÈÐ\™Ý[Y[^Ù\[Û—NŽ›™]Ê	ù.#y«høàj¹¢$9§§9âjxàiøàfxà ‰Ê_NÉÝXÝ\™OQÙ]TÝXÝ\™H	[™ÝXYÙNÉQÙ]Q]T›Ü\H	ÝXÝ\™K›Û[Y\È
+Ù]U›Û[YTÝ]RÙ^H	›Û[YH	Ø]
+H	[ÚYŠ	[Y\H	ˆ[Üˆ[›ÝÜÝš[™×I‹›Ý]]Š^Ý›ÝÈ	ù§ 9í`”¸àkøào¸àh9/g9¢$8àexà£8ài¸àa8ào¸àføà¤øà ‰ßNÉ]ÏQÙ]T]ÎÉ[VÒSË”]NŽ‘Ù][]
+ÜÝš[™×I‹›Ý]]ŠNÉ›ÛÝVÒSË”]NŽ‘Ù][]
+ÜÝš[™×I]Ë›Ý]]\ŠNÚYŠ[›Ý	›ÛÝ‘[™ÕÚ]
+ÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŠJ^É›ÛÝ
+ÏVÒSË”]NŽ‘\™XÝÜžTÙ\\˜]ÜÚ\ŸNÚYŠ[›Ý	[”Ý\ÕÚ]
+	›ÛÝÔÝš[™ÐÛÛ\\š\ÛÛ—NŽ“Ü™[˜[YÛ›Ü™PØ\ÙJJ^Ý›ÝÈ	ùaî¹b¦øàåxàªxàêøàà9i%¸àk”¸àkú(j9é.¸àiøàcxào¸àføà¤øà ‰ßNÚYŠ[›Ý
+\ÝT]	[
+J^Ý›ÝÈ	ù§ 9í`”¸àåxà¨xà©8àêøàc:)¢øài8àbøà¢¸ào¸àføà¤øà ‰ßNÕÜš]KPž]\Ô™\ÜÛœÙH	ÛÛ^Œ
+ÒSË‘š[WNŽ”™XY[ž]\Ê	[
+JH	Ø\XØ][Û‹Ü‰ÂŸB‚™[˜Ý[ÛˆÙ\™KQš[˜[Š	ÛÛ^ÜÝš[™×I[™ÝXYÙJHÂˆÙ\™KQš[˜[žU›Û[YH	ÛÛ^	[™ÝXYÙH
+ÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉÝ›Û[YI×JH
+ÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉØØ]YÛÜžI×JBŸB‚™[˜Ý[Ûˆ[™KP\J	ÛÛ^
+HÂˆ	[™ÝXYÙHHÙ]QY™™XÝ]™S[™ÝXYÙBˆ	]H	ÛÛ^”™\]Y\Ý•\›XœÛÛ]T]ˆ	Y]ÙH	ÛÛ^”™\]Y\Ý’Y]Ù•Õ\\’[˜\šX[
+
+BˆžHÂˆÈ\ÙHYÚÙZYÚ[™Ú[È\™HÛ›H›ÜˆÝ\\™XY[™\ÜÈÚXÚÜË‚ˆÈ^H[[[Û˜[HÈ›Ý™\]Z\™HHÙ\ÜÚ[ÛˆÚÙ[ˆÛÈHØØ[ØZ]YÙBˆÈØ[ˆ]XÝ™XY[™\ÜÈ]™[ˆYˆHœ›ÝÜÙ\ˆÝš\ÈÜˆ[^\È]Y\žH[™[™Ë‚ˆYˆ
+	Y]ÙY\H	ÓÔSÓ”ÉÊHÂˆÜš]KU^™\ÜÛœÙH	ÛÛ^Œ	ÉÈ	Ý^ÜZ[ŽÈÚ\œÙ]]]‹N	ÎÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÑÑU	ÈX[™	]Y\H	ËØ\KÜ™XYK™ÚY‰ÊHÂˆÜš]KPž]\Ô™\ÜÛœÙH	ÛÛ^Œ	ØÜš\”™XYQÚYž]\È	Ú[XYÙKÙÚY‰È	YNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÑÑU	ÈX[™	]Y\H	ËØ\KÜ[™ÉÊHÂˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+ÛÜ™\™YPÈÚÈH	YNÈ[ÙHH	[ÙNÈ]H™]ËS›ÝÒ\ÛÈJH	YNÈ™]\›‚ˆBˆYˆ
+[›Ý
+\ÝUÚÙ[ˆ	ÛÛ^”™\]Y\Ý
+JHÈÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^È
+ÛÜ™\™YPÈÚÈH	˜[ÙNÈ\œ›ÜˆH	Ú[˜[YÚÙ[‰ÈJNÈ™]\›ˆBˆÝXÚPÛY[XÝ]š]H	ÉÈÝ]S[ˆYˆ
+	Y]ÙY\H	ÔÔÕ	ÈX[™	]Y\H	ËØ\KÚX\™X]	ÊHÂˆ	›ÙHH™XYP›ÙRœÛÛˆ	ÛÛ^”™\]Y\ÝˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+ÝXÚPÛY[XÝ]š]H
+ÜÝš[™×I›ÙK˜ÛY[Y
+JNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÔÔÕ	ÈX[™	]Y\H	ËØ\KØÛY[ØÛÜÙIÊHÂˆ	›ÙHH™XYP›ÙRœÛÛˆ	ÛÛ^”™\]Y\ÝˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+›ÝYžKPÛY[ÛÜÚ[™È
+ÜÝš[™×I›ÙK˜ÛY[Y
+JNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÔÔÕ	ÈX[™	]Y\H	ËØ\KÜÚ]ÝÛ‰ÊHÂˆ	›ÙHH™XYP›ÙRœÛÛˆ	ÛÛ^”™\]Y\ÝˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+™\]Y\ÝTÙ\™\”Ú]ÝÛˆ
+ÜÝš[™×I›ÙKœ™X\ÛÛŠJNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÔÔÕ	ÈX[™	]Y\H	ËØ\KØ]]ËÜ™[™\‰ÊHÂˆ	›ÙHH™XYP›ÙRœÛÛˆ	ÛÛ^”™\]Y\Ýˆ	YÈH
+
+BˆYˆ
+	›ÙKÛÜšØ›ÛÚÒYÊHÈ	YÈH
+Ù]P\œ˜^H	›ÙKÛÜšØ›ÛÚÒYÈ›Ü‘XXÚSØš™XÝÈÜÝš[™×IÈJHBˆ	™\Ý[H[›ÚÙKP]]Ô™[™\ˆ	[™ÝXYÙH	YÂˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+ÛÜ™\™YPÈÚÈH	YNÈ™\Ý[H	™\Ý[JNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÑÑU	ÈX[™	]Y\H	ËØ\KÜÝ]IÊHÂˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+Ù]TÝ]T^[ØY	[™ÝXYÙJNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÑÑU	ÈX[™	]Y\H	ËØ\KÙš[˜[Ü™XY[™\ÜÉÊHÂˆ	Ø]T™\]Z\™KUÛÜšØ›ÛÚÐØ]YÛÜžH
+ÜÝš[™×IÛÛ^”™\]Y\Ý”]Y\žTÝš[™ÖÉØØ]YÛÜžI×JBˆ	ÝXÝ\™OQÙ]TÝXÝ\™H	[™ÝXYÙNÉ›ÛÏVÛÜ™\™YPßBˆ›Ü™XXÚ
+	›Û[YH[ˆ
+Ù]U›Û[YS\Ý	[™ÝXYÙ_Ú\™KSØš™XÝÉÈ[™H	Û›Û™IßJJ^É›ÛÖÉ›Û[YWOQÙ]Qš[˜[Z[™XY[™\ÜÈ	ÝXÝ\™H	[™ÝXYÙH	›Û[YH	Ø]BˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+ÛÜ™\™YPÛÚÏIYNØØ]YÛÜžOIØ]Ý›Û[Y\ÏI›ÛßJNÜ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÑÑU	ÈX[™	]Y\H	ËØ\KÜÝX›Z\ÜÚ[Û‹Yš[\ÉÊHÂˆÜš]KRœÛÛ”™\ÜÛœÙH	ÛÛ^Œ
+ÛÜ™\™YPÈÚÈH	YNÈØØ[›™Y]H
+™]ËS›ÝÒ\ÛÊNÈš[\ÈH
+Ù]Q^Ù[š[\Ò[”ÝX›Z\ÜÚ[ÛŠHJNÈ™]\›‚ˆBˆYˆ
+	Y]ÙY\H	ÔÔÕ	È9ÛÝí¢G§²ÚîÆ­y×6æ6†÷D–Bp¢–b‚Öæ÷B„æWrÕ6æ6†÷E–âFÆæwVvRGv$–BG6æ6†÷D–BvÖçVÂr…¶÷&FW&VEÔ²–ææVDBÒæWrÔæ÷t—6òÒ’’’°¢F‡&÷r~[^jÛN8îKùÞŠÛ~h8^Z8).KùÞZÙŽ8~8Þ8î8¾8)>8~8~8þ8"p¢Ð¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VRÒ“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWuõ5BrÖæBGF‚ÖWrö’ö†—7F÷'’÷Vç–âr’°¢F&öG’Ò&VBÔ&öG”§6öâD6öçFW‡Bå&WVW7@¢Gv$–BÒ76W'BÕ6fU7F÷&vU6VvÖVçB…·7G&–æuÒF&öG’çv÷&¶&öö´–B’wv÷&¶&öö´–Bp¢G6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçB…·7G&–æuÒF&öG’ç6æ6†÷D–B’w6æ6†÷D–Bp¢&VÖ÷fRÕ6æ6†÷E–âFÆæwVvRGv$–BG6æ6†÷D–BvÖçVÂp¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VRÒ“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWttUBrÖæBGF‚ÖWrö’öÆ–÷WB÷6æ6†÷G2r’°¢F6BÒ&WV—&RÕv÷&¶&öö´6FVv÷'’…·7G&–æuÒD6öçFW‡Bå&WVW7BåVW'•7G&–æu²v6FVv÷'’uÒ¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VS²6æ6†÷G2Ò„vWBÔÆ–÷WE6æ6†÷G2FÆæwVvRF6B’Ò“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWuõ5BrÖæBGF‚ÖWrö’öÆ–÷WB÷&W7F÷&R÷&Wf–Wrr’°¢F&öG’Ò&VBÔ&öG”§6öâD6öçFW‡Bå&WVW7@¢F6BÒ&WV—&RÕv÷&¶&öö´6FVv÷'’…·7G&–æuÒF&öG’æ6FVv÷'’¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VS²&Wf–WrÒ„vWBÔÆ–÷WE&W7F÷&U&Wf–WrFÆæwVvRF6B…·7G&–æuÒF&öG’ç6æ6†÷D–B’’Ò“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWuõ5BrÖæBGF‚ÖWrö’öÆ–÷WB÷&W7F÷&Rr’°¢F&öG’Ò&VBÔ&öG”§6öâD6öçFW‡Bå&WVW7@¢F6BÒ&WV—&RÕv÷&¶&öö´6FVv÷'’…·7G&–æuÒF&öG’æ6FVv÷'’¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VS²&W7VÇBÒ…&W7F÷&RÔÆ–÷WE6æ6†÷BFÆæwVvRF6B…·7G&–æuÒF&öG’ç6æ6†÷D–B’’Ò“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWttUBrÖæBGF‚ÖWrö’öf–æÂö&6†—fW2r’°¢F6BÒ&WV—&RÕv÷&¶&öö´6FVv÷'’…·7G&–æuÒD6öçFW‡Bå&WVW7BåVW'•7G&–æu²v6FVv÷'’uÒ¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VS²&6†—fW2Ò„vWBÔf–æÄ&6†—fW2FÆæwVvRF6B’Ò“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWttUBrÖæBGF‚ÖWrö’öWFò÷7FFRr’°¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VS²WFòÒ„vWBÔWFõ7FFU7VÖÖ'’FÆæwVvR’Ò“²&WGW&à¢Ð¢–b‚FÖWF†öBÖWuõ5BrÖæBGF‚ÖWrö’öWFò÷'VâÖæ÷rr’°¢F&öG’Ò&VBÔ&öG”§6öâD6öçFW‡Bå&WVW7@¢Gv$–BÒ76W'BÕ6fU7F÷&vU6VvÖVçB…·7G&–æuÒF&öG’çv÷&¶&öö´–B’wv÷&¶&öö´–Bp¢w&—FRÔ§6öå&W7öç6RD6öçFW‡B#…¶÷&FW&VEÔ²ö²ÒGG'VS²&W7VÇBÒ…&WVW7BÔWFõ'Väæ÷rFÆæwVvRGv$–B’Ò“²&WGW&à¢Ð¢w&—FRÔ§6öå&W7öç6RD6öçFW‡BCB…¶÷&FW&VEÔ²ö²ÒFfÇ6S²W'&÷"ÒwVæ¶æ÷vâ’&÷WFRrÒ¢Ò6F6‚µ7—7FVÒä&wVÖVçDW†6WF–öåÒ°¢w&—FRÔ§6öå&W7öç6RD6öçFW‡BC…¶÷&FW&VEÔ²ö²ÒFfÇ6S²W'&÷"ÒEòäW†6WF–öâäÖW76vRÒ¢Ò6F6‚°¢w&—FRÔ§6öå&W7öç6RD6öçFW‡BS…¶÷&FW&VEÔ²ö²ÒFfÇ6S²W'&÷"ÒEòäW†6WF–öâäÖW76vS²FWF–ÂÒ„vWBÔW'&÷$FWF–ÂEò’Ò¢Ð§Ð  ¦gVæ7F–öâFW7BÕF76öçFW‡B‚D6öçFW‡B’°¢&WGW&â‚FçVÆÂÖæRD6öçFW‡BÖæBFçVÆÂÖæRD6öçFW‡Bå4ö&¦V7Bå&÷W'F–W5²t—5F7uÒÖæBD6öçFW‡Bä—5F7ÖWGG'VR§Ð ¦gVæ7F–öâvWBÔ‡GG7FGW5FW‡B…¶–çEÒE7FGW2’°¢7v—F6‚‚E7FGW2’°¢#²&WGW&âtô²rÐ¢#B²&WGW&âtæò6öçFVçBrÐ¢C²&WGW&ât&B&WVW7BrÐ¢C2²&WGW&âtf÷&&–FFVârÐ¢CB²&WGW&âtæ÷Bf÷VæBrÐ¢S²&WGW&ât–çFW&æÂ6W'fW"W'&÷"rÐ¢FVfVÇB²&WGW&âtô²rÐ¢Ð§Ð ¦gVæ7F–öâw&—FRÕF7&W7öç6R‚D6öçFW‡BÂ¶–çEÒE7FGW2Â¶'—FUµÕÒD'—FW2Â·7G&–æuÒD6öçFVçEG—RÂ¶&ööÅÒDÆÆ÷t6÷'2ÒFfÇ6R’°¢G'’°¢G7FGW5FW‡BÒvWBÔ‡GG7FGW5FW‡BE7FGW0¢24õ%>89Ž88>888;Î8þ‹[~X¹^[è^889®8;Î8+‚†f–ÆS¢òòž8ÎŠªÞ8([ø^Šh8î8.8(¾‹»Þ˜xþ8*Ž8;>88ž89Þ8*N8;>88Ž888¾K¹Ž88(¾8 ¢288Ž8;Î8*þ8;>KùÞŠÛtž8²66W72Ô6öçG&öÂÔÆÆ÷rÔ÷&–v–ã¢¢8).K¹Ž88(¾8Ž888Ž8;Î8*þ8;>kÈþ8Ž8Ni˜.8°¢2K»¾hHþ8åvV.89®8;Î8+Ž8¾8(ž[ùÎzÙN8).ŠªÞ8(8n8~8î8n8þ8(8iz.Zé®8~8þK¹Ž88®8NûÈŽYÎKˆ8*®8:®8+Ž8;>8¾8þKˆÞŠhûÈž8 ¢F6÷'4†VFW"Òrp¢–b‚DÆÆ÷t6÷'2’²F6÷'4†VFW"Ò$66W72Ô6öçG&öÂÔÆÆ÷rÔ÷&–v–ã¢¦&â"Ð¢F†VFW"Ò$…EEóãE7FGW2G7FGW5FW‡F&ä6öçFVçBÕG—S¢D6öçFVçEG—V&ä6öçFVçBÔÆVæwFƒ¢B‚D'—FW2äÆVæwF‚–&ä66†RÔ6öçG&öÃ¢æò×7F÷&V&âG¶6÷'4†VFW'Ô6öææV7F–öã¢6Æ÷6V&æ&â ¢F†VFW$'—FW2ÒµFW‡BäVæ6öF–æuÓ£¤44”’ävWD'—FW2‚F†VFW"¢G7G&VÒÒD6öçFW‡BåF77G&VÐ¢G7G&VÒåw&—FR‚F†VFW$'—FW2ÂÂF†VFW$'—FW2äÆVæwF‚¢–b‚D'—FW2äÆVæwF‚ÖwB’²G7G&VÒåw&—FR‚D'—FW2ÂÂD'—FW2äÆVæwF‚’Ð¢G7G&VÒäfÇW6‚‚¢Òf–æÆÇ’°¢G'’²–b‚D6öçFW‡BåF77G&VÒ’²D6öçFW‡BåF77G&VÒä6Æ÷6R‚’ÒÒ6F6‚·Ð¢G'’²–b‚D6öçFW‡BåF76Æ–VçB’²D6öçFW‡BåF76Æ–VçBä6Æ÷6R‚’ÒÒ6F6‚·Ð¢Ð§Ð ¦gVæ7F–öâf–æBÔ‡GG†VFW$VæB…¶'—FUµÕÒD'—FW2’°¢–b‚D'—FW2äÆVæwF‚ÖÇBB’²&WGW&âÓÐ¢f÷"‚F’Ò3²F’ÖÇBD'—FW2äÆVæwFƒ²F’²²’°¢–b‚D'—FW5²F’Ò5ÒÖW2ÖæBD'—FW5²F’Ò%ÒÖWÖæBD'—FW5²F’ÒÒÖW2ÖæBD'—FW5²F•ÒÖW’°¢&WGW&â‚F’Ò2¢Ð¢Ð¢&WGW&âÓ§Ð ¦gVæ7F–öâæWrÔæÖUfÇVT6öÆÆV7F–öä6ö×B°¢G'’²&WGW&âæWrÔö&¦V7B7—7FVÒä6öÆÆV7F–öç2å7V6–Æ—¦VBäæÖUfÇVT6öÆÆV7F–öâ…µ7G&–æt6ö×&W%Ó£¤÷&F–æÄ–væ÷&T66R’Ð¢6F6‚²&WGW&âæWrÔö&¦V7B7—7FVÒä6öÆÆV7F–öç2å7V6–Æ—¦VBäæÖUfÇVT6öÆÆV7F–öâÐ§Ð ¦gVæ7F–öâFV6öFRÕW&Å'B…·7G&–æuÒEfÇVR’°¢–b‚FçVÆÂÖWEfÇVR’²&WGW&ârrÐ¢&WGW&âµW&•Ó£¥VæW66TFF7G&–ær‚‚EfÇVR×&WÆ6RuÂ²rÂrr’§Ð ¦gVæ7F–öâæWrÕVW'•7G&–æt6öÆÆV7F–öâ…·7G&–æuÒEVW'’’°¢Fçf2ÒæWrÔæÖUfÇVT6öÆÆV7F–öä6ö×@¢2æÖUfÇVT6öÆÆV7F–öâ—2VçVÖW&&ÆRâ&WGW&æ–ær—Bæ÷&ÖÆÇ’Ö¶W2÷vW%6†VÆÀ¢2Vçw&—G2fÇVW2–çFòö&¦V7EµÒ†÷"66Æ"f÷"6–ævÆRVW'’—FVÒ’Â6ð¢2&WVW7BåVW'•7G&–æu²wFö¶VâuÒ6âæWfW"&WG&–WfRF†RFö¶Vââ¶VWF†P¢26öÆÆV7F–öâ2öæR—VÆ–æRö&¦V7BöâWfW'’&WGW&âF‚à¢–b…·7G&–æuÓ£¤—4çVÆÄ÷$V×G’‚EVW'’’’²&WGW&âÂFçf2Ð¢GÒEVW'¢–b‚Gå7F'G5v—F‚‚sòr’’²GÒGå7V'7G&–ærƒ’Ð¢–b…·7G&–æuÓ£¤—4çVÆÄ÷$V×G’‚G’’²&WGW&âÂFçf2Ð¢f÷&V6‚‚G—"–â‚G×7Æ—Brbr’’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷$V×G’‚G—"’’²6öçF–çVRÐ¢FWÒG—"ä–æFW„öb‚sÒr¢–b‚FWÖvR’°¢FæÖRÒFV6öFRÕW&Å'BG—"å7V'7G&–ærƒÂFW¢GfÇVRÒFV6öFRÕW&Å'BG—"å7V'7G&–ær‚FW²¢ÒVÇ6R°¢FæÖRÒFV6öFRÕW&Å'BG— ¢GfÇVRÒrp¢Ð¢Fçf2äFB‚FæÖRÂGfÇVR¢Ð¢&WGW&âÂFçf0§Ð ¦gVæ7F–öâ&VBÕF7‡GG6öçFW‡B‚EF76Æ–VçBÂ¶–çEÒE÷'B’°¢G7G&VÒÒEF76Æ–VçBävWE7G&VÒ‚¢2'&÷w6W'26â÷Vâ7V7VÆF—fRö–FÆRÆö6Â6öææV7F–öç2&Vf÷&R6VæF–ær&WVW7Bà¢2F†R6W'fW"†æFÆW2&WVW7G26WVVçF–ÆÇ’Â6òÆöær†VFW"F–ÖV÷WB6âg&VW¦R7F'GWà¢G7G&VÒå&VEF–ÖV÷WBÒ# ¢F'VffW"ÒæWrÔö&¦V7B'—FUµÒƒ“ ¢F×2ÒæWrÔö&¦V7B”òäÖVÖ÷'•7G&VÐ¢F†VFW$VæBÒÓ¢v†–ÆR‚F†VFW$VæBÖÇB’°¢G&VBÒG7G&VÒå&VB‚F'VffW"ÂÂF'VffW"äÆVæwF‚¢–b‚G&VBÖÆR’²F‡&÷rtV×G’…EE&WVW7BârÐ¢F×2åw&—FR‚F'VffW"ÂÂG&VB¢FFFÒF×2åFô'&’‚¢F†VFW$VæBÒf–æBÔ‡GG†VFW$VæBFFF¢–b‚F×2äÆVæwF‚ÖwBcSS3bÖæBF†VFW$VæBÖÇB’²F‡&÷rt…EE†VFW"—2FöòÆ&vRârÐ¢Ð ¢FFFÒF×2åFô'&’‚¢F†VFW%FW‡BÒµFW‡BäVæ6öF–æuÓ£¤44”’ävWE7G&–ær‚FFFÂÂF†VFW$VæB¢FÆ–æW2ÒF†VFW%FW‡B×7Æ—B&#öâ ¢–b‚FÆ–æW2ä6÷VçBÖÇB’²F‡&÷rt–çfÆ–B…EE&WVW7BârÐ¢G&WVW7DÆ–æRÒFÆ–æW5³Ò×7Æ—Brp¢–b‚G&WVW7DÆ–æRä6÷VçBÖÇB"’²F‡&÷rt–çfÆ–B…EE&WVW7BÆ–æRârÐ¢FÖWF†öBÒG&WVW7DÆ–æU³Ð¢GF&vWBÒG&WVW7DÆ–æU³Ð ¢F†VFW'2ÒæWrÔæÖUfÇVT6öÆÆV7F–öä6ö×@¢f÷"‚F’Ò²F’ÖÇBFÆ–æW2ä6÷VçC²F’²²’°¢FÆ–æRÒFÆ–æW5²F•Ð¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FÆ–æR’’²6öçF–çVRÐ¢F6öÆöâÒFÆ–æRä–æFW„öb‚s¢r¢–b‚F6öÆöâÖwB’°¢F†VFW'2äFB‚FÆ–æRå7V'7G&–ærƒÂF6öÆöâ’åG&–Ò‚’ÂFÆ–æRå7V'7G&–ær‚F6öÆöâ²’åG&–Ò‚’¢Ð¢Ð ¢F6öçFVçDÆVæwF‚Ò ¢F6öçFVçDÆVæwF…FW‡BÒ·7G&–æuÒF†VFW'5²t6öçFVçBÔÆVæwF‚uÐ¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6öçFVçDÆVæwF…FW‡B’’°¢–b‚Öæ÷B¶–çEÓ£¥G'•'6R‚F6öçFVçDÆVæwF…FW‡BÂ·&VeÒF6öçFVçDÆVæwF‚’Ö÷"F6öçFVçDÆVæwF‚ÖÇB’°¢F‡&÷rµ7—7FVÒä&wVÖVçDW†6WF–öåÓ£¦æWr‚t–çfÆ–B6öçFVçBÔÆVæwF‚†VFW"âr¢Ð¢2&W÷'D&–æFW"öæÇ’66WG26ÖÆÂ¥4ôâ6öÖÖæG2âÆ–Ö—B¶VW2ÖÆf÷&ÖV@¢2÷"†÷7F–ÆRÆö6Â&WVW7Bg&öÒ&Æö6¶–ærF†R6–ævÆR×F‡&VFVBÆ—7FVæW"à¢–b‚F6öçFVçDÆVæwF‚ÖwBCƒSsb’°¢F‡&÷rµ7—7FVÒä&wVÖVçDW†6WF–öåÓ£¦æWr‚u&WVW7B&öG’—2FöòÆ&vRâr¢Ð¢Ð¢–b‚F6öçFVçDÆVæwF‚ÖwB’²G7G&VÒå&VEF–ÖV÷WBÒÐ¢F&öG”×2ÒæWrÔö&¦V7B”òäÖVÖ÷'•7G&VÐ¢F&öG•7F'BÒF†VFW$VæB²@¢–b‚FFFäÆVæwF‚ÖwBF&öG•7F'BÖæBF6öçFVçDÆVæwF‚ÖwB’°¢Ff–Æ&ÆRÒ´ÖF…Ó£¤Ö–â‚FFFäÆVæwF‚ÒF&öG•7F'BÂF6öçFVçDÆVæwF‚¢–b‚Ff–Æ&ÆRÖwB’²F&öG”×2åw&—FR‚FFFÂF&öG•7F'BÂFf–Æ&ÆR’Ð¢Ð¢v†–ÆR‚F&öG”×2äÆVæwF‚ÖÇBF6öçFVçDÆVæwF‚’°¢FæVVFVBÒ´ÖF…Ó£¤Ö–â‚F'VffW"äÆVæwF‚ÂF6öçFVçDÆVæwF‚Ò¶–çEÒF&öG”×2äÆVæwF‚¢G&VBÒG7G&VÒå&VB‚F'VffW"ÂÂFæVVFVB¢–b‚G&VBÖÆR’²'&V²Ð¢F&öG”×2åw&—FR‚F'VffW"ÂÂG&VB¢Ð¢–b‚F&öG”×2äÆVæwF‚ÖæRF6öçFVçDÆVæwF‚’°¢F‡&÷rµ7—7FVÒä&wVÖVçDW†6WF–öåÓ£¦æWr‚t–æ6ö×ÆWFR…EE&WVW7B&öG’âr¢Ð¢F&öG”×2å÷6—F–öâÒ  ¢GF„öæÇ’ÒGF&vW@¢GVW'’Òrp¢GÖ&²ÒGF&vWBä–æFW„öb‚sòr¢–b‚GÖ&²ÖvR’°¢GF„öæÇ’ÒGF&vWBå7V'7G&–ærƒÂGÖ&²¢GVW'’ÒGF&vWBå7V'7G&–ær‚GÖ&²²¢Ð¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚GF„öæÇ’’’²GF„öæÇ’ÒròrÐ¢GW&’ÒæWrÔö&¦V7B7—7FVÒåW&’‚&‡GG¢òó#rããã¢E÷'BGF&vWB" ¢G&WVW7BÒ·67W7FöÖö&¦V7EÔ°¢W&ÂÒGW&¢‡GGÖWF†öBÒFÖWF†ö@¢†VFW'2ÒF†VFW'0¢VW'•7G&–ærÒ„æWrÕVW'•7G&–æt6öÆÆV7F–öâGVW'’¢–çWE7G&VÒÒF&öG”×0¢6öçFVçDVæ6öF–ærÒµFW‡BäVæ6öF–æuÓ£¥UDc€¢Ð¢&WGW&â·67W7FöÖö&¦V7EÔ°¢—5F7ÒGG'VP¢F76Æ–VçBÒEF76Æ–Vç@¢F77G&VÒÒG7G&VÐ¢&WVW7BÒG&WVW7@¢&W7öç6RÒ·67W7FöÖö&¦V7EÔ·Ð¢Ð§Ð   ¦gVæ7F–öâ&W6öÇfRÔVFvTW†V7WF&ÆTg&öÔ6öÖÖæEFW‡B…·7G&–æuÒD6öÖÖæEFW‡B’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚D6öÖÖæEFW‡B’’²&WGW&ârrÐ¢FW‡æFVBÒ´Vçf—&öæÖVçEÓ£¤W‡æDVçf—&öæÖVçEf&–&ÆW2‚D6öÖÖæEFW‡BåG&–Ò‚’¢F6æF–FFRÒrp¢–b‚FW‡æFVBÖÖF6‚uåÇ2¢"…µâ%Ò¦×6VFvUÂæW†R’"r’²F6æF–FFRÒFÖF6†W5³ÒÐ¢VÇ6V–b‚FW‡æFVBÖÖF6‚uåÇ2¢…µåÇ2%Ò¦×6VFvUÂæW†R’r’²F6æF–FFRÒFÖF6†W5³ÒÐ¢VÇ6V–b‚FW‡æFVBÖÖF6‚r"…µâ%Ò¦×6VFvUÂæW†R’"r’²F6æF–FFRÒFÖF6†W5³ÒÐ¢VÇ6V–b‚FW‡æFVBÖÖF6‚r…µåÇ2%Ò¦×6VFvUÂæW†R’r’²F6æF–FFRÒFÖF6†W5³ÒÐ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6æF–FFR’’²&WGW&ârrÐ¢F6æF–FFRÒF6æF–FFRåG&–Ò‚r"r¢G'’°¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚F6æF–FFR’²&WGW&â…´”òåF…Ó£¤vWDgVÆÅF‚‚F6æF–FFR’’Ð¢Ò6F6‚·Ð¢&WGW&ârp§Ð ¦gVæ7F–öâFBÔVFvTW†V7WF&ÆT6æF–FFR‚D6æF–FFW2Â·7G&–æuÒEfÇVR’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EfÇVR’’²&WGW&âÐ¢FW‡æFVBÒ´Vçf—&öæÖVçEÓ£¤W‡æDVçf—&öæÖVçEf&–&ÆW2‚EfÇVRåG&–Ò‚’¢G'6VBÒ&W6öÇfRÔVFvTW†V7WF&ÆTg&öÔ6öÖÖæEFW‡BFW‡æFV@¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G'6VB’’°¢·fö–EÒD6æF–FFW2äFB‚G'6VB¢&WGW&à¢Ð¢G&rÒFW‡æFVBåG&–Ò‚r"r¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&r’’²·fö–EÒD6æF–FFW2äFB‚G&r’Ð§Ð ¦gVæ7F–öâvWBÕ&Vv—7G'”FVfVÇEfÇVUFW‡B…·7G&–æuÒEF‚’°¢G'’°¢F¶W’ÒvWBÔ—FVÒÔÆ—FW&ÅF‚EF‚ÔW'&÷$7F–öâ7F÷ ¢&WGW&â·7G&–æuÒF¶W’ävWEfÇVR‚rr¢Ò6F6‚°¢&WGW&ârp¢Ð§Ð ¦gVæ7F–öâvWBÔVFvTW†V7WF&ÆUF‚°¢F6æF–FFW2ÒæWrÔö&¦V7B7—7FVÒä6öÆÆV7F–öç2ävVæW&–2äÆ—7E·7G&–æuÐ¢G'’°¢F6ÖBÒvWBÔ6öÖÖæB×6VFvRæW†RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢–b‚F6ÖBÖæBÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R…·7G&–æuÒF6ÖBå6÷W&6R’’°¢FBÔVFvTW†V7WF&ÆT6æF–FFRF6æF–FFW2…·7G&–æuÒF6ÖBå6÷W&6R¢Ð¢Ò6F6‚·Ð ¢f÷&V6‚‚G&VuF‚–â€¢t„´5S¥Å4ôeEt$UÄÖ–7&÷6ögEÅv–æF÷w5Ä7W'&VçEfW'6–öåÄF‡5Æ×6VFvRæW†RrÀ¢t„´ÄÓ¥Å4ôeEt$UÄÖ–7&÷6ögEÅv–æF÷w5Ä7W'&VçEfW'6–öåÄF‡5Æ×6VFvRæW†RrÀ¢t„´ÄÓ¥Å4ôeEt$UÅtõscC3$æöFUÄÖ–7&÷6ögEÅv–æF÷w5Ä7W'&VçEfW'6–öåÄF‡5Æ×6VFvRæW†RrÀ¢t„´5S¥Å4ôeEt$UÄ6Æ76W5ÄÕ4VFvT…DÕÇ6†VÆÅÆ÷VåÆ6öÖÖæBrÀ¢t„´ÄÓ¥Å4ôeEt$UÄ6Æ76W5ÄÕ4VFvT…DÕÇ6†VÆÅÆ÷VåÆ6öÖÖæBrÀ¢t„´5S¥Å4ôeEt$UÄ6Æ76W5ÆÖ–7&÷6ögBÖVFvUÇ6†VÆÅÆ÷VåÆ6öÖÖæBrÀ¢t„´ÄÓ¥Å4ôeEt$UÄ6Æ76W5ÆÖ–7&÷6ögBÖVFvUÇ6†VÆÅÆ÷VåÆ6öÖÖæBp¢’’°¢FBÔVFvTW†V7WF&ÆT6æF–FFRF6æF–FFW2„vWBÕ&Vv—7G'”FVfVÇEfÇVUFW‡BG&VuF‚¢Ð ¢f÷&V6‚‚F&6R–â€¢´Vçf—&öæÖVçEÓ£¤vWDVçf—&öæÖVçEf&–&ÆR‚u&öw&Ôf–ÆW2‡ƒƒb’r’À¢´Vçf—&öæÖVçEÓ£¤vWDVçf—&öæÖVçEf&–&ÆR‚u&öw&Ôf–ÆW2r’À¢´Vçf—&öæÖVçEÓ£¤vWDVçf—&öæÖVçEf&–&ÆR‚tÆö6ÄFFr¢’’°¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6R’’°¢FBÔVFvTW†V7WF&ÆT6æF–FFRF6æF–FFW2„¦ö–âÕF‚F&6RtÖ–7&÷6ögEÄVFvUÄÆ–6F–öåÆ×6VFvRæW†Rr¢Ð¢Ð ¢f÷&V6‚‚F6æF–FFR–â‚F6æF–FFW2Â6VÆV7BÔö&¦V7BÕVæ—VR’’°¢G'’°¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6æF–FFR’ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚F6æF–FFR’’°¢&WGW&â…´”òåF…Ó£¤vWDgVÆÅF‚‚F6æF–FFR’¢Ð¢Ò6F6‚·Ð¢Ð¢&WGW&ârp§Ð ¦gVæ7F–öâ6öçfW'EFòÔVFvT÷VåF&vWB…·7G&–æuÒEF&vWB’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EF&vWB’’²&WGW&ârrÐ¢GG&–ÖÖVBÒEF&vWBåG&–Ò‚¢G'’°¢2v–æF÷w2G&—fRF‚7V6‚23¥Ââââ×W7Bæ÷B&RÖ—7F¶Vâf÷"U$’66†VÖRà¢–b‚GG&–ÖÖVBÖÖF6‚uå´Õ¦×¥Ó¥µÅÂõÒrÖ÷"GG&–ÖÖVBÖÖF6‚uåÅÅÅÂr’°¢&WGW&â…µW&•Ò…´”òåF…Ó£¤vWDgVÆÅF‚‚GG&–ÖÖVB’’’ä'6öÇWFUW&¢Ð¢–b‚GG&–ÖÖVBÖÖF6‚uæf–ÆS¢r’²&WGW&âGG&–ÖÖVBÐ¢–b‚GG&–ÖÖVBÖÖF6‚uå´Õ¦×¥Õ´Õ¦×£Ó’²âÕÒ£¢r’²&WGW&âGG&–ÖÖVBÐ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GG&–ÖÖVB’°¢&WGW&â…µW&•Ò…´”òåF…Ó£¤vWDgVÆÅF‚‚GG&–ÖÖVB’’’ä'6öÇWFUW&¢Ð¢&WGW&âGG&–ÖÖV@¢Ò6F6‚°¢&WGW&âGG&–ÖÖV@¢Ð§Ð  ¦gVæ7F–öâ÷VâÕ&W÷'D&–æFW$'&÷w6W"…·7G&–æuÒEW&Â’°¢w&—FRÔ†÷7B%&W÷'D&–æFW"U$Ã¢EW&Â ¢GF&vWBÒ6öçfW'EFòÔVFvT÷VåF&vWBEW&À¢FVFvRÒvWBÔVFvTW†V7WF&ÆUF€¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FVFvR’’°¢G'’²7F'BÕ&ö6W72Ôf–ÆUF‚FVFvRÔ&wVÖVçDÆ—7B‚GF&vWB’ÔW'&÷$7F–öâ7F÷Â÷WBÔçVÆÃ²&WGW&âGG'VRÐ¢6F6‚²w&—FRÕv&æ–ær‚$6÷VÆBæ÷B÷VâÖ–7&÷6ögBVFvS¢"²EòäW†6WF–öâäÖW76vR’Ð¢ÒVÇ6R°¢w&—FRÕv&æ–ær$Ö–7&÷6ögBVFvRW†V7WF&ÆRF‚v2æ÷B&W6öÇfVBâG'––ær&÷Fö6öÂö6öÖÖæBfÆÆ&6·2â ¢Ð¢–b‚GF&vWBÖÖF6‚uæ‡GG3ó¢òòr’°¢G'’²7F'BÕ&ö6W72Ôf–ÆUF‚‚&Ö–7&÷6ögBÖVFvS¢"²GF&vWB’ÔW'&÷$7F–öâ7F÷Â÷WBÔçVÆÃ²&WGW&âGG'VRÐ¢6F6‚²w&—FRÕv&æ–ær‚$6÷VÆBæ÷B÷VâÖ–7&÷6ögBVFvRf–&÷Fö6öÂfÆÆ&6³¢"²EòäW†6WF–öâäÖW76vR’Ð¢Ð¢G'’°¢F6ÖDW†RÒ¦ö–âÕF‚FVçc¥7—7FVÕ&ö÷Bu7—7FVÓ3%Æ6ÖBæW†Rp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚F6ÖDW†R’’²F6ÖDW†RÒv6ÖBæW†RrÐ¢FW66VEF&vWBÒGF&vWB×&WÆ6Rr"rÂr""p¢F6ÖD&w2Òrö27F'B""×6VFvRæW†R"r²FW66VEF&vWB²r"p¢7F'BÕ&ö6W72Ôf–ÆUF‚F6ÖDW†RÔ&wVÖVçDÆ—7BF6ÖD&w2Õv–æF÷u7G–ÆR†–FFVâÔW'&÷$7F–öâ7F÷Â÷WBÔçVÆÀ¢&WGW&âGG'VP¢Ò6F6‚²w&—FRÕv&æ–ær‚$6÷VÆBæ÷B÷VâÖ–7&÷6ögBVFvRf–6öÖÖæBfÆÆ&6³¢"²EòäW†6WF–öâäÖW76vR’Ð¢&WGW&âFfÇ6P§Ð ¦gVæ7F–öâ7F'BÔÆö6ÅF76W'fW"…¶–çEÒDÆ—7FVå÷'BÂ·7G&–æuÒD÷VåW&ÂÂ¶&ööÅÒE6¶—÷Vâ’°¢28+ž8+8+Ž8:^8;Î8:ž8;Î8þ8>8î™j.i[8(Ž8(®XXŽ8¾‹[~X¹^8ž8(¾8þ8(8Æ—7FVæW"8îyIþh‰8;µ7F'B8ÎZKiY~8~8þZNYŽ8( ¢2f–æÆÇ’8¾XZ^8>8n[ø^8®ZÙ89~8:Þ8+¾8+ž8).XÎjÚ.8~8Þ8(¾8(Ž8n8X‰ÞiÉþXÉnXZŽKÙ>8)"G'’Xh^8¾{Úî8þ8 ¢GF7ÒFçVÆÀ¢G'’°¢GF7ÒæWrÔö&¦V7BæWBå6ö6¶WG2åF7Æ—7FVæW"…´æWBä•FG&W75Ó£¥'6R‚s#rãããr’ÂDÆ—7FVå÷'B¢GF7å7F'B‚¢w&—FRÔ†÷7B%&W÷'D&–æFW"Æö6Â6W'fW"7F'FVBöâ#rããã¢DÆ—7FVå÷'B ¢w&—FRÔ†÷7B%&W÷'D&–æFW"U$Ã¢D÷VåW&Â ¢w&—FRÔ†÷7B%&W÷'D&–æFW"v–ÆÂ7F÷gFW"3Ö–çWFW2v—F†÷WB'&÷w6W"7F—f—G’âDb7&VF–öâ¦ö'26öçF–çVRWfVâ–bF†RF"—26Æ÷6VBâ ¢–b‚Öæ÷BE6¶—÷Vâ’²÷VâÕ&W÷'D&–æFW$'&÷w6W"D÷VåW&ÂÐ¢v†–ÆR‚GG'VR’°¢Fæ÷rÒ´FFUF–ÖUÓ£¥WF4æ÷p¢–b‚E67&—C¥6‡WFF÷vå&WVW7FVB’°¢w&—FRÔ†÷7B%&W÷'D&–æFW"6‡WFF÷vâ&WVW7FVBâ ¢'&V°¢Ð¢–b‚Öæ÷BE67&—C¤6Æ–VçDGF6†VBÖæB‚‚Fæ÷rÒE67&—C¥6W'fW%7F'FVEWF2’åF÷FÅ6V6öæG2ÖvRE67&—C¤æô6Æ–VçE7F'GWF–ÖV÷WE6V6öæG2’’°¢–b‚Öæ÷B…FW7BÔ7F—fU&VæFW$¦ö'2DÖöFR’’°¢w&—FRÔ†÷7B%&W÷'D&–æFW"'&÷w6W"v2æ÷B÷VæVB÷"GF6†VBâ7F÷–ærÆö6Â6W'fW"â ¢'&V°¢Ð¢Ð¢–b‚E67&—C¤6Æ–VçDGF6†VBÖæB‚‚Fæ÷rÒE67&—C¤Æ7D†V'F&VEWF2’åF÷FÅ6V6öæG2ÖvRE67&—C¤–FÆUF–ÖV÷WE6V6öæG2’’°¢–b…FW7BÔ7F—fU&VæFW$¦ö'2DÖöFR’°¢w&—FRÔ†÷7B%&W÷'D&–æFW"—2–FÆRÂ'WBDb7&VF–öâ¦ö"—27F–ÆÂ'Vææ–ærâ¶VW–ærÆö6Â6W'fW"Æ—fRâ ¢E67&—C¤Æ7D†V'F&VEWF2ÒFæ÷p¢ÒVÇ6R°¢w&—FRÔ†÷7B%&W÷'D&–æFW"–FÆRF–ÖV÷WB&V6†VBâ7F÷–ærÆö6Â6W'fW"â ¢'&V°¢Ð¢Ð ¢–b‚Öæ÷BGF7åVæF–ær‚’’°¢7F'BÕ6ÆVWÔÖ–ÆÆ—6V6öæG2#S ¢6öçF–çVP¢Ð ¢F6Æ–VçBÒGF7ä66WEF76Æ–VçB‚¢G'’°¢F6öçFW‡BÒ&VBÕF7‡GG6öçFW‡BF6Æ–VçBDÆ—7FVå÷'@¢GF‚ÒF6öçFW‡Bå&WVW7BåW&Âä'6öÇWFUF€¢–b‚GF‚å7F'G5v—F‚‚rö’òr’’²†æFÆRÔ’F6öçFW‡BÒVÇ6R²6W'fRÕ7FF–2F6öçFW‡BGF‚Ð¢Ò6F6‚°¢G'’°¢F7G‚Ò·67W7FöÖö&¦V7EÔ²—5F7ÒGG'VS²F76Æ–VçBÒF6Æ–VçC²F77G&VÒÒF6Æ–VçBävWE7G&VÒ‚“²&WVW7BÒFçVÆÃ²&W7öç6RÒ·67W7FöÖö&¦V7EÔ·ÒÐ¢FW'"Ò¶÷&FW&VEÔ²ö²ÒFfÇ6S²W'&÷"ÒEòäW†6WF–öâäÖW76vRÐ¢G7FGW2ÒB†–b‚EòäW†6WF–öâÖ—2µ7—7FVÒä&wVÖVçDW†6WF–öåÒ’²CÒVÇ6R²SÒ¢w&—FRÔ§6öå&W7öç6RF7G‚G7FGW2FW' ¢Ò6F6‚°¢G'’²F6Æ–VçBä6Æ÷6R‚’Ò6F6‚·Ð¢Ð¢Ð¢Ð¢Òf–æÆÇ’°¢2Šj¥”Nyº>Šin888¾šÎ8(ž8®8˜	®[‹Ž{X.K¨n8;¶Æ—7FVæW.‹[~X¹^ZKiY~8î8ž88(ž8~8(.iˆîzK®XÎjÚ.8ž8(¾8 ¢G'’²7F÷ÔWFõ66†VGVÆW%&ö6W72Ò6F6‚²Ð¢–b‚GF7’²G'’²GF7å7F÷‚’Ò6F6‚²ÒÐ¢Ð§Ð ¦gVæ7F–öâvWBÔg&VU÷'B°¢FÆ—7FVæW"ÒæWrÔö&¦V7BæWBå6ö6¶WG2åF7Æ—7FVæW"…´æWBä•FG&W75Ó£¥'6R‚s#rãããr’Â¢FÆ—7FVæW"å7F'B‚¢GÒFÆ—7FVæW"äÆö6ÄVæGö–çBå÷'@¢FÆ—7FVæW"å7F÷‚¢&WGW&âG §Ð  ¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢2cR7FvR"(	B†6R¢jIÎyú^x˜Ž8+ž88®88>89~8+~8:~88>88‚†–çWB†—7F÷'’¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¦gVæ7F–öâvWBÔ–çWD†—7F÷'•&ö÷B…·7G&–æuÒDÆæwVvR’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’v–çWBÖ†—7F÷'’r§Ð¦gVæ7F–öâvWBÕv÷&¶&öö´†—7F÷'”F—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢G6fUv÷&¶&öö´–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEv÷&¶&öö´–Bwv÷&¶&öö´–Bp¢&WGW&â„¦ö–âÕF‚„vWBÔ–çWD†—7F÷'•&ö÷BDÆæwVvR’G6fUv÷&¶&öö´–B§Ð¦gVæ7F–öâvWBÕ6æ6†÷DF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢G6fU6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBE6æ6†÷D–Bw6æ6†÷D–Bp¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&¶&öö´†—7F÷'”F—"DÆæwVvREv÷&¶&öö´–B’G6fU6æ6†÷D–B§Ð¦gVæ7F–öâvWBÔW†VÖW&Ä¦ö%&ö÷B…·7G&–æuÒDÆæwVvR’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’w7FFUÆ¦ö'2r§Ð ¦gVæ7F–öâw&—FRÔ†—7F÷'”WfVçB…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEG—RÂDFF’°¢2cRÜ*sBã3¢8*N89ž8;>88ƒ89^8*8*N8:¾8.X[iÈž88ž8:ž8*N89nKˆ®8~8ä¥4ôäÎ‹ûÞŠ‰Ž8þŠÎ8Îk{~8n8(¾8þ8(KÛþ8(þ8®8N8 ¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&âÐ¢G'’°¢FF—"Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’v†—7F÷'•ÆWfVçG2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢G6fUG—RÒ·&VvW…Ó£¥&WÆ6R…·7G&–æuÒEG—RÂuµäÕ¦×£Ó’åòÕÒ²rÂrÒr¢FæÖRÒ‚w³Õ÷³Òæ§6öârÖb„æWrÕ&$–B’ÂG6fUG—R¢G–ÆöBÒ¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ²WfVçEG—RÒ·7G&–æuÒEG—S²BÒæWrÔæ÷t—6ð¢4æÖRÒFVçc¤4ôÕUDU$äÔS²W6W$æÖRÒ"FVçc¥U4U$DôÔ”åÂFVçc¥U4U$äÔR ¢FFÒDFF¢Ð¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"FæÖR’G–Æö@¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâvWBÕ6æ6†÷DÖæ–fW7B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢GF‚Ò¦ö–âÕF‚„vWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’vÖæ–fW7Bæ§6öâp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’’²&WGW&âFçVÆÂÐ¢G'’²&WGW&â…&VBÔ§6öäf–ÆRGF‚FçVÆÂ’Ò6F6‚²&WGW&âFçVÆÂÐ§Ð ¦gVæ7F–öâvWBÕ6æ6†÷D–G2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢FF—"ÒvWBÕv÷&¶&öö´†—7F÷'”F—"DÆæwVvREv÷&¶&öö´–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&â‚’Ð¢&WGW&â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"ÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÀ¢v†W&RÔö&¦V7B²FW7BÕF‚ÔÆ—FW&ÅF‚„¦ö–âÕF‚EòägVÆÄæÖRvÖæ–fW7Bæ§6öâr’ÒÀ¢6÷'BÔö&¦V7BæÖRÂf÷$V6‚Ôö&¦V7B²·7G&–æuÒEòäæÖRÒ§Ð ¦gVæ7F–öâf–æBÕ6æ6†÷D'•6÷W&6T†6‚…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6÷W&6T†6‚’°¢GF&vWBÒæ÷&ÖÆ—¦RÔf–ÆT†6‚E6÷W&6T†6€¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚GF&vWB’’²&WGW&ârrÐ¢f÷&V6‚‚F–B–â„vWBÕ6æ6†÷D–G2DÆæwVvREv÷&¶&öö´–B’’°¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BF–@¢–b‚FçVÆÂÖWFÒ’²6öçF–çVRÐ¢–b‚„æ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’FÒw6÷W&6T†6‚rrr’’’ÖWGF&vWB’²&WGW&âF–BÐ¢Ð¢&WGW&ârp§Ð ¦gVæ7F–öâvWBÕ6æ6†÷E6÷W&6U7FFR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢2cRÔ•bÓS¢xûîxšž8îiÈžxJ8ò–Ö×WF&ÆR8¢Öæ–fW7B8¾8þi»Ž8¾8®8N8 ¢FF—"ÒvWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢G7FFUF‚Ò¦ö–âÕF‚FF—"w6÷W&6R×7FFRæ§6öâp¢G6÷W&6UF‚Ò¦ö–âÕF‚FF—"w6÷W&6Rç†Ç7‚p¢FW†—7G2ÒFW7BÕF‚ÔÆ—FW&ÅF‚G6÷W&6UF€¢G7FFRÒFçVÆÀ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚G7FFUF‚’²G'’²G7FFRÒ&VBÔ§6öäf–ÆRG7FFUF‚FçVÆÂÒ6F6‚²ÒÐ¢&WGW&â¶÷&FW&VEÔ°¢6÷W&6U&WF–æVBÒ¶&ööÅÒFW†—7G0¢6÷W&6UF‚ÒG6÷W&6UF€¢&VÖ÷fVDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRw&VÖ÷fVDBrrr¢&VÖ÷fVE&V6öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRw&VÖ÷fVE&V6öârrr¢Ð§Ð ¦gVæ7F–öâ6WBÕ6æ6†÷E6÷W&6U7FFR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ¶&ööÅÒE&WF–æVBÂ·7G&–æuÒE&V6öâ’°¢FF—"ÒvWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&âÐ¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"w6÷W&6R×7FFRæ§6öâr’…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ²6÷W&6U&WF–æVBÒE&WF–æV@¢&VÖ÷fVDBÒB†–b‚E&WF–æVB’²rrÒVÇ6R²æWrÔæ÷t—6òÒ¢&VÖ÷fVE&V6öâÒB†–b‚E&WF–æVB’²rrÒVÇ6R²·7G&–æuÒE&V6öâÒ¢Ò§Ð ¢2ÒÒÒÒ–ç2òÆV6W2ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâvWBÕ6æ6†÷E–äF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢&WGW&â„¦ö–âÕF‚„vWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’w–ç2r§Ð¦gVæ7F–öâvWBÕ6æ6†÷DÆV6TF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢&WGW&â„¦ö–âÕF‚„vWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’vÆV6W2r§Ð ¦gVæ7F–öâæWrÕ6æ6†÷E–â…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒE–äæÖRÂDFF’°¢2cRÔ•bÓ#¢KùÞŠÛ~8þ89^8*8*N8:¾8îKÙÎh‰8;¾X˜®™šN8~ŠŽ8ž8.˜XÞX‰~8îi»Ž8Þhù¾8Ž8þ8~8®8N8 ¢G'’°¢FF—"ÒvWBÕ6æ6†÷E–äF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"‚'³Òæ§6öâ"ÖbE–äæÖR’’DFF¢&WGW&âGG'VP¢Ò6F6‚²&WGW&âFfÇ6RÐ§Ð ¦gVæ7F–öâ&VÖ÷fRÕ6æ6†÷E–â…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒE–äæÖR’°¢G'’°¢GF‚Ò¦ö–âÕF‚„vWBÕ6æ6†÷E–äF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’‚'³Òæ§6öâ"ÖbE–äæÖR¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâvWBÕ6æ6†÷E–ç2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢FF—"ÒvWBÕ6æ6†÷E–äF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&â‚’Ð¢&WGW&â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂf÷$V6‚Ôö&¦V7B²·7G&–æuÒEòä&6TæÖRÒ§Ð ¦gVæ7F–öâæWrÕ6æ6†÷DÆV6R…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEW'÷6RÂ·7G&–æuÒD¦ö$–BÂ¶–çEÒDÖ–çWFW5fÆ–BÒ3Â·7G&–æuÒEfW'6–öä–BÒrr’°¢G'’°¢FF—"ÒvWBÕ6æ6†÷DÆV6TF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢FæÖRÒ‚w³Õ÷³Òæ§6öârÖbEW'÷6RÂD¦ö$–B¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"FæÖR’…¶÷&FW&VEÔ°¢¦ö$–BÒD¦ö$–C²W'÷6RÒEW'÷6S²fW'6–öä–BÒEfW'6–öä–@¢7&VFVDBÒæWrÔæ÷t—6ó²†V'F&VDBÒæWrÔæ÷t—6ð¢W‡—&W4BÒ…´FFUF–ÖUÓ£¥WF4æ÷räFDÖ–çWFW2‚DÖ–çWFW5fÆ–B’åFõ7G&–ær‚vòr’¢4æÖRÒFVçc¤4ôÕUDU$äÔP¢Ò¢&WGW&âFæÖP¢Ò6F6‚²&WGW&ârrÐ§Ð ¦gVæ7F–öâ&VÖ÷fRÕ6æ6†÷DÆV6R…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒDÆV6TæÖR’°¢G'’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚DÆV6TæÖR’’²&WGW&âÐ¢GF‚Ò¦ö–âÕF‚„vWBÕ6æ6†÷DÆV6TF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’DÆV6TæÖP¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâFW7BÔÆV6T7F—fR‚DÆV6Tf–ÆR’°¢G'’°¢F¢Ò&VBÔ§6öäf–ÆRDÆV6Tf–ÆRägVÆÄæÖRFçVÆÀ¢FW‡Ò·7G&–æuÒ„vWBÔFF&÷W'G’F¢vW‡—&W4Brrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FW‡’’²&WGW&âFfÇ6RÐ¢&WGW&â…´FFUF–ÖUÓ£¥'6R‚FW‡’åFõVæ—fW'6ÅF–ÖR‚’ÖwB´FFUF–ÖUÓ£¥WF4æ÷r¢Ò6F6‚²&WGW&âFfÇ6RÐ§Ð ¦gVæ7F–öâvWBÔ7F—fTÆV6T6÷VçB…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢FF—"ÒvWBÕ6æ6†÷DÆV6TF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&âÐ¢FâÒ ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢–b…FW7BÔÆV6T7F—fRFb’²Fâ²²ÒVÇ6R²G'’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FbägVÆÄæÖRÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒ6F6‚²ÒÐ¢Ð¢&WGW&âFà§Ð  ¦gVæ7F–öâ6ÆV"ÔW‡—&VDÆV6W2…·7G&–æuÒDÆæwVvR’°¢26æ6†÷BæB6öçFVçBÕDbÆV6W2&÷F‚W‡—&RgFW"&æ÷&ÖÂFW&Ö–æF–öâà¢G'’°¢G&ö÷BÒvWBÔ–çWD†—7F÷'•&ö÷BDÆæwVvP¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚G&ö÷B’°¢f÷&V6‚‚Gv"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚G&ö÷BÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢f÷&V6‚‚G6â–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚Gv"ägVÆÄæÖRÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢·fö–EÒ„vWBÔ7F—fTÆV6T6÷VçBDÆæwVvRGv"äæÖRG6âäæÖR¢Ð¢Ð¢Ð¢Ò6F6‚²Ð¢G'’°¢F6öçFVçE&ö÷BÒ¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’v6öçFVçB×Fbp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚F6öçFVçE&ö÷B’°¢f÷&V6‚‚Gv"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚F6öçFVçE&ö÷BÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢f÷&V6‚‚GfW"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚Gv"ägVÆÄæÖRÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢FÆV6TF—"Ò¦ö–âÕF‚GfW"ägVÆÄæÖRvÆV6W2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FÆV6TF—"’’²6öçF–çVRÐ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FÆV6TF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢–b‚Öæ÷B…FW7BÔÆV6T7F—fRFb’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FbägVÆÄæÖRÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ð¢Ð¢Ð¢Ð¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâVç7W&RÕ6æ6†÷DÖWFFF…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE&VÆF—fUF‚Â·7G&–æuÒD6FVv÷'’Â·7G&–æuÒE6÷W&6UF‚Â·7G&–æuÒE6÷W&6T†6‚Â·7G&–æuÒD6GW&U&V6öâ’°¢2cRÜ*t3¢8:8+þ88~8;Î8+þ8î˜xÞŠH~hé.™šN888).h¸^[Ù>8ž8(¾8.XZ^X©¾89^8*8*N8:¾8îz+®KùÞ8ò6GW&RÕ&VæFW$–çWB8î[Ûžyºî8 ¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvæ÷BÖ&÷fVBs²6æ6†÷D–BÒrrÒÐ¢F†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚E6÷W&6T†6€¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F†6‚’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvæòÖ†6‚s²6æ6†÷D–BÒrrÒÐ ¢FÆö6µF‚Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’‚&Æö6·5Ç6æ6†÷E÷³ÒæÆö6²"ÖbEv÷&¶&öö´–B¢&WGW&â–çfö¶RÕv—F„Æö6²FÆö6µF‚°¢FW†—7F–ærÒf–æBÕ6æ6†÷D'•6÷W&6T†6‚DÆæwVvREv÷&¶&öö´–BF†6€¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FW†—7F–ær’’°¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv–çWBç6æ6†÷BæFVGWÆ–6FVBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒEv÷&¶&öö´–C²6æ6†÷D–BÒFW†—7F–æs²6÷W&6T†6‚ÒF†6ƒ²6GW&U&V6öâÒD6GW&U&V6öâÒ¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²6æ6†÷D–BÒFW†—7F–æs²—4æWrÒFfÇ6RÐ¢Ð¢F–G2Ò„vWBÕ6æ6†÷D–G2DÆæwVvREv÷&¶&öö´–B¢G&Wf–÷W2ÒB†–b‚F–G2ä6÷VçBÖwB’²·7G&–æuÒF–G5²ÓÒÒVÇ6R²rrÒ¢G&VçBÒvWBÕv÷&¶&öö´†—7F÷'”F—"DÆæwVvREv÷&¶&öö´–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G&VçB’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚G&VçBÔf÷&6RÂ÷WBÔçVÆÂÐ¢F7&VFVBÒæWrÕVæ—VTF—&V7F÷'’G&VçB²æWrÕ&$–BÐ¢G6æ6†÷D–BÒ·7G&–æuÒF7&VFVBæ–@¢F—FVÒÒFçVÆÀ¢G'’²F—FVÒÒvWBÔ—FVÒÔÆ—FW&ÅF‚E6÷W&6UF‚ÔW'&÷$7F–öâ7F÷Ò6F6‚²Ð¢2cRÜ*s2ã#¢Öæ–fW7Bæ§6öâ8îZÙŽYÊŽ8ÎZèÎh‰89î8;Î8*¾8;Î8.XXŽ8²VæF–ær8Ž8~8ni»Ž8Þ8¢26÷W&6R8î8+>89N8;Î8;¾jIÎŠ‹Î8Î{X.8(þ8>8n8¾8(’Öæ–fW7Bæ§6öâ8ŽiKžYÞ8ž8(²„6ö×ÆWFRÕ6æ6†÷Bž8 ¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚…·7G&–æuÒF7&VFVBçF‚’vÖæ–fW7BçVæF–æræ§6öâr’…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ¢6æ6†÷D–BÒG6æ6†÷D–@¢v÷&¶&öö´–BÒEv÷&¶&öö´–@¢ÆæwVvRÒDÆæwVvP¢6FVv÷'’ÒD6FVv÷'¢&VÆF—fUF‚ÒE&VÆF—fUF€¢6÷W&6T†6„Æv÷&—F†ÒÒu4„Ó#Sbp¢6÷W&6T†6‚ÒF†6€¢6÷W&6U6—¦RÒB†–b‚F—FVÒ’²F—FVÒäÆVæwF‚ÒVÇ6R²Ò¢6÷W&6TÆ7Ew&—FUWF5F–6·2ÒB†–b‚F—FVÒ’²·7G&–æuÒF—FVÒäÆ7Ew&—FUF–ÖUWF2åF–6·2ÒVÇ6R²rrÒ¢6÷W&6TÖöF–f–VDBÒB†–b‚F—FVÒ’²F—FVÒäÆ7Ew&—FUF–ÖRåFõ7G&–ær‚w———’ÔÔÒÖFED„ƒ¦ÖÓ§77§§¢r’ÒVÇ6R²rrÒ¢FWFV7FVDBÒæWrÔæ÷t—6ð¢6GW&U&V6öâÒD6GW&U&V6öà¢&Wf–÷W56æ6†÷D–BÒG&Wf–÷W0¢7FGW2Òv6ö×ÆWFRp¢'6W%fW'6–öâÒ¢6GW&VD'’Ò¶÷&FW&VEÔ²4æÖRÒFVçc¤4ôÕUDU$äÔS²W6W$æÖRÒ"FVçc¥U4U$DôÔ”åÂFVçc¥U4U$äÔR"Ð¢Ò¢6WBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvREv÷&¶&öö´–BG6æ6†÷D–BFfÇ6Rvæ÷BÖ6GW&VBp¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²6æ6†÷D–BÒG6æ6†÷D–C²—4æWrÒGG'VS²VæF–ærÒGG'VRÐ¢Ð§Ð ¦gVæ7F–öâ6ö×ÆWFRÕ6æ6†÷B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢2VæF–ær8¾8(’Öæ–fW7Bæ§6öâ8ŽiKžYÞ8~8nZèÎh‰8^8¾8(¾8.Kº^[èÎ8>8îjIÎyú^x˜Ž8þXø.xZ~Xúþˆ;Þ8¾8®8(¾8 ¢FF—"ÒvWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢GVæF–ærÒ¦ö–âÕF‚FF—"vÖæ–fW7BçVæF–æræ§6öâp¢Ff–æÂÒ¦ö–âÕF‚FF—"vÖæ–fW7Bæ§6öâp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚Ff–æÂ’²&WGW&âGG'VRÐ¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚GVæF–ær’’²&WGW&âFfÇ6RÐ¢G'’°¢Ö÷fRÔ—FVÒÔÆ—FW&ÅF‚GVæF–ærÔFW7F–æF–öâFf–æÂÔf÷&6P¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv–çWBç6æ6†÷Bæ7&VFVBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒEv÷&¶&öö´–C²6æ6†÷D–BÒE6æ6†÷D–BÒ¢&WGW&âGG'VP¢Ò6F6‚²&WGW&âFfÇ6RÐ§Ð ¦gVæ7F–öâ6fRÕ6æ6†÷E6÷W&6Tf–ÆR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒE6÷W&6UF‚Â·7G&–æuÒE6÷W&6T†6‚’°¢2cRÜ*s2ã"h˜¾šcBÓƒ¢8+>89N8;ÂÓâ88þ88>8+~8:^jIÎŠ‹ÂÓâ[^jÛN89^8*ž8:¾888Žz{¾X¹RÓâXhÞ88þ88>8+~8:^8 ¢–b‚Öæ÷B…FW7BÕ6÷W&6U&WFVçF–öäVæ&ÆVB’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒw&WFVçF–öâÖæ÷BÖ&÷fVBrÒÐ¢FF—"ÒvWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒw6æ6†÷BÖÖ—76–ærrÒÐ¢FFW7BÒ¦ö–âÕF‚FF—"w6÷W&6Rç†Ç7‚p¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FFW7B’²&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²F‚ÒFFW7C²&WW6VBÒGG'VRÒÐ ¢GF×F—"Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’‚w7FFUÇF×Âr²„æWrÕ&$–B’¢æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚GF×F—"Ôf÷&6RÂ÷WBÔçVÆÀ¢GF×Ò¦ö–âÕF‚GF×F—"w6÷W&6Rç†Ç7‚p¢G'’°¢F&Vf÷&RÒvWBÔ—FVÒÔÆ—FW&ÅF‚E6÷W&6UF‚ÔW'&÷$7F–öâ7F÷ ¢F6÷–VBÒFfÇ6S²FÆ7DW'&÷"Òrp¢f÷"‚F’Ò²F’ÖÆR3²F’²²’°¢G'’²6÷’Ôf–ÆU6†&VE&VBE6÷W&6UF‚GF×²F6÷–VBÒGG'VS²'&V²Ò6F6‚²FÆ7DW'&÷"ÒEòäW†6WF–öâäÖW76vRÐ¢–b‚F’ÖÇB2’²7F'BÕ6ÆVWÕ6V6öæG2"Ð¢Ð¢–b‚Öæ÷BF6÷–VB’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒv6÷’Öf–ÆVBs²ÖW76vRÒFÆ7DW'&÷"ÒÐ¢G'’²Væ&Æö6²Ôf–ÆRÔÆ—FW&ÅF‚GF×ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒ6F6‚²Ð¢F6÷”†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbGF×¢–b‚F6÷”†6‚ÖæR„æ÷&ÖÆ—¦RÔf–ÆT†6‚E6÷W&6T†6‚’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒv†6‚ÖÖ—6ÖF6‚rÒÐ¢FgFW"ÒvWBÔ—FVÒÔÆ—FW&ÅF‚E6÷W&6UF‚ÔW'&÷$7F–öâ7F÷ ¢–b‚FgFW"äÆVæwF‚ÖæRF&Vf÷&RäÆVæwF‚Ö÷"FgFW"äÆ7Ew&—FUF–ÖUWF2ÖæRF&Vf÷&RäÆ7Ew&—FUF–ÖUWF2’°¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒw6÷W&6RÖ6†ævVBÖGW&–ærÖ6÷’rÐ¢Ð¢Ö÷fRÔ—FVÒÔÆ—FW&ÅF‚GF×ÔFW7F–æF–öâFFW7BÔf÷&6P¢Ff–æÄ†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbFFW7B¢–b‚Ff–æÄ†6‚ÖæRF6÷”†6‚’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FFW7BÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒwfW&–g’Öf–ÆVBrÐ¢Ð¢6WBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BGG'VRrp¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²F‚ÒFFW7C²&WW6VBÒFfÇ6RÐ¢Ò6F6‚°¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvW'&÷"s²ÖW76vRÒEòäW†6WF–öâäÖW76vRÐ¢Òf–æÆÇ’°¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF×F—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF×F—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ð§Ð ¦gVæ7F–öâ6GW&RÔFWFV7FVE6æ6†÷B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒD6GW&U&V6öâ’°¢2cRÜ*s2ãü*s2ã3¢jIÎyú^8ŽYÎi˜.8¾KùÞZÙŽ8ž8(¾8.™ÙžjÚ.[è^88(Ž8(®X˜Þ8 ¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvæ÷BÖ&÷fVBrÒÐ¢GF‡2ÒvWBÕF‡0¢G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvP¢Gv"Ò„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWEv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Gv"ä6÷VçBÖW’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒwv÷&¶&öö²ÖÖ—76–ærrÒÐ¢GrÒGv%³Ð¢G6÷W&6UF‚Ò¦ö–âÕ6fR…·7G&–æuÒGF‡2ç7V&Ö—76–öäF—"’…·7G&–æuÒGrç&VÆF—fUF‚¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G6÷W&6UF‚’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvf–ÆRÖÖ—76–ærrÒÐ ¢FW‡V7FVE&Wf–÷W2Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’Grv7W'&VçDW†6VÄ†6‚rrr’¢F—FVÒÒvWBÔ—FVÒÔÆ—FW&ÅF‚G6÷W&6UF‚ÔW'&÷$7F–öâ7F÷ ¢F6GW&VD†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbG6÷W&6UF‚¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6GW&VD†6‚’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒv†6‚Öf–ÆVBrÒÐ¢F6GW&VEF–6·2Ò·7G&–æuÒF—FVÒäÆ7Ew&—FUF–ÖUWF2åF–6·0¢F6GW&VE6—¦RÒF—FVÒäÆVæwF€ ¢FÖWFÒVç7W&RÕ6æ6†÷DÖWFFFDÆæwVvREv÷&¶&öö´–B…·7G&–æuÒGrç&VÆF—fUF‚’…·7G&–æuÒGræ6FVv÷'’’G6÷W&6UF‚F6GW&VD†6‚D6GW&U&V6öà¢–b‚Öæ÷B¶&ööÅÒFÖWFæö²’²&WGW&âFÖWFÐ¢G6æ6†÷D–BÒ·7G&–æuÒFÖWFç6æ6†÷D–@¢–b…¶&ööÅÒ„vWBÔFF&÷W'G’FÖWFwVæF–ærrFfÇ6R’’°¢–b…FW7BÕ6÷W&6U&WFVçF–öäVæ&ÆVB’°¢G6fVBÒ6fRÕ6æ6†÷E6÷W&6Tf–ÆRDÆæwVvREv÷&¶&öö´–BG6æ6†÷D–BG6÷W&6UF‚F6GW&VD†6€¢–b‚Öæ÷B¶&ööÅÒG6fVBæö²’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒ·7G&–æuÒG6fVBç&V6öâÒÐ¢Ð¢–b‚Öæ÷B„6ö×ÆWFRÕ6æ6†÷BDÆæwVvREv÷&¶&öö´–BG6æ6†÷D–B’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒv6ö×ÆWFRÖf–ÆVBrÒÐ¢Ð ¢2cRÜ*s2ã3¢8+>89þ88>88Ž8ò6ö×&RÖæB×6WN8%28îi˜.X‹¾8~8þ8®8þhùX{®89^8*8*N8:¾8îZéþx«nhX¾8~XŠNZé®8ž8(¾8 ¢F6öÖÖ—GFVBÒWFFRÕ7G'V7GW&TÆö6¶VBDÆæwVvR°¢&Ò‚G7B¢G‚Ò„vWBÔ'&’G7Bçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWEv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Öæ÷BG‚ä6÷VçB’²&WGW&â¶÷&FW&VEÔ²6öÖÖ—GFVBÒFfÇ6S²&V6öâÒwv÷&¶&öö²ÖÖ—76–ærrÒÐ¢GBÒG…³Ð¢FÆ—fRÒFçVÆÀ¢G'’²FÆ—fRÒvWBÔ—FVÒÔÆ—FW&ÅF‚G6÷W&6UF‚ÔW'&÷$7F–öâ7F÷Ò6F6‚²Ð¢G7F–ÆÄ7W'&VçBÒ‚FçVÆÂÖæRFÆ—fR’Öæ@¢…·7G&–æuÒFÆ—fRäÆ7Ew&—FUF–ÖUWF2åF–6·2ÖWF6GW&VEF–6·2’Öæ@¢‚FÆ—fRäÆVæwF‚ÖWF6GW&VE6—¦R¢–b‚Öæ÷BG7F–ÆÄ7W'&VçB’²&WGW&â¶÷&FW&VEÔ²6öÖÖ—GFVBÒFfÇ6S²&V6öâÒw7WW'6VFVBrÒÐ¢2cRÕ‚3’“¢F–6·2÷6—¦R8ÎYÎKˆ8~8(.Xh^Zëž8Îi»Ž8Þhù¾8(þ8>8n8N8(¾Xúþˆ;Þh
+~8Î8.8(¾8þ8(8¢28+>89þ88>88Žy»NX˜Þ8¾Zéþ89^8*8*N8:¾8).XhÞ88þ88>8+~8:^8~8hÙ^hØži˜.8î88þ88>8+~8:^8ŽKˆˆ{N8ž8(¾8>8Ž8).z+®Š¨Þ8ž8(¾8 ¢FÆ—fT†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbG6÷W&6UF‚¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FÆ—fT†6‚’Ö÷"FÆ—fT†6‚ÖæRF6GW&VD†6‚’°¢&WGW&â¶÷&FW&VEÔ²6öÖÖ—GFVBÒFfÇ6S²&V6öâÒw7WW'6VFVBrÐ¢Ð¢FÆFW7BÒæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’GBv7W'&VçDW†6VÄ†6‚rrr’¢–b‚Öæ÷B…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FÆFW7B’’ÖæBFÆFW7BÖæRFW‡V7FVE&Wf–÷W2ÖæBFÆFW7BÖæRF6GW&VD†6‚’°¢&WGW&â¶÷&FW&VEÔ²6öÖÖ—GFVBÒFfÇ6S²&V6öâÒv6öæ7W'&VçB×WFFRrÐ¢Ð¢FBÔæ÷FU&÷W'G”–dÖ—76–ærGBv7W'&VçE6æ6†÷D–Brrp¢FBÔæ÷FU&÷W'G”–dÖ—76–ærGBvÆ7DFWFV7FVDBrrp¢6WBÔæ÷FU&÷W'G’GBv7W'&VçDW†6VÄ†6‚rF6GW&VD†6€¢6WBÔæ÷FU&÷W'G’GBv7W'&VçDW†6VÄÆ7Ew&—FUWF5F–6·2rF6GW&VEF–6·0¢6WBÔæ÷FU&÷W'G’GBv7W'&VçDW†6VÅ6—¦RrF6GW&VE6—¦P¢6WBÔæ÷FU&÷W'G’GBv7W'&VçDW†6VÄÖöF–f–VDBr‚FÆ—fRäÆ7Ew&—FUF–ÖRåFõ7G&–ær‚w———’ÔÔÒÖFED„ƒ¦ÖÓ§77§§¢r’¢6WBÔæ÷FU&÷W'G’GBv7W'&VçE6æ6†÷D–BrG6æ6†÷D–@¢6WBÔæ÷FU&÷W'G’GBvÆ7DFWFV7FVDBr„æWrÔæ÷t—6ò¢G&VæFW&VBÒæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’GBvÆ7E&VæFW&VDW†6VÄ†6‚rrr’¢–b‚G&VæFW&VBÖæBG&VæFW&VBÖæRF6GW&VD†6‚ÖæB·7G&–æuÒGBç7FGW2ÖæRw&VæFW"ÖW'&÷"r’²6WBÔæ÷FU&÷W'G’GBw7FGW2rvW†6VÂ×WFFVBrÐ¢&WGW&â¶÷&FW&VEÔ²6öÖÖ—GFVBÒGG'VRÐ¢Ð¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²6æ6†÷D–BÒG6æ6†÷D–C²—4æWrÒ¶&ööÅÒFÖWFæ—4æWs²6öÖÖ—GFVBÒ¶&ööÅÒF6öÖÖ—GFVBæ6öÖÖ—GFVC²&V6öâÒ·7G&–æuÒF6öÖÖ—GFVBç&V6öâÐ§Ð ¦gVæ7F–öâWFFRÔ–çWD†—7F÷'”gFW%66â…·7G&–æuÒDÆæwVvR’°¢266âÕWFFW28îy»N[èÎ8¾YÎ8n8.xûîYÊŽ88þ88>8+~8:^8¾Zûî[ùÎ8ž8(¾jIÎyú^x˜Ž8ÎxJ8N89n88>8*þ888).KùÞZÙŽ8ž8(¾8 ¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&â‚’Ð¢G&W7VÇBÒ‚¢G'’°¢G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvP¢f÷&V6‚‚Gr–â„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2’’°¢F–BÒ·7G&–æuÒGrçv÷&¶&öö´–@¢F7W"Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’Grv7W'&VçDW†6VÄ†6‚rrr’¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W"’’²6öçF–çVRÐ¢F7W%6æÒ·7G&–æuÒ„vWBÔFF&÷W'G’Grv7W'&VçE6æ6†÷D–Brrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W%6æ’’°¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvRF–BF7W%6æ ¢–b‚FçVÆÂÖæRFÒÖæB„æ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’FÒw6÷W&6T†6‚rrr’’’ÖWF7W"’²6öçF–çVRÐ¢Ð¢G"Ò6GW&RÔFWFV7FVE6æ6†÷BDÆæwVvRF–Bw66âp¢–b…¶&ööÅÒG"æö²’²G&W7VÇB³Ò¶÷&FW&VEÔ²v÷&¶&öö´–BÒF–C²6æ6†÷D–BÒ·7G&–æuÒG"ç6æ6†÷D–BÒÐ¢Ð¢Ò6F6‚²Ð¢&WGW&âG&W7VÇ@§Ð ¦gVæ7F–öâ6GW&RÕ&VæFW$–çWB…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒD¦ö$–B’°¢2cRÜ*t2Ó#¢jIÎyú^x˜Ž8Îiz.8¾8.8>8n8(.88:Î8;>888:®8;>8+K¨ŽZé®8®8(žXZ^X©¾89^8*8*N8:¾8þ[ø^8®z+®KùÞ8ž8(¾8 ¢GF‡2ÒvWBÕF‡0¢G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvP¢Gv"Ò„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWEv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Gv"ä6÷VçBÖW’²F‡&÷r%v÷&¶&öö¾8ÎŠh¾8N8¾8(®8î8¾8)3¢Ev÷&¶&öö´–B"Ð¢GrÒGv%³Ð¢FÆ—fUF‚Ò¦ö–âÕ6fR…·7G&–æuÒGF‡2ç7V&Ö—76–öäF—"’…·7G&–æuÒGrç&VÆF—fUF‚¢G6æÒE6æ6†÷D–@¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6æ’’²G6æÒ·7G&–æuÒ„vWBÔFF&÷W'G’Grv7W'&VçE6æ6†÷D–Brrr’Ð ¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6æ’’°¢2[^jÛNj™þˆ;Þ8ÎxJX«“¢[é>iÚ^8ž8®8(®hùX{®89^8*ž8:¾888îxûîxšž8).y»Nhê^KÛþ8n8 ¢&WGW&â¶÷&FW&VEÔ²F‚Òrs²6æ6†÷D–BÒrs²W†VÖW&ÂÒFfÇ6S²†6‚ÒrrÐ¢Ð¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BG6æ ¢–b‚FçVÆÂÖWFÒ’²&WGW&â¶÷&FW&VEÔ²F‚Òrs²6æ6†÷D–BÒrs²W†VÖW&ÂÒFfÇ6S²†6‚ÒrrÒÐ¢F†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’FÒw6÷W&6T†6‚rrr’ ¢–b…FW7BÕ6÷W&6U&WFVçF–öäVæ&ÆVB’°¢G7FFRÒvWBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvREv÷&¶&öö´–BG6æ ¢–b…¶&ööÅÒG7FFRç6÷W&6U&WF–æVB’°¢&WGW&â¶÷&FW&VEÔ²F‚Ò·7G&–æuÒG7FFRç6÷W&6UFƒ²6æ6†÷D–BÒG6æ²W†VÖW&ÂÒFfÇ6S²†6‚ÒF†6‚Ð¢Ð¢2xûîxšž8ÎkhŽ8Ž8n8N8(³¢hùX{®89^8*ž8:¾888îxûîxšž8ÎYÎ8Ž88þ88>8+~8:^8®8(ž[êžXX>8ž8(¾8 ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FÆ—fUF‚’°¢FÆ—fT†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbFÆ—fUF‚¢–b‚FÆ—fT†6‚ÖWF†6‚’°¢G"Ò6fRÕ6æ6†÷E6÷W&6Tf–ÆRDÆæwVvREv÷&¶&öö´–BG6æFÆ—fUF‚F†6€¢–b…¶&ööÅÒG"æö²’²&WGW&â¶÷&FW&VEÔ²F‚Ò·7G&–æuÒG"çFƒ²6æ6†÷D–BÒG6æ²W†VÖW&ÂÒFfÇ6S²†6‚ÒF†6‚ÒÐ¢Ð¢Ð¢Ð ¢2{Šî˜8:.8;Î88ž88î8þ8þxûîxšž8).[êžXX>8~8Þ8®8NZNYŽ8þKˆi˜.8+>89N8;Î8).KÙÎ8(¾8 ¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FÆ—fUF‚’’²&WGW&â¶÷&FW&VEÔ²F‚Òrs²6æ6†÷D–BÒG6æ²W†VÖW&ÂÒFfÇ6S²†6‚ÒF†6‚ÒÐ¢F6GW&T–BÒB†–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚D¦ö$–B’’²æWrÕ&$–BÒVÇ6R²D¦ö$–BÒ¢FF—"Ò¦ö–âÕF‚„vWBÔW†VÖW&Ä¦ö%&ö÷BDÆæwVvR’F6GW&T–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢GF×Ò¦ö–âÕF‚FF—"w6÷W&6Rç†Ç7‚p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚GF×’’°¢6÷’Ôf–ÆU6†&VE&VBFÆ—fUF‚GF× ¢G'’²Væ&Æö6²Ôf–ÆRÔÆ—FW&ÅF‚GF×ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒ6F6‚²Ð¢Ð¢GF×†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbGF×¢–b‚GF×†6‚ÖæRF†6‚’°¢2hùX{®89^8*ž8:¾888îxûîxšž8þiz.8¾XŠ^8îx˜Ž8¾8®8>8n8N8(¾8 ¢28>8îjIÎyú^x˜Ž8îXZ^X©¾8Ž8~8n8þKÛþ8Ž8®8B„ƒ8åDn8Ž8~8dƒ.8).{XN8)>8~8~8î8n8þ8(ž8 ¢&VÖ÷fRÔW†VÖW&Ä6÷’DÆæwVvRF6GW&T–@¢&WGW&â¶÷&FW&VEÔ²F‚Òrs²6æ6†÷D–BÒrs²W†VÖW&ÂÒFfÇ6S²†6‚ÒrrÐ¢Ð¢&WGW&â¶÷&FW&VEÔ²F‚ÒGF×²6æ6†÷D–BÒG6æ²W†VÖW&ÂÒGG'VS²†6‚ÒGF×†6ƒ²6GW&T–BÒF6GW&T–BÐ§Ð ¦gVæ7F–öâ&VÖ÷fRÔW†VÖW&Ä6÷’…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6GW&T–B’°¢G'’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚D6GW&T–B’’²&WGW&âÐ¢FF—"Ò¦ö–âÕF‚„vWBÔW†VÖW&Ä¦ö%&ö÷BDÆæwVvR’D6GW&T–@¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FF—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâ6ÆV"Õ7FÆTW†VÖW&Ä6÷–W2…·7G&–æuÒDÆæwVvR’°¢2cRÜ*sã3¢™ÙîKùÞhÈh›þŠ¨Þ8®8î8¾xûîxšž8Î™[~iÉþ™i>jè¾8(ž8®8N8(Ž8n8Kˆ®™™i˜.™i>8~[ø^8®khŽ8ž8 ¢G'’°¢G&ö÷BÒvWBÔW†VÖW&Ä¦ö%&ö÷BDÆæwVvP¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G&ö÷B’’²&WGW&âÐ¢FÖ„vRÒ¶–çEÒ„vWBÔ–çWD†—7F÷'•6WGF–æw2’æW†VÖW&Ä6÷”Ö„vTÖ–çWFW0¢–b‚FÖ„vRÖÆR’²FÖ„vRÒ3Ð¢FÆ–Ö—BÒ´FFUF–ÖUÓ£¥WF4æ÷räFDÖ–çWFW2‚Ó¢FÖ„vR¢f÷&V6‚‚FB–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚G&ö÷BÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢–b‚FBäÆ7Ew&—FUF–ÖUWF2ÖÇBFÆ–Ö—B’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FBägVÆÄæÖRÕ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv†—7F÷'’æ6ÆVçWr…¶÷&FW&VEÔ²¶–æBÒvW†VÖW&ÂÖ6÷’s²6GW&T–BÒ·7G&–æuÒFBäæÖRÒ¢Ð¢Ð¢Ò6F6‚²Ð§Ð  ¢2ÒÒÒÒhè>™šB…cRÜ*s2ãbò*s2ãr’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâvWBÕ&÷FV7FVE6æ6†÷D–G2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢2cRÜ*t2Ó3¢KùÞhÈi[8îiê8Ž8þxJ™j.Kø.8¾[‹Ži˜.KùÞŠÛ~8ž8(¾jIÎyú^x˜Ž8 ¢2ƒÓâƒ"ÓâXhÔƒ8~8òÖæ–fW7B8âFWFV7FVDB8ÎXúN8N8î8î8®8î8~8iz^i˜.šn8î8Îy»N‹ùîx˜Ž8Þ8~8þxûîYÊŽx˜Ž8).khŽ8~8n8(¾8 ¢F–G2Ò‚¢G'’°¢G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvP¢Gv"Ò„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWEv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Gv"ä6÷VçBÖwB’°¢F–G2³Ò·7G&–æuÒ„vWBÔFF&÷W'G’Gv%³Òv7W'&VçE6æ6†÷D–Brrr¢F–G2³Ò·7G&–æuÒ„vWBÔFF&÷W'G’Gv%³ÒvÆ7E&VæFW&VE6æ6†÷D–Brrr¢Ð¢Ò6F6‚²Ð¢G'’°¢FWFòÒ&VBÔWFõ7FFRDÆæwVvREv÷&¶&öö´–@¢–b‚FçVÆÂÖæRFWFò’²F–G2³Ò·7G&–æuÒ„vWBÔFF&÷W'G’FWFòwVæF–æu6æ6†÷D–Brrr’Ð¢Ò6F6‚²Ð¢G'’°¢GG"ÒvWBÔ6ö×&—6öä&6VÆ–æUö–çFW"DÆæwVvREv÷&¶&öö´–@¢–b‚FçVÆÂÖæRGG"’²F–G2³Ò·7G&–æuÒ„vWBÔFF&÷W'G’GG"w6æ6†÷D–Brrr’Ð¢Ò6F6‚²Ð¢&WGW&â‚F–G2Âv†W&RÔö&¦V7B²Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Eò’ÒÂ6VÆV7BÔö&¦V7BÕVæ—VR§Ð ¦gVæ7F–öâvWBÔf–æÅFe–ävTF—2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢2jÚ>[ÈõDn8~KÛþ8(þ8(Î8þx˜Ž8î8n88iÈ8(.ik8~8NX{®X©¾8¾8(ž8î{XÎ˜îiz^i[8).‹ùN8ž8'–â8ÎxJ88(Î8Ó8 ¢FF—"ÒvWBÕ6æ6†÷E–äF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&âÓÐ¢FæWvW7BÒFçVÆÀ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"vf–æÂ×Feò¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢–b‚FçVÆÂÖWFæWvW7BÖ÷"FbäÆ7Ew&—FUF–ÖUWF2ÖwBFæWvW7B’²FæWvW7BÒFbäÆ7Ew&—FUF–ÖUWF2Ð¢Ð¢–b‚FçVÆÂÖWFæWvW7B’²&WGW&âÓÐ¢&WGW&â…´FFUF–ÖUÓ£¥WF4æ÷rÒFæWvW7B’åF÷FÄF—0§Ð ¦gVæ7F–öâ–çfö¶RÔ–çWD†—7F÷'”6ÆVçW…·7G&–æuÒDÆæwVvR’°¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&âÐ¢FÆö6µF‚Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’vÆö6·5Æ†—7F÷'’Ö6ÆVçWæÆö6²p¢F†æFÆRÒG'’Ô7V—&TÆö6´†æFÆRFÆö6µF€¢–b‚FçVÆÂÖWF†æFÆR’²&WGW&âÒ2K¹n8+^8;Î898;Î8Îhè>™šNKŠÐ¢G'’°¢F6frÒvWBÔ–çWD†—7F÷'•6WGF–æw0¢G&ö÷BÒvWBÔ–çWD†—7F÷'•&ö÷BDÆæwVvP¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G&ö÷B’’²&WGW&âÐ¢f÷&V6‚‚Gv$F—"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚G&ö÷BÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢Gv÷&¶&öö´–BÒ·7G&–æuÒGv$F—"äæÖP¢G&÷FV7FVBÒ„vWBÕ&÷FV7FVE6æ6†÷D–G2DÆæwVvRGv÷&¶&öö´–B¢FÆÂÒ„vWBÕ6æ6†÷D–G2DÆæwVvRGv÷&¶&öö´–B¢2iÊ®ZèÎh‰K‰nKº2†Öæ–fW7B8®8rž8).X˜®™š@¢f÷&V6‚‚FB–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚Gv$F—"ägVÆÄæÖRÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚„¦ö–âÕF‚FBägVÆÄæÖRvÖæ–fW7Bæ§6öâr’’’°¢–b‚FBäÆ7Ew&—FUF–ÖUWF2ÖÇB´FFUF–ÖUÓ£¥WF4æ÷räFD†÷W'2‚Ób’’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FBägVÆÄæÖRÕ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢Ð¢Ð¢Ð¢–b‚FÆÂä6÷VçBÖW’²6öçF–çVRÐ¢F¶VW&V6VçBÒ‚FÆÂÂ6VÆV7BÔö&¦V7BÔÆ7B…´ÖF…Ó£¤Ö‚ƒÂ¶–çEÒF6frç&WF–å6÷W&6UfW'6–öç2’’¢f÷&V6‚‚G6â–âFÆÂ’°¢–b‚G&÷FV7FVBÖ6öçF–ç2G6â’²6öçF–çVRÐ¢–b‚F¶VW&V6VçBÖ6öçF–ç2G6â’²6öçF–çVRÐ¢–b‚„vWBÔ7F—fTÆV6T6÷VçBDÆæwVvRGv÷&¶&öö´–BG6â’ÖwB’²6öçF–çVRÐ¢G–ç2Ò„vWBÕ6æ6†÷E–ç2DÆæwVvRGv÷&¶&öö´–BG6â¢–b‚G–ç2Ö6öçF–ç2v6ö×&—6öâÖ&6VÆ–æRr’²6öçF–çVRÐ¢–b‚G–ç2Ö6öçF–ç2vÖçVÂr’²6öçF–çVRÐ¢Ff–æÅ–ç2Ò‚G–ç2Âv†W&RÔö&¦V7B²EòÖÆ–¶Rvf–æÂ×Feò¢rÒ ¢2ÒÒÒjë^™¨ã¢6÷W&6Rç†Ç7‚888).X˜®™šN8ž8(²ÒÒÐ¢G7FFRÒvWBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvRGv÷&¶&öö´–BG6à¢–b…¶&ööÅÒG7FFRç6÷W&6U&WF–æVB’°¢F6å&VÖ÷fU6÷W&6RÒGG'VP¢–b‚Ff–æÅ–ç2ä6÷VçBÖwB’°¢FF—2Ò¶F÷V&ÆUÒ„vWBÔ–çWD†—7F÷'•6WGF–æw2’ç6÷W&6U&WFVçF–öäF—4gFW$'V–Æ@¢F6öæf–wW&VBÒ„vWBÔ–çWD†—7F÷'•6WGF–æw2’ç6÷W&6U&WFVçF–öäF—4gFW$'V–Æ@¢–b‚FçVÆÂÖWF6öæf–wW&VB’²F6å&VÖ÷fU6÷W&6RÒFfÇ6RÐ¢VÇ6R°¢FvRÒvWBÔf–æÅFe–ävTF—2DÆæwVvRGv÷&¶&öö´–BG6à¢–b‚FvRÖÇB¶F÷V&ÆUÒF6öæf–wW&VB’²F6å&VÖ÷fU6÷W&6RÒFfÇ6RÐ¢Ð¢Ð¢–b‚F6å&VÖ÷fU6÷W&6R’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚…·7G&–æuÒG7FFRç6÷W&6UF‚’Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢6WBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvRGv÷&¶&öö´–BG6âFfÇ6Rw&WFVçF–öâp¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv–çWBç6÷W&6Rç&VÖ÷fVBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒGv÷&¶&öö´–C²6æ6†÷D–BÒG6ã²&V6öâÒw&WFVçF–öârÒ¢Ð¢Ð ¢2ÒÒÒjë^™¨ã#¢–â8ÃK»n8(.xJ88(Î889^8*ž8:¾888N8ŽX˜®™šN8ž8(²ÒÒÐ¢–b‚Ff–æÅ–ç2ä6÷VçBÖWÖæBG–ç2ä6÷VçBÖW’°¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvRGv÷&¶&öö´–BG6à¢–b‚FçVÆÂÖæRFÒÖæB·7G&–æuÒ„vWBÔFF&÷W'G’FÒw7FGW2rrr’ÖWv6ö×ÆWFRr’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚„vWBÕ6æ6†÷DF—"DÆæwVvRGv÷&¶&öö´–BG6â’Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv†—7F÷'’æ6ÆVçWr…¶÷&FW&VEÔ²¶–æBÒw6æ6†÷Bs²v÷&¶&öö´–BÒGv÷&¶&öö´–C²6æ6†÷D–BÒG6âÒ¢Ð¢Ð¢Ð¢Ð¢Ò6F6‚°¢2hè>™šN8îZKiY~8þ8:Î8;>888:®8;>8+8îZKiY~8¾8~8®8N8 ¢w&—FRÕv&æ–ær‚.[^jÛN8îhè>™šN8¾ZKiY~8~8î8~8ó¢"²EòäW†6WF–öâäÖW76vR¢Òf–æÆÇ’°¢&VÆV6RÔÆö6´†æFÆRF†æFÆP¢2cRÕ#¢hè>™šN8~Zëž˜xþ8ÎZHž8(þ8(¾8þ8(8jÊY¹î8âö’÷7FFR8~ZéþkŠÎ8^8¾8(¾8 ¢&W6WBÔ–çWD†—7F÷'•6—¦T66†P¢Ð§Ð ¦gVæ7F–öâvWBÔ–çWD†—7F÷'•6—¦TÖ"…·7G&–æuÒDÆæwVvR’°¢2–çWBÖ†—7F÷'’˜XÞKˆ¾8îXZŽXhÞ[‹X‰~hÉž8þX[iÈž88ž8:ž8*N89nKˆ®8~™Ùî[‹Ž8¾˜xÞ8N8 ¢2ö’÷7FFR8î89Þ8;Î8:®8;>8+8N8Ž8¾ZéþŠÎ8¾8£czy.8*Þ8:>88>8+~8:^8ž8(¾8 ¢2FFF—"8).Xˆ~8(®i»þ8Ž8þy»N[èÎ8¾iz~8:þ8;Î8*þ8+ž89®8;Î8+ž8îX
+N8).‹ùN8^8®8N8(Ž8n88:¾8;Î88Ž898+ž8(.8*Þ8;Î8¾Y
+¾8(8(¾8 ¢G&ö÷BÒrp¢G'’²G&ö÷BÒvWBÔ–çWD†—7F÷'•&ö÷BDÆæwVvRÒ6F6‚²Ð¢F66†T¶W’Ò‚w³×Ç³ÒrÖbDÆæwVvRÂ·7G&–æuÒG&ö÷B’åFôÆ÷vW$–çf&–çB‚¢–b‚FçVÆÂÖæRE67&—C¤†—7F÷'•6—¦T66†RÖæBE67&—C¤†—7F÷'•6—¦T66†T¶W’ÖWF66†T¶W’ÖæB‚…´FFUF–ÖUÓ£¥WF4æ÷rÒE67&—C¤†—7F÷'•6—¦T66†TEWF2’åF÷FÅ6V6öæG2ÖÇBE67&—C¤†—7F÷'•6—¦T66†U6V6öæG2’’°¢&WGW&âE67&—C¤†—7F÷'•6—¦T66†P¢Ð¢GfÇVRÒ ¢G'’°¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&ö÷B’ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚G&ö÷B’’°¢F'—FW2Ò„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚G&ö÷BÕ&V7W'6RÔf–ÆRÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂÖV7W&RÔö&¦V7BÕ&÷W'G’ÆVæwF‚Õ7VÒ’å7VÐ¢–b‚FçVÆÂÖæRF'—FW2’²GfÇVRÒ´ÖF…Ó£¥&÷VæB‚‚F'—FW2òÔ"’Â’Ð¢Ð¢Ò6F6‚²GfÇVRÒÐ¢E67&—C¤†—7F÷'•6—¦T66†RÒGfÇVP¢E67&—C¤†—7F÷'•6—¦T66†T¶W’ÒF66†T¶W¢E67&—C¤†—7F÷'•6—¦T66†TEWF2Ò´FFUF–ÖUÓ£¥WF4æ÷p¢&WGW&âGfÇVP§Ð ¦gVæ7F–öâ&W6WBÔ–çWD†—7F÷'•6—¦T66†R°¢E67&—C¤†—7F÷'•6—¦T66†RÒFçVÆÀ¢E67&—C¤†—7F÷'•6—¦T66†T¶W’Òrp¢E67&—C¤†—7F÷'•6—¦T66†TEWF2Ò´FFUF–ÖUÓ£¤Ö–åfÇVP§Ð ¢2ÒÒÒÒ6öçFVçB×Fb8îKùÞŠÛr…cRÜ*s2ãr’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâvWBÔ6öçFVçEFefW'6–öäF—"…·7G&–æuÒEv÷&·76RÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–B’°¢G6fUv÷&¶&öö´–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEv÷&¶&öö´–Bwv÷&¶&öö´–Bp¢G6fUfW'6–öä–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEfW'6–öä–BwfW'6–öä–Bp¢&WGW&â„¦ö–âÕF‚Ev÷&·76R„¦ö–âÕF‚v6öçFVçB×Fbr„¦ö–âÕF‚G6fUv÷&¶&öö´–BG6fUfW'6–öä–B’’§Ð ¦gVæ7F–öâæWrÔ6öçFVçEFe–â…·7G&–æuÒEv÷&·76RÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒE–äæÖRÂDFF’°¢2cRÕ‚3B“¢ZKiY~8).hú8(®8N8n8^8¢GG'VRòFfÇ6R8~‹ùN8ž8.YÎX{®XX>8Î{YiéÎ8).jIÎiû¾8~8n8:Þ8;Î8:¾8988>8*þ8~8Þ8(¾8(Ž8n8¾8ž8(¾8 ¢G'’°¢FF—"Ò¦ö–âÕF‚„vWBÔ6öçFVçEFefW'6–öäF—"Ev÷&·76REv÷&¶&öö´–BEfW'6–öä–B’w–ç2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢G–åF‚Ò¦ö–âÕF‚FF—"‚'³Òæ§6öâ"ÖbE–äæÖR¢w&—FRÔ§6öäf–ÆRG–åF‚DFF¢&WGW&â…FW7BÕF‚ÔÆ—FW&ÅF‚G–åF‚¢Ò6F6‚²&WGW&âFfÇ6RÐ§Ð ¦gVæ7F–öâ&VÖ÷fRÔ6öçFVçEFe–â…·7G&–æuÒEv÷&·76RÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒE–äæÖR’°¢G'’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EfW'6–öä–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E–äæÖR’’²&WGW&âÐ¢GF‚Ò¦ö–âÕF‚„¦ö–âÕF‚„vWBÔ6öçFVçEFefW'6–öäF—"Ev÷&·76REv÷&¶&öö´–BEfW'6–öä–B’w–ç2r’‚'³Òæ§6öâ"ÖbE–äæÖR¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ò6F6‚²Ð§Ð  ¦gVæ7F–öâæWrÔ6öçFVçEFdÆV6R…·7G&–æuÒEv÷&·76RÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒEW'÷6RÂ·7G&–æuÒD¦ö$–BÂ¶–çEÒDÖ–çWFW5fÆ–BÒ#’°¢G'’°¢FF—"Ò¦ö–âÕF‚„vWBÔ6öçFVçEFefW'6–öäF—"Ev÷&·76REv÷&¶&öö´–BEfW'6–öä–B’vÆV6W2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢FæÖRÒ‚w³Õ÷³Òæ§6öârÖbEW'÷6RÂD¦ö$–B¢GF‚Ò¦ö–âÕF‚FF—"FæÖP¢w&—FRÔ§6öäf–ÆRGF‚…¶÷&FW&VEÔ°¢¦ö$–BÒD¦ö$–C²W'÷6RÒEW'÷6S²fW'6–öä–BÒEfW'6–öä–@¢7&VFVDBÒæWrÔæ÷t—6ó²†V'F&VDBÒæWrÔæ÷t—6ð¢W‡—&W4BÒ…´FFUF–ÖUÓ£¥WF4æ÷räFDÖ–çWFW2‚DÖ–çWFW5fÆ–B’åFõ7G&–ær‚vòr’¢4æÖRÒFVçc¤4ôÕUDU$äÔP¢Ò¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’’²&WGW&ârrÐ¢&WGW&âFæÖP¢Ò6F6‚²&WGW&ârrÐ§Ð ¦gVæ7F–öâ&VÖ÷fRÔ6öçFVçEFdÆV6R…·7G&–æuÒEv÷&·76RÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒDÆV6TæÖR’°¢G'’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚DÆV6TæÖR’’²&WGW&âÐ¢GF‚Ò¦ö–âÕF‚„¦ö–âÕF‚„vWBÔ6öçFVçEFefW'6–öäF—"Ev÷&·76REv÷&¶&öö´–BEfW'6–öä–B’vÆV6W2r’DÆV6TæÖP¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâ&Vg&W6‚ÔÆV6Tf–ÆR…·7G&–æuÒEF‚Â¶–çEÒDÖ–çWFW5fÆ–BÒ#’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EF‚’Ö÷"Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚EF‚’’²&WGW&âFfÇ6RÐ¢G'’°¢FÆV6RÒ&VBÔ§6öäf–ÆREF‚FçVÆÀ¢–b‚FçVÆÂÖWFÆV6R’²&WGW&âFfÇ6RÐ¢6WBÔæ÷FU&÷W'G’FÆV6Rv†V'F&VDBr„æWrÔæ÷t—6ò¢6WBÔæ÷FU&÷W'G’FÆV6RvW‡—&W4Br…´FFUF–ÖUÓ£¥WF4æ÷räFDÖ–çWFW2‚DÖ–çWFW5fÆ–B’åFõ7G&–ær‚vòr’¢w&—FRÔ§6öäf–ÆREF‚FÆV6P¢&WGW&âGG'VP¢Ò6F6‚²&WGW&âFfÇ6RÐ§Ð ¦gVæ7F–öâæWrÔF–fd¦ö$ÆV6W2…·7G&–æuÒDÆæwVvRÂD6öçFW‡BÂ·7G&–æuÒD¦ö$–B’°¢Gv÷&·76RÒvWBÕv÷&·76UF‚DÆæwVvP¢F†—7F÷'”Æö6²Ò¦ö–âÕF‚Gv÷&·76RvÆö6·5Æ†—7F÷'’Ö6ÆVçWæÆö6²p¢F6öçFVçDÆö6²ÒvWBÔ6öçFVçEFdÖ–çFVææ6TÆö6µF‚Gv÷&·76R…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B¢&WGW&â–çfö¶RÕv—F„Æö6²F†—7F÷'”Æö6²°¢–çfö¶RÕv—F„Æö6²F6öçFVçDÆö6²°¢FÆV6W2Ò‚¢G'’°¢f÷&V6‚‚G6–FR–â€¢¶÷&FW&VEÔ²&öÆRÒv&6VÆ–æRs²6æ6†÷D–BÒ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æU6æ6†÷D–C²fW'6–öä–BÒ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æUfW'6–öä–BÒÀ¢¶÷&FW&VEÔ²&öÆRÒv7W'&VçBs²6æ6†÷D–BÒ·7G&–æuÒD6öçFW‡Bæ7W'&VçE6æ6†÷D–C²fW'6–öä–BÒ·7G&–æuÒD6öçFW‡Bæ7W'&VçEfW'6–öä–BÐ¢’’°¢–b‚FçVÆÂÖW„vWBÕ6æ6†÷DÖæ–fW7BDÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒG6–FRç6æ6†÷D–B’’’°¢F‡&÷r~jùN‹È>Zûî‹8î[^jÛNx˜Ž8Îi[Nyn8^8(Î8þ8þ8(8Xznyn8).™h¾Zx¾8~8Þ8î8¾8)>8"p¢Ð¢Ff–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒG6–FRç6æ6†÷D–B’…·7G&–æuÒG6–FRçfW'6–öä–B¢–b‚Öæ÷B¶&ööÅÒFf–Æ&–Æ—G’ç&VG’’²F‡&÷r·7G&–æuÒFf–Æ&–Æ—G’ç&V6öâÐ¢G6æ6†÷DÆV6RÒæWrÕ6æ6†÷DÆV6RDÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒG6–FRç6æ6†÷D–B’‚vF–fbÒr²·7G&–æuÒG6–FRç&öÆR’D¦ö$–B#…·7G&–æuÒG6–FRçfW'6–öä–B¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6æ6†÷DÆV6R’’²F‡&÷r~[^jÛNx˜Ž8îKùÞŠÛvÆV6^8).KÙÎh‰8~8Þ8î8¾8)>8~8~8þ8"rÐ¢FÆV6RÒ¶÷&FW&VEÔ°¢&öÆRÒ·7G&–æuÒG6–FRç&öÆP¢6æ6†÷D–BÒ·7G&–æuÒG6–FRç6æ6†÷D–@¢fW'6–öä–BÒ·7G&–æuÒG6–FRçfW'6–öä–@¢6æ6†÷DÆV6TæÖRÒG6æ6†÷DÆV6P¢6öçFVçDÆV6TæÖRÒrp¢Ð¢FÆV6W2³ÒFÆV6P¢F6öçFVçDÆV6RÒæWrÔ6öçFVçEFdÆV6RGv÷&·76R…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒG6–FRçfW'6–öä–B’‚vF–fbÒr²·7G&–æuÒG6–FRç&öÆR’D¦ö$–B# ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6öçFVçDÆV6R’’²F‡&÷rv6öçFVçBDn8îKùÞŠÛvÆV6^8).KÙÎh‰8~8Þ8î8¾8)>8~8~8þ8"rÐ¢FÆV6Ræ6öçFVçDÆV6TæÖRÒF6öçFVçDÆV6P¢Ð¢&WGW&â‚FÆV6W2¢Ò6F6‚°¢f÷&V6‚‚FÆV6R–â‚FÆV6W2’’°¢&VÖ÷fRÕ6æ6†÷DÆV6RDÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒFÆV6Rç6æ6†÷D–B’…·7G&–æuÒFÆV6Rç6æ6†÷DÆV6TæÖR¢&VÖ÷fRÔ6öçFVçEFdÆV6RGv÷&·76R…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒFÆV6RçfW'6–öä–B’…·7G&–æuÒFÆV6Ræ6öçFVçDÆV6TæÖR¢Ð¢F‡&÷p¢Ð¢Ð¢Ð§Ð ¦gVæ7F–öâ&Vg&W6‚ÔF–fd¦ö$ÆV6W2‚D¦ö"’°¢FÆæwVvRÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"vÖöFRrDÖöFR¢Gv÷&¶&öö´–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"wv÷&¶&öö´–Brrr¢Gv÷&·76RÒvWBÕv÷&·76UF‚FÆæwVvP¢f÷&V6‚‚FÆV6R–â„vWBÔ'&’„vWBÔFF&÷W'G’D¦ö"vÆV6W2r‚’’’’°¢G6æ6†÷EF‚Ò¦ö–âÕF‚„vWBÕ6æ6†÷DÆV6TF—"FÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒFÆV6Rç6æ6†÷D–B’’…·7G&–æuÒFÆV6Rç6æ6†÷DÆV6TæÖR¢F6öçFVçEF‚Ò¦ö–âÕF‚„¦ö–âÕF‚„vWBÔ6öçFVçEFefW'6–öäF—"Gv÷&·76RGv÷&¶&öö´–B…·7G&–æuÒFÆV6RçfW'6–öä–B’’vÆV6W2r’…·7G&–æuÒFÆV6Ræ6öçFVçDÆV6TæÖR¢–b‚Öæ÷B…&Vg&W6‚ÔÆV6Tf–ÆRG6æ6†÷EF‚#’’²F‡&÷r~[^jÛNx˜Ž8îKùÞŠÛvÆV6^8).i»Nik8~8Þ8î8¾8)>8~8~8þ8"rÐ¢–b‚Öæ÷B…&Vg&W6‚ÔÆV6Tf–ÆRF6öçFVçEF‚#’’²F‡&÷rv6öçFVçBDn8îKùÞŠÛvÆV6^8).i»Nik8~8Þ8î8¾8)>8~8~8þ8"rÐ¢Ð§Ð ¦gVæ7F–öâ&VÖ÷fRÔF–fd¦ö$ÆV6W2‚D¦ö"’°¢G'’°¢FÆæwVvRÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"vÖöFRrDÖöFR¢Gv÷&¶&öö´–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"wv÷&¶&öö´–Brrr¢Gv÷&·76RÒvWBÕv÷&·76UF‚FÆæwVvP¢f÷&V6‚‚FÆV6R–â„vWBÔ'&’„vWBÔFF&÷W'G’D¦ö"vÆV6W2r‚’’’’°¢&VÖ÷fRÕ6æ6†÷DÆV6RFÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒFÆV6Rç6æ6†÷D–B’…·7G&–æuÒFÆV6Rç6æ6†÷DÆV6TæÖR¢&VÖ÷fRÔ6öçFVçEFdÆV6RGv÷&·76RGv÷&¶&öö´–B…·7G&–æuÒFÆV6RçfW'6–öä–B’…·7G&–æuÒFÆV6Ræ6öçFVçDÆV6TæÖR¢Ð¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâFW7BÔ6öçFVçEFe&÷FV7FVB…·7G&–æuÒEv÷&·76RÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–B’°¢F&6RÒvWBÔ6öçFVçEFefW'6–öäF—"Ev÷&·76REv÷&¶&öö´–BEfW'6–öä–@¢f÷&V6‚‚G7V"–â‚w–ç2rÂvÆV6W2r’’°¢FBÒ¦ö–âÕF‚F&6RG7V ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FB’°¢Ff–ÆW2Ò„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FBÔf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR¢–b‚G7V"ÖWw–ç2rÖæBFf–ÆW2ä6÷VçBÖwB’²&WGW&âGG'VRÐ¢–b‚G7V"ÖWvÆV6W2r’²f÷&V6‚‚Fb–âFf–ÆW2’²–b…FW7BÔÆV6T7F—fRFb’²&WGW&âGG'VRÒÒÐ¢Ð¢Ð¢&WGW&âFfÇ6P§Ð  ¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢2cR7FvR2(	B†6R$¢jIÎyú^898*N89~8:ž8*N8;>8Žˆz®X¹^8+ž8+8+Ž8:^8;Î8:ž8;À¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¦gVæ7F–öâvWBÔWFõ7FFTF—"…·7G&–æuÒDÆæwVvR’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’w7FFUÆWFò×&VæFW"r§Ð¦gVæ7F–öâ&VBÔWFõ7FFR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢G'’°¢G6fUv÷&¶&öö´–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEv÷&¶&öö´–Bwv÷&¶&öö´–Bp¢GÒ¦ö–âÕF‚„vWBÔWFõ7FFTF—"DÆæwVvR’‚'³Òæ§6öâ"ÖbG6fUv÷&¶&öö´–B¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G’’²&WGW&âFçVÆÂÐ¢&WGW&â…&VBÔ§6öäf–ÆRGFçVÆÂ¢Ò6F6‚²&WGW&âFçVÆÂÐ§Ð¦gVæ7F–öâw&—FRÔWFõ7FFR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂE7FFR’°¢G'’°¢G6fUv÷&¶&öö´–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEv÷&¶&öö´–Bwv÷&¶&öö´–Bp¢FF—"ÒvWBÔWFõ7FFTF—"DÆæwVvP¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢6WBÔæ÷FU&÷W'G’E7FFRwv÷&¶&öö´–BrG6fUv÷&¶&öö´–@¢6WBÔæ÷FU&÷W'G’E7FFRwWFFVDBr„æWrÔæ÷t—6ò¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"‚'³Òæ§6öâ"ÖbG6fUv÷&¶&öö´–B’’E7FFP¢Ò6F6‚²Ð§Ð¦gVæ7F–öâæWrÔWFõ7FFR…·7G&–æuÒEv÷&¶&öö´–B’°¢&WGW&â¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ²v÷&¶&öö´–BÒEv÷&¶&öö´–C²WFFVDBÒæWrÔæ÷t—6ð¢VæF–æu6æ6†÷D–BÒrs²VæF–æt†6‚Òrs²7F&ÆT6÷VçBÒ ¢f—'7DFWFV7FVDBÒrs²Æ7E6VVäBÒrs²V–WDFVFÆ–æRÒrp¢7FFRÒv–FÆRs²FVfW%&V6öâÒrs²÷væW%4æÖRÒrs²÷væW$¦ö$–BÒrp¢Ð§Ð ¦gVæ7F–öâFW7BÔ–çFW&7F—fTW†6VÄ–åW6R…·7G&–æuÒE6÷W&6UF‚’°¢2cRÜ*sRã3¢XÙŽ{IN8¢vWBÕ&ö6W72U„4TÂ8~8þjÚ.8î8(®8ž8î8(¾8 ¢2&W÷'D&–æFW"8î8:Î8;>888:®8;>8+yJ‚W†6VÂ8òf—6–&ÆSÒFfÇ6R8®8î8~8:8*N8;>8*n8*>8;>88ž8*n8).hÈ8þ8®8N8 ¢2ZûîŠ›i8ÞKÙÎ8^8(Î8n8N8(²W†6VÂ8Ž8Zûî‹89^8*8*N8:¾8î8:Þ88>8*þ89^8*8*N8:¾888).Šh¾8(¾8 ¢G'’°¢G&ö72Ò„vWBÕ&ö6W72ÔæÖRU„4TÂÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂv†W&RÔö&¦V7B²EòäÖ–åv–æF÷t†æFÆRÖæRÒ¢–b‚G&ö72ä6÷VçBÖwB’²&WGW&âGG'VRÐ¢Ò6F6‚²Ð¢G'’°¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6÷W&6UF‚’’°¢FF—"Ò7Æ—BÕF‚Õ&VçBE6÷W&6UF€¢FæÖRÒ´”òåF…Ó£¤vWDf–ÆTæÖR‚E6÷W&6UF‚¢FÆö6²Ò¦ö–âÕF‚FF—"‚wâBr²FæÖR¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FÆö6²’²&WGW&âGG'VRÐ¢Ð¢Ò6F6‚²Ð¢&WGW&âFfÇ6P§Ð ¦gVæ7F–öâFW7BÕ&VæFW$Væv–æT'W7’…·7G&–æuÒDÆæwVvR’°¢F‚ÒG'’Ô7V—&TÆö6´†æFÆR„vWBÕ&VæFW$Væv–æTÆö6µF‚DÆæwVvR¢–b‚FçVÆÂÖWF‚’²&WGW&âGG'VRÐ¢&VÆV6RÔÆö6´†æFÆRF€¢&WGW&âFfÇ6P§Ð ¦gVæ7F–öâ7F'BÔWFõ&VæFW$¦ö$f÷%v÷&¶&öö²…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢2cRÕ¢™ÙžjÚ.z+®Š¨Þ8~8þ8î8þ8Î8Þ8îjIÎyú^x˜Ž8Þ8®8î8~88+Ž8:~89nZéþŠÎi˜.8¾XŠ^8îx˜Ž8Ž8ž8(®i»þ8(þ8>8n8þ8N88®8N8 ¢2Zûî‹6æ6†÷N8).iˆîzK®y¨N8¾Y»®Zé®8~8n8+Ž8:~89n8ŽkŠ8ž8 ¢G'’°¢G–ç2Ò·Ð¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6æ6†÷D–B’’°¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚FçVÆÂÖæRFÒ’°¢G–ç5²Ev÷&¶&öö´–EÒÒ¶÷&FW&VEÔ²6æ6†÷D–BÒE6æ6†÷D–C²W‡V7FVD†6‚Ò·7G&–æuÒ„vWBÔFF&÷W'G’FÒw6÷W&6T†6‚rrr’Ð¢Ð¢Ð¢F¦ö"Ò7F'BÕ&VæFW$¦ö"DÆæwVvR‚Ev÷&¶&öö´–B’FfÇ6RrrG–ç0¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²¦ö$–BÒ·7G&–æuÒF¦ö"æ¦ö$–BÐ¢Ò6F6‚°¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²ÖW76vRÒEòäW†6WF–öâäÖW76vRÐ¢Ð§Ð ¦gVæ7F–öâ–çfö¶RÔWFõ66†VGVÆW%F–6²…·7G&–æuÒDÆæwVvRÂD÷væVDÆö6·2’°¢2cRÜ*sRãRü*tÓ3¢F–6²Xh^8~8+ž8:®8;Î89~8~8®8Nx«nhX¾j™þj+8.89n88>8*þ8N8Ž8¾y»NX‰~8sƒzy.[è^8þ8®8N8 ¢G6WGF–æw2ÒvWBÔWFõ&VæFW%6WGF–æw0¢–b‚Öæ÷B¶&ööÅÒG6WGF–æw2æVæ&ÆVB’²&WGW&âÐ¢2cRÕ¢89n8:ž8*n8+n8ã3zy.8+þ8*N89î8;Î8¾KéÞZÙŽ8~8®8N8.8+ž8+8+Ž8:^8;Î8:ž8;Îˆz®‹ª¾8ÎjIÎyú^8~8jIÎyú^8ŽYÎi˜.8¾KùÞZÙŽ8ž8(¾8 ¢G'’²·fö–EÒ…66âÕWFFW2DÆæwVvRFçVÆÂFfÇ6R’Ò6F6‚²w&—FRÕv&æ–ærEòäW†6WF–öâäÖW76vRÐ¢G'’²·fö–EÒ…WFFRÔ–çWD†—7F÷'”gFW%66âDÆæwVvR’Ò6F6‚²w&—FRÕv&æ–ærEòäW†6WF–öâäÖW76vRÐ¢GF‡2ÒvWBÕF‡0¢G7G'V7GW&RÒFçVÆÀ¢G'’²G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvRÒ6F6‚²&WGW&âÐ¢Fæ÷rÒ´FFUF–ÖUÓ£¥WF4æ÷p ¢f÷&V6‚‚Gr–â„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2’’°¢F–BÒ·7G&–æuÒGrçv÷&¶&öö´–@¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F–B’’²6öçF–çVRÐ ¢2cRÜ*sRãS¢89n88>8*þXÙŽKØÞ8îh˜iÈžjŠž8.Xùn[é~8~8Þ8®8N89n88>8*þ8þK¹n8+^8;Î898;Î8îh¸^[Ù>8®8î8~›¹ž8>8nš9¾88ž8 ¢–b‚Öæ÷BD÷væVDÆö6·2ä6öçF–ç4¶W’‚F–B’’°¢FÆö6µF‚Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’‚&Æö6·5ÆWFòÖ÷væW%÷³ÒæÆö6²"ÖbF–B¢F‚ÒG'’Ô7V—&TÆö6´†æFÆRFÆö6µF€¢–b‚FçVÆÂÖWF‚’²6öçF–çVRÐ¢D÷væVDÆö6·5²F–EÒÒF€¢Ð ¢G7FFRÒ&VBÔWFõ7FFRDÆæwVvRF–@¢–b‚FçVÆÂÖWG7FFR’²G7FFRÒæWrÔWFõ7FFRF–BÐ ¢G6÷W&6UF‚Ò¦ö–âÕ6fR…·7G&–æuÒGF‡2ç7V&Ö—76–öäF—"’…·7G&–æuÒGrç&VÆF—fUF‚¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G6÷W&6UF‚’’°¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrv–FÆRs²6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârvf–ÆRÖÖ—76–ærp¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFS²6öçF–çVP¢Ð ¢F7W'&VçD†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’Grv7W'&VçDW†6VÄ†6‚rrr’¢G&VæFW&VD†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’GrvÆ7E&VæFW&VDW†6VÄ†6‚rrr’¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçD†6‚’Ö÷"F7W'&VçD†6‚ÖWG&VæFW&VD†6‚’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRw7FFRrrr’ÖæRv–FÆRr’°¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrv–FÆRs²6WBÔæ÷FU&÷W'G’G7FFRwVæF–æu6æ6†÷D–Brrp¢6WBÔæ÷FU&÷W'G’G7FFRwVæF–æt†6‚rrs²6WBÔæ÷FU&÷W'G’G7FFRw7F&ÆT6÷VçBr ¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFP¢Ð¢6öçF–çVP¢Ð ¢GVæF–æt†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRwVæF–æt†6‚rrr’¢–b‚GVæF–æt†6‚ÖæRF7W'&VçD†6‚’°¢2ik8~8Nx˜Ž8).jIÎyú^8.[è^j™þ8).8(N8(®y»N8’ŽXúN8NKˆi˜.8+>89N8;Î8þzNj8Bž8 ¢FöÆD6GW&RÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRvW†VÖW&Ä6GW&T–Brrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FöÆD6GW&R’’²&VÖ÷fRÔW†VÖW&Ä6÷’DÆæwVvRFöÆD6GW&RÐ¢6WBÔæ÷FU&÷W'G’G7FFRwVæF–æt†6‚rF7W'&VçD†6€¢6WBÔæ÷FU&÷W'G’G7FFRwVæF–æu6æ6†÷D–Br…·7G&–æuÒ„vWBÔFF&÷W'G’Grv7W'&VçE6æ6†÷D–Brrr’¢6WBÔæ÷FU&÷W'G’G7FFRw7F&ÆT6÷VçBr¢6WBÔæ÷FU&÷W'G’G7FFRvf—'7DFWFV7FVDBr„æWrÔæ÷t—6ò¢6WBÔæ÷FU&÷W'G’G7FFRwV–WDFVFÆ–æRr‚Fæ÷räFE6V6öæG2…¶–çEÒG6WGF–æw2çV–WEW&–öE6V6öæG2’åFõ7G&–ær‚vòr’¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrwv—F–ærp¢6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârrp¢6WBÔæ÷FU&÷W'G’G7FFRv÷væW%4æÖRrFVçc¤4ôÕUDU$äÔP¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFP¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvWFòæFWFV7FVBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒF–C²†6‚ÒF7W'&VçD†6‚Ò¢6öçF–çVP¢Ð ¢6WBÔæ÷FU&÷W'G’G7FFRw7F&ÆT6÷VçBr…¶–çEÒ„vWBÔFF&÷W'G’G7FFRw7F&ÆT6÷VçBr’²¢6WBÔæ÷FU&÷W'G’G7FFRvÆ7E6VVäBr„æWrÔæ÷t—6ò ¢FFVFÆ–æUFW‡BÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRwV–WDFVFÆ–æRrrr¢FFVFÆ–æU&V6†VBÒFfÇ6P¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FFVFÆ–æUFW‡B’’°¢G'’²FFVFÆ–æU&V6†VBÒ…´FFUF–ÖUÓ£¥'6R‚FFVFÆ–æUFW‡B’åFõVæ—fW'6ÅF–ÖR‚’ÖÆRFæ÷r’Ò6F6‚²FFVFÆ–æU&V6†VBÒGG'VRÐ¢Ð¢–b‚Öæ÷BFFVFÆ–æU&V6†VBÖ÷"¶–çEÒ„vWBÔFF&÷W'G’G7FFRw7F&ÆT6÷VçBr’ÖÇB¶–çEÒG6WGF–æw2ç&WV—&U7F&ÆT†6„6÷VçB’°¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrwv—F–ærs²w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFS²6öçF–çVP¢Ð¢–b…¶&ööÅÒG6WGF–æw2æFVfW%v†–ÆTW†6VÄ–åW6RÖæB…FW7BÔ–çFW&7F—fTW†6VÄ–åW6RG6÷W&6UF‚’’°¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrvFVfW'&VBs²6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârvW†6VÂÖ–â×W6Rp¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFP¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvWFòæFVfW'&VBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒF–C²&V6öâÒvW†6VÂÖ–â×W6RrÒ¢6öçF–çVP¢Ð¢–b…FW7BÕ&VæFW$Væv–æT'W7’DÆæwVvR’°¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrvFVfW'&VBs²6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârv¦ö"Ö'W7’p¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFS²6öçF–çVP¢Ð ¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrw&VæFW&–ærs²6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârrp¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFP¢G7F'FVBÒ7F'BÔWFõ&VæFW$¦ö$f÷%v÷&¶&öö²DÆæwVvRF–B…·7G&–æuÒ„vWBÔFF&÷W'G’G7FFRwVæF–æu6æ6†÷D–Brrr’¢–b…¶&ööÅÒG7F'FVBæö²’°¢6WBÔæ÷FU&÷W'G’G7FFRv÷væW$¦ö$–Br…·7G&–æuÒG7F'FVBæ¦ö$–B¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRw&VæFW"ç7F'FVBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒF–C²¦ö$–BÒ·7G&–æuÒG7F'FVBæ¦ö$–C²G&–vvW"ÒvWFòrÒ¢ÒVÇ6R°¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrwv—F–ærp¢6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârw7F'BÖf–ÆVBp¢Ð¢w&—FRÔWFõ7FFRDÆæwVvRF–BG7FFP¢Ð§Ð ¦gVæ7F–öâ–çfö¶RÔWFõ66†VGVÆW$g&öÔf–ÆR…·7G&–æuÒD6öçG&öÅF‚Â¶–çEÒE&VçE&ö6W74–B’°¢2cRÜ*sRãs¢™ÙžjÚ.[è^88ò…EE8:®8+ž88®8;Î8îKŠÞ8~ŠÎ8(þ8®8N8 ¢2cB8î8+^8;Î898;Î8þXÙŽKˆ8+ž8:Î88>88ž8â66WEF76Æ–VçB8:¾8;Î89~8®8î8~8†æFÆRÔ’Xh^8~[è^8N8ŽyK¾™Ú.8ÎjÚ.8î8(¾8 ¢FÆæwVvRÒv¦p¢G'’°¢F6öçG&öÂÒ&VBÔ§6öäf–ÆRD6öçG&öÅF‚FçVÆÀ¢–b‚FçVÆÂÖæRF6öçG&öÂ’²FÆæwVvRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6öçG&öÂvÆæwVvRrv¦r’Ð¢Ò6F6‚²Ð¢F÷væVBÒ·Ð¢G'’°¢6ÆV"ÔW‡—&VDÆV6W2FÆæwVvP¢6ÆV"Õ7FÆTW†VÖW&Ä6÷–W2FÆæwVvP¢&V6÷fW"ÔWFõ7FFW2FÆæwVvP¢v†–ÆR‚GG'VR’°¢2Šj¥”Nyº>Šin8¾Xª8Ž87F÷89^8*8*N8:¾8)#×>XÙŽKØÞ8~z+®Š¨Þ8ž8(¾8 ¢2[é>iÚ^8ãzy%6ÆVW8~8þjÚ>[‹Ž{X.K¨n8~8(.Šj®8ÎZÙ8)$¶–ÆÎ8ž8(¾[ø^Šh8Î8.8(®8f–æÆÇž8îx«nhX¾[êžiz~8Î‹[8(ž8®8¾8>8þ8 ¢–b‚E&VçE&ö6W74–BÖÆRÖ÷"FçVÆÂÖW„vWBÕ&ö6W72Ô–BE&VçE&ö6W74–BÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’²'&V²Ð¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚‚D6öçG&öÅF‚²rç7F÷r’’²'&V²Ð¢G'’²–çfö¶RÔWFõ66†VGVÆW%F–6²FÆæwVvRF÷væVBÒ6F6‚²w&—FRÕv&æ–ærEòäW†6WF–öâäÖW76vRÐ¢G'’²6ÆV"Õ7FÆTW†VÖW&Ä6÷–W2FÆæwVvRÒ6F6‚²Ð¢2XÎjÚ.z+®Š¨Þ8òS×2™i>™©N8$6öçG&öÅF‚8þX[iÈž88ž8:ž8*N89nKˆ®8¾8.8(¾8þ8(8¢2×2™i>™©N88ŽXŠžyJŽˆ^8N8Ž8¾jøîzy#Y¹î8å4Ô"FW7BÕF‚8Î[‹Ži˜.y›®yIþ8ž8(¾8 ¢2Šj®XN8òv—Df÷$W†—Bƒ#S’[è^8N8î8~8S×28~8(.jÚ>[‹Ž{X.K¨n8Ž[èÎx˜~K¹Ž88þ™i>8¾YŽ8n8 ¢G7F÷&WVW7FVBÒFfÇ6P¢f÷"‚F’Ò²F’ÖÇB#²F’²²’°¢–b‚E&VçE&ö6W74–BÖÆRÖ÷"FçVÆÂÖW„vWBÕ&ö6W72Ô–BE&VçE&ö6W74–BÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’Ö÷"…FW7BÕF‚ÔÆ—FW&ÅF‚‚D6öçG&öÅF‚²rç7F÷r’’’°¢G7F÷&WVW7FVBÒGG'VP¢'&V°¢Ð¢7F'BÕ6ÆVWÔÖ–ÆÆ—6V6öæG2S ¢Ð¢–b‚G7F÷&WVW7FVB’²'&V²Ð¢Ð¢Òf–æÆÇ’°¢f÷&V6‚‚F²–â‚F÷væVBä¶W—2’’²&VÆV6RÔÆö6´†æFÆRF÷væVE²FµÒÐ¢G'’°¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚„vWBÔWFõ7FFTF—"FÆæwVvR’Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢G7BÒ&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖæRG7BÖæB‚w&VæFW&–ærrÂw&VG’r’Ö6öçF–ç2·7G&–æuÒ„vWBÔFF&÷W'G’G7Bw7FFRrrr’’°¢6WBÔæ÷FU&÷W'G’G7Bw7FFRrwv—F–ærp¢w&—FRÔ§6öäf–ÆRFbägVÆÄæÖRG7@¢Ð¢Ð¢Ò6F6‚²Ð¢2jÚ>[‹Ž{X.K¨n8î8þ8>8¾X‹n[ê¥4ôâòç7F÷8).jè¾8^8®8N8 ¢f÷&V6‚‚GF‚–â‚D6öçG&öÅF‚Â‚D6öçG&öÅF‚²rç7F÷r’’’°¢G'’²–b‚GF‚ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒÒ6F6‚²Ð¢Ð¢Ð§Ð ¦gVæ7F–öâ&V6÷fW"ÔWFõ7FFW2…·7G&–æuÒDÆæwVvR’°¢2cRÜ*sRãS¢‹[~X¹^i˜.8:®8*¾898:®8;Î8 ¢G'’°¢FF—"ÒvWBÔWFõ7FFTF—"DÆæwVvP¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&âÐ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢G7BÒ&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖWG7B’²6öçF–çVRÐ¢G7FFRÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7Bw7FFRrrr¢F6†ævVBÒFfÇ6P¢–b‚G7FFRÖWw&VæFW&–ærr’²6WBÔæ÷FU&÷W'G’G7Bw7FFRrwv—F–ærs²F6†ævVBÒGG'VRÐ¢VÇ6V–b‚G7FFRÖWw&VG’r’²6WBÔæ÷FU&÷W'G’G7Bw7FFRrwv—F–ærs²F6†ævVBÒGG'VRÐ¢GVæF–ærÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7BwVæF–æu6æ6†÷D–Brrr¢Gv$–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7Bwv÷&¶&öö´–Brrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚GVæF–ær’ÖæBÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Gv$–B’’°¢–b‚FçVÆÂÖW„vWBÕ6æ6†÷DÖæ–fW7BDÆæwVvRGv$–BGVæF–ær’’°¢6WBÔæ÷FU&÷W'G’G7BwVæF–æu6æ6†÷D–Brrs²6WBÔæ÷FU&÷W'G’G7BwVæF–æt†6‚rrp¢6WBÔæ÷FU&÷W'G’G7Bw7F&ÆT6÷VçBr²6WBÔæ÷FU&÷W'G’G7Bw7FFRrv–FÆRs²F6†ævVBÒGG'VP¢Ð¢Ð¢–b‚F6†ævVB’²w&—FRÔ§6öäf–ÆRFbägVÆÄæÖRG7BÐ¢Ð¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâ7F'BÔWFõ66†VGVÆW%&ö6W72…·7G&–æuÒDÆæwVvR’°¢F6öçG&öÅF‚Òrp¢G'’°¢G6WGF–æw2ÒvWBÔWFõ&VæFW%6WGF–æw0¢–b‚Öæ÷B¶&ööÅÒG6WGF–æw2æVæ&ÆVB’²&WGW&âFçVÆÂÐ¢FF—"Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’w7FFRp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢2X‹n[ê89^8*8*N8:¾8õ>YÒ¾Šj¥”N8~89~8:Þ8+¾8+žXÙŽKØÞ8¾Xˆn™º.8ž8(¾8 ¢F6öçG&öÄæÖRÒvWFò×66†VGVÆW%÷³Õ÷³Òæ§6öârÖb…·&VvW…Ó£¥&WÆ6R…·7G&–æuÒFVçc¤4ôÕUDU$äÔRÂuµäÕ¦×£Ó•òâÕÒ²rÂuòr’’ÂE”@¢F6öçG&öÅF‚Ò¦ö–âÕF‚FF—"F6öçG&öÄæÖP¢w&—FRÔ§6öäf–ÆRF6öçG&öÅF‚…¶÷&FW&VEÔ²66†VÖfW'6–öâÒ²ÆæwVvRÒDÆæwVvS²7F'FVDBÒæWrÔæ÷t—6ó²&VçE–BÒE”C²4æÖRÒ·7G&–æuÒFVçc¤4ôÕUDU$äÔRÒ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚‚F6öçG&öÅF‚²rç7F÷r’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚‚F6öçG&öÅF‚²rç7F÷r’Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢2&ö÷BòX‹n[ê89^8*8*N8:¾8î898+ž8¾z›®y›Þ8ÎY
+¾8î8(Î8n8(.ZÙ89~8:Þ8+¾8+ž8Î‹[~X¹^8~8Þ8(¾8(Ž8niˆîzK®y¨N8¾[É^yJŽ8ž8(¾8 ¢G6W'fW%67&—BÒ¦ö–âÕF‚E67&—C¤&ö÷Bw6W'fW"ç3p¢G6’Ò‚rÔæõ&öf–ÆRrÂrÔW†V7WF–öåöÆ–7’rÂt'—72rÂrÔf–ÆRrÂ‚r'³Ò"rÖbG6W'fW%67&—B’À¢rÔÖöFRrÂDÆæwVvRÂrÔWFõ66†VGVÆW%F‚rÂ‚r'³Ò"rÖbF6öçG&öÅF‚’ÂrÕ&VçE&ö6W74–BrÂ·7G&–æuÒE”B¢G&ö2Ò7F'BÕ&ö6W72Ôf–ÆUF‚w÷vW'6†VÆÂæW†RrÔ&wVÖVçDÆ—7BG6’Õv–æF÷u7G–ÆR†–FFVâÕ75F‡'P¢E67&—C¤WFõ66†VGVÆW%&ö6W72ÒG&ö0¢E67&—C¤WFõ66†VGVÆW%&ö6W74–BÒG&ö2ä–@¢E67&—C¤WFõ66†VGVÆW$6öçG&öÅF‚ÒF6öçG&öÅF€¢&WGW&âG&ö0¢Ò6F6‚°¢f÷&V6‚‚GF‚–â‚F6öçG&öÅF‚Â‚F6öçG&öÅF‚²rç7F÷r’’’°¢G'’²–b‚GF‚ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒÒ6F6‚²Ð¢Ð¢w&—FRÕv&æ–ær‚~ˆz®X¹^8+ž8+8+Ž8:^8;Î8:ž8;Î8).‹[~X¹^8~8Þ8î8¾8)>8~8~8ó¢r²EòäW†6WF–öâäÖW76vR¢&WGW&âFçVÆÀ¢Ð§Ð ¦gVæ7F–öâFW7BÔWFõ66†VGVÆW%&ö6W75'Vææ–ær°¢G'’°¢–b‚FçVÆÂÖæRE67&—C¤WFõ66†VGVÆW%&ö6W72’°¢E67&—C¤WFõ66†VGVÆW%&ö6W72å&Vg&W6‚‚¢&WGW&â‚Öæ÷BE67&—C¤WFõ66†VGVÆW%&ö6W72ä†4W†—FVB¢Ð¢–b‚E67&—C¤WFõ66†VGVÆW%&ö6W74–BÖwB’°¢&WGW&â‚FçVÆÂÖæR„vWBÕ&ö6W72Ô–BE67&—C¤WFõ66†VGVÆW%&ö6W74–BÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’¢Ð¢Ò6F6‚²Ð¢&WGW&âFfÇ6P§Ð ¦gVæ7F–öâ7F÷ÔWFõ66†VGVÆW%&ö6W72°¢F6öçG&öÅF‚Ò·7G&–æuÒE67&—C¤WFõ66†VGVÆW$6öçG&öÅF€¢G'’°¢–b‚F6öçG&öÅF‚’°¢6WBÔ6öçFVçBÔÆ—FW&ÅF‚‚F6öçG&öÅF‚²rç7F÷r’ÕfÇVRw7F÷rÔVæ6öF–ær44”’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢Ð¢GÒE67&—C¤WFõ66†VGVÆW%&ö6W70¢–b‚FçVÆÂÖWGÖæBE67&—C¤WFõ66†VGVÆW%&ö6W74–BÖwB’°¢GÒvWBÕ&ö6W72Ô–BE67&—C¤WFõ66†VGVÆW%&ö6W74–BÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢Ð¢–b‚FçVÆÂÖæRG’°¢2ZÙXN8ó×>XÙŽKØÞ8w7F÷8).z+®Š¨Þ8ž8(¾8þ8(88î8®jÚ>[‹Ž{X.K¨n8†f–æÆÇž8î[èÎx˜~K¹Ž88).[è^8N8 ¢FW†—FVBÒFfÇ6P¢G'’²FW†—FVBÒGåv—Df÷$W†—Bƒ#S’Ò6F6‚²Ð¢–b‚Öæ÷BFW†—FVB’°¢G'’²Gä¶–ÆÂ‚’Ò6F6‚²Ð¢G'’²·fö–EÒGåv—Df÷$W†—Bƒ’Ò6F6‚²Ð¢Ð¢Ð¢Ò6F6‚²Ð¢f–æÆÇ’°¢f÷&V6‚‚GF‚–â‚F6öçG&öÅF‚Â‚F6öçG&öÅF‚²rç7F÷r’’’°¢G'’²–b‚GF‚ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒÒ6F6‚²Ð¢Ð¢E67&—C¤WFõ66†VGVÆW%&ö6W72ÒFçVÆÀ¢E67&—C¤WFõ66†VGVÆW%&ö6W74–BÒ ¢E67&—C¤WFõ66†VGVÆW$6öçG&öÅF‚Òrp¢Ð§Ð  ¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢2cR7FvRB(	B†6R$#¢yK¾X8þ88þ88>8+~8:^8ŽjùN‹È0¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¢E67&—C¥f—7VÄ†6…&öf–ÆUfW'6–öâÒ ¢E67&—C¥f—7VÄ†6…vTF—7Fæ6TÆ–Ö—BÒãsP¢E67&—C¥f—7VÄ†6„fW&vTF—7Fæ6TÆ–Ö—BÒãC ¢E67&—C¥f—7VÄ†6„G’Ò#  ¦gVæ7F–öâvWBÕ&VæFW%&V6÷&DF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–B’°¢&WGW&â„¦ö–âÕF‚„vWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’„¦ö–âÕF‚w&VæFW'2rEfW'6–öä–B’§Ð ¦gVæ7F–öâvWBÕ&VæFW%&7FW%6†VWDF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒE6†VWDæÖR’°¢G&V6÷&DF—"ÒvWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–@¢&WGW&â„¦ö–âÕF‚G&V6÷&DF—"„¦ö–âÕF‚w&7FW"×cr„vWBÔF–fe6†VWD¶W’E6†VWDæÖR’’§Ð ¦gVæ7F–öâvWBÕf—7VÄ†6…&öf–ÆR°¢GFd&÷…fW'6–öâÒrp¢G'’°¢GfbÒ¦ö–âÕF‚E67&—C¤&ö÷BvÆ–%ÇFf&÷…ÅDd$õ…õdU%4”ôâçG‡Bp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚Gfb’²GFd&÷…fW'6–öâÒ‚„vWBÔ6öçFVçBÔÆ—FW&ÅF‚GfbÕ&r’×&WÆ6RuÇ2²rÂrr’åG&–Ò‚’Ð¢Ò6F6‚²Ð¢&WGW&â¶÷&FW&VEÔ°¢&öf–ÆUfW'6–öâÒE67&—C¥f—7VÄ†6…&öf–ÆUfW'6–öà¢Fd&÷…fW'6–öâÒGFd&÷…fW'6–öà¢G’ÒE67&—C¥f—7VÄ†6„G¢6öÆ÷$ÖöFRÒu$t"p¢Ð§Ð ¦gVæ7F–öâvWBÔ†W„†ÖÖ–æu&F–ò…·7G&–æuÒDÆVgBÂ·7G&–æuÒE&–v‡B’°¢FÒ…·7G&–æuÒDÆVgB’åG&–Ò‚’åFõWW$–çf&–çB‚¢F"Ò…·7G&–æuÒE&–v‡B’åG&–Ò‚’åFõWW$–çf&–çB‚¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F’Ö÷"FäÆVæwF‚ÖæRF"äÆVæwF‚’²&WGW&âãÐ¢FF–ffW&VçD&—G2Ò ¢f÷"‚F’Ò²F’ÖÇBFäÆVæwFƒ²F’²²’°¢G'’°¢G†÷"Ò…´6öçfW'EÓ£¥Fô–çC3"‚F²F•ÒåFõ7G&–ær‚’Âb’Ö'†÷"´6öçfW'EÓ£¥Fô–çC3"‚F%²F•ÒåFõ7G&–ær‚’Âb’¢Ò6F6‚²&WGW&âãÐ¢v†–ÆR‚G†÷"ÖwB’°¢FF–ffW&VçD&—G2³Ò‚G†÷"Ö&æB¢G†÷"ÒG†÷"×6‡"¢Ð¢Ð¢&WGW&â…¶F÷V&ÆUÒFF–ffW&VçD&—G2ò´ÖF…Ó£¤Ö‚ƒÂFäÆVæwF‚¢B’§Ð ¦gVæ7F–öâFW7BÕ6†VWEf—7VÄWV—fÆVçB‚D&Vf÷&RÂDgFW"’°¢–b‚FçVÆÂÖWD&Vf÷&RÖ÷"FçVÆÂÖWDgFW"’²&WGW&âFfÇ6RÐ¢–b‚„vWBÔ–çDFF&÷W'G’D&Vf÷&RwvT6÷VçBrÓ’ÖæR„vWBÔ–çDFF&÷W'G’DgFW"wvT6÷VçBrÓ"’’²&WGW&âFfÇ6RÐ¢F&Vf÷&UFW‡BÒæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’D&Vf÷&RwFW‡D†6‚rrr’¢FgFW%FW‡BÒæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’DgFW"wFW‡D†6‚rrr’¢F†46ö×&&ÆUFW‡BÒÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&Vf÷&UFW‡B’ÖæBÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FgFW%FW‡B¢–b‚F†46ö×&&ÆUFW‡BÖæBF&Vf÷&UFW‡BÖæRFgFW%FW‡B’²&WGW&âFfÇ6RÐ ¢F&Vf÷&UvW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’D&Vf÷&RwvUW&6WGVÄ†6†W2r‚’’¢FgFW%vW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’DgFW"wvUW&6WGVÄ†6†W2r‚’’¢–b‚F&Vf÷&UvW2ä6÷VçBÖWÖ÷"F&Vf÷&UvW2ä6÷VçBÖæRFgFW%vW2ä6÷VçB’²&WGW&âFfÇ6RÐ¢GF÷FÂÒã ¢GvTÆ–Ö—BÒB†–b‚F†46ö×&&ÆUFW‡B’²E67&—C¥f—7VÄ†6…vTF—7Fæ6TÆ–Ö—BÒVÇ6R²ã3RÒ¢FfW&vTÆ–Ö—BÒB†–b‚F†46ö×&&ÆUFW‡B’²E67&—C¥f—7VÄ†6„fW&vTF—7Fæ6TÆ–Ö—BÒVÇ6R²ã#Ò¢f÷"‚F’Ò²F’ÖÇBF&Vf÷&UvW2ä6÷VçC²F’²²’°¢FF—7Fæ6RÒvWBÔ†W„†ÖÖ–æu&F–ò…·7G&–æuÒF&Vf÷&UvW5²F•Ò’…·7G&–æuÒFgFW%vW5²F•Ò¢–b‚FF—7Fæ6RÖwBGvTÆ–Ö—B’²&WGW&âFfÇ6RÐ¢GF÷FÂ³ÒFF—7Fæ6P¢Ð¢&WGW&â‚‚GF÷FÂò´ÖF…Ó£¤Ö‚ƒÂF&Vf÷&UvW2ä6÷VçB’’ÖÆRFfW&vTÆ–Ö—B§Ð ¦gVæ7F–öâFW7BÕFevTæÇ—¦W$f–Æ&ÆR°¢–b‚FçVÆÂÖæRE67&—C¥FevTæÇ—¦W$f–Æ&ÆR’²&WGW&â¶&ööÅÒE67&—C¥FevTæÇ—¦W$f–Æ&ÆRÐ¢E67&—C¥FevTæÇ—¦W$f–Æ&ÆRÒFfÇ6P¢G'’°¢F¦"Ò¦ö–âÕF‚E67&—C¤&ö÷BvÆ–%ÇFf&÷…Å&W÷'EFd6ö×÷6W"æ¦"p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚F¦"’’²&WGW&âFfÇ6RÐ¢FBÕG—RÔ76VÖ&Ç”æÖRu7—7FVÒä”òä6ö×&W76–öâäf–ÆU7—7FVÒrÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢G¦—Ò´”òä6ö×&W76–öâå¦—f–ÆUÓ£¤÷Vå&VB‚F¦"¢G'’²E67&—C¥FevTæÇ—¦W$f–Æ&ÆRÒ‚G¦—äVçG&–W2Âv†W&RÔö&¦V7B²EòägVÆÄæÖRÖWuFevTæÇ—¦W"æ6Æ72rÒ’ä6÷VçBÖwBÐ¢f–æÆÇ’²G¦—äF—7÷6R‚’Ð¢Ò6F6‚²E67&—C¥FevTæÇ—¦W$f–Æ&ÆRÒFfÇ6RÐ¢&WGW&â¶&ööÅÒE67&—C¥FevTæÇ—¦W$f–Æ&ÆP§Ð ¦gVæ7F–öâ–çfö¶RÕFevTæÇ—¦W"…¶†6‡F&ÆUµÕÒE6†VWG2’°¢289n88>8*þ8N8Ž8²¦f8)#Y¹î88‹[~X¹^8~8nXZŽ8+~8;Î88Ž8).Šz>ié8ž8(¾8 ¢–b‚FçVÆÂÖWE6†VWG2Ö÷"E6†VWG2ä6÷VçBÖW’²&WGW&âFçVÆÂÐ¢GFööÂÒFçVÆÀ¢G'’²GFööÂÒvWBÕFd&F6…FööÄ–æfòÒ6F6‚²Ð¢F¦fW†RÒrp¢F7Òrp¢G'’°¢F¦fW†RÒ&W6öÇfRÔ¦fW†P¢F7Ò„¦ö–âÕF‚E67&—C¤&ö÷BvÆ–%ÇFf&÷…Å&W÷'EFd6ö×÷6W"æ¦"r’²s²r²„¦ö–âÕF‚E67&—C¤&ö÷BvÆ–%ÇFf&÷…ÇFf&÷‚Öæ¦"r¢Ò6F6‚²&WGW&âFçVÆÂÐ¢2cRÕ¢¤"8²FevTæÇ—¦W"æ6Æ728ÎXZ^8>8n8N8®8N˜XÞ[ˆ>xšž8~8þ8Šz>ié888).›¹ž8>8nŠºn8(8(¾8 ¢2†'V–ÆBç38).ZéþŠÎ8~8b¤"8).XhÞyIþh‰8ž8(¾8ŽiÈžX«ž8¾8®8(²¢–b‚Öæ÷B…FW7BÕFevTæÇ—¦W$f–Æ&ÆR’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²ÖW76vRÒuFevTæÇ—¦W"8Â¤"8¾Y
+¾8î8(Î8n8N8î8¾8)>8&ÆÆ–%ÇFf&÷…Æ'V–ÆBç38).ZéþŠÎ8~8n8þ88^8N8"rÒÐ¢GF×F—"Ò¦ö–âÕF‚…´”òåF…Ó£¤vWEFV×F‚‚’’‚w&"ÖæÇ—¦RÒr²„æWrÕ&$–B’¢æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚GF×F—"Ôf÷&6RÂ÷WBÔçVÆÀ¢G'’°¢G&WÒ¦ö–âÕF‚GF×F—"w&WVW7Bæ§6öâp¢G&W2Ò¦ö–âÕF‚GF×F—"w&W7VÇBæ§6öâp¢w&—FRÔ§6öäf–ÆRG&W…¶÷&FW&VEÔ²6†VWG2Ò‚E6†VWG2Âf÷$V6‚Ôö&¦V7B°¢¶÷&FW&VEÔ°¢6†VWDæÖRÒ·7G&–æuÒEòç6†VWDæÖP¢FbÒ·7G&–æuÒEòçF`¢&7FW$F—&V7F÷'’Ò·7G&–æuÒ„vWBÔFF&÷W'G’Eòw&7FW$F—&V7F÷'’rrr¢Ð¢Ò’Ò¢G'VâÒ–çfö¶RÔæF—fT6GW&RF¦fW†R‚rÔF¦fæwBæ†VFÆW73×G'VRrÂrÖ7rÂF7ÂuFevTæÇ—¦W"rÂrÒÖ–çWBrÂG&WÂrÒÖ÷WGWBrÂG&W2ÂrÒÖG’rÂ·7G&–æuÒE67&—C¥f—7VÄ†6„G’¢–b…¶–çEÒG'VâæW†—D6öFRÖæRÖ÷"Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G&W2’’°¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²ÖW76vRÒ‚&W†—CÒ"²·7G&–æuÒG'VâæW†—D6öFR²&â"²·7G&–æuÒG'VâçFW‡B’Ð¢Ð¢G'6VBÒ&VBÔ§6öäf–ÆRG&W2FçVÆÀ¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²&W7VÇBÒG'6VBÐ¢Ò6F6‚°¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²ÖW76vRÒEòäW†6WF–öâäÖW76vRÐ¢Òf–æÆÇ’°¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF×F—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF×F—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ð§Ð ¦gVæ7F–öâw&—FRÕ&VæFW%&V6÷&B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒEW'÷6RÂ¶&ööÅÒD6öçFVçEFe&WF–æVBÂDæÇ—6—2’°¢2cRÔ•bÓ3¢8:Î8;>888:®8;>8+{YiéÎ8ò&VæFW'5ÃÇfW'6–öä–CåÂ8¾K‰nKº>8N8Ž8¾{Úî8Þ8i»Ž8N8þ8(žZHži»N8~8®8N8 ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6æ6†÷D–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EfW'6–öä–B’’²&WGW&âÐ¢G'’°¢FF—"ÒvWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢FÖæ–fW7EF‚Ò¦ö–âÕF‚FF—"w&VæFW"ÖÖæ–fW7Bæ§6öâp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FÖæ–fW7EF‚’’°¢w&—FRÔ§6öäf–ÆRFÖæ–fW7EF‚…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ¢W'÷6RÒEW'÷6P¢2–Ö×WF&ÆR&VæFW"&V6÷&C¢F†—26—2v†WF†W"6öçFVçBDbv2&öGV6VBf÷"F†—2&VæFW"à¢27W'&VçB&WFVçF–öâ—2FWFW&Ö–æVBg&öÒF†R7GVÂ6öçFVçB×FbF—&V7F÷'’ÂæWfW"g&öÒF†—2Öæ–fW7Bà¢6öçFVçEFe&öGV6VBÒD6öçFVçEFe&WF–æV@¢6öçFVçEFe&WF–æVBÒD6öçFVçEFe&WF–æVB2ÆVv7’6ö×F–&–Æ—G“²Fòæ÷BW6R27W'&VçB×7FFRG'WF€¢6÷W&6U6æ6†÷D–BÒE6æ6†÷D–@¢v÷&¶&öö´–BÒEv÷&¶&öö´–@¢fW'6–öä–BÒEfW'6–öä–@¢7&VFVDBÒæWrÔæ÷t—6ð¢7FGW2Òv6ö×ÆWFRp¢&VæFW$Vçf—&öæÖVçDf–ævW'&–çBÒ·7G&–æuÒE67&—C¤7W'&VçE&VæFW$Vçdf–ævW'&–ç@¢&VæFW$Vçf—&öæÖVçBÒE67&—C¤7W'&VçE&VæFW$Vçd–æfð¢W†6VÅ&–çE&öf–ÆUfW'6–öâÒE67&—C¤W†6VÅ&–çE&öf–ÆUfW'6–öà¢f—7VÄ†6…&öf–ÆRÒ„vWBÕf—7VÄ†6…&öf–ÆR¢Ò¢Ð¢F†6…F‚Ò¦ö–âÕF‚FF—"wf—7VÂÖ†6†W2æ§6öâp¢–b‚FçVÆÂÖæRDæÇ—6—2ÖæBÖæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚F†6…F‚’’°¢w&—FRÔ§6öäf–ÆRF†6…F‚…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ¢6æ6†÷D–BÒE6æ6†÷D–@¢fW'6–öä–BÒEfW'6–öä–@¢&VæFW$Vçf—&öæÖVçDf–ævW'&–çBÒ·7G&–æuÒE67&—C¤7W'&VçE&VæFW$Vçdf–ævW'&–ç@¢f—7VÄ†6…&öf–ÆRÒ„vWBÕf—7VÄ†6…&öf–ÆR¢æÇ—¦W%fW'6–öâÒ¶–çEÒ„vWBÔFF&÷W'G’DæÇ—6—2væÇ—¦W%fW'6–öâr¢¦ffW'6–öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’DæÇ—6—2v¦ffW'6–öârrr¢¦ffVæF÷"Ò·7G&–æuÒ„vWBÔFF&÷W'G’DæÇ—6—2v¦ffVæF÷"rrr¢6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’DæÇ—6—2w6†VWG2r‚’’¢Ò¢Ð¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâvWBÕf—7VÄ†6†W2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–B’°¢GÒ¦ö–âÕF‚„vWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–B’wf—7VÂÖ†6†W2æ§6öâp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G’’²&WGW&âFçVÆÂÐ¢G'’²&WGW&â…&VBÔ§6öäf–ÆRGFçVÆÂ’Ò6F6‚²&WGW&âFçVÆÂÐ§Ð ¦gVæ7F–öâvWBÕ&VæFW%fW'6–öä–G2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢FF—"Ò¦ö–âÕF‚„vWBÕ6æ6†÷DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’w&VæFW'2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&â‚’Ð¢&WGW&â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"ÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂ6÷'BÔö&¦V7BæÖRÂf÷$V6‚Ôö&¦V7B²·7G&–æuÒEòäæÖRÒ§Ð ¢2ÒÒÒÒ&6VÆ–æR89Þ8*N8;>8+ò…cRÜ*sbãb’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâvWBÔ6ö×&—6öä&6VÆ–æUö–çFW%F‚…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&¶&öö´†—7F÷'”F—"DÆæwVvREv÷&¶&öö´–B’v6ö×&—6öâÖ&6VÆ–æRæ§6öâr§Ð¦gVæ7F–öâvWBÔ6ö×&—6öä&6VÆ–æUö–çFW"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢GÒvWBÔ6ö×&—6öä&6VÆ–æUö–çFW%F‚DÆæwVvREv÷&¶&öö´–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G’’²&WGW&âFçVÆÂÐ¢G'’²&WGW&â…&VBÔ§6öäf–ÆRGFçVÆÂ’Ò6F6‚²&WGW&âFçVÆÂÐ§Ð¦gVæ7F–öâ6WBÔ6ö×&—6öä&6VÆ–æR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒDVçdf–ævW'&–çB’°¢2Xˆ~i»þšn[¨ó¢ik6æ6†÷Bö6öçFVçB–âÓâ89Þ8*N8;>8+þ{Úîhù²Óâizw–îX˜®™šN8.˜	NKŠÞXÎjÚ.i˜.8þKùÞŠÛ~˜îZI®XN8¾X	.8ž8 ¢Gv÷&·76RÒvWBÕv÷&·76UF‚DÆæwVvP¢F†—7F÷'”Æö6²Ò¦ö–âÕF‚Gv÷&·76RvÆö6·5Æ†—7F÷'’Ö6ÆVçWæÆö6²p¢F6öçFVçDÆö6²ÒvWBÔ6öçFVçEFdÖ–çFVææ6TÆö6µF‚Gv÷&·76REv÷&¶&öö´–@¢–çfö¶RÕv—F„Æö6²F†—7F÷'”Æö6²°¢–çfö¶RÕv—F„Æö6²F6öçFVçDÆö6²°¢–b‚FçVÆÂÖW„vWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’’²F‡&÷r~jùN‹È>Yû®k©n8î[^jÛNx˜Ž8ÎŠh¾8N8¾8(®8î8¾8)>8"rÐ¢Ff–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–@¢–b‚Öæ÷B¶&ööÅÒFf–Æ&–Æ—G’ç&VG’’²F‡&÷r‚~jùN‹È>Yû®k©n8).KùÞŠÛ~8~8Þ8î8¾8)3¢r²·7G&–æuÒFf–Æ&–Æ—G’ç&V6öâ’Ð¢FöÆBÒvWBÔ6ö×&—6öä&6VÆ–æUö–çFW"DÆæwVvREv÷&¶&öö´–@¢FöÆE6æ6†÷BÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBw6æ6†÷D–Brrr¢FöÆEfW'6–öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBwfW'6–öä–Brrr¢G–äFFÒ¶÷&FW&VEÔ°¢6æ6†÷D–BÒE6æ6†÷D–C²fW'6–öä–BÒEfW'6–öä–@¢&VæFW$Vçf—&öæÖVçDf–ævW'&–çBÒDVçdf–ævW'&–ç@¢f—7VÄ†6…&öf–ÆUfW'6–öâÒE67&—C¥f—7VÄ†6…&öf–ÆUfW'6–öà¢–ææVDBÒæWrÔæ÷t—6ð¢Ð¢–b‚Öæ÷B„æWrÕ6æ6†÷E–âDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–Bv6ö×&—6öâÖ&6VÆ–æRrG–äFF’’°¢F‡&÷r~jùN‹È>Yû®k©n8î[^jÛNx˜Ž8).KùÞŠÛ~8~8Þ8î8¾8)>8~8~8þ8"p¢Ð¢–b‚Öæ÷B„æWrÔ6öçFVçEFe–âGv÷&·76REv÷&¶&öö´–BEfW'6–öä–Bv6ö×&—6öâÖ&6VÆ–æRrG–äFF’’°¢&VÖ÷fRÕ6æ6†÷E–âDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–Bv6ö×&—6öâÖ&6VÆ–æRp¢F‡&÷r~jùN‹È>Yû®k©n8æ6öçFVçBDn8).KùÞŠÛ~8~8Þ8î8¾8)>8~8~8þ8"p¢Ð¢w&—FRÔ§6öäf–ÆR„vWBÔ6ö×&—6öä&6VÆ–æUö–çFW%F‚DÆæwVvREv÷&¶&öö´–B’…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ#²6æ6†÷D–BÒE6æ6†÷D–C²fW'6–öä–BÒEfW'6–öä–@¢&VæFW$Vçf—&öæÖVçDf–ævW'&–çBÒDVçdf–ævW'&–çC²WFFVDBÒæWrÔæ÷t—6ð¢Ò¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FöÆE6æ6†÷B’ÖæBFöÆE6æ6†÷BÖæRE6æ6†÷D–B’°¢&VÖ÷fRÕ6æ6†÷E–âDÆæwVvREv÷&¶&öö´–BFöÆE6æ6†÷Bv6ö×&—6öâÖ&6VÆ–æRp¢Ð¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FöÆEfW'6–öâ’ÖæBFöÆEfW'6–öâÖæREfW'6–öä–B’°¢&VÖ÷fRÔ6öçFVçEFe–âGv÷&·76REv÷&¶&öö´–BFöÆEfW'6–öâv6ö×&—6öâÖ&6VÆ–æRp¢Ð¢Ð¢ÒÂ÷WBÔçVÆÀ§Ð ¦gVæ7F–öâvWBÔÆFW7D6ö×&—6öä76WEö–çFW%F‚…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&¶&öö´†—7F÷'”F—"DÆæwVvREv÷&¶&öö´–B’vÆFW7BÖ6ö×&—6öâÖ76WG2æ§6öâr§Ð ¦gVæ7F–öâvWBÔÆFW7D6ö×&—6öä76WEö–çFW"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢GF‚ÒvWBÔÆFW7D6ö×&—6öä76WEö–çFW%F‚DÆæwVvREv÷&¶&öö´–@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’’²&WGW&âFçVÆÂÐ¢G'’²&WGW&â…&VBÔ§6öäf–ÆRGF‚FçVÆÂ’Ò6F6‚²&WGW&âFçVÆÂÐ§Ð ¦gVæ7F–öâ6WBÔÆFW7D6ö×&—6öä76WG2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂD6ö×&—6öâ’°¢2ZHži»N8988>8+Ž8ÎzK®8žy»N‹ù8îˆz®X¹^jùN‹È>8þ8jÊY¹îjùN‹È>Yû®k©n8îXˆ~i»þ8Ž8þXŠ^8¾KŠx˜Ž8).KùÞŠÛ~8ž8(¾8 ¢2Y»®Zé§&öÆ^YÞ8).XŠ^8^8¾KÛþ8n8þ8(8izv7W'&VçN8Îik&6VÆ–æ^8¾8®8(¾ZNYŽ8(.ZèžXZŽ8¾Xˆ~8(®i»þ8Ž8(ž8(Î8(¾8 ¢–b‚FçVÆÂÖWD6ö×&—6öâÖ÷"·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâw66÷Rrrr’ÖæRvWFöÖF–2rÖ÷ ¢·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâw7FGW2rrr’ÖæRv6ö×ÆWFRr’²F‡&÷r~y»N‹ùjùN‹È>8Ž8~8nKùÞŠÛ~8~8Þ8(¾ˆz®X¹^jùN‹È>{YiéÎ8Î8.8(®8î8¾8)>8"rÐ¢f÷&V6‚‚Ff–VÆB–â‚v&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–Br’’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R…·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâFf–VÆBrr’’’²F‡&÷r.y»N‹ùjùN‹È>8îŠÙŽXŠ^ZÙ8ÎKˆÞ‹k>8~8n8N8î8“¢Ff–VÆB"Ð¢Ð¢Gv÷&·76RÒvWBÕv÷&·76UF‚DÆæwVvP¢F†—7F÷'”Æö6²Ò¦ö–âÕF‚Gv÷&·76RvÆö6·5Æ†—7F÷'’Ö6ÆVçWæÆö6²p¢F6öçFVçDÆö6²ÒvWBÔ6öçFVçEFdÖ–çFVææ6TÆö6µF‚Gv÷&·76REv÷&¶&öö´–@¢–çfö¶RÕv—F„Æö6²F†—7F÷'”Æö6²°¢–çfö¶RÕv—F„Æö6²F6öçFVçDÆö6²°¢F&6VÆ–æTf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–B…·7G&–æuÒD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–B’…·7G&–æuÒD6ö×&—6öâæ&6VÆ–æUfW'6–öä–B¢F7W'&VçDf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–B…·7G&–æuÒD6ö×&—6öâæ7W'&VçE6æ6†÷D–B’…·7G&–æuÒD6ö×&—6öâæ7W'&VçEfW'6–öä–B¢–b‚Öæ÷B¶&ööÅÒF&6VÆ–æTf–Æ&–Æ—G’ç&VG’Ö÷"Öæ÷B¶&ööÅÒF7W'&VçDf–Æ&–Æ—G’ç&VG’’°¢F‡&÷r~y»N‹ùjùN‹È>8îyK¾X8þ88þ88>8+~8:^8ŽYÎKˆK‰nKº>8æ6öçFVçBDn8).KùÞŠÛ~8~8Þ8î8¾8)>8"p¢Ð¢FöÆBÒvWBÔÆFW7D6ö×&—6öä76WEö–çFW"DÆæwVvREv÷&¶&öö´–@¢G–äFFÒ¶÷&FW&VEÔ°¢66÷RÒvWFöÖF–2p¢&6VÆ–æU6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–@¢&6VÆ–æUfW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æUfW'6–öä–@¢7W'&VçE6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçE6æ6†÷D–@¢7W'&VçEfW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçEfW'6–öä–@¢6ö×&VDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâv6ö×&VDBrrr¢–ææVDBÒæWrÔæ÷t—6ð¢Ð¢G7V72Ò€¢¶÷&FW&VEÔ²&öÆRÒv&6VÆ–æRs²–äæÖRÒvÆFW7BÖ6ö×&—6öâÖ&6VÆ–æRs²6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–C²fW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æUfW'6–öä–BÒÀ¢¶÷&FW&VEÔ²&öÆRÒv7W'&VçBs²–äæÖRÒvÆFW7BÖ6ö×&—6öâÖ7W'&VçBs²6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçE6æ6†÷D–C²fW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçEfW'6–öä–BÐ¢¢2˜	NKŠÞZKiY~i˜.8þX˜®™šN8¾8®KùÞŠÛ~˜îZI®XN8ŽX	.8ž8.izwö–çFW"÷–î8(.jè¾8(¾8þ8(jùN‹È>‹8~yJ>8þZK8(þ8(Î8®8N8 ¢f÷&V6‚‚G7V2–âG7V72’°¢FFFÒ¶÷&FW&VEÔ·Ð¢f÷&V6‚‚F¶W’–â‚G–äFFä¶W—2’’²FFF²F¶W•ÒÒG–äFF²F¶W•ÒÐ¢FFFç&öÆRÒ·7G&–æuÒG7V2ç&öÆP¢–b‚Öæ÷B„æWrÕ6æ6†÷E–âDÆæwVvREv÷&¶&öö´–B…·7G&–æuÒG7V2ç6æ6†÷D–B’…·7G&–æuÒG7V2ç–äæÖR’FFF’’°¢F‡&÷r~y»N‹ùjùN‹È>8î[^jÛNx˜Ž8).KùÞŠÛ~8~8Þ8î8¾8)>8~8~8þ8"p¢Ð¢–b‚Öæ÷B„æWrÔ6öçFVçEFe–âGv÷&·76REv÷&¶&öö´–B…·7G&–æuÒG7V2çfW'6–öä–B’…·7G&–æuÒG7V2ç–äæÖR’FFF’’°¢F‡&÷r~y»N‹ùjùN‹È>8æ6öçFVçBDn8).KùÞŠÛ~8~8Þ8î8¾8)>8~8~8þ8"p¢Ð¢Ð¢Gö–çFW%F‚ÒvWBÔÆFW7D6ö×&—6öä76WEö–çFW%F‚DÆæwVvREv÷&¶&öö´–@¢w&—FRÔ§6öäf–ÆRGö–çFW%F‚…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ¢&6VÆ–æU6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–@¢&6VÆ–æUfW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æUfW'6–öä–@¢7W'&VçE6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçE6æ6†÷D–@¢7W'&VçEfW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçEfW'6–öä–@¢6ö×&VDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâv6ö×&VDBrrr¢WFFVDBÒæWrÔæ÷t—6ð¢Ò¢G6fVEö–çFW"Ò&VBÔ§6öäf–ÆRGö–çFW%F‚FçVÆÀ¢–b‚FçVÆÂÖWG6fVEö–çFW"’²F‡&÷r~y»N‹ùjùN‹È>8îKùÞŠÛ~89Þ8*N8;>8+þ8).KùÞZÙŽ[èÎ8¾XhÞŠªÞ‹ëÎ8~8Þ8î8¾8)>8~8~8þ8"rÐ¢f÷&V6‚‚Ff–VÆB–â‚v&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–Br’’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’G6fVEö–çFW"Ff–VÆBrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâFf–VÆBrr’’°¢F‡&÷r.y»N‹ùjùN‹È>8îKùÞŠÛ~89Þ8*N8;>8+þjIÎŠ‹Î8¾ZKiY~8~8î8~8ó¢Ff–VÆB ¢Ð¢Ð¢f÷&V6‚‚FöÆE7V2–â€¢¶÷&FW&VEÔ²–äæÖRÒvÆFW7BÖ6ö×&—6öâÖ&6VÆ–æRs²6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBv&6VÆ–æU6æ6†÷D–Brrr“²fW'6–öä–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBv&6VÆ–æUfW'6–öä–Brrr“²æWu6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–C²æWufW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æUfW'6–öä–BÒÀ¢¶÷&FW&VEÔ²–äæÖRÒvÆFW7BÖ6ö×&—6öâÖ7W'&VçBs²6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBv7W'&VçE6æ6†÷D–Brrr“²fW'6–öä–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBv7W'&VçEfW'6–öä–Brrr“²æWu6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçE6æ6†÷D–C²æWufW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçEfW'6–öä–BÐ¢’’°¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R…·7G&–æuÒFöÆE7V2ç6æ6†÷D–B’ÖæB·7G&–æuÒFöÆE7V2ç6æ6†÷D–BÖæR·7G&–æuÒFöÆE7V2ææWu6æ6†÷D–B’°¢&VÖ÷fRÕ6æ6†÷E–âDÆæwVvREv÷&¶&öö´–B…·7G&–æuÒFöÆE7V2ç6æ6†÷D–B’…·7G&–æuÒFöÆE7V2ç–äæÖR¢Ð¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R…·7G&–æuÒFöÆE7V2çfW'6–öä–B’ÖæB·7G&–æuÒFöÆE7V2çfW'6–öä–BÖæR·7G&–æuÒFöÆE7V2ææWufW'6–öä–B’°¢&VÖ÷fRÔ6öçFVçEFe–âGv÷&·76REv÷&¶&öö´–B…·7G&–æuÒFöÆE7V2çfW'6–öä–B’…·7G&–æuÒFöÆE7V2ç–äæÖR¢Ð¢Ð¢Ð¢ÒÂ÷WBÔçVÆÀ§Ð ¢2ÒÒÒÒjùN‹È>[.yJŽ8:Î8;>888:®8;>8+…cRÜ*sbãr’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ  ¦gVæ7F–öâ&VæFW"Õ6æ6†÷Df÷$6ö×&—6öâ…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢27G'V7GW&Ræ§6öîzØž8þZHži»N8~8®8N8Î8yK¾X8þ88þ88>8+~8:^8ŽYÎKˆK‰nKº>8æ6öçFVçBDn8þKùÞhÈ8ž8(¾8 ¢28>8(Î8¾8(Ž8(®XhÞ8:Î8;>888:®8;>8+jùN‹È>8~8(.8XŠNZé®Zûî‹8ŽyK¾™Ú.ŠŽzK®Zûî‹8Î[ø^8®Kˆˆ{N8ž8(¾8 ¢G7FFRÒvWBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢–b‚Öæ÷B¶&ööÅÒG7FFRç6÷W&6U&WF–æVB’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒw6÷W&6RÖÖ—76–ærrÒÐ¢&WGW&â–çfö¶RÕv—F…&VæFW$Æö6²DÆæwVvREv÷&¶&öö´–B°¢GfW'6–öä–BÒæWrÕ&%fW'6–öä–@¢GF×F—"Ò¦ö–âÕF‚…´”òåF…Ó£¤vWEFV×F‚‚’’‚w&"Ö6×Òr²„æWrÕ&$–B’¢Gv÷&·76RÒvWBÕv÷&·76UF‚DÆæwVvP¢F6öçFVçDF—"ÒvWBÔ6öçFVçEFefW'6–öäF—"Gv÷&·76REv÷&¶&öö´–BGfW'6–öä–@¢æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚GF×F—"Ôf÷&6RÂ÷WBÔçVÆÀ¢æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚F6öçFVçDF—"Ôf÷&6RÂ÷WBÔçVÆÀ¢FÆV6T¦ö$–BÒæWrÕ&$–@¢G6æ6†÷DÆV6RÒrs²F6öçFVçDÆV6RÒrp¢G'’°¢F†—7F÷'”Æö6²Ò¦ö–âÕF‚Gv÷&·76RvÆö6·5Æ†—7F÷'’Ö6ÆVçWæÆö6²p¢F6öçFVçDÆö6²ÒvWBÔ6öçFVçEFdÖ–çFVææ6TÆö6µF‚Gv÷&·76REv÷&¶&öö´–@¢FÆV6U&W7VÇBÒ–çfö¶RÕv—F„Æö6²F†—7F÷'”Æö6²°¢–çfö¶RÕv—F„Æö6²F6öçFVçDÆö6²°¢–b‚FçVÆÂÖW„vWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’’²F‡&÷r~jùN‹È>XX>8î[^jÛNx˜Ž8Îi[Nyn8^8(Î8î8~8þ8"rÐ¢FæWu6æ6†÷DÆV6RÒæWrÕ6æ6†÷DÆV6RDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–Bv6ö×&RrFÆV6T¦ö$–B#GfW'6–öä–@¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FæWu6æ6†÷DÆV6R’’²F‡&÷r~[^jÛNx˜Ž8îKùÞŠÛvÆV6^8).KÙÎh‰8~8Þ8î8¾8)>8~8~8þ8"rÐ¢FæWt6öçFVçDÆV6RÒæWrÔ6öçFVçEFdÆV6RGv÷&·76REv÷&¶&öö´–BGfW'6–öä–Bv6ö×&RrFÆV6T¦ö$–B# ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FæWt6öçFVçDÆV6R’’°¢&VÖ÷fRÕ6æ6†÷DÆV6RDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BFæWu6æ6†÷DÆV6P¢F‡&÷rv6öçFVçBDn8îKùÞŠÛvÆV6^8).KÙÎh‰8~8Þ8î8¾8)>8~8~8þ8"p¢Ð¢&WGW&â·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ²6æ6†÷DÆV6RÒFæWu6æ6†÷DÆV6S²6öçFVçDÆV6RÒFæWt6öçFVçDÆV6RÐ¢Ð¢Ð¢G6æ6†÷DÆV6RÒ·7G&–æuÒFÆV6U&W7VÇBç6æ6†÷DÆV6P¢F6öçFVçDÆV6RÒ·7G&–æuÒFÆV6U&W7VÇBæ6öçFVçDÆV6P¢Ò6F6‚°¢&VÖ÷fRÕ6æ6†÷DÆV6RDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BG6æ6†÷DÆV6P¢&VÖ÷fRÔ6öçFVçEFdÆV6RGv÷&·76REv÷&¶&öö´–BGfW'6–öä–BF6öçFVçDÆV6P¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚F6öçFVçDF—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvÆV6RÖf–ÆVBs²ÖW76vRÒEòäW†6WF–öâäÖW76vRÐ¢Ð¢FW†6VÂÒFçVÆÃ²F&öö²ÒFçVÆÃ²G7V66W72ÒFfÇ6P¢G'’°¢Gv÷&²Ò¦ö–âÕF‚GF×F—"w6÷W&6Rç†Ç7‚p¢6÷’Ôf–ÆU6†&VE&VB…·7G&–æuÒG7FFRç6÷W&6UF‚’Gv÷&°¢G'’²Væ&Æö6²Ôf–ÆRÔÆ—FW&ÅF‚Gv÷&²ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒ6F6‚²Ð¢G'’²·fö–EÒ…&VÖ÷fRÕ†Ç7„†VFW$fö÷FW%†ÖÂGv÷&²’Ò6F6‚²Ð¢FW†6VÂÒæWrÔW†6VÄÆ–6F–öäf÷%&VæFW ¢FVçd–æfòÒvWBÕ&VæFW$Vçf—&öæÖVçBFW†6VÀ¢E67&—C¤7W'&VçE&VæFW$Vçdf–ævW'&–çBÒvWBÕ&VæFW$Vçf—&öæÖVçDf–ævW'&–çBFVçd–æfð¢E67&—C¤7W'&VçE&VæFW$Vçd–æfòÒFVçd–æfð¢F&öö²Ò÷VâÔW†6VÅv÷&¶&ööµ6fRFW†6VÂGv÷&²GG'VP¢G6†VWG2Ò‚¢G6†VWD6÷VçBÒ ¢G'’²G6†VWD6÷VçBÒ¶–çEÒF&öö²åv÷&·6†VWG2ä6÷VçBÒ6F6‚²G6†VWD6÷VçBÒÐ¢f÷"‚F’Ò²F’ÖÆRG6†VWD6÷VçC²F’²²’°¢Gw2ÒFçVÆÀ¢G'’°¢Gw2ÒF&öö²åv÷&·6†VWG2ä—FVÒ‚F’¢G6†VWDæÖRÒ·7G&–æuÒGw2äæÖP¢–b‚Öæ÷B‚…¶–çEÒGw2åf—6–&ÆRÖWÓ’ÖæBG6†VWDæÖRÖÖF6‚uå³Ó•Ò²Br’’²6öçF–çVRÐ¢F÷WEFbÒ¦ö–âÕF‚F6öçFVçDF—"‚'³ÒçFb"ÖbG6†VWDæÖR¢·fö–EÒ„W‡÷'BÕv÷&·6†VWEFõFe6fRFW†6VÂF&öö²Gw2F÷WEFbG6†VWDæÖRFfÇ6R¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚F÷WEFb’°¢G6†VWG2³Ò°¢6†VWDæÖRÒG6†VWDæÖP¢FbÒF÷WEF`¢&7FW$F—&V7F÷'’Ò„vWBÕ&VæFW%&7FW%6†VWDF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BGfW'6–öä–BG6†VWDæÖR¢Ð¢Ð¢Ò6F6‚°¢Òf–æÆÇ’²–çfö¶RÔ6öÕ&VÆV6RGw2Ð¢Ð¢–b‚G6†VWG2ä6÷VçBÖW’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvæò×6†VWG2rÒÐ¢FæÇ—6—2Ò–çfö¶RÕFevTæÇ—¦W"G6†VWG0¢–b‚FçVÆÂÖWFæÇ—6—2Ö÷"Öæ÷B¶&ööÅÒFæÇ—6—2æö²’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvæÇ—¦RÖf–ÆVBrÒÐ¢w&—FRÕ&VæFW%&V6÷&BDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BGfW'6–öä–Bv6ö×&—6öârGG'VR…·67W7FöÖö&¦V7EÒFæÇ—6—2ç&W7VÇB¢Ff–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BGfW'6–öä–@¢–b‚Öæ÷B¶&ööÅÒFf–Æ&–Æ—G’ç&VG’’²&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒw&WFVçF–öâ×fW&–g’Öf–ÆVBs²ÖW76vRÒ·7G&–æuÒFf–Æ&–Æ—G’ç&V6öâÒÐ¢G7V66W72ÒGG'VP¢&WGW&â¶÷&FW&VEÔ²ö²ÒGG'VS²fW'6–öä–BÒGfW'6–öä–C²Vçdf–ævW'&–çBÒ·7G&–æuÒE67&—C¤7W'&VçE&VæFW$Vçdf–ævW'&–çBÐ¢Ò6F6‚°¢&WGW&â¶÷&FW&VEÔ²ö²ÒFfÇ6S²&V6öâÒvW'&÷"s²ÖW76vRÒEòäW†6WF–öâäÖW76vRÐ¢Òf–æÆÇ’°¢–b‚F&öö²’²G'’²F&öö²ä6Æ÷6R‚FfÇ6R’Ò6F6‚²Ò²–çfö¶RÔ6öÕ&VÆV6RF&öö²Ð¢–b‚FW†6VÂ’²6Æ÷6RÔW†6VÄÆ–6F–öäf÷%&VæFW"FW†6VÂÐ¢&VÖ÷fRÕ6æ6†÷DÆV6RDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BG6æ6†÷DÆV6P¢&VÖ÷fRÔ6öçFVçEFdÆV6RGv÷&·76REv÷&¶&öö´–BGfW'6–öä–BF6öçFVçDÆV6P¢–b‚Öæ÷BG7V66W72ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚F6öçFVçDF—"’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚F6öçFVçDF—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF×F—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF×F—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢´t5Ó£¤6öÆÆV7B‚“²´t5Ó£¥v—Df÷%VæF–ætf–æÆ—¦W'2‚¢Ð¢Ð§Ð ¦gVæ7F–öâ6ö×&RÕ6æ6†÷Ef—7VÂ…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒD7W'&VçE6æ6†÷D–BÂ·7G&–æuÒD7W'&VçEfW'6–öä–B’°¢2ŠŽxûî8þ8ÎŠh¾‰Þ8Ž8~8®8~8Þ8~8þ8®8þ8ÎiÈ{X%Dn8îŠh¾8þyºî8).Yû®k©n8Ž8~8þš¹Ž{+î[ªn8®XŠNZé®8Þ8 ¢G&W7VÇBÒ¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ#²7FGW2ÒwVæf–Æ&ÆRp¢66÷RÒvWFöÖF–2p¢&6VÆ–æU6æ6†÷D–BÒrs²&6VÆ–æUfW'6–öä–BÒrp¢7W'&VçE6æ6†÷D–BÒD7W'&VçE6æ6†÷D–C²7W'&VçEfW'6–öä–BÒD7W'&VçEfW'6–öä–@¢6ö×&VDBÒæWrÔæ÷t—6ó²ÖWF†öBÒrp¢6†ævVE6†VWG2Ò‚“²Væ6†ævVE6†VWG2Ò‚“²Væ¶æ÷vå6†VWG2Ò‚¢FFVE6†VWG2Ò‚“²&VÖ÷fVE6†VWG2Ò‚“²ÖW76vRÒrp¢Ð¢F7W"ÒvWBÕf—7VÄ†6†W2DÆæwVvREv÷&¶&öö´–BD7W'&VçE6æ6†÷D–BD7W'&VçEfW'6–öä–@¢–b‚FçVÆÂÖWF7W"’²G&W7VÇBæÖW76vRÒ~K¸®Y¹îx˜Ž8îyK¾X8þ88þ88>8+~8:^8Î8.8(®8î8¾8)>8"s²&WGW&âG&W7VÇBÐ¢F7W$VçbÒ·7G&–æuÒ„vWBÔFF&÷W'G’F7W"w&VæFW$Vçf—&öæÖVçDf–ævW'&–çBrrr ¢GG"ÒvWBÔ6ö×&—6öä&6VÆ–æUö–çFW"DÆæwVvREv÷&¶&öö´–@¢F&6U6æÒ·7G&–æuÒ„vWBÔFF&÷W'G’GG"w6æ6†÷D–Brrr¢F&6UfW"Ò·7G&–æuÒ„vWBÔFF&÷W'G’GG"wfW'6–öä–Brrr¢2F†R&6VÆ–æRö–çFW"—2WF†÷&—FF—fRâfÆÆ–ær&6²FòÖæ–fW7Bç&Wf–÷W56æ6†÷D–@¢2—2Vç6fRgFW"&Vv—7G&F–öâ&V6÷fW'’÷"†6‚FRÖGWÆ–6F–öã¢F†R'&Wf–÷W2 ¢26æ6†÷B6â&RÖöçF‡2öÆBWfVâF†÷Vv‚F†RW6W"§W7B&V7&VFVBDbà¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6U6æ’Ö÷"F&6U6æÖWD7W'&VçE6æ6†÷D–B’°¢G&W7VÇBæÖW76vRÒ~X˜ÞY¹î8îjùN‹È>Yû®k©n8Î8.8(®8î8¾8)>8.K¸®Y¹îx˜Ž8).ik8~8NYû®k©n8¾8~8î8ž8"p¢&WGW&âG&W7VÇ@¢Ð ¢2ˆz®X¹^jùN‹È>8(.[^jÛNjùN‹È>8ŽYÎ8Ž8þ8XŠNZé®88þ88>8+~8:^8ŽŠŽzK¥Dn8îK‰nKº>Kˆˆ{N8).[ø^šŽ8¾8ž8(¾8 ¢F7W'&VçDf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BD7W'&VçE6æ6†÷D–BD7W'&VçEfW'6–öä–@¢–b‚Öæ÷B¶&ööÅÒF7W'&VçDf–Æ&–Æ—G’ç&VG’’°¢G&W7VÇBæÖW76vRÒ~K¸®Y¹îx˜Ž8îyK¾X8þ88þ88>8+~8:^8ŽYÎKˆK‰nKº>8æ6öçFVçBDn8Î8Þ8(Þ8>8n8N8®8N8þ8(8ˆz®X¹^jùN‹È>8~8Þ8î8¾8)>8"p¢&WGW&âG&W7VÇ@¢Ð¢F&6RÒFçVÆÀ¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6UfW"’’²F&6RÒvWBÕf—7VÄ†6†W2DÆæwVvREv÷&¶&öö´–BF&6U6æF&6UfW"Ð¢F&6Tf–Æ&–Æ—G’ÒFçVÆÀ¢–b‚FçVÆÂÖæRF&6RÖæBÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6UfW"’’°¢F&6Tf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BF&6U6æF&6UfW ¢Ð¢F7W%&öf–ÆRÒvWBÔFF&÷W'G’F7W"wf—7VÄ†6…&öf–ÆRrFçVÆÀ¢F&6U&öf–ÆRÒB†–b‚FçVÆÂÖæRF&6R’²vWBÔFF&÷W'G’F&6Rwf—7VÄ†6…&öf–ÆRrFçVÆÂÒVÇ6R²FçVÆÂÒ¢FVçf—&öæÖVçD6†ævVBÒ‚FçVÆÂÖæRF&6RÖæB€¢·7G&–æuÒ„vWBÔFF&÷W'G’F&6Rw&VæFW$Vçf—&öæÖVçDf–ævW'&–çBrrr’ÖæRF7W$VçbÖ÷ ¢„vWBÔ–çDFF&÷W'G’F&6RvæÇ—¦W%fW'6–öâr’ÖæR„vWBÔ–çDFF&÷W'G’F7W"væÇ—¦W%fW'6–öâr’Ö÷ ¢„vWBÔ–çDFF&÷W'G’F&6U&öf–ÆRw&öf–ÆUfW'6–öâr’ÖæR„vWBÔ–çDFF&÷W'G’F7W%&öf–ÆRw&öf–ÆUfW'6–öâr’’¢F76WG4Ö—76–ærÒ‚FçVÆÂÖWF&6Tf–Æ&–Æ—G’Ö÷"Öæ÷B¶&ööÅÒF&6Tf–Æ&–Æ—G’ç&VG’¢FÖWF†öBÒw7F÷&VBÖ†6‚p¢–b‚FçVÆÂÖWF&6RÖ÷"FVçf—&öæÖVçD6†ævVBÖ÷"F76WG4Ö—76–ær’°¢2y+Z(>[zî8;¾88þ88>8+~8:^jÊ‰Þ8;¾YÎKˆK‰nKº5DnjÊ‰Þ8î8N8®8(Î8~8(.8KùÞZÙŽkˆŽ8ôW†6VÎ8¾8(žKˆ{XN8).XhÞyIþh‰8ž8(¾8 ¢G&RÒ&VæFW"Õ6æ6†÷Df÷$6ö×&—6öâDÆæwVvREv÷&¶&öö´–BF&6U6æ ¢–b…¶&ööÅÒG&Ræö²’°¢F&6UfW"Ò·7G&–æuÒG&RçfW'6–öä–@¢F&6RÒvWBÕf—7VÄ†6†W2DÆæwVvREv÷&¶&öö´–BF&6U6æF&6UfW ¢F&6Tf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BF&6U6æF&6UfW ¢FÖWF†öBÒw&R×&VæFW&VBp¢ÒVÇ6R°¢G&W7VÇBæÖW76vRÒ~X˜ÞY¹îx˜Ž8îjùN‹È>‹8~yJ>8).YÎKˆK‰nKº>8~z+®KùÞ8~8Þ8®8N8þ8(8ˆz®X¹^jùN‹È>8~8Þ8î8¾8)>8.K¸®Y¹îx˜Ž8).ik8~8NjùN‹È>Yû®k©n8Ž8~8î8ž8"p¢&WGW&âG&W7VÇ@¢Ð¢Ð¢–b‚FçVÆÂÖWF&6RÖ÷"FçVÆÂÖWF&6Tf–Æ&–Æ—G’Ö÷"Öæ÷B¶&ööÅÒF&6Tf–Æ&–Æ—G’ç&VG’’°¢G&W7VÇBæÖW76vRÒ~X˜ÞY¹îx˜Ž8îyK¾X8þ88þ88>8+~8:^8ŽYÎKˆK‰nKº>8æ6öçFVçBDn8).z+®Š¨Þ8~8Þ8î8¾8)>8"p¢&WGW&âG&W7VÇ@¢Ð ¢F&6TÖÒ·Ð¢f÷&V6‚‚G2–â„vWBÔ'&’„vWBÔFF&÷W'G’F&6Rw6†VWG2r‚’’’’²F&6TÖµ·7G&–æuÒG2ç6†VWDæÖUÒÒG2Ð¢F7W$æÖW2Ò·Ð¢F6†ævVBÒ‚“²GVæ6†ævVBÒ‚“²GVæ¶æ÷vâÒ‚“²FFFVBÒ‚“²G&VÖ÷fVBÒ‚¢f÷&V6‚‚G2–â„vWBÔ'&’„vWBÔFF&÷W'G’F7W"w6†VWG2r‚’’’’°¢FæÖRÒ·7G&–æuÒG2ç6†VWDæÖP¢F7W$æÖW5²FæÖUÒÒGG'VP¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’G2w7FGW2rrr’ÖæRvö²r’²GVæ¶æ÷vâ³ÒFæÖS²6öçF–çVRÐ¢–b‚Öæ÷BF&6TÖä6öçF–ç4¶W’‚FæÖR’’²FFFVB³ÒFæÖS²6öçF–çVRÐ¢F"ÒF&6TÖ²FæÖUÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F"w7FGW2rrr’ÖæRvö²r’²GVæ¶æ÷vâ³ÒFæÖS²6öçF–çVRÐ¢–b‚„æ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’F"w6†VWEf—7VÄ†6‚rrr’’’ÖW„æ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’G2w6†VWEf—7VÄ†6‚rrr’’’Ö÷ ¢…FW7BÕ6†VWEf—7VÄWV—fÆVçBF"G2’’²GVæ6†ævVB³ÒFæÖRÐ¢VÇ6R²F6†ævVB³ÒFæÖRÐ¢Ð¢G&W7VÇBç7FGW2Òv6ö×ÆWFRp¢G&W7VÇBæ&6VÆ–æU6æ6†÷D–BÒF&6U6æ ¢G&W7VÇBæ&6VÆ–æUfW'6–öä–BÒF&6UfW ¢G&W7VÇBæÖWF†öBÒFÖWF†ö@¢2cRÕ¢K¸®Y¹îx˜Ž8î8+~8;Î88Ž888).Y¹î8ž8Ž8X˜®™šN8^8(Î8þ8+~8;Î88Ž8Î[zîXˆn8¾X{®8®8N8 ¢f÷&V6‚‚F²–â‚F&6TÖä¶W—2’’²–b‚Öæ÷BF7W$æÖW2ä6öçF–ç4¶W’…·7G&–æuÒF²’’²G&VÖ÷fVB³Ò·7G&–æuÒF²ÒÐ¢G&W7VÇBæ6†ævVE6†VWG2Ò‚F6†ævVB¢G&W7VÇBçVæ6†ævVE6†VWG2Ò‚GVæ6†ævVB¢G&W7VÇBçVæ¶æ÷vå6†VWG2Ò‚GVæ¶æ÷vâ¢G&W7VÇBæFFVE6†VWG2Ò‚FFFVB¢G&W7VÇBç&VÖ÷fVE6†VWG2Ò‚G&VÖ÷fVB¢FF—"Ò¦ö–âÕF‚„vWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BD7W'&VçE6æ6†÷D–BD7W'&VçEfW'6–öä–B’v6ö×&—6öç2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢F6ö×&—6öä¶W’Ò„vWBÕ6†#SeFW‡B‚'³×Ç³×Ç³'×Ç³7×ÆWFöÖF–2"ÖbF&6U6æÂF&6UfW"ÂD7W'&VçE6æ6†÷D–BÂD7W'&VçEfW'6–öä–B’’å7V'7G&–ærƒrÂb¢F6ö×&—6öåF‚Ò¦ö–âÕF‚FF—"‚&6××³Òæ§6öâ"ÖbF6ö×&—6öä¶W’¢w&—FRÔ§6öäf–ÆRF6ö×&—6öåF‚G&W7VÇ@¢G6fVBÒ&VBÔ§6öäf–ÆRF6ö×&—6öåF‚FçVÆÀ¢–b‚FçVÆÂÖWG6fVB’²F‡&÷r~ˆz®X¹^jùN‹È>{YiéÎ8).KùÞZÙŽ[èÎ8¾XhÞŠªÞ‹ëÎ8~8Þ8î8¾8)>8~8~8þ8"rÐ¢f÷&V6‚‚Ff–VÆB–â‚w66÷RrÂv&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–Br’’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’G6fVBFf–VÆBrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’G&W7VÇBFf–VÆBrr’’°¢F‡&÷r.ˆz®X¹^jùN‹È>{YiéÎ8îKùÞZÙŽjIÎŠ‹Î8¾ZKiY~8~8î8~8ó¢Ff–VÆB ¢Ð¢Ð¢G'’°¢6WBÔÆFW7D6ö×&—6öä76WG2DÆæwVvREv÷&¶&öö´–BG6fV@¢Ò6F6‚°¢2KùÞŠÛ~8~8Þ8®8NjùN‹È>8).iÈikZHži»N8988>8+Ž8ŽXZÎ™h¾8~8®8N8 ¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚F6ö×&—6öåF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢F‡&÷p¢Ð¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv6ö×&Ræ6ö×ÆWFVBr…¶÷&FW&VEÔ²v÷&¶&öö´–BÒEv÷&¶&öö´–C²6æ6†÷D–BÒD7W'&VçE6æ6†÷D–C²6†ævVBÒ‚F6†ævVB“²Væ¶æ÷vâÒ‚GVæ¶æ÷vâ’Ò¢&WGW&âG6fV@§Ð ¦gVæ7F–öâ–çfö¶RÕ÷7E&VæFW$æÇ—6—2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–BÂE&VæFW&VB’°¢2cRÜ*sbãS¢DnKÙÎh‰8î8*þ8:®88n8*>8*¾8:¾898+ž8îZIn8.ZKiY~8~8n8("DbKÙÎh‰8þh‰X©þh›8N8î8î8î8 ¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&âFçVÆÂÐ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6æ6†÷D–B’’²&WGW&âFçVÆÂÐ¢G'’°¢G6†VWG2Ò‚¢f÷&V6‚‚G"–â„vWBÔ'&’E&VæFW&VB’’°¢GFbÒ·7G&–æuÒ„vWBÔFF&÷W'G’G"wFbrrr¢FæÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’G"w6†VWDæÖRrrr¢–b‚GFbÖæBFæÖRÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚GFb’’°¢G6†VWG2³Ò°¢6†VWDæÖRÒFæÖP¢FbÒGF`¢&7FW$F—&V7F÷'’Ò„vWBÕ&VæFW%&7FW%6†VWDF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–BFæÖR¢Ð¢Ð¢Ð¢–b‚G6†VWG2ä6÷VçBÖW’²&WGW&âFçVÆÂÐ¢FæÇ—6—2Ò–çfö¶RÕFevTæÇ—¦W"G6†VWG0¢G'6VBÒFçVÆÀ¢–b‚FçVÆÂÖæRFæÇ—6—2ÖæB¶&ööÅÒFæÇ—6—2æö²’²G'6VBÒ·67W7FöÖö&¦V7EÒFæÇ—6—2ç&W7VÇBÐ¢w&—FRÕ&VæFW%&V6÷&BDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–Bvæ÷&ÖÂrGG'VRG'6V@¢–b‚FçVÆÂÖWG'6VB’²&WGW&âFçVÆÂÐ¢F6×Ò6ö×&RÕ6æ6†÷Ef—7VÂDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–@¢26ö×ÆWFR÷Væf–Æ&Æ^8î8ž88(ž8~8(.Šz>ié{YiéÎ8).x˜Ž8îŠ‰Ž˜Ë.8Žjè¾8ž8 ¢2™ÙîYÎiÉþŠz>ié8îz»nYŽ8(Ny+Z(>[zî8~jùN‹È>8~8Þ8®8NZNYŽ8¾8ynyK8).[èÎ8¾8(žz+®Š¨Þ8~8Þ8(¾8 ¢G'’°¢FæÇ—6—5&V6÷&DF—"ÒvWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–@¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FæÇ—6—5&V6÷&DF—"v6ö×&—6öâÖæÇ—6—2æ§6öâr’F6× ¢Ò6F6‚²Ð¢2cRÜ*sbãc¢&6VÆ–æR8).i»Nik8ž8(¾8î8þK¸®Y¹î8îŠz>ié8¾h‰X©þ8~8þ8Ž8Þ888 ¢2Væ¶æ÷vâx˜Ž8).Yû®k©n8¾8ž8(¾8ŽjÊY¹î8îjùN‹È>XX>8ÎZK8(þ8(Î8(¾8 ¢F†4ö²Ò„vWBÔ'&’„vWBÔFF&÷W'G’G'6VBw6†VWG2r‚’’Âv†W&RÔö&¦V7B²·7G&–æuÒEòç7FGW2ÖWvö²rÒ’ä6÷VçBÖwB ¢–b‚F†4ö²’²6WBÔ6ö×&—6öä&6VÆ–æRDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–B…·7G&–æuÒE67&—C¤7W'&VçE&VæFW$Vçdf–ævW'&–çB’Ð¢&WGW&âF6× ¢Ò6F6‚°¢w&—FRÕv&æ–ær‚~yK¾X8þ88þ88>8+~8:^8îŠz>ié8¾ZKiY~8~8î8~8ó¢r²EòäW†6WF–öâäÖW76vR¢&WGW&âFçVÆÀ¢Ð§Ð ¦gVæ7F–öâvWBÔÆFW7D6ö×&—6öâ…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂEv÷&¶&öö²ÒFçVÆÂ’°¢G'’°¢2cRÕ#¢YÎX{®XX>8Îiz.8²7G'V7GW&R8).ŠªÞ8)>8~8N8(¾ZNYŽ8þXhÞŠªÞ‹ëÎ8~8®8N8 ¢2ö’÷7FFR8þ89n88>8*óK»n8N8Ž8¾8>8>8ŽiÚ^8(¾8þ8(8“K»n8®8(’7G'V7GW&Ræ§6öâ8)#“Y¹îŠªÞ8)>8~8N8þ8 ¢GF&vWBÒEv÷&¶&öö°¢–b‚FçVÆÂÖWGF&vWB’°¢G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvP¢Gv"Ò„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWEv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Gv"ä6÷VçBÖW’²&WGW&âFçVÆÂÐ¢GF&vWBÒGv%³Ð¢Ð¢G6æÒ·7G&–æuÒ„vWBÔFF&÷W'G’GF&vWBvÆ7E&VæFW&VE6æ6†÷D–Brrr¢GfW"Ò·7G&–æuÒ„vWBÔFF&÷W'G’GF&vWBvÆ7E&VæFW&VEfW'6–öä–Brrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6æ’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚GfW"’’²&WGW&âFçVÆÂÐ¢FF—"Ò¦ö–âÕF‚„vWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BG6æGfW"’v6ö×&—6öç2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&âFçVÆÂÐ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂ6÷'BÔö&¦V7BÆ7Ew&—FUF–ÖUWF2ÔFW66VæF–ær’’°¢G'’°¢F6æF–FFRÒ&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖWF6æF–FFR’²6öçF–çVRÐ¢G66÷RÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRw66÷Rrrr¢266÷^xJ8~8þiz~x˜ŽK©.hù¾8.[^jÛNyK¾™Ú.8¾8(žKÙÎ8>8þK»¾hHþjùN‹È>8þ8¢2iÈikx˜Ž8îZHži»N8988>8+Ž8(Nˆz®X¹^jùN‹È>Yû®k©n8Ž8~8nh›8(þ8®8N8 ¢–b‚Öæ÷B…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G66÷R’Ö÷"G66÷RÖWvWFöÖF–2r’’²6öçF–çVRÐ¢2ik[Ú.[Èþ8þxûîYÊŽx˜Ž8ç6æ6†÷B÷fW'6–öî8(.ZèÎXZŽKˆˆ{N8^8¾8(¾8.iz~[Ú.[Èþ8~š^yºî8ÎxJ8NZNYŽ888¢2xšžyny¨N8¾xûîYÊŽx˜‡&VæFW.89^8*ž8:¾88Xh^8¾8.8(¾8>8Ž8).jžhº8¾K©.hù¾ŠªÞ‹ëÎ8ž8(¾8 ¢F6æF–FFU6æ6†÷BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRv7W'&VçE6æ6†÷D–Brrr¢F6æF–FFUfW'6–öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRv7W'&VçEfW'6–öä–Brrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6æF–FFU6æ6†÷B’ÖæBF6æF–FFU6æ6†÷BÖæRG6æ’²6öçF–çVRÐ¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F6æF–FFUfW'6–öâ’ÖæBF6æF–FFUfW'6–öâÖæRGfW"’²6öçF–çVRÐ¢&WGW&âF6æF–FFP¢Ò6F6‚²Ð¢Ð¢&WGW&âFçVÆÀ¢Ò6F6‚²&WGW&âFçVÆÂÐ§Ð  ¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢2cR7FvRR(	B†6R"ò$3¢8*.8;Î8*¾8*N89n8;¾8:Î8*N8*.8*n88Ž[^jÛN8;¾X{®X©¾88Ž8:ž8;>8+n8*þ8+~8:~8;0¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¦gVæ7F–öâvWBÔ&6†—fU&ö÷B…·7G&–æuÒDÆæwVvR’²&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’vW‡÷'G5Æ&6†—fRr’Ð¦gVæ7F–öâvWBÔÆ–÷WD†—7F÷'”F—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’’²&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’„¦ö–âÕF‚vÆ–÷WBÖ†—7F÷'’rD6FVv÷'’’’Ð¦gVæ7F–öâvWBÔf–æÅG&ç67F–öäF—"…·7G&–æuÒDÆæwVvR’²&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’w7FFUÆf–æÂ×G&ç67F–öç2r’Ð¦gVæ7F–öâvWBÔf–æÅG&ç67F–öä&6·WF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEG&ç67F–öä–B’²&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’„¦ö–âÕF‚w7FFUÆf–æÂÖ&6·W2rEG&ç67F–öä–B’’Ð¦gVæ7F–öâ&VÖ÷fRÔf–æÅG&ç67F–öä&6·WF—"…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEG&ç67F–öä–B’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EG&ç67F–öä–B’’²&WGW&âÐ¢G'’°¢FF—"ÒvWBÔf–æÅG&ç67F–öä&6·WF—"DÆæwVvREG&ç67F–öä–@¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FF—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ò6F6‚²Ð§Ð ¢2ÒÒÒÒ8:Î8*N8*.8*n88Žh©^[Û8+ž88®88>89~8+~8:~88>88Ž8Ž™™Zé®[êžXX2…cRÜ*sBã"’ÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâ6fRÔÆ–÷WE6æ6†÷B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuÒE&V6öâÂE7G'V7GW&RÒFçVÆÂ’°¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’²&WGW&ârrÐ¢G'’°¢G7BÒE7G'V7GW&P¢–b‚FçVÆÂÖWG7B’²G7BÒvWBÕ7G'V7GW&RDÆæwVvRÐ¢GvW2Ò‚¢f÷&V6‚‚G–â„vWBÔ'&’G7BçvW2’’°¢Gv"Ò„vWBÔ'&’G7Bçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖW·7G&–æuÒGçv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Gv"ä6÷VçBÖW’²6öçF–çVRÐ¢–b‚Öæ÷B…FW7BÕv÷&¶&öö´6FVv÷'’Gv%³ÒD6FVv÷'’’’²6öçF–çVRÐ¢2cRÜ*sBã#¢8:Î8*N8*.8*n88Žš^yºî888).KùÞZÙŽ8ž8(¾8'7G'V7GW&RXZŽKÙ>8þKùÞZÙŽ8~8®8N8 ¢GvW2³Ò¶÷&FW&VEÔ°¢vT–BÒ…&W6öÇfRÕvT–BG¢F—FÆRÒ·7G&–æuÒGçF—FÆP¢föÇVÖRÒ·7G&–æuÒGçföÇVÖP¢Væ&ÆVBÒ¶&ööÅÒGæVæ&ÆV@¢÷&FW"Ò¶F÷V&ÆUÒGæ÷&FW ¢÷&FW$ÖçVÂÒ¶&ööÅÒ„vWBÔFF&÷W'G’Gv÷&FW$ÖçVÂrFfÇ6R¢çVÖ&W&–ætÖöFRÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvçVÖ&W&–ætÖöFRrwf—6–&ÆRr¢çVÖ&W&–ætÖçVÂÒ¶&ööÅÒ„vWBÔFF&÷W'G’GvçVÖ&W&–ætÖçVÂrFfÇ6R¢Ð¢Ð¢–b‚GvW2ä6÷VçBÖW’²&WGW&ârrÐ¢FF—"ÒvWBÔÆ–÷WD†—7F÷'”F—"DÆæwVvRD6FVv÷'¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢F–BÒæWrÕ&$–@¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"‚'³Òæ§6öâ"ÖbF–B’’…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ²6æ6†÷D–BÒF–C²ÆæwVvRÒDÆæwVvS²6FVv÷'’ÒD6FVv÷'¢7&VFVDBÒæWrÔæ÷t—6ó²&V6öâÒE&V6öã²vW2ÒGvW0¢Ò¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvÆ–÷WBæ6†ævVBr…¶÷&FW&VEÔ²6FVv÷'’ÒD6FVv÷'“²&V6öâÒE&V6öã²6æ6†÷D–BÒF–C²vT6÷VçBÒGvW2ä6÷VçBÒ¢&WGW&âF–@¢Ò6F6‚²&WGW&ârrÐ§Ð ¦gVæ7F–öâvWBÔÆ–÷WE6æ6†÷G2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’’°¢FF—"ÒvWBÔÆ–÷WD†—7F÷'”F—"DÆæwVvRD6FVv÷'¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&â‚’Ð¢F÷WBÒ‚¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂ6÷'BÔö&¦V7BæÖRÔFW66VæF–ærÂ6VÆV7BÔö&¦V7BÔf—'7B’’°¢G'’°¢F¢Ò&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢F÷WB³Ò¶÷&FW&VEÔ°¢6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢w6æ6†÷D–BrFbä&6TæÖR¢7&VFVDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢v7&VFVDBrrr¢&V6öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢w&V6öârrr¢vT6÷VçBÒ„vWBÔ'&’„vWBÔFF&÷W'G’F¢wvW2r‚’’’ä6÷Vç@¢Ð¢Ò6F6‚²Ð¢Ð¢&WGW&âF÷W@§Ð ¦gVæ7F–öâ&VBÔÆ–÷WE6æ6†÷B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuÒE6æ6†÷D–B’°¢G6fU6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBE6æ6†÷D–Bw6æ6†÷D–Bp¢GÒ¦ö–âÕF‚„vWBÔÆ–÷WD†—7F÷'”F—"DÆæwVvRD6FVv÷'’’‚'³Òæ§6öâ"ÖbG6fU6æ6†÷D–B¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G’’²F‡&÷r.8:Î8*N8*.8*n88Ž[^jÛN8ÎŠh¾8N8¾8(®8î8¾8)3¢E6æ6†÷D–B"Ð¢&WGW&â…&VBÔ§6öäf–ÆRGFçVÆÂ§Ð ¦gVæ7F–öâvWBÔÆ–÷WE&W7F÷&U&Wf–Wr…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuÒE6æ6†÷D–B’°¢G6æÒ&VBÔÆ–÷WE6æ6†÷BDÆæwVvRD6FVv÷'’E6æ6†÷D–@¢G7BÒvWBÕ7G'V7GW&RDÆæwVvP¢F7W'&VçD–G2Ò·Ð¢f÷&V6‚‚G–â„vWBÔ'&’G7BçvW2’’°¢Gv"Ò„vWBÔ'&’G7Bçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖW·7G&–æuÒGçv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Gv"ä6÷VçBÖW’²6öçF–çVRÐ¢–b‚Öæ÷B…FW7BÕv÷&¶&öö´6FVv÷'’Gv%³ÒD6FVv÷'’’’²6öçF–çVRÐ¢F7W'&VçD–G5²…&W6öÇfRÕvT–BG•ÒÒG ¢Ð¢FÆ–VBÒ²G7DöæÇ’Ò‚“²GföÇVÖT6†ævW2Ò‚¢G6æ–G2Ò·Ð¢f÷&V6‚‚G7–â„vWBÔ'&’„vWBÔFF&÷W'G’G6æwvW2r‚’’’’°¢GvT¶W’Ò·7G&–æuÒG7çvT–@¢G6æ–G5²GvT¶W•ÒÒGG'VP¢–b‚Öæ÷BF7W'&VçD–G2ä6öçF–ç4¶W’‚GvT¶W’’’²G7DöæÇ’³ÒGvT¶W“²6öçF–çVRÐ¢FÆ–VB²°¢F7W"ÒF7W'&VçD–G5²GvT¶W•Ð¢–b…·7G&–æuÒF7W"çföÇVÖRÖæR·7G&–æuÒG7çföÇVÖR’°¢GföÇVÖT6†ævW2³Ò¶÷&FW&VEÔ²vT–BÒGvT¶W“²F—FÆRÒ·7G&–æuÒF7W"çF—FÆS²g&öÒÒ·7G&–æuÒF7W"çföÇVÖS²FòÒ·7G&–æuÒG7çföÇVÖRÐ¢Ð¢Ð¢F7W'&VçDöæÇ’Ò‚F7W'&VçD–G2ä¶W—2Âv†W&RÔö&¦V7B²Öæ÷BG6æ–G2ä6öçF–ç4¶W’‚Eò’Ò¢&WGW&â¶÷&FW&VEÔ°¢6æ6†÷D–BÒE6æ6†÷D–@¢7&VFVDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’G6æv7&VFVDBrrr¢&V6öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’G6æw&V6öârrr¢Æ–VEvT6÷VçBÒFÆ–V@¢7DöæÇ•vT–G2Ò‚G7DöæÇ’¢7W'&VçDöæÇ•vT–G2Ò‚F7W'&VçDöæÇ’¢föÇVÖT6†ævW2Ò‚GföÇVÖT6†ævW2¢&WV—&W5&V'V–ÆBÒGG'VP¢Ð§Ð ¦gVæ7F–öâ&W7F÷&RÔÆ–÷WE6æ6†÷B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuÒE6æ6†÷D–B’°¢G6æÒ&VBÔÆ–÷WE6æ6†÷BDÆæwVvRD6FVv÷'’E6æ6†÷D–@¢2[êžXX>8îy»NX˜Þ8¾8(.KùÞZÙŽ8~8n8®8Þ88Î[êžXX>8).Xùn8(®khŽ8ž8Þ8).Xúþˆ;Þ8¾8ž8(¾8 ¢GVæFô–BÒ6fRÔÆ–÷WE6æ6†÷BDÆæwVvRD6FVv÷'’w&R×&W7F÷&Rp¢FÆ–VBÒWFFRÕ7G'V7GW&TÆö6¶VBDÆæwVvR°¢&Ò‚G7B¢FÖÒ·Ð¢f÷&V6‚‚G–â„vWBÔ'&’G7BçvW2’’²FÖ²…&W6öÇfRÕvT–BG•ÒÒGÐ¢FâÒ ¢f÷&V6‚‚G7–â„vWBÔ'&’„vWBÔFF&÷W'G’G6æwvW2r‚’’’’°¢GvT¶W’Ò·7G&–æuÒG7çvT–@¢–b‚Öæ÷BFÖä6öçF–ç4¶W’‚GvT¶W’’’²6öçF–çVRÐ¢GÒFÖ²GvT¶W•Ð¢2cRÜ*sBã#¢˜žyJŽ8~8n8(Ž8N8î8þ8:Î8*N8*.8*n88Žš^yºî8î8þ8 ¢26öçFVçEFbò7FGW2òv&æ–æw2ò7W'&VçDW†6VÄ†6‚òÆ7E&VæFW&VB¢òföÇVÖW28þŠzn8(ž8®8N8 ¢6WBÔæ÷FU&÷W'G’GwF—FÆRr…·7G&–æuÒG7çF—FÆR¢6WBÔæ÷FU&÷W'G’GwföÇVÖRr…·7G&–æuÒG7çföÇVÖR¢6WBÔæ÷FU&÷W'G’GvVæ&ÆVBr…¶&ööÅÒG7æVæ&ÆVB¢6WBÔæ÷FU&÷W'G’Gv÷&FW"r…¶F÷V&ÆUÒG7æ÷&FW"¢6WBÔæ÷FU&÷W'G’Gv÷&FW$ÖçVÂr…¶&ööÅÒG7æ÷&FW$ÖçVÂ¢6WBÔæ÷FU&÷W'G’GvçVÖ&W&–ætÖöFRr…·7G&–æuÒG7æçVÖ&W&–ætÖöFR¢6WBÔæ÷FU&÷W'G’GvçVÖ&W&–ætÖçVÂr…¶&ööÅÒG7æçVÖ&W&–ætÖçVÂ¢6WBÔæ÷FU&÷W'G’GwWFFVDBr„æWrÔæ÷t—6ò¢Fâ²°¢Ð¢Ç’ÔFVfVÇDçVÖ&W&–æuW%föÇVÖRDÆæwVvRG7BD6FVv÷'¢GföÇ2Ò„vWBÕföÇVÖTÆ—7BDÆæwVvRÂv†W&RÔö&¦V7B²EòÖæRvæöæRrÒ¢Ö&²ÕföÇVÖTæVVG5&V'V–ÆBG7BDÆæwVvRD6FVv÷'’GföÇ2vÆ–÷WB×&W7F÷&VBr~89®8;Î8+Žjx¾h‰8).˜îXë¾8îx«nhX¾8Žh‹¾8~8î8~8òp¢&WGW&âFà¢Ð¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvÆ–÷WBç&W7F÷&VBr…¶÷&FW&VEÔ²6FVv÷'’ÒD6FVv÷'“²6æ6†÷D–BÒE6æ6†÷D–C²VæFõ6æ6†÷D–BÒGVæFô–C²Æ–VEvT6÷VçBÒFÆ–VBÒ¢&WGW&â¶÷&FW&VEÔ²Æ–VEvT6÷VçBÒFÆ–VC²VæFõ6æ6†÷D–BÒGVæFô–BÐ§Ð ¢2ÒÒÒÒiÈ{X%Dn8*.8;Î8*¾8*N89b…cRÜ*sBã’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâæWrÔf–æÄ&6†—fR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuÒEföÇVÖRÂ·7G&–æuÒD'V–ÆD–BÂ·7G&–æuÒD÷WGWEFbÂDÖæ–fW7BÂE6æ6†÷B’°¢2Xj®zØ“¢Kˆi˜.89^8*ž8:¾888~ZèÎh‰8^8¾8n8¾8(’'V–ÆD–B89^8*ž8:¾888Žz{¾X¹^8ž8(¾8 ¢G'’°¢GF&vWBÒ¦ö–âÕF‚„¦ö–âÕF‚„¦ö–âÕF‚„vWBÔ&6†—fU&ö÷BDÆæwVvR’D6FVv÷'’’EföÇVÖR’D'V–ÆD–@¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF&vWB’²&WGW&âGF&vWBÐ¢G7FvRÒGF&vWB²rç7Fv–ærp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚G7FvR’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚G7FvRÕ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚G7FvRÔf÷&6RÂ÷WBÔçVÆÀ¢6÷’Ô—FVÒÔÆ—FW&ÅF‚D÷WGWEFbÔFW7F–æF–öâ„¦ö–âÕF‚G7FvRvf–æÂçFbr’Ôf÷&6P¢G6†Òæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#Sb„¦ö–âÕF‚G7FvRvf–æÂçFbr’¢6WBÔ6öçFVçBÔÆ—FW&ÅF‚„¦ö–âÕF‚G7FvRw6†#SbçG‡Br’ÕfÇVRG6†ÔVæ6öF–ær44”¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚G7FvRvÖæ–fW7Bæ§6öâr’DÖæ–fW7@ ¢2cRÕ¢X{®X©¾8¾8ÎZéþ™©¾8¾KÛþ8>8þ8ÞKˆÞZHž8îh8^Z888).Š‰Ž˜Ë.8ž8(¾8 ¢28>8>8~jx¾˜
+88~8;Î8+þ8).ŠªÞ8þy»N8ž8Ž8X{®X©¾[èÎ8¾XŠ^8:Î8;>888:®8;>8+8ÎZèÎK¨n8~8þZNYŽ8°¢2jÚ>[ÈõDn8~KÛþ8>8n8N8®8B6æ6†÷BòfW'6–öä–B8).Š‰Ž˜Ë.8~8n8~8î8n8 ¢FVçg2Ò¶÷&FW&VEÔ·Ð¢G6÷W&6Uv÷&¶&öö·2Ò‚¢f÷&V6‚‚G7r–â„vWBÔ'&’„vWBÔFF&÷W'G’E6æ6†÷Bw6÷W&6Uv÷&¶&öö·2r‚’’’’°¢FgÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7rw&VæFW$Vçf—&öæÖVçDf–ævW'&–çBrrr¢–b‚FgÖæBÖæ÷BFVçg2ä6öçF–ç2‚Fg’’²FVçg5²FgÒÒ„vWBÔFF&÷W'G’G7rw&VæFW$Vçf—&öæÖVçBrFçVÆÂ’Ð¢G6÷W&6Uv÷&¶&öö·2³ÒG7p¢Ð¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚G7FvRvÖWFFFæ§6öâr’…¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ²'V–ÆD–BÒD'V–ÆD–C²ÆæwVvRÒDÆæwVvS²6FVv÷'’ÒD6FVv÷'“²föÇVÖRÒEföÇVÖP¢&ö¦V7D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’E6æ6†÷Bw&ö¦V7D–Brrr“²'V–ÇDBÒæWrÔæ÷t—6ð¢–çWDf–ævW'&–çBÒ·7G&–æuÒ„vWBÔFF&÷W'G’E6æ6†÷Bvf–ævW'&–çBrrr¢÷WGWEFe6†#SbÒG6†²÷WGWDf–ÆTæÖRÒ´”òåF…Ó£¤vWDf–ÆTæÖR‚D÷WGWEFb¢vT6÷VçBÒ„vWBÔ'&’„vWBÔFF&÷W'G’E6æ6†÷BwvW2r‚’’’ä6÷Vç@¢6÷W&6Uv÷&¶&öö·2Ò‚G6÷W&6Uv÷&¶&öö·2¢W†6VÅ&–çE&öf–ÆUfW'6–öâÒE67&—C¤W†6VÅ&–çE&öf–ÆUfW'6–öà¢&VæFW$Vçf—&öæÖVçG2ÒFVçg0¢6ö×÷6W$Vçf—&öæÖVçBÒ¶÷&FW&VEÔ²4æÖRÒFVçc¤4ôÕUDU$äÔS²÷5fW'6–öâÒ´Vçf—&öæÖVçEÓ£¤õ5fW'6–öâåfW'6–öå7G&–ærÐ¢'V–ÇD'’Ò¶÷&FW&VEÔ²4æÖRÒFVçc¤4ôÕUDU$äÔS²W6W$æÖRÒ"FVçc¥U4U$DôÔ”åÂFVçc¥U4U$äÔR"Ð¢Ò¢Ö÷fRÔ—FVÒÔÆ—FW&ÅF‚G7FvRÔFW7F–æF–öâGF&vWBÔf÷&6P ¢2cRÕ¢–â8þ8*.8;Î8*¾8*N89n8ÎjÚ>[Èþ89^8*ž8:¾888Žz{¾X¹^8~8Þ8n8¾8(žKÙÎ8(¾8 ¢2XXŽ8¾KÙÎ8(¾8Ž8z{¾X¹^8¾ZKiY~8~8þ8Ž8Þ8¾8*.8;Î8*¾8*N89n8ÎxJ8N8î8²–â88jè¾8(¾8 ¢f÷&V6‚‚G7r–âG6÷W&6Uv÷&¶&öö·2’°¢Gv$–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7rwv÷&¶&öö´–Brrr¢G6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7rw6æ6†÷D–Brrr¢GfW'6–öä–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’G7rwfW'6–öä–Brrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Gv$–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6æ6†÷D–B’’²6öçF–çVRÐ¢2cRÕ‚3B“¢–â8).KÙÎ8(Î8®88(Î888Ž8:ž8;>8+n8*þ8+~8:~8;>8).ZKiY~8^8¾8(¾8 ¢2–â8þjÚ>[ÈõDn8ÎXø.xZ~8ž8(²6÷W&6Rö6öçFVçB×Fb8).[èÎiz^8îhè>™šN8¾8(žZèŽ8(¾YJþKˆ8îK¹^{XN8þ8~8.8(®8¢2KÙÎh‰8¾ZKiY~8~8þ8î8â6ö×ÆWFVB8¾8ž8(¾8Ž8Xø.xZ~XXŽ8ÎX˜®™šN8^8(Î[é~8(¾8 ¢G–äö²ÒæWrÕ6æ6†÷E–âDÆæwVvRGv$–BG6æ6†÷D–B‚&f–æÂ×Fe÷³Ò"ÖbD'V–ÆD–B’…¶÷&FW&VEÔ°¢'V–ÆD–BÒD'V–ÆD–C²6æ6†÷D–BÒG6æ6†÷D–C²fW'6–öä–BÒGfW'6–öä–@¢föÇVÖRÒEföÇVÖS²6FVv÷'’ÒD6FVv÷'“²&6†—fUF‚ÒGF&vW@¢Ò¢–b‚Öæ÷BG–äö²’²F‡&÷r‚.8+ž88®88>89~8+~8:~88>88ŽKùÞŠÛr‡–âž8).KÙÎh‰8~8Þ8î8¾8)>8~8~8ó¢³Òò³Ò"ÖbGv$–BÂG6æ6†÷D–B’Ð¢–b‚GfW'6–öä–B’°¢F7–äö²ÒæWrÔ6öçFVçEFe–â„vWBÕv÷&·76UF‚DÆæwVvR’Gv$–BGfW'6–öä–B‚&f–æÂ×Fe÷³Ò"ÖbD'V–ÆD–B’…¶÷&FW&VEÔ°¢'V–ÆD–BÒD'V–ÆD–C²föÇVÖRÒEföÇVÖS²6FVv÷'’ÒD6FVv÷'¢Ò¢–b‚Öæ÷BF7–äö²’²F‡&÷r‚&6öçFVçB×FbKùÞŠÛr‡–âž8).KÙÎh‰8~8Þ8î8¾8)>8~8~8ó¢³Òò³Ò"ÖbGv$–BÂGfW'6–öä–B’Ð¢Ð¢Ð¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvf–æÂæ&6†—fRæ7&VFVBr…¶÷&FW&VEÔ²6FVv÷'’ÒD6FVv÷'“²föÇVÖRÒEföÇVÖS²'V–ÆD–BÒD'V–ÆD–C²F‚ÒGF&vWBÒ¢&WGW&âGF&vW@¢Ò6F6‚°¢2cRÕ¢hú8(®8N8n8^8®8N8.YÎX{®XX>8Î8:Þ8;Î8:¾8988>8*þ8ž8(¾8 ¢G'’²–b…FW7BÕF‚ÔÆ—FW&ÅF‚‚GF&vWB²rç7Fv–ærr’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚‚GF&vWB²rç7Fv–ærr’Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÒÒ6F6‚²Ð¢F‡&÷r‚.iÈ{X%Dn8î8*.8;Î8*¾8*N89n8¾ZKiY~8~8î8~8ó¢"²EòäW†6WF–öâäÖW76vR¢Ð§Ð ¦gVæ7F–öâ&VÖ÷fRÔf–æÄ&6†—fT'F–f7G2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuÒEföÇVÖRÂ·7G&–æuÒD'V–ÆD–B’°¢28:Þ8;Î8:¾8988>8*þi˜.8¾8˜:ŽXˆny¨N8¾8~8Þ8þ8*.8;Î8*¾8*N89n8‚–â8).hè>™šN8ž8(¾8 ¢G'’°¢GF&vWBÒ¦ö–âÕF‚„¦ö–âÕF‚„¦ö–âÕF‚„vWBÔ&6†—fU&ö÷BDÆæwVvR’D6FVv÷'’’EföÇVÖR’D'V–ÆD–@¢f÷&V6‚‚GF‚–â‚GF&vWBÂ‚GF&vWB²rç7Fv–ærr’’’°¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚GF‚’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF‚Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢Ð¢G&ö÷BÒvWBÔ–çWD†—7F÷'•&ö÷BDÆæwVvP¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚G&ö÷B’°¢f÷&V6‚‚Gv$F—"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚G&ö÷BÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢f÷&V6‚‚G6äF—"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚Gv$F—"ägVÆÄæÖRÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢&VÖ÷fRÕ6æ6†÷E–âDÆæwVvRGv$F—"äæÖRG6äF—"äæÖR‚&f–æÂ×Fe÷³Ò"ÖbD'V–ÆD–B¢Ð¢Ð¢Ð¢F7&ö÷BÒ¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’v6öçFVçB×Fbp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚F7&ö÷B’°¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚F7&ö÷BÕ&V7W'6RÔf–ÆRÔf–ÇFW"‚&f–æÂ×Fe÷³Òæ§6öâ"ÖbD'V–ÆD–B’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FbägVÆÄæÖRÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢Ð¢Ð¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâvWBÔf–æÄ&6†—fW2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’’°¢G&ö÷BÒ¦ö–âÕF‚„vWBÔ&6†—fU&ö÷BDÆæwVvR’D6FVv÷'¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G&ö÷B’’²&WGW&â‚’Ð¢F÷WBÒ‚¢f÷&V6‚‚GföÄF—"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚G&ö÷BÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢f÷&V6‚‚F"–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚GföÄF—"ägVÆÄæÖRÔF—&V7F÷'’ÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂ6÷'BÔö&¦V7BæÖRÔFW66VæF–ærÂ6VÆV7BÔö&¦V7BÔf—'7BS’’°¢G'’°¢FÖWFÒ&VBÔ§6öäf–ÆR„¦ö–âÕF‚F"ägVÆÄæÖRvÖWFFFæ§6öâr’FçVÆÀ¢–b‚FçVÆÂÖWFÖWF’²6öçF–çVRÐ¢F÷WB³Ò¶÷&FW&VEÔ°¢'V–ÆD–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÖWFv'V–ÆD–BrF"äæÖR¢föÇVÖRÒ·7G&–æuÒGföÄF—"äæÖP¢'V–ÇDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÖWFv'V–ÇDBrrr¢vT6÷VçBÒ¶–çEÒ„vWBÔFF&÷W'G’FÖWFwvT6÷VçBr¢÷WGWDf–ÆTæÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÖWFv÷WGWDf–ÆTæÖRrrr¢÷WGWEFe6†#SbÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÖWFv÷WGWEFe6†#Sbrrr¢'V–ÇD'’Ò„vWBÔFF&÷W'G’FÖWFv'V–ÇD'’rFçVÆÂ¢F‚Ò·7G&–æuÒF"ägVÆÄæÖP¢Ð¢Ò6F6‚²Ð¢Ð¢Ð¢&WGW&â‚F÷WBÂ6÷'BÔö&¦V7B²·7G&–æuÒEòæ'V–ÇDBÒÔFW66VæF–ær§Ð  ¢2ÒÒÒÒjÚ>[ÈþX{®X©¾88Ž8:ž8;>8+n8*þ8+~8:~8;2…cRÜ*srã"’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâw&—FRÔf–æÄ¦÷W&æÂ…·7G&–æuÒDÆæwVvRÂD¦÷W&æÂ’°¢FF—"ÒvWBÔf–æÅG&ç67F–öäF—"DÆæwVvP¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢6WBÔæ÷FU&÷W'G’D¦÷W&æÂwWFFVDBr„æWrÔæ÷t—6ò¢w&—FRÔ§6öäf–ÆR„¦ö–âÕF‚FF—"‚'³Òæ§6öâ"Öb·7G&–æuÒD¦÷W&æÂçG&ç67F–öä–B’’D¦÷W&æÀ§Ð¦gVæ7F–öâ6WBÔ¦÷W&æÅ†6R…·7G&–æuÒDÆæwVvRÂD¦÷W&æÂÂ·7G&–æuÒE†6R’°¢2cRÜ*srã#¢†6R8þ8Þ8îXšþKÙÎyJŽ8).8ÎZx¾8(8(¾X˜Þ8Þ8¾i»Ž8þ8.[èÎ8~i»Ž8þ8Ž[êžiz~8~8Þ8®8Nz©>8Îjè¾8(¾8 ¢6WBÔæ÷FU&÷W'G’D¦÷W&æÂw†6RrE†6P¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRD¦÷W&æÀ§Ð¦gVæ7F–öâvWBÔ¦÷W&æÅF&vWB‚D¦÷W&æÂÂ·7G&–æuÒEföÇVÖR’°¢f÷&V6‚‚GB–â„vWBÔ'&’D¦÷W&æÂçF&vWG2’’²–b…·7G&–æuÒGBçföÇVÖRÖWEföÇVÖR’²&WGW&âGBÒÐ¢&WGW&âFçVÆÀ§Ð ¦gVæ7F–öâ–çfö¶RÔf–æÄ'V–ÆEG&ç67F–öâ…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒD6FVv÷'’Â·7G&–æuµÕÒEföÇVÖW2’°¢2XÙŽKÙ>X{®X©¾8(.8î8Ž8(8nX{®X©¾8(.8[ø^8®8>8ãiÊÎ8).˜	®8(²ŽXÙŽKÙ>88™©ÎZë>[êžiz~8ÎxJ8Nx«nhX¾8).KÙÎ8(ž8®8Bž8 ¢F6BÒ&WV—&RÕv÷&¶&öö´6FVv÷'’D6FVv÷'¢GF‡2ÒvWBÕF‡0¢Gv÷&·76RÒvWBÕv÷&·76UF‚DÆæwVvP¢G'’²·fö–EÒ…66âÕWFFW2DÆæwVvRFçVÆÂFfÇ6R’Ò6F6‚²Ð ¢FÆÆ÷vVBÒ„vWBÕföÇVÖTÆ—7BDÆæwVvRÂv†W&RÔö&¦V7B²EòÖæRvæöæRrÒ¢G&WVW7FVBÒ‚EföÇVÖW2Âv†W&RÔö&¦V7B²FÆÆ÷vVBÖ6öçF–ç2EòÒ¢–b‚G&WVW7FVBä6÷VçBÖW’²F‡&÷rµ7—7FVÒä&wVÖVçDW†6WF–öåÓ£¦æWr‚wföÇVÖ^8¾8þiÊÎKÙ>8î8þ8þŠ9Î‹k>8).hÈ~Zé®8~8n8þ88^8N8"r’Ð ¢2cRÜ*srã#¢Zûî‹8òvT6÷VçBâ8âföÇVÖR8î8þ8 ¢2vWBÔf–æÄ'V–ÆD–çWE6æ6†÷B8ò89®8;Î8+Ž8)"æò×vW2&Æö6¶W"8¾8ž8(¾8þ8(8¢2Š9Î‹k>8Îz›®8îjŽK»n8~8Î8î8Ž8(8nX{®X©¾8Þ8Î[‹Ž8¾ZKiY~8~8n8~8î8n8 ¢FÆö6µF‚Ò¦ö–âÕF‚Gv÷&·76R‚&Æö6·5Æf–æÂÖ'V–ÆE÷³ÒæÆö6²"ÖbF6B¢&WGW&â–çfö¶RÕv—F„Æö6²FÆö6µF‚°¢G6æ6†÷G2Ò·Ð¢GF&vWG2Ò‚¢G6¶—VBÒ‚¢f÷&V6‚‚Gb–âG&WVW7FVB’°¢G6æÒWFFRÕ7G'V7GW&TÆö6¶VBDÆæwVvR°¢&Ò‚G7B¢Ç’ÔFVfVÇDçVÖ&W&–æuW%föÇVÖRDÆæwVvRG7BF6@¢G6âÒvWBÔf–æÄ'V–ÆD–çWE6æ6†÷BG7BDÆæwVvRGbF6@¢2cRÕ¢8*.8;Î8*¾8*N89nyJŽ8îh8^Z8þ8>8îi˜.x+ž8~Y»®Zé®8ž8(²Ž[èÎ8r7G'V7GW&R8).ŠªÞ8þy»N8^8®8Bž8 ¢G6VVâÒ·Ð¢G7rÒ‚¢f÷&V6‚‚Gr–â„vWBÔ'&’„vWBÔFF&÷W'G’G6âwvW2r‚’’’’°¢Gv–BÒ·7G&–æuÒGrçv÷&¶&öö´–@¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Gv–B’Ö÷"G6VVâä6öçF–ç4¶W’‚Gv–B’’²6öçF–çVRÐ¢G6VVå²Gv–EÒÒGG'VP¢GrÒ„vWBÔ'&’G7Bçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWGv–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚Grä6÷VçBÖW’²6öçF–çVRÐ¢G7r³Ò¶÷&FW&VEÔ°¢v÷&¶&öö´–BÒGv–@¢f–ÆTæÖRÒ·7G&–æuÒGu³Òæf–ÆTæÖP¢6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gu³ÒvÆ7E&VæFW&VE6æ6†÷D–Brrr¢fW'6–öä–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gu³ÒvÆ7E&VæFW&VEfW'6–öä–Brrr¢6÷W&6T†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’Gu³ÒvÆ7E&VæFW&VDW†6VÄ†6‚rrr’¢&VæFW$Vçf—&öæÖVçDf–ævW'&–çBÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gu³Òw&VæFW$Vçf—&öæÖVçDf–ævW'&–çBrrr¢&VæFW$Vçf—&öæÖVçBÒ„vWBÔFF&÷W'G’Gu³Òw&VæFW$Vçf—&öæÖVçBrFçVÆÂ¢Ð¢Ð¢6WBÔæ÷FU&÷W'G’G6âw6÷W&6Uv÷&¶&öö·2r‚G7r¢&WGW&âG6à¢Ð¢–b…¶–çEÒG6æçvT6÷VçBÖÆR’²G6¶—VB³ÒGc²6öçF–çVRÐ¢F&Æö6¶W'2Ò„vWBÔ'&’G6ææ&Æö6¶W'2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ6öFRÖæRvæò×vW2rÒ¢–b‚F&Æö6¶W'2ä6÷VçBÖwB’²F‡&÷r´–çfÆ–D÷W&F–öäW†6WF–öåÓ£¦æWr‚‚'³ÞûÉ§³Ò"Öb„vWBÕföÇVÖTÆ&VÄf÷$ÖW76vRGb’Â·7G&–æuÒF&Æö6¶W'5³ÒæÖW76vR’’Ð¢G6æ6†÷G5²GeÒÒG6æ ¢GF&vWG2³ÒG`¢Ð¢–b‚GF&vWG2ä6÷VçBÖW’²&WGW&â¶÷&FW&VEÔ²'V–ÇBÒ‚“²6¶—VBÒ‚G6¶—VB“²ÖW76vRÒ~X{®X©¾Zûî‹8Î8.8(®8î8¾8)>8"rÒÐ ¢F6ö×÷6W$¦"Ò¦ö–âÕF‚E67&—C¤&ö÷BvÆ–%ÇFf&÷…Å&W÷'EFd6ö×÷6W"æ¦"p¢GFf&÷„¦"Ò¦ö–âÕF‚E67&—C¤&ö÷BvÆ–%ÇFf&÷…ÇFf&÷‚Öæ¦"p¢–b‚Öæ÷B…FW7BÕF‚F6ö×÷6W$¦"’’²F‡&÷ru&W÷'EFd6ö×÷6W"æ¦"8Î8.8(®8î8¾8)>8"rÐ¢–b‚Öæ÷B…FW7BÕF‚GFf&÷„¦"’’²F‡&÷rwFf&÷‚Öæ¦"8Î8.8(®8î8¾8)>8"rÐ ¢GG„–BÒæWrÕ&$–@¢F¦÷W&æÂÒ¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ²G&ç67F–öä–BÒGG„–C²ÆæwVvRÒDÆæwVvS²6FVv÷'’ÒF6@¢7F'FVDBÒæWrÔæ÷t—6ó²†6RÒw&W&VBp¢F&vWG2Ò‚GF&vWG2Âf÷$V6‚Ôö&¦V7B²¶÷&FW&VEÔ²föÇVÖRÒEó²'V–ÆD–BÒ„æWrÕ&$–B“²&6·W7&VFVBÒFfÇ6S²f–ÆU&WÆ6VBÒFfÇ6S²öÆEFd†6‚Òrs²æWuFd†6‚Òrs²W†—7FVBÒFfÇ6S²f–æÅF‚Òrs²&6·WF‚Òrs²FV×F‚ÒrrÒÒ¢&Vf÷&Tf–ævW'&–çG2Ò¶÷&FW&VEÔ·Ð¢öÆEföÇVÖU7FFW2Ò¶÷&FW&VEÔ·Ð¢æWuföÇVÖU7FFW2Ò¶÷&FW&VEÔ·Ð¢Ð¢f÷&V6‚‚Gb–âGF&vWG2’²F¦÷W&æÂæ&Vf÷&Tf–ævW'&–çG5²GeÒÒ·7G&–æuÒG6æ6†÷G5²GeÒæf–ævW'&–çBÐ¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRF¦÷W&æÀ ¢F&6·WF—"Ò¦ö–âÕF‚Gv÷&·76R‚'7FFUÆf–æÂÖ&6·W5Â"²GG„–B¢G'’°¢2RâX{®X©¾XX…Dn8Î™h¾8¾8(Î8n8N8®8N8¾8).8Zûî‹8ž8ž8n8î8Ž8(8nz+®Š¨Ð¢f÷&V6‚‚Gb–âGF&vWG2’°¢GBÒvWBÔ¦÷W&æÅF&vWBF¦÷W&æÂG`¢F÷WDæÖRÒvWBÔ÷WGWDf–ÆTæÖRGb…·7G&–æuÒG6æ6†÷G5²GeÒç&ö¦V7D–B’D6FVv÷'¢F÷WEF‚Ò¦ö–âÕF‚…·7G&–æuÒGF‡2æ÷WGWDF—"’F÷WDæÖP¢6WBÔæ÷FU&÷W'G’GBvf–æÅF‚rF÷WEF€¢6WBÔæ÷FU&÷W'G’GBvW†—7FVBr…¶&ööÅÒ…FW7BÕF‚ÔÆ—FW&ÅF‚F÷WEF‚’¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚F÷WEF‚’°¢FbÒFçVÆÀ¢G'’²FbÒ´”òäf–ÆUÓ£¤÷Vâ‚F÷WEF‚Â´”òäf–ÆTÖöFUÓ£¤÷VâÂ´”òäf–ÆT66W75Ó£¥&VEw&—FRÂ´”òäf–ÆU6†&UÓ£¤æöæR’Ð¢6F6‚²F‡&÷r.X{®X©¾XXŽ8îiÈ{X%Dn8Î™h¾8¾8(Î8n8N8(¾8þ8(Kˆ®i»Ž8Þ8~8Þ8î8¾8)3¢F÷WDæÖR"Ð¢f–æÆÇ’²–b‚Fb’²FbäF—7÷6R‚’ÒÐ¢Ð¢Ð¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRF¦÷W&æÀ ¢2rÓ‚âKˆi˜.89^8*8*N8:¾8Ž{XNx˜€¢f÷&V6‚‚Gb–âGF&vWG2’°¢GBÒvWBÔ¦÷W&æÅF&vWBF¦÷W&æÂG`¢GF×Ò¦ö–âÕF‚…·7G&–æuÒGF‡2æ÷WGWDF—"’‚'æ'V–ÆF–æu÷³Õ÷³Õ÷³'ÒçFb"ÖbGbÂF6BÂGG„–B¢–b…FW7BÕF‚GF×’²&VÖ÷fRÔ—FVÒGF×Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢6WBÔæ÷FU&÷W'G’GBwFV×F‚rGF× ¢G6æÒG6æ6†÷G5²GeÐ¢FÖæ–fW7BÒ¶÷&FW&VEÔ²66†VÖfW'6–öãÓ#²ÆæwVvSÒDÆæwVvS²6FVv÷'“ÒF6C²föÇVÖSÒGc²&ö¦V7D–CÕ·7G&–æuÒG6æç&ö¦V7D–C²–çWDf–ævW'&–çCÕ·7G&–æuÒG6ææf–ævW'&–çC²÷WGWEFcÒGF×²7&VFVDCÔæWrÔæ÷t—6ó²vTçVÖ&W#Õ¶÷&FW&VEÔ¶föçCÒt&–Âs¶föçE6—¦SÓƒ¶&÷GFöÕCÓƒ¶f÷&ÖCÒv‡—†VæFVBs¶6÷VçD†–FFVãÒGG'VWÓ²vW3ÒG6ææÖæ–fW7EvW2Ð¢FÖæ–fW7EF‚Ò¦ö–âÕF‚Gv÷&·76R‚&W‡÷'G5ÆÖæ–fW7E÷³Õ÷³Òæ§6öâ"ÖbGbÂF6B¢w&—FRÔ§6öäf–ÆRFÖæ–fW7EF‚FÖæ–fW7@¢F¦fÒ&W6öÇfRÔ¦fW†P¢G'VâÒ–çfö¶RÔæF—fT6GW&RF¦f‚rÖ7rÂ"F6ö×÷6W$¦#²GFf&÷„¦""Âu&W÷'EFd6ö×÷6W"rÂrÒÖÖæ–fW7BrÂFÖæ–fW7EF‚¢FW†—BÒ¶–çEÒG'VâæW†—D6öFP¢GFW‡BÒ·7G&–æuÒG'VâçFW‡@¢–b‚FW†—BÖæR’²F‡&÷r%Dd&÷Ž{XNx˜Ž8¾ZKiY~8~8î8~8þ8&W†—CÒFW†—FâGFW‡B"Ð¢–b‚Öæ÷B…FW7BÕF‚GF×’Ö÷"„vWBÔ—FVÒGF×’äÆVæwF‚ÖÆR’²F‡&÷r~iÈ{X%Dn8).KÙÎh‰8~8Þ8î8¾8)>8~8~8þ8"rÐ¢6WBÔæ÷FU&÷W'G’GBvæWuFd†6‚r„æ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbGF×’¢6WBÔæ÷FU&÷W'G’GBvÖæ–fW7BrFÖæ–fW7@¢Ð¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRF¦÷W&æÀ ¢2’âf–ævW'&–çBXhÞz+®Š¨Ð¢f÷&V6‚‚Gb–âGF&vWG2’°¢FgFW"ÒWFFRÕ7G'V7GW&TÆö6¶VBDÆæwVvR²&Ò‚G7B’&WGW&âvWBÔf–æÄ'V–ÆD–çWE6æ6†÷BG7BDÆæwVvRGbF6BÐ¢–b…·7G&–æuÒFgFW"æf–ævW'&–çBÖæR·7G&–æuÒF¦÷W&æÂæ&Vf÷&Tf–ævW'&–çG5²GeÒ’°¢F‡&÷ruDnKÙÎh‰KŠÞ8¾89®8;Î8+Žjx¾h‰8î8þ8õDnXZ^X©¾8ÎZHži»N8^8(Î8î8~8þ8.iÈik8îx«nhX¾8~XhÞ[ªnX{®X©¾8~8n8þ88^8N8"p¢Ð¢Ð ¢2â8988>8*þ8*.88>89p¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂv&6·W2Ö7&VFVBp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚F&6·WF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚F&6·WF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢f÷&V6‚‚Gb–âGF&vWG2’°¢GBÒvWBÔ¦÷W&æÅF&vWBF¦÷W&æÂG`¢–b…¶&ööÅÒGBæW†—7FVB’°¢F&²Ò¦ö–âÕF‚F&6·WF—"‚'³ÒçFb"ÖbGb¢6÷’Ô—FVÒÔÆ—FW&ÅF‚…·7G&–æuÒGBæf–æÅF‚’ÔFW7F–æF–öâF&²Ôf÷&6P¢6WBÔæ÷FU&÷W'G’GBv&6·WF‚rF&°¢6WBÔæ÷FU&÷W'G’GBvöÆEFd†6‚r„æ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbF&²’¢Ð¢6WBÔæ÷FU&÷W'G’GBv&6·W7&VFVBrGG'VP¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRF¦÷W&æÀ¢Ð ¢2â[zî8~i»þ8€¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂw&WÆ6–ærÖf–ÆW2p¢f÷&V6‚‚Gb–âGF&vWG2’°¢GBÒvWBÔ¦÷W&æÅF&vWBF¦÷W&æÂG`¢Ö÷fRÔ—FVÒÔÆ—FW&ÅF‚…·7G&–æuÒGBçFV×F‚’ÔFW7F–æF–öâ…·7G&–æuÒGBæf–æÅF‚’Ôf÷&6P¢6WBÔæ÷FU&÷W'G’GBvf–ÆU&WÆ6VBrGG'VP¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRF¦÷W&æÀ¢Ð¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂvf–ÆW2×&WÆ6VBp ¢2"â7G'V7GW&Ri»NikŽ8:Þ88>8*þXh^8rf–ævW'&–çBXhÞz+®Š¨Þ8öÆBöæWr8).XXŽ8¾i»Ž8Þ{X.8Ž8(²¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂw7G'V7GW&RÖ6öÖÖ—GF–ærp¢F6öÖÖ—BÒWFFRÕ7G'V7GW&TÆö6¶VBDÆæwVvR°¢&Ò‚G7B¢f÷&V6‚‚Gb–âGF&vWG2’°¢FgFW"ÒvWBÔf–æÄ'V–ÆD–çWE6æ6†÷BG7BDÆæwVvRGbF6@¢–b…·7G&–æuÒFgFW"æf–ævW'&–çBÖæR·7G&–æuÒF¦÷W&æÂæ&Vf÷&Tf–ævW'&–çG5²GeÒ’²&WGW&â¶÷&FW&VEÔ²6†ævVBÒGG'VS²föÇVÖRÒGbÒÐ¢Ð¢f÷&V6‚‚Gb–âGF&vWG2’°¢F¶W’ÒvWBÕföÇVÖU7FFT¶W’GbF6@¢FöÆBÒvWBÔFF&÷W'G’G7BçföÇVÖW2F¶W’FçVÆÀ¢F¦÷W&æÂæöÆEföÇVÖU7FFW5²GeÒÒB†–b‚FçVÆÂÖWFöÆB’²FçVÆÂÒVÇ6R²¶÷&FW&VEÔ°¢'V–ÇDf–ævW'&–çBÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBv'V–ÇDf–ævW'&–çBrrr¢7FGW2Ò·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBw7FGW2rrr¢÷WGWEFbÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBv÷WGWEFbrrr¢Æ7D'V–ÇDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’FöÆBvÆ7D'V–ÇDBrrr¢7FÆU&V6öç2Ò„vWBÔ'&’„vWBÔFF&÷W'G’FöÆBw7FÆU&V6öç2r‚’’¢ÒÒ¢GBÒvWBÔ¦÷W&æÅF&vWBF¦÷W&æÂG`¢F¦÷W&æÂææWuföÇVÖU7FFW5²GeÒÒ¶÷&FW&VEÔ°¢'V–ÇDf–ævW'&–çBÒ·7G&–æuÒF¦÷W&æÂæ&Vf÷&Tf–ævW'&–çG5²GeÐ¢7FGW2Òv'V–ÇBs²÷WGWEFbÒ·7G&–æuÒGBæf–æÅFƒ²Æ7D'V–ÇDBÒæWrÔæ÷t—6ó²7FÆU&V6öç2Ò‚¢Ð¢Ð¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRF¦÷W&æÀ¢f÷&V6‚‚Gb–âGF&vWG2’°¢F¶W’ÒvWBÕföÇVÖU7FFT¶W’GbF6@¢Gg2ÒvWBÔFF&÷W'G’G7BçföÇVÖW2F¶W’FçVÆÀ¢–b‚FçVÆÂÖWGg2’²Gg2ÒæWrÔV×G•föÇVÖU7FFS²6WBÔæ÷FU&÷W'G’G7BçföÇVÖW2F¶W’Gg2Ð¢FâÒF¦÷W&æÂææWuföÇVÖU7FFW5²GeÐ¢6WBÔæ÷FU&÷W'G’Gg2v'V–ÇDf–ævW'&–çBr…·7G&–æuÒFâæ'V–ÇDf–ævW'&–çB¢6WBÔæ÷FU&÷W'G’Gg2vÆ7D'V–ÇDBr…·7G&–æuÒFâæÆ7D'V–ÇDB¢6WBÔæ÷FU&÷W'G’Gg2v÷WGWEFbr…·7G&–æuÒFâæ÷WGWEFb¢6WBÔæ÷FU&÷W'G’Gg2w7FÆU&V6öç2r‚¢G&VG’ÒvWBÔf–æÄ'V–ÆE&VF–æW72G7BDÆæwVvRGbF6@¢–b‚G&VG’æ&Æö6¶W'2ä6÷VçBÖwB’°¢6WBÔæ÷FU&÷W'G’Gg2w7FGW2rvæVVG2×&V'V–ÆBp¢FBÕ7FÆU&V6öâGg2vW†6VÂ×WFFVBr~XX4W†6VÎ8Îi»Nik8^8(Î8þ8þ8(8Dn8).XhÞKÙÎh‰[èÎ8¾iÈ{X%Dn8).XhÞX{®X©¾8~8n8þ88^8Bp¢ÒVÇ6R²6WBÔæ÷FU&÷W'G’Gg2w7FGW2rv'V–ÇBrÐ¢Ð¢&WGW&â¶÷&FW&VEÔ²6†ævVBÒFfÇ6RÐ¢Ð¢–b…¶&ööÅÒF6öÖÖ—Bæ6†ævVB’²F‡&÷ruDnKÙÎh‰KŠÞ8¾89®8;Î8+Žjx¾h‰8î8þ8õDnXZ^X©¾8ÎZHži»N8^8(Î8î8~8þ8.iÈik8îx«nhX¾8~XhÞ[ªnX{®X©¾8~8n8þ88^8N8"rÐ¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂw7G'V7GW&RÖ6öÖÖ—GFVBp ¢22â8*.8;Î8*¾8*N89n8‚–âŽXj®zØ’¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂv&6†—f–ærp¢F'V–ÇBÒ‚¢f÷&V6‚‚Gb–âGF&vWG2’°¢GBÒvWBÔ¦÷W&æÅF&vWBF¦÷W&æÂG`¢F&6†—fRÒæWrÔf–æÄ&6†—fRDÆæwVvRF6BGb…·7G&–æuÒGBæ'V–ÆD–B’…·7G&–æuÒGBæf–æÅF‚’„vWBÔFF&÷W'G’GBvÖæ–fW7BrFçVÆÂ’G6æ6†÷G5²GeÐ¢6fRÔÆ–÷WE6æ6†÷BDÆæwVvRF6Bvf–æÂÖ'V–ÆBrÂ÷WBÔçVÆÀ¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvf–æÂæ'V–ÇBr…¶÷&FW&VEÔ²6FVv÷'’ÒF6C²föÇVÖRÒGc²'V–ÆD–BÒ·7G&–æuÒGBæ'V–ÆD–C²÷WGWEFbÒ·7G&–æuÒGBæf–æÅF‚Ò¢F'V–ÇB³Ò¶÷&FW&VEÔ²föÇVÖRÒGc²6FVv÷'’ÒF6C²÷WGWEFbÒ·7G&–æuÒGBæf–æÅFƒ²'V–ÆD–BÒ·7G&–æuÒGBæ'V–ÆD–C²&6†—fUF‚ÒF&6†—fS²–çWDf–ævW'&–çBÒ·7G&–æuÒF¦÷W&æÂæ&Vf÷&Tf–ævW'&–çG5²GeÒÐ¢Ð¢6WBÔ¦÷W&æÅ†6RDÆæwVvRF¦÷W&æÂv6ö×ÆWFVBp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚F&6·WF—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚F&6·WF—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢&WGW&â¶÷&FW&VEÔ²'V–ÇBÒ‚F'V–ÇB“²6¶—VBÒ‚G6¶—VB“²G&ç67F–öä–BÒGG„–BÐ¢Ò6F6‚°¢f÷&V6‚‚GB–â„vWBÔ'&’F¦÷W&æÂçF&vWG2’’²&VÖ÷fRÔf–æÄ&6†—fT'F–f7G2DÆæwVvRF6B…·7G&–æuÒGBçföÇVÖR’…·7G&–æuÒGBæ'V–ÆD–B’Ð¢&W7F÷&RÔf–æÅG&ç67F–öâDÆæwVvRF¦÷W&æÀ¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRvf–æÂæ'V–ÆBæf–ÆVBr…¶÷&FW&VEÔ²6FVv÷'’ÒF6C²G&ç67F–öä–BÒGG„–C²ÖW76vRÒEòäW†6WF–öâäÖW76vRÒ¢F‡&÷p¢Ð¢Ð§Ð ¦gVæ7F–öâ&W7F÷&RÔf–æÅG&ç67F–öâ…·7G&–æuÒDÆæwVvRÂD¦÷W&æÂ’°¢2cRÜ*t"Ó¢[êžiz~XŠNZé®8þ89^8:ž8+8~8þ8®8þZéþ89^8*8*N8:¾8î88þ88>8+~8:^8).jÚ>8Ž8ž8(¾8 ¢2f–ÆU&WÆ6VC×G'VR8).i»Ž8þX˜Þ8¾‰Þ88(¾z©>8Î8.8(¾8þ8(8 ¢G'’°¢G†6RÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦÷W&æÂw†6Rrrr¢f÷&V6‚‚GB–â„vWBÔ'&’D¦÷W&æÂçF&vWG2’’°¢Ff–æÂÒ·7G&–æuÒ„vWBÔFF&÷W'G’GBvf–æÅF‚rrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Ff–æÂ’’²6öçF–çVRÐ¢GF×Ò·7G&–æuÒ„vWBÔFF&÷W'G’GBwFV×F‚rrr¢–b‚GF×ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚GF×’’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚GF×Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢FæWt†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’GBvæWuFd†6‚rrr’¢FöÆD†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’GBvöÆEFd†6‚rrr’¢FW†—7FVBÒ¶&ööÅÒ„vWBÔFF&÷W'G’GBvW†—7FVBrFfÇ6R¢F&6·WÒ·7G&–æuÒ„vWBÔFF&÷W'G’GBv&6·WF‚rrr¢F7W'&VçBÒrp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚Ff–æÂ’²F7W'&VçBÒæ÷&ÖÆ—¦RÔf–ÆT†6‚„æWrÕ6†#SbFf–æÂ’Ð ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçB’’°¢–b‚Öæ÷BFW†—7FVB’²6öçF–çVRÒ2XX>8¾8(žxJ8þ8K¸®8(.xJ8@¢–b‚F&6·WÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚F&6·W’’²6÷’Ô—FVÒÔÆ—FW&ÅF‚F&6·WÔFW7F–æF–öâFf–æÂÔf÷&6RÐ¢6öçF–çVP¢Ð¢–b‚FæWt†6‚ÖæBF7W'&VçBÖWFæWt†6‚’°¢–b‚Öæ÷BFW†—7FVB’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚Ff–æÂÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢VÇ6V–b‚F&6·WÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚F&6·W’’²6÷’Ô—FVÒÔÆ—FW&ÅF‚F&6·WÔFW7F–æF–öâFf–æÂÔf÷&6RÐ¢6öçF–çVP¢Ð¢–b‚FöÆD†6‚ÖæBF7W'&VçBÖWFöÆD†6‚’²6öçF–çVRÒ2iÊ®[zî8~i»þ8€¢28ž8(Î8Ž8(.Kˆˆ{N8~8®8C¢ˆz®X¹^8~Kˆ®i»Ž8Þ8~8®8N8 ¢6WBÔæ÷FU&÷W'G’D¦÷W&æÂw†6RrvÖçVÂ×&V6÷fW'’×&WV—&VBp¢6WBÔæ÷FU&÷W'G’D¦÷W&æÂvÖçVÅ&V6÷fW'•&V6öâr‚.X{®X©¾XX…Dn8ÎŠ‰Ž˜Ë.8^8(Î8þ8ž8îx«nhX¾8Ž8(.Kˆˆ{N8~8î8¾8)3¢"²Ff–æÂ¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRD¦÷W&æÀ¢&WGW&à¢Ð¢27G'V7GW&R8î[{¾8Þh‹¾8rŽZûî‹föÇVÖ^8îš^yºî88¢–b„‚w7G'V7GW&RÖ6öÖÖ—GF–ærrÂw7G'V7GW&RÖ6öÖÖ—GFVBrÂv&6†—f–ærr’Ö6öçF–ç2G†6R’°¢FöÆG2ÒvWBÔFF&÷W'G’D¦÷W&æÂvöÆEföÇVÖU7FFW2rFçVÆÀ¢FæWw2ÒvWBÔFF&÷W'G’D¦÷W&æÂvæWuföÇVÖU7FFW2rFçVÆÀ¢–b‚FçVÆÂÖæRFöÆG2’°¢F6BÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦÷W&æÂv6FVv÷'’rrr¢WFFRÕ7G'V7GW&TÆö6¶VBDÆæwVvR°¢&Ò‚G7B¢f÷&V6‚‚GB–â„vWBÔ'&’D¦÷W&æÂçF&vWG2’’°¢GbÒ·7G&–æuÒGBçföÇVÖP¢F¶W’ÒvWBÕföÇVÖU7FFT¶W’GbF6@¢Gg2ÒvWBÔFF&÷W'G’G7BçföÇVÖW2F¶W’FçVÆÀ¢–b‚FçVÆÂÖWGg2’²6öçF–çVRÐ¢FæWu7FFRÒvWBÔFF&÷W'G’FæWw2GbFçVÆÀ¢–b‚FçVÆÂÖæRFæWu7FFRÖæB·7G&–æuÒ„vWBÔFF&÷W'G’Gg2v'V–ÇDf–ævW'&–çBrrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’FæWu7FFRv'V–ÇDf–ævW'&–çBrrr’’²6öçF–çVRÐ¢FöÆE7FFRÒvWBÔFF&÷W'G’FöÆG2GbFçVÆÀ¢–b‚FçVÆÂÖWFöÆE7FFR’²6öçF–çVRÐ¢6WBÔæ÷FU&÷W'G’Gg2v'V–ÇDf–ævW'&–çBr…·7G&–æuÒ„vWBÔFF&÷W'G’FöÆE7FFRv'V–ÇDf–ævW'&–çBrrr’¢6WBÔæ÷FU&÷W'G’Gg2w7FGW2r…·7G&–æuÒ„vWBÔFF&÷W'G’FöÆE7FFRw7FGW2rvæ÷BÖ'V–ÇBr’¢6WBÔæ÷FU&÷W'G’Gg2v÷WGWEFbr…·7G&–æuÒ„vWBÔFF&÷W'G’FöÆE7FFRv÷WGWEFbrrr’¢6WBÔæ÷FU&÷W'G’Gg2vÆ7D'V–ÇDBr…·7G&–æuÒ„vWBÔFF&÷W'G’FöÆE7FFRvÆ7D'V–ÇDBrrr’¢6WBÔæ÷FU&÷W'G’Gg2w7FÆU&V6öç2r„vWBÔ'&’„vWBÔFF&÷W'G’FöÆE7FFRw7FÆU&V6öç2r‚’’¢Ð¢ÒÂ÷WBÔçVÆÀ¢Ð¢Ð¢6WBÔæ÷FU&÷W'G’D¦÷W&æÂw†6Rrw&öÆÆVBÖ&6²p¢w&—FRÔf–æÄ¦÷W&æÂDÆæwVvRD¦÷W&æÀ¢2[{¾8Þh‹¾8~8¾KÛþ8N{X.8Ž8þizuDn8988>8*þ8*.88>89~8).jè¾8^8®8N8 ¢&VÖ÷fRÔf–æÅG&ç67F–öä&6·WF—"DÆæwVvR…·7G&–æuÒ„vWBÔFF&÷W'G’D¦÷W&æÂwG&ç67F–öä–Brrr’¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâ&V6÷fW"Ôf–æÅG&ç67F–öç2…·7G&–æuÒDÆæwVvR’°¢2cS¢‹[~X¹^i˜.[êžiz~8("f–æÂÖ'V–ÆB8:Þ88>8*þ8).Xùn8(²ŽŠH~i[8+^8;Î898;Î8ÎYÎ8Ž[êžiz~8).‹[8(ž8¾8®8Bž8 ¢G'’°¢FF—"ÒvWBÔf–æÅG&ç67F–öäF—"DÆæwVvP¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&âÐ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢F¢Ò&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖWF¢’²6öçF–çVRÐ¢G†6RÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢w†6Rrrr¢–b„‚v6ö×ÆWFVBrÂw&öÆÆVBÖ&6²r’Ö6öçF–ç2G†6R’°¢2ZèÎK¨nkˆŽ8òþ[{¾8Þh‹¾8~kˆŽ8þ8~8þ8988>8*þ8*.88>89~8þKˆÞŠh8.X˜ÞY¹îX˜®™šN8¾ZKiY~8~8n8N8n8(.‹[~X¹^i˜.8¾XhÞŠšnŠÎ8ž8(¾8 ¢28+Ž8:>8;Î88®8:¾iÊÎKÙ>8ó3iz^jè¾8~8ÖçVÂ×&V6÷fW'’×&WV—&VB8þh¸^[Ù>ˆ^8Îz+®Š¨Þ8ž8(¾8î8~jè¾8ž8 ¢G'’°¢&VÖ÷fRÔf–æÅG&ç67F–öä&6·WF—"DÆæwVvR…·7G&–æuÒ„vWBÔFF&÷W'G’F¢wG&ç67F–öä–BrFbä&6TæÖR’¢–b‚FbäÆ7Ew&—FUF–ÖUWF2ÖÇB´FFUF–ÖUÓ£¥WF4æ÷räFDF—2‚Ó3’’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚FbägVÆÄæÖRÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢Ð¢Ò6F6‚²Ð¢6öçF–çVP¢Ð¢–b‚G†6RÖWvÖçVÂ×&V6÷fW'’×&WV—&VBr’²6öçF–çVRÐ¢F6BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢v6FVv÷'’rrr¢FÆö6µF‚Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’‚&Æö6·5Æf–æÂÖ'V–ÆE÷³ÒæÆö6²"ÖbF6B¢F‚ÒG'’Ô7V—&TÆö6´†æFÆRFÆö6µF€¢–b‚FçVÆÂÖWF‚’²6öçF–çVRÐ¢G'’°¢2cRÕ‚3‚“¢˜	®[‹Ž8îZKiY~{XÎ‹zò„–çfö¶RÔf–æÄ'V–ÆEG&ç67F–öâ8â6F6‚ž8ŽYÎ8Ž8þ8¢2‹[~X¹^i˜.[êžiz~8~8(.˜:ŽXˆny¨N8¾8~8Þ8þ8*.8;Î8*¾8*N89b÷–â8).hè>™šN8~8n8¾8(ž[{¾8Þh‹¾8ž8 ¢2&6†—f–ærKŠÞ8¾[Ë~X‹n{X.K¨n8ž8(¾8Ž8Kˆ˜:Ž8î[{¾888*.8;Î8*¾8*N89b÷–â8Îjè¾8(®87G'V7GW&R88[{¾8Þh‹¾8(¾8 ¢f÷&V6‚‚GB–â„vWBÔ'&’F¢çF&vWG2’’²&VÖ÷fRÔf–æÄ&6†—fT'F–f7G2DÆæwVvRF6B…·7G&–æuÒGBçföÇVÖR’…·7G&–æuÒGBæ'V–ÆD–B’Ð¢&W7F÷&RÔf–æÅG&ç67F–öâDÆæwVvRF ¢Òf–æÆÇ’²&VÆV6RÔÆö6´†æFÆRF‚Ð¢Ð¢Ò6F6‚²Ð§Ð ¦gVæ7F–öâvWBÕföÇVÖTÆ&VÄf÷$ÖW76vR…·7G&–æuÒEföÇVÖR’°¢7v—F6‚‚EföÇVÖR’°¢v¦ÖÖ–âr²&WGW&â~iÊÎKÙ2rÒv¦ÖVæF—‚r²&WGW&â~Š9Î‹k2rÐ¢vVâÖÖ–âr²&WGW&âtÖ–ârÒvVâÖVæF—‚r²&WGW&âtVæF—‚rÐ¢FVfVÇB²&WGW&âEföÇVÖRÐ¢Ð§Ð  ¢2ÒÒÒÒ’Š9ÎXª’…cR’ÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÒÐ ¦gVæ7F–öâvWBÔ†—7F÷'•F–ÖVÆ–æR…·7G&–æuÒDÆæwVvRÂ¶–çEÒDÆ–Ö—B’°¢G'’°¢FF—"Ò¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’v†—7F÷'•ÆWfVçG2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&â‚’Ð¢F÷WBÒ‚¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂ6÷'BÔö&¦V7BæÖRÔFW66VæF–ærÂ6VÆV7BÔö&¦V7BÔf—'7BDÆ–Ö—B’’°¢G'’°¢F¢Ò&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖæRF¢’²F÷WB³ÒF¢Ð¢Ò6F6‚²Ð¢Ð¢&WGW&âF÷W@¢Ò6F6‚²&WGW&â‚’Ð§Ð  ¦gVæ7F–öâ&W6öÇfRÔ6öçFVçEFe6†VWEF„W†7B…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒE6†VWDæÖR’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EfW'6–öä–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6†VWDæÖR’’²&WGW&ârrÐ¢Gv÷&·76RÒvWBÕv÷&·76UF‚DÆæwVvP¢FF—"ÒvWBÔ6öçFVçEFefW'6–öäF—"Gv÷&·76REv÷&¶&öö´–B„76W'BÕ6fU7F÷&vU6VvÖVçBEfW'6–öä–BwfW'6–öä–Br¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²&WGW&ârrÐ¢G6fTæÖRÒ·&VvW…Ó£¥&WÆ6R‚E6†VWDæÖRÂuµãÓ”Õ¦×¥Ò²rÂrÒr¢f÷&V6‚‚Ff–ÆR–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢çFbrÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢–b…·7G&–æuÓ£¤WVÇ2…·7G&–æuÒFf–ÆRä&6TæÖRÂE6†VWDæÖRÂµ7G&–æt6ö×&—6öåÓ£¤÷&F–æÄ–væ÷&T66R’Ö÷ ¢·7G&–æuÓ£¤WVÇ2…·7G&–æuÒFf–ÆRä&6TæÖRÂG6fTæÖRÂµ7G&–æt6ö×&—6öåÓ£¤÷&F–æÄ–væ÷&T66R’’°¢FgVÆÂÒ´”òåF…Ó£¤vWDgVÆÅF‚‚Ff–ÆRägVÆÄæÖR¢G&ö÷BÒ´”òåF…Ó£¤vWDgVÆÅF‚‚Gv÷&·76R¢–b‚Öæ÷BG&ö÷BäVæG5v—F‚…´”òåF…Ó£¤F—&V7F÷'•6W&F÷$6†"’’²G&ö÷B³Ò´”òåF…Ó£¤F—&V7F÷'•6W&F÷$6†"Ð¢–b‚FgVÆÂå7F'G5v—F‚‚G&ö÷BÂµ7G&–æt6ö×&—6öåÓ£¤÷&F–æÄ–væ÷&T66R’’²&WGW&âFgVÆÂÐ¢Ð¢Ð¢&WGW&ârp§Ð ¦gVæ7F–öâvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–B’°¢G&W7VÇBÒ¶÷&FW&VEÔ°¢fW'6–öä–BÒ·7G&–æuÒEfW'6–öä–@¢f—7VÄ†6„f–Æ&ÆRÒFfÇ6P¢6öçFVçEFdf–Æ&ÆRÒFfÇ6P¢&VG’ÒFfÇ6P¢Ö—76–æu6†VWG2Ò‚¢&V6öâÒrp¢Ð¢F†6†W2ÒvWBÕf—7VÄ†6†W2DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–BEfW'6–öä–@¢–b‚FçVÆÂÖWF†6†W2’°¢G&W7VÇBç&V6öâÒ~yK¾X8þ88þ88>8+~8:^8ÎKùÞZÙŽ8^8(Î8n8N8î8¾8)>8"p¢&WGW&â·67W7FöÖö&¦V7EÒG&W7VÇ@¢Ð¢G&W7VÇBçf—7VÄ†6„f–Æ&ÆRÒGG'VP¢G6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F†6†W2w6†VWG2r‚’’¢–b‚G6†VWG2ä6÷VçBÖW’°¢G&W7VÇBç&V6öâÒ~jùN‹È>Zûî‹8+~8;Î88Ž8îyK¾X8þ88þ88>8+~8:^8Î8.8(®8î8¾8)>8"p¢&WGW&â·67W7FöÖö&¦V7EÒG&W7VÇ@¢Ð¢FÖ—76–ærÒ‚¢f÷&V6‚‚G6†VWB–âG6†VWG2’°¢FæÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’G6†VWBw6†VWDæÖRrrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FæÖR’’°¢FÖ—76–ær³Òu·6†VWDæÖRÖ—76–æuÒp¢6öçF–çVP¢Ð¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚…&W6öÇfRÔ6öçFVçEFe6†VWEF„W†7BDÆæwVvREv÷&¶&öö´–BEfW'6–öä–BFæÖR’’’²FÖ—76–ær³ÒFæÖRÐ¢Ð¢G&W7VÇBæÖ—76–æu6†VWG2Ò‚FÖ—76–ær¢G&W7VÇBæ6öçFVçEFdf–Æ&ÆRÒ‚FÖ—76–ærä6÷VçBÖW¢G&W7VÇBç&VG’Ò…¶&ööÅÒG&W7VÇBçf—7VÄ†6„f–Æ&ÆRÖæB¶&ööÅÒG&W7VÇBæ6öçFVçEFdf–Æ&ÆR¢–b‚Öæ÷B¶&ööÅÒG&W7VÇBç&VG’’°¢G&W7VÇBç&V6öâÒB†–b‚FÖ—76–ærä6÷VçBÖwB’²~YÎ8Ž8:Î8;>888:®8;>8+K‰nKº>8æ6öçFVçBDn8ÎKˆÞ‹k>8~8n8N8î8ž8"rÒVÇ6R²v6öçFVçBDn8ÎKùÞZÙŽ8^8(Î8n8N8î8¾8)>8"rÒ¢Ð¢&WGW&â·67W7FöÖö&¦V7EÒG&W7VÇ@§Ð  ¦gVæ7F–öâvWBÕ6æ6†÷E7VÖÖ&–W2…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Ev÷&¶&öö´–B’’²&WGW&â‚’Ð¢F÷WBÒ‚¢f÷&V6‚‚F–B–â„vWBÕ6æ6†÷D–G2DÆæwVvREv÷&¶&öö´–B’’°¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BF–@¢–b‚FçVÆÂÖWFÒ’²6öçF–çVRÐ¢G7FFRÒvWBÕ6æ6†÷E6÷W&6U7FFRDÆæwVvREv÷&¶&öö´–BF–@¢GfW'6–öç2Ò„vWBÕ&VæFW%fW'6–öä–G2DÆæwVvREv÷&¶&öö´–BF–B¢G&VfW'&VBÒrp¢Gf—7VÄf–Æ&ÆRÒFfÇ6P¢F6öçFVçDf–Æ&ÆRÒFfÇ6P¢G&V6öâÒuDnKÙÎh‰kˆŽ8þ8îjùN‹È>Xúþˆ;Þ8®x˜Ž8Î8.8(®8î8¾8)>8"p¢f÷&V6‚‚GfW'6–öä–B–â‚GfW'6–öç2Â6÷'BÔö&¦V7BÔFW66VæF–ær’’°¢Ff–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BF–B…·7G&–æuÒGfW'6–öä–B¢–b…¶&ööÅÒFf–Æ&–Æ—G’çf—7VÄ†6„f–Æ&ÆR’²Gf—7VÄf–Æ&ÆRÒGG'VRÐ¢–b…¶&ööÅÒFf–Æ&–Æ—G’æ6öçFVçEFdf–Æ&ÆR’²F6öçFVçDf–Æ&ÆRÒGG'VRÐ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&VfW'&VB’ÖæB¶&ööÅÒFf–Æ&–Æ—G’ç&VG’’°¢G&VfW'&VBÒ·7G&–æuÒGfW'6–öä–@¢G&V6öâÒrp¢ÒVÇ6V–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&VfW'&VB’ÖæBÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R…·7G&–æuÒFf–Æ&–Æ—G’ç&V6öâ’’°¢G&V6öâÒ·7G&–æuÒFf–Æ&–Æ—G’ç&V6öà¢Ð¢Ð¢F÷WB³Ò¶÷&FW&VEÔ°¢6æ6†÷D–BÒF–@¢FWFV7FVDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÒvFWFV7FVDBrrr¢6GW&U&V6öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÒv6GW&U&V6öârrr¢6÷W&6T†6‚Ò·7G&–æuÒ„vWBÔFF&÷W'G’FÒw6÷W&6T†6‚rrr¢6÷W&6U&WF–æVBÒ¶&ööÅÒG7FFRç6÷W&6U&WF–æV@¢–ç2Ò„vWBÕ6æ6†÷E–ç2DÆæwVvREv÷&¶&öö´–BF–B¢&VæFW%fW'6–öä–G2Ò‚GfW'6–öç2¢f—7VÄ6ö×&U&VG’Ò‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&VfW'&VB’¢&VfW'&VEfW'6–öä–BÒG&VfW'&V@¢f—7VÄ†6„f–Æ&ÆRÒGf—7VÄf–Æ&ÆP¢6öçFVçEFdf–Æ&ÆRÒF6öçFVçDf–Æ&ÆP¢Væf–Æ&ÆU&V6öâÒG&V6öà¢Ð¢Ð¢&WGW&â‚F÷WBÂ6÷'BÔö&¦V7B²·7G&–æuÒEòç6æ6†÷D–BÒÔFW66VæF–ær§Ð  ¦gVæ7F–öâvWBÕ7F÷&VD6ö×&—6öâ€¢·7G&–æuÒDÆæwVvRÀ¢·7G&–æuÒEv÷&¶&öö´–BÀ¢·7G&–æuÒDg&öÕ6æ6†÷D–BÀ¢·7G&–æuÒEFõ6æ6†÷D–BÀ¢·7G&–æuÒDg&öÕfW'6–öä–BÒrrÀ¢·7G&–æuÒEFõfW'6–öä–BÒrrÀ¢·7G&–æuÒE66÷RÒv†—7F÷'’p¢’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Ev÷&¶&öö´–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Dg&öÕ6æ6†÷D–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EFõ6æ6†÷D–B’’²&WGW&âFçVÆÂÐ¢GfW'6–öç2Ò–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EFõfW'6–öä–B’’²‚EFõfW'6–öä–B’ÒVÇ6R²„vWBÕ&VæFW%fW'6–öä–G2DÆæwVvREv÷&¶&öö´–BEFõ6æ6†÷D–B’Ð¢f÷&V6‚‚GfW"–âGfW'6–öç2’°¢FF—"Ò¦ö–âÕF‚„vWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BEFõ6æ6†÷D–B…·7G&–æuÒGfW"’’v6ö×&—6öç2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²6öçF–çVRÐ¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÂ6÷'BÔö&¦V7BÆ7Ew&—FUF–ÖUWF2ÔFW66VæF–ær’’°¢G'’°¢F6æF–FFRÒ&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖWF6æF–FFR’²6öçF–çVRÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRw66÷Rrrr’ÖæRE66÷R’²6öçF–çVRÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRv&6VÆ–æU6æ6†÷D–Brrr’ÖæRDg&öÕ6æ6†÷D–B’²6öçF–çVRÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRv7W'&VçE6æ6†÷D–Brrr’ÖæREFõ6æ6†÷D–B’²6öçF–çVRÐ¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Dg&öÕfW'6–öä–B’Öæ@¢·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRv&6VÆ–æUfW'6–öä–Brrr’ÖæRDg&öÕfW'6–öä–B’²6öçF–çVRÐ¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EFõfW'6–öä–B’Öæ@¢·7G&–æuÒ„vWBÔFF&÷W'G’F6æF–FFRv7W'&VçEfW'6–öä–Brrr’ÖæREFõfW'6–öä–B’²6öçF–çVRÐ¢&WGW&âF6æF–FFP¢Ò6F6‚²Ð¢Ð¢Ð¢&WGW&âFçVÆÀ§Ð ¦gVæ7F–öâ6W'fRÔ†—7F÷'”6öçFVçEFb‚D6öçFW‡BÂ·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒE6†VWDæÖRÂ·7G&–æuÒE6æ6†÷D–BÒrr’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Ev÷&¶&öö´–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6†VWDæÖR’’°¢F‡&÷rwv÷&¶&öö´–Bò6†VWDæÖR8Î[ø^Šh8~8ž8"p¢Ð¢G6fUv÷&¶&öö´–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEv÷&¶&öö´–Bwv÷&¶&öö´–Bp¢G6fU6æ6†÷D–BÒrp¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6æ6†÷D–B’’²G6fU6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBE6æ6†÷D–Bw6æ6†÷D–BrÐ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EfW'6–öä–B’’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6fU6æ6†÷D–B’’²F‡&÷rwfW'6–öä–B8î8þ8ò6æ6†÷D–B8Î[ø^Šh8~8ž8"rÐ¢EfW'6–öä–BÒvWBÕ&VfW'&VD†—7F÷'•&VæFW%fW'6–öâDÆæwVvRG6fUv÷&¶&öö´–BG6fU6æ6†÷D–@¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚EfW'6–öä–B’’²F‡&÷r~hÈ~Zé®8~8þjIÎyú^x˜Ž8åDn8þKùÞhÈ8^8(Î8n8N8î8¾8)>8"rÐ¢Ð¢G6fUfW'6–öä–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEfW'6–öä–BwfW'6–öä–Bp¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6fU6æ6†÷D–B’Öæ@¢„vWBÕ&VæFW%fW'6–öä–G2DÆæwVvRG6fUv÷&¶&öö´–BG6fU6æ6†÷D–B’Öæ÷F6öçF–ç2G6fUfW'6–öä–B’°¢F‡&÷r~hÈ~Zé®8~8õDnK‰nKº>8þ88>8î[^jÛNx˜Ž8¾[î8~8n8N8î8¾8)>8"p¢Ð¢FgVÆÂÒ&W6öÇfRÔ6öçFVçEFe6†VWEF„W†7BDÆæwVvRG6fUv÷&¶&öö´–BG6fUfW'6–öä–BE6†VWDæÖP¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FgVÆÂ’’²F‡&÷r~hÈ~Zé®8~8þK‰nKº>8åDn8ÎŠh¾8N8¾8(®8î8¾8)>8"rÐ¢w&—FRÔ'—FW5&W7öç6RD6öçFW‡B#…´”òäf–ÆUÓ£¥&VDÆÄ'—FW2‚FgVÆÂ’’vÆ–6F–öâ÷Fbp§Ð ¦gVæ7F–öâvWBÔWFõ7FFU7VÖÖ'’…·7G&–æuÒDÆæwVvR’°¢G6WGF–æw2ÒvWBÔWFõ&VæFW%6WGF–æw0¢GöÆ–7’ÒvWBÕv÷&·76UöÆ–7¢F—FV×2Ò‚¢G'’°¢FF—"ÒvWBÔWFõ7FFTF—"DÆæwVvP¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’°¢f÷&V6‚‚Fb–â„vWBÔ6†–ÆD—FVÒÔÆ—FW&ÅF‚FF—"Ôf–ÆRÔf–ÇFW"r¢æ§6öârÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVR’’°¢F¢Ò&VBÔ§6öäf–ÆRFbägVÆÄæÖRFçVÆÀ¢–b‚FçVÆÂÖWF¢’²6öçF–çVRÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F¢w7FFRrrr’ÖWv–FÆRr’²6öçF–çVRÐ¢F—FV×2³Ò¶÷&FW&VEÔ°¢v÷&¶&öö´–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢wv÷&¶&öö´–BrFbä&6TæÖR¢7FFRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢w7FFRrrr¢FVfW%&V6öâÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢vFVfW%&V6öârrr¢V–WDFVFÆ–æRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢wV–WDFVFÆ–æRrrr¢f—'7DFWFV7FVDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢vf—'7DFWFV7FVDBrrr¢÷væW%4æÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¢v÷væW%4æÖRrrr¢Ð¢Ð¢Ð¢Ò6F6‚²Ð¢&WGW&â¶÷&FW&VEÔ°¢Væ&ÆVBÒ¶&ööÅÒG6WGF–æw2æVæ&ÆV@¢–çWD†—7F÷'”&÷fVBÒ¶&ööÅÒ„vWBÔFF&÷W'G’GöÆ–7’v–çWD†—7F÷'”&÷fVBrFfÇ6R¢6÷W&6U&WFVçF–öä&÷fVBÒ¶&ööÅÒ…FW7BÕ6÷W&6U&WFVçF–öäVæ&ÆVB¢V–WEW&–öE6V6öæG2Ò¶–çEÒG6WGF–æw2çV–WEW&–öE6V6öæG0¢66†VGVÆW%'Vææ–ærÒ…FW7BÔWFõ66†VGVÆW%&ö6W75'Vææ–ær¢†—7F÷'•6—¦TÖ"Ò„vWBÔ–çWD†—7F÷'•6—¦TÖ"DÆæwVvR¢6ögD6ÖVv'—FW2Ò¶–çEÒ„vWBÔ–çWD†—7F÷'•6WGF–æw2’ç6ögD6ÖVv'—FW0¢—FV×2Ò‚F—FV×2¢Ð§Ð ¦gVæ7F–öâ&WVW7BÔWFõ'Väæ÷r…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–B’°¢2[»niÉþKŠÞ8î89n88>8*þ8).XÛ>i˜.ZéþŠÎ8ž8(¾8.8+ž8+8+Ž8:^8;Î8:ž8;ÎZÙ89~8:Þ8+¾8+ž8ÎjÊ8âF–6²8~h»î8n8 ¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Ev÷&¶&öö´–B’’²F‡&÷rwv÷&¶&öö´–B8Î[ø^Šh8~8ž8"rÐ¢G7FFRÒ&VBÔWFõ7FFRDÆæwVvREv÷&¶&öö´–@¢–b‚FçVÆÂÖWG7FFR’²G7FFRÒæWrÔWFõ7FFREv÷&¶&öö´–BÐ¢6WBÔæ÷FU&÷W'G’G7FFRwV–WDFVFÆ–æRr…´FFUF–ÖUÓ£¥WF4æ÷räFE6V6öæG2‚Ó’åFõ7G&–ær‚vòr’¢6WBÔæ÷FU&÷W'G’G7FFRw7F&ÆT6÷VçBr“¢6WBÔæ÷FU&÷W'G’G7FFRvFVfW%&V6öârrp¢6WBÔæ÷FU&÷W'G’G7FFRw7FFRrwv—F–ærp¢w&—FRÔWFõ7FFRDÆæwVvREv÷&¶&öö´–BG7FFP¢&WGW&â¶÷&FW&VEÔ²v÷&¶&öö´–BÒEv÷&¶&öö´–C²&WVW7FVBÒGG'VRÐ§Ð ¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ¢2cR[zîXˆnŠ›>{K8;¾ŠinŠi®jùN‹È0¢2ÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÓÐ ¢E67&—C¤F–fdFWF–ÄÆv÷&—F†ÕfW'6–öâÒ¢E67&—C¤F–fdFWF–ÄG’Ò# ¢E67&—C¤F–fdFWF–ÅF‡&W6†öÆBÒ#@¢E67&—C¤F–fdFWF–ÄÖ–æ–×VÕ&Vv–öå—†VÇ2Ò#@¢E67&—C¤F–fdFWF–ÅFF–ærÒP ¦gVæ7F–öâvWBÔF–fe6æ6†÷DFFR…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒDfÆÆ&6²Òrr’°¢G'’°¢FÒÒvWBÕ6æ6†÷DÖæ–fW7BDÆæwVvREv÷&¶&öö´–BE6æ6†÷D–@¢FFWFV7FVBÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÒvFWFV7FVDBrrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FFWFV7FVB’’²&WGW&âFFWFV7FVBÐ¢Ò6F6‚²Ð¢&WGW&âDfÆÆ&6°§Ð  ¦gVæ7F–öâvWBÕ&VfW'&VD†—7F÷'•&VæFW%fW'6–öâ…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–B’°¢f÷&V6‚‚GfW'6–öä–B–â‚„vWBÕ&VæFW%fW'6–öä–G2DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B’Â6÷'BÔö&¦V7BÔFW66VæF–ær’’°¢Ff–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvREv÷&¶&öö´–BE6æ6†÷D–B…·7G&–æuÒGfW'6–öä–B¢–b…¶&ööÅÒFf–Æ&–Æ—G’ç&VG’’²&WGW&â·7G&–æuÒGfW'6–öä–BÐ¢Ð¢&WGW&ârp§Ð  ¦gVæ7F–öâæWrÔ†—7F÷&–6Å6æ6†÷D6ö×&—6öâ€¢·7G&–æuÒDÆæwVvRÀ¢·7G&–æuÒEv÷&¶&öö´–BÀ¢·7G&–æuÒD&6VÆ–æU6æ6†÷D–BÀ¢·7G&–æuÒD&6VÆ–æUfW'6–öä–BÀ¢·7G&–æuÒD7W'&VçE6æ6†÷D–BÀ¢·7G&–æuÒD7W'&VçEfW'6–öä–@¢’°¢F&6RÒvWBÕf—7VÄ†6†W2DÆæwVvREv÷&¶&öö´–BD&6VÆ–æU6æ6†÷D–BD&6VÆ–æUfW'6–öä–@¢F7W'&VçBÒvWBÕf—7VÄ†6†W2DÆæwVvREv÷&¶&öö´–BD7W'&VçE6æ6†÷D–BD7W'&VçEfW'6–öä–@¢G&W7VÇBÒ¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ ¢7FGW2ÒwVæf–Æ&ÆRp¢66÷RÒv†—7F÷'’p¢&6VÆ–æU6æ6†÷D–BÒD&6VÆ–æU6æ6†÷D–@¢&6VÆ–æUfW'6–öä–BÒD&6VÆ–æUfW'6–öä–@¢7W'&VçE6æ6†÷D–BÒD7W'&VçE6æ6†÷D–@¢7W'&VçEfW'6–öä–BÒD7W'&VçEfW'6–öä–@¢6ö×&VDBÒæWrÔæ÷t—6ð¢ÖWF†öBÒw7F÷&VBÖ†6‚Ö†—7F÷'’p¢6öæf–FVæ6RÒã ¢6†ævVE6†VWG2Ò‚¢Væ6†ævVE6†VWG2Ò‚¢Væ¶æ÷vå6†VWG2Ò‚¢FFVE6†VWG2Ò‚¢&VÖ÷fVE6†VWG2Ò‚¢ÖW76vRÒrp¢Ð¢–b‚FçVÆÂÖWF&6RÖ÷"FçVÆÂÖWF7W'&VçB’°¢G&W7VÇBæÖW76vRÒ~˜Žh©î8~8þx˜Ž8îyK¾X8þ88þ88>8+~8:^8ÎKùÞZÙŽ8^8(Î8n8N8®8N8þ8(jùN‹È>8~8Þ8î8¾8)>8"p¢&WGW&â·67W7FöÖö&¦V7EÒG&W7VÇ@¢Ð¢F&6TVçf—&öæÖVçBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F&6Rw&VæFW$Vçf—&öæÖVçDf–ævW'&–çBrrr¢F7W'&VçDVçf—&öæÖVçBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F7W'&VçBw&VæFW$Vçf—&öæÖVçDf–ævW'&–çBrrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6TVçf—&öæÖVçB’Öæ@¢Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçDVçf—&öæÖVçB’Öæ@¢F&6TVçf—&öæÖVçBÖæRF7W'&VçDVçf—&öæÖVçB’°¢G&W7VÇBæÖWF†öBÒw7F÷&VBÖ†6‚Ö†—7F÷'’ÖVçf—&öæÖVçBÖÖ—6ÖF6‚p¢G&W7VÇBæ6öæf–FVæ6RÒãcP¢G&W7VÇBæÖW76vRÒs.x˜Ž8åDnKÙÎh‰y+Z(>8Îy[8®8(®8î8ž8.ŠŽzK®{YiéÎ8).yºîŠin8~z+®Š¨Þ8~8n8þ88^8N8"p¢Ð¢F&6TÖÒ·Ð¢f÷&V6‚‚G6†VWB–â„vWBÔ'&’„vWBÔFF&÷W'G’F&6Rw6†VWG2r‚’’’’°¢FæÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’G6†VWBw6†VWDæÖRrrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FæÖR’’²F&6TÖ²FæÖUÒÒG6†VWBÐ¢Ð¢F7W'&VçDæÖW2Ò·Ð¢F6†ævVBÒ‚“²GVæ6†ævVBÒ‚“²GVæ¶æ÷vâÒ‚“²FFFVBÒ‚“²G&VÖ÷fVBÒ‚¢f÷&V6‚‚G6†VWB–â„vWBÔ'&’„vWBÔFF&÷W'G’F7W'&VçBw6†VWG2r‚’’’’°¢FæÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’G6†VWBw6†VWDæÖRrrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FæÖR’’²6öçF–çVRÐ¢F7W'&VçDæÖW5²FæÖUÒÒGG'VP¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’G6†VWBw7FGW2rrr’ÖæRvö²r’²GVæ¶æ÷vâ³ÒFæÖS²6öçF–çVRÐ¢–b‚Öæ÷BF&6TÖä6öçF–ç4¶W’‚FæÖR’’²FFFVB³ÒFæÖS²6öçF–çVRÐ¢F&Vf÷&RÒF&6TÖ²FæÖUÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F&Vf÷&Rw7FGW2rrr’ÖæRvö²r’²GVæ¶æ÷vâ³ÒFæÖS²6öçF–çVRÐ¢–b‚„æ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’F&Vf÷&Rw6†VWEf—7VÄ†6‚rrr’’’ÖW¢„æ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’G6†VWBw6†VWEf—7VÄ†6‚rrr’’’Ö÷ ¢…FW7BÕ6†VWEf—7VÄWV—fÆVçBF&Vf÷&RG6†VWB’’²GVæ6†ævVB³ÒFæÖRÒVÇ6R²F6†ævVB³ÒFæÖRÐ¢Ð¢f÷&V6‚‚FæÖR–â‚F&6TÖä¶W—2’’²–b‚Öæ÷BF7W'&VçDæÖW2ä6öçF–ç4¶W’…·7G&–æuÒFæÖR’’²G&VÖ÷fVB³Ò·7G&–æuÒFæÖRÒÐ¢G&W7VÇBç7FGW2Òv6ö×ÆWFRp¢G&W7VÇBæ6†ævVE6†VWG2Ò‚F6†ævVB¢G&W7VÇBçVæ6†ævVE6†VWG2Ò‚GVæ6†ævVB¢G&W7VÇBçVæ¶æ÷vå6†VWG2Ò‚GVæ¶æ÷vâ¢G&W7VÇBæFFVE6†VWG2Ò‚FFFVB¢G&W7VÇBç&VÖ÷fVE6†VWG2Ò‚G&VÖ÷fVB¢&WGW&â·67W7FöÖö&¦V7EÒG&W7VÇ@§Ð  ¦gVæ7F–öâ6fRÔ†—7F÷&–6Å6æ6†÷D6ö×&—6öâ…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂD6ö×&—6öâ’°¢–b‚FçVÆÂÖWD6ö×&—6öâÖ÷"·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâw7FGW2rrr’ÖæRv6ö×ÆWFRr’²F‡&÷r~KùÞZÙŽ8~8Þ8(¾[^jÛNjùN‹È>{YiéÎ8Î8.8(®8î8¾8)>8"rÐ¢f÷&V6‚‚Ff–VÆB–â‚v&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–Br’’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R…·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâFf–VÆBrr’’’²F‡&÷r.[^jÛNjùN‹È>{YiéÎ8îŠÙŽXŠ^ZÙ8ÎKˆÞ‹k>8~8n8N8î8“¢Ff–VÆB"Ð¢Ð¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâw66÷Rrrr’ÖæRv†—7F÷'’r’²F‡&÷r~[^jÛNjùN‹È>Kº^ZIn8þ8>8îKùÞZÙŽ{XÎ‹zþ8).KÛþyJŽ8~8Þ8î8¾8)>8"rÐ¢F7W'&VçE6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçE6æ6†÷D–@¢F7W'&VçEfW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ7W'&VçEfW'6–öä–@¢FF—"Ò¦ö–âÕF‚„vWBÕ&VæFW%&V6÷&DF—"DÆæwVvREv÷&¶&öö´–BF7W'&VçE6æ6†÷D–BF7W'&VçEfW'6–öä–B’v6ö×&—6öç2p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚FF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢F¶W’Ò„vWBÕ6†#SeFW‡B‚&†—7F÷'—Ç³×Ç³×Ç³'×Ç³7Ò"ÖbD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–BÂD6ö×&—6öâæ&6VÆ–æUfW'6–öä–BÂF7W'&VçE6æ6†÷D–BÂF7W'&VçEfW'6–öä–B’’å7V'7G&–ærƒrÂb¢GF‚Ò¦ö–âÕF‚FF—"‚&†6××³Òæ§6öâ"ÖbF¶W’¢w&—FRÔ§6öäf–ÆRGF‚D6ö×&—6öà¢G6fVBÒ&VBÔ§6öäf–ÆRGF‚FçVÆÀ¢–b‚FçVÆÂÖWG6fVB’²F‡&÷r~[^jÛNjùN‹È>{YiéÎ8).KùÞZÙŽ[èÎ8¾XhÞŠªÞ‹ëÎ8~8Þ8î8¾8)>8~8~8þ8"rÐ¢f÷&V6‚‚Ff–VÆB–â‚w66÷RrÂv&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–Br’’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’G6fVBFf–VÆBrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’D6ö×&—6öâFf–VÆBrr’’°¢F‡&÷r.[^jÛNjùN‹È>{YiéÎ8îKùÞZÙŽjIÎŠ‹Î8¾ZKiY~8~8î8~8ó¢Ff–VÆB ¢Ð¢Ð¢w&—FRÔ†—7F÷'”WfVçBDÆæwVvRv6ö×&Ræ†—7F÷'’æ7&VFVBr…¶÷&FW&VEÔ°¢v÷&¶&öö´–BÒEv÷&¶&öö´–@¢&6VÆ–æU6æ6†÷D–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æU6æ6†÷D–@¢&6VÆ–æUfW'6–öä–BÒ·7G&–æuÒD6ö×&—6öâæ&6VÆ–æUfW'6–öä–@¢7W'&VçE6æ6†÷D–BÒF7W'&VçE6æ6†÷D–@¢7W'&VçEfW'6–öä–BÒF7W'&VçEfW'6–öä–@¢6†ævVBÒ„vWBÔ'&’D6ö×&—6öâæ6†ævVE6†VWG2¢Væ¶æ÷vâÒ„vWBÔ'&’D6ö×&—6öâçVæ¶æ÷vå6†VWG2¢Ò¢&WGW&âG6fV@§Ð  ¦gVæ7F–öâvWBÔF–fdFWF–Ä6öçFW‡B€¢·7G&–æuÒDÆæwVvRÀ¢·7G&–æuÒEv÷&¶&öö´–BÀ¢·7G&–æuÒD&6VÆ–æU6æ6†÷D–BÒrrÀ¢·7G&–æuÒD7W'&VçE6æ6†÷D–BÒrp¢’°¢G6fUv÷&¶&öö´–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEv÷&¶&öö´–Bwv÷&¶&öö´–Bp¢G7G'V7GW&RÒvWBÕ7G'V7GW&RDÆæwVvP¢FÖF6†W2Ò„vWBÔ'&’G7G'V7GW&Rçv÷&¶&öö·2Âv†W&RÔö&¦V7B²·7G&–æuÒEòçv÷&¶&öö´–BÖWG6fUv÷&¶&öö´–BÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚FÖF6†W2ä6÷VçBÖW’²F‡&÷r~y›¾˜Ë.kˆŽ8ôW†6VÎ8ÎŠh¾8N8¾8(®8î8¾8)>8"rÐ¢Gv÷&¶&öö²ÒFÖF6†W5³Ð¢FF—7Æ”æÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²vF—7Æ”æÖRrrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FF—7Æ”æÖR’’²FF—7Æ”æÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²vf–ÆTæÖRrG6fUv÷&¶&öö´–B’Ð¢F&6U&W7VÇBÒ¶÷&FW&VEÔ°¢f–Æ&ÆRÒFfÇ6S²7FGW2ÒwVæf–Æ&ÆRs²ÖW76vRÒrp¢v÷&¶&öö´–BÒG6fUv÷&¶&öö´–C²v÷&¶&öö´æÖRÒFF—7Æ”æÖS²v÷&¶&öö²ÒGv÷&¶&öö°¢6ö×&—6öâÒFçVÆÃ²6ö×&—6öåW'6—7FVBÒFfÇ6P¢7W'&VçE6æ6†÷D–BÒrs²7W'&VçEfW'6–öä–BÒrs²&6VÆ–æU6æ6†÷D–BÒrs²&6VÆ–æUfW'6–öä–BÒrp¢7W'&VçDBÒrs²&6VÆ–æTBÒrs²ÖWF†öBÒrs²66÷RÒvWFöÖF–2p¢Ð¢–b‚Öæ÷B…FW7BÔ–çWD†—7F÷'”Væ&ÆVB’’°¢F&6U&W7VÇBæÖW76vRÒ~XZ^X©¾[^jÛN8ÎxJX«ž8®8þ8(8[zîXˆnŠ›>{K8þXŠžyJŽ8~8Þ8î8¾8)>8"p¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F†4&6VÆ–æRÒÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚D&6VÆ–æU6æ6†÷D–B¢F†47W'&VçBÒÖæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚D7W'&VçE6æ6†÷D–B¢–b‚F†4&6VÆ–æR×†÷"F†47W'&VçB’²F‡&÷r~[^jÛNjùN‹È>8~8þjùN‹È>XX>8ŽjùN‹È>XXŽ8îKŠikž8).hÈ~Zé®8~8n8þ88^8N8"rÐ¢–b‚F†4&6VÆ–æRÖæBF†47W'&VçB’°¢F&6VÆ–æU6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBD&6VÆ–æU6æ6†÷D–Bv&6VÆ–æU6æ6†÷D–Bp¢F7W'&VçE6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBD7W'&VçE6æ6†÷D–Bv7W'&VçE6æ6†÷D–Bp¢F&6U&W7VÇBç66÷RÒv†—7F÷'’p¢–b‚F&6VÆ–æU6æ6†÷D–BÖWF7W'&VçE6æ6†÷D–B’²F&6U&W7VÇBæÖW76vRÒ~y[8®8(³.x˜Ž8).˜Žh©î8~8n8þ88^8N8"s²&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇBÐ¢–b‚FçVÆÂÖW„vWBÕ6æ6†÷DÖæ–fW7BDÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–B’Ö÷ ¢FçVÆÂÖW„vWBÕ6æ6†÷DÖæ–fW7BDÆæwVvRG6fUv÷&¶&öö´–BF7W'&VçE6æ6†÷D–B’’°¢F&6U&W7VÇBæÖW76vRÒ~˜Žh©î8~8þ[^jÛNx˜Ž8ÎŠh¾8N8¾8(®8î8¾8)>8.KùÞZÙŽiÉþ™™8î8þ8þ[^jÛNi[Nyn8).z+®Š¨Þ8~8n8þ88^8N8"p¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F&6VÆ–æUfW'6–öä–BÒvWBÕ&VfW'&VD†—7F÷'•&VæFW%fW'6–öâDÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–@¢F7W'&VçEfW'6–öä–BÒvWBÕ&VfW'&VD†—7F÷'•&VæFW%fW'6–öâDÆæwVvRG6fUv÷&¶&öö´–BF7W'&VçE6æ6†÷D–@¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6VÆ–æUfW'6–öä–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçEfW'6–öä–B’’°¢F&6U&W7VÇBæÖW76vRÒ~˜Žh©î8~8ó.x˜Ž8þ8yK¾X8þ88þ88>8+~8:^8ŽYÎKˆK‰nKº>8æ6öçFVçBDn8Î8Þ8(Þ8>8n8N8®8N8þ8(ŠinŠi®jùN‹È>8~8Þ8î8¾8)>8"p¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F6ö×&—6öâÒvWBÕ7F÷&VD6ö×&—6öâDÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–BF7W'&VçE6æ6†÷D–BF&6VÆ–æUfW'6–öä–BF7W'&VçEfW'6–öä–Bv†—7F÷'’p¢–b‚FçVÆÂÖWF6ö×&—6öâ’°¢F6ö×&—6öâÒæWrÔ†—7F÷&–6Å6æ6†÷D6ö×&—6öâDÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–BF&6VÆ–æUfW'6–öä–BF7W'&VçE6æ6†÷D–BF7W'&VçEfW'6–öä–@¢ÒVÇ6R²F&6U&W7VÇBæ6ö×&—6öåW'6—7FVBÒGG'VRÐ¢–b‚FçVÆÂÖWF6ö×&—6öâÖ÷"·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâw7FGW2rrr’ÖæRv6ö×ÆWFRr’°¢F&6U&W7VÇBæÖW76vRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâvÖW76vRr~˜Žh©î8~8ó.x˜Ž8).jùN‹È>8~8Þ8î8¾8)>8"r¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F&6U&W7VÇBæf–Æ&ÆRÒGG'VS²F&6U&W7VÇBç7FGW2Òvf–Æ&ÆRs²F&6U&W7VÇBæ6ö×&—6öâÒF6ö×&—6öà¢F&6U&W7VÇBæ7W'&VçE6æ6†÷D–BÒF7W'&VçE6æ6†÷D–C²F&6U&W7VÇBæ7W'&VçEfW'6–öä–BÒF7W'&VçEfW'6–öä–@¢F&6U&W7VÇBæ&6VÆ–æU6æ6†÷D–BÒF&6VÆ–æU6æ6†÷D–C²F&6U&W7VÇBæ&6VÆ–æUfW'6–öä–BÒF&6VÆ–æUfW'6–öä–@¢F&6U&W7VÇBæ7W'&VçDBÒvWBÔF–fe6æ6†÷DFFRDÆæwVvRG6fUv÷&¶&öö´–BF7W'&VçE6æ6†÷D–Brp¢F&6U&W7VÇBæ&6VÆ–æTBÒvWBÔF–fe6æ6†÷DFFRDÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–Brp¢F&6U&W7VÇBæÖWF†öBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâvÖWF†öBrw7F÷&VBÖ†6‚Ö†—7F÷'’r¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢G7FGW2Ò·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²w7FGW2rrr¢F7W'&VçD†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²v7W'&VçDW†6VÄ†6‚rrr’¢G&VæFW&VD†6‚Òæ÷&ÖÆ—¦RÔf–ÆT†6‚…·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²vÆ7E&VæFW&VDW†6VÄ†6‚rrr’¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&VæFW&VD†6‚’Ö÷"G7FGW2Ö–â‚væWrrÂvW†6VÂ×WFFVBrÂw&VæFW"ÖW'&÷"rÂw&VæFW&–ærr’Ö÷ ¢‚‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçD†6‚’’ÖæBF7W'&VçD†6‚ÖæRG&VæFW&VD†6‚’’°¢F&6U&W7VÇBæÖW76vRÒ~iÈik8åDn8).KÙÎh‰8~8n8¾8(ž[zîXˆn8).z+®Š¨Þ8~8n8þ88^8N8"s²&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F7W'&VçE6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²vÆ7E&VæFW&VE6æ6†÷D–Brrr¢F7W'&VçEfW'6–öä–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²vÆ7E&VæFW&VEfW'6–öä–Brrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçE6æ6†÷D–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7W'&VçEfW'6–öä–B’’°¢F&6U&W7VÇBæÖW76vRÒ~xûîYÊŽx˜Ž8).KˆhHþ8¾ŠÙŽXŠ^8~8Þ8®8N8þ8(8[zîXˆnŠ›>{K8).™h¾88î8¾8)>8"s²&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F7W'&VçE6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBF7W'&VçE6æ6†÷D–Bv7W'&VçE6æ6†÷D–Bp¢F7W'&VçEfW'6–öä–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBF7W'&VçEfW'6–öä–Bv7W'&VçEfW'6–öä–Bp¢F6ö×&—6öâÒvWBÔÆFW7D6ö×&—6öâDÆæwVvRG6fUv÷&¶&öö´–BGv÷&¶&öö°¢–b‚FçVÆÂÖWF6ö×&—6öâ’²F&6U&W7VÇBæÖW76vRÒ~KùÞZÙŽkˆŽ8þ8îjùN‹È>{YiéÎ8Î8.8(®8î8¾8)>8%Dn8).XhÞKÙÎh‰8~8n8þ88^8N8"s²&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇBÐ¢F&6VÆ–æU6æ6†÷D–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâv&6VÆ–æU6æ6†÷D–Brrr¢F&6VÆ–æUfW'6–öä–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâv&6VÆ–æUfW'6–öä–Brrr¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâw7FGW2rrr’ÖæRv6ö×ÆWFRrÖ÷ ¢·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6VÆ–æU6æ6†÷D–B’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&6VÆ–æUfW'6–öä–B’’°¢F&6U&W7VÇBæÖW76vRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâvÖW76vRr~X˜ÞY¹î8îjùN‹È>Yû®k©n8Î8.8(®8î8¾8)>8"r“²&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F&6VÆ–æU6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBF&6VÆ–æU6æ6†÷D–Bv&6VÆ–æU6æ6†÷D–Bp¢F&6VÆ–æUfW'6–öä–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBF&6VÆ–æUfW'6–öä–Bv&6VÆ–æUfW'6–öä–Bp¢F7W'&VçDf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvRG6fUv÷&¶&öö´–BF7W'&VçE6æ6†÷D–BF7W'&VçEfW'6–öä–@¢F&6VÆ–æTf–Æ&–Æ—G’ÒvWBÔ†—7F÷'•&VæFW%fW'6–öäf–Æ&–Æ—G’DÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–BF&6VÆ–æUfW'6–öä–@¢–b‚Öæ÷B¶&ööÅÒF7W'&VçDf–Æ&–Æ—G’ç&VG’Ö÷"Öæ÷B¶&ööÅÒF&6VÆ–æTf–Æ&–Æ—G’ç&VG’’°¢F&6U&W7VÇBæÖW76vRÒ~ˆz®X¹^jùN‹È>8¾KÛþ8>8þyK¾X8þ88þ88>8+~8:^8ŽYÎKˆK‰nKº>8æ6öçFVçBDn8ÎKùÞhÈ8^8(Î8n8N8î8¾8)>8%Dn8).XhÞKÙÎh‰8~8n8þ88^8N8"p¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@¢Ð¢F&6U&W7VÇBæf–Æ&ÆRÒGG'VS²F&6U&W7VÇBç7FGW2Òvf–Æ&ÆRs²F&6U&W7VÇBæ6ö×&—6öâÒF6ö×&—6öã²F&6U&W7VÇBæ6ö×&—6öåW'6—7FVBÒGG'VP¢F&6U&W7VÇBæ7W'&VçE6æ6†÷D–BÒF7W'&VçE6æ6†÷D–C²F&6U&W7VÇBæ7W'&VçEfW'6–öä–BÒF7W'&VçEfW'6–öä–@¢F&6U&W7VÇBæ&6VÆ–æU6æ6†÷D–BÒF&6VÆ–æU6æ6†÷D–C²F&6U&W7VÇBæ&6VÆ–æUfW'6–öä–BÒF&6VÆ–æUfW'6–öä–@¢F&6U&W7VÇBæ7W'&VçDBÒvWBÔF–fe6æ6†÷DFFRDÆæwVvRG6fUv÷&¶&öö´–BF7W'&VçE6æ6†÷D–B…·7G&–æuÒ„vWBÔFF&÷W'G’Gv÷&¶&öö²vÆ7E&VæFW&VDBrrr’¢F&6U&W7VÇBæ&6VÆ–æTBÒvWBÔF–fe6æ6†÷DFFRDÆæwVvRG6fUv÷&¶&öö´–BF&6VÆ–æU6æ6†÷D–Brp¢F&6U&W7VÇBæÖWF†öBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâvÖWF†öBrrr¢&WGW&â·67W7FöÖö&¦V7EÒF&6U&W7VÇ@§Ð  ¦gVæ7F–öâvWBÔF–fe—$¶W’‚D6öçFW‡B’°¢&WGW&â„vWBÕ6†#SeFW‡B‚'³×Ç³×Ç³'×Ç³7×Ç³G×Ç³W×Ç³gÒ"Ö`¢·7G&–æuÒD6öçFW‡Bç66÷RÂ·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–BÀ¢·7G&–æuÒD6öçFW‡Bæ&6VÆ–æU6æ6†÷D–BÂ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æUfW'6–öä–BÀ¢·7G&–æuÒD6öçFW‡Bæ7W'&VçE6æ6†÷D–BÂ·7G&–æuÒD6öçFW‡Bæ7W'&VçEfW'6–öä–BÀ¢E67&—C¤F–fdFWF–ÄÆv÷&—F†ÕfW'6–öâ’’å7V'7G&–ærƒrÂ#B§Ð¦gVæ7F–öâvWBÔF–fdÆVæ6„Æö6µF‚…·7G&–æuÒDÆæwVvRÂD6öçFW‡B’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’‚&Æö6·5ÆF–fbÖÆVæ6…÷³ÒæÆö6²"Öb„vWBÔF–fe—$¶W’D6öçFW‡B’’§Ð¦gVæ7F–öâvWBÔF–fdvVæW&F–öäÆö6µF‚…·7G&–æuÒDÆæwVvRÂD6öçFW‡B’°¢&WGW&â„¦ö–âÕF‚„vWBÕv÷&·76UF‚DÆæwVvR’‚&Æö6·5ÆF–fbÖvVæW&FU÷³ÒæÆö6²"Öb„vWBÔF–fe—$¶W’D6öçFW‡B’’§Ð ¦gVæ7F–öâvWBÔF–fdFWF–Ä66†TF—"‚D6öçFW‡B’°¢G&V6÷&BÒvWBÕ&VæFW%&V6÷&DF—"„vWBÔVffV7F—fTÆæwVvR’…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒD6öçFW‡Bæ7W'&VçE6æ6†÷D–B’…·7G&–æuÒD6öçFW‡Bæ7W'&VçEfW'6–öä–B¢F&6VÆ–æRÒ76W'BÕ6fU7F÷&vU6VvÖVçB…·7G&–æuÒD6öçFW‡Bæ&6VÆ–æU6æ6†÷D–B’v&6VÆ–æU6æ6†÷D–Bp¢F66†T¶W’Ò„vWBÕ6†#SeFW‡B‚'³×Ç³×Ç³'×Ç³7Ò"Öb·7G&–æuÒD6öçFW‡Bç66÷RÂF&6VÆ–æRÂ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æUfW'6–öä–BÂE67&—C¤F–fdFWF–ÄÆv÷&—F†ÕfW'6–öâ’’å7V'7G&–ærƒrÂb¢&WGW&â„¦ö–âÕF‚G&V6÷&B„¦ö–âÕF‚v6ö×&—6öç2r‚&G³Ò"ÖbF66†T¶W’’’§Ð ¦gVæ7F–öâvWBÔF–fdFWF–Ä66†TF—$f÷$ÆæwVvR…·7G&–æuÒDÆæwVvRÂD6öçFW‡B’°¢G&V6÷&BÒvWBÕ&VæFW%&V6÷&DF—"DÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒD6öçFW‡Bæ7W'&VçE6æ6†÷D–B’…·7G&–æuÒD6öçFW‡Bæ7W'&VçEfW'6–öä–B¢F&6VÆ–æRÒ76W'BÕ6fU7F÷&vU6VvÖVçB…·7G&–æuÒD6öçFW‡Bæ&6VÆ–æU6æ6†÷D–B’v&6VÆ–æU6æ6†÷D–Bp¢F66†T¶W’Ò„vWBÕ6†#SeFW‡B‚'³×Ç³×Ç³'×Ç³7Ò"Öb·7G&–æuÒD6öçFW‡Bç66÷RÂF&6VÆ–æRÂ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æUfW'6–öä–BÂE67&—C¤F–fdFWF–ÄÆv÷&—F†ÕfW'6–öâ’’å7V'7G&–ærƒrÂb¢&WGW&â„¦ö–âÕF‚G&V6÷&B„¦ö–âÕF‚v6ö×&—6öç2r‚&G³Ò"ÖbF66†T¶W’’’§Ð ¦gVæ7F–öâvWBÔF–fe6†VWD¶W’…·7G&–æuÒE6†VWDæÖR’°¢F†6‚ÒvWBÕ6†#SeFW‡BE6†VWDæÖP¢&WGW&â‚w2Òr²F†6‚å7V'7G&–ærƒrÂ’§Ð ¦gVæ7F–öâFW7BÔF–fdFWF–ÄÖF6†W46öçFW‡B‚DFWF–ÂÂD6öçFW‡B’°¢–b‚FçVÆÂÖWDFWF–ÂÖ÷"FçVÆÂÖWD6öçFW‡B’²&WGW&âFfÇ6RÐ¢–b‚„vWBÔ–çDFF&÷W'G’DFWF–ÂvÆv÷&—F†ÕfW'6–öâr’ÖæRE67&—C¤F–fdFWF–ÄÆv÷&—F†ÕfW'6–öâ’²&WGW&âFfÇ6RÐ¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’DFWF–Âwv÷&¶&öö´–Brrr’ÖæR·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’²&WGW&âFfÇ6RÐ¢F6ö×&—6öâÒvWBÔFF&÷W'G’DFWF–Âv6ö×&—6öârFçVÆÀ¢–b‚FçVÆÂÖWF6ö×&—6öâ’²&WGW&âFfÇ6RÐ¢f÷&V6‚‚Ff–VÆB–â‚w66÷RrÂv&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–Br’’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâFf–VÆBrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’D6öçFW‡BFf–VÆBrr’’²&WGW&âFfÇ6RÐ¢Ð¢&WGW&âGG'VP§Ð ¦gVæ7F–öâvWBÔF–fd†6…6†VWDÖ‚D†6†W2’°¢FÖÒ·Ð¢–b‚FçVÆÂÖWD†6†W2’²&WGW&âFÖÐ¢f÷&V6‚‚G6†VWB–â„vWBÔ'&’„vWBÔFF&÷W'G’D†6†W2w6†VWG2r‚’’’’°¢FÖµ·7G&–æuÒ„vWBÔFF&÷W'G’G6†VWBw6†VWDæÖRrrr•ÒÒG6†VW@¢Ð¢&WGW&âFÖ §Ð ¦gVæ7F–öâæWrÔF–fdFWF–Å6¶VÆWFöâ…·7G&–æuÒDÆæwVvRÂD6öçFW‡B’°¢F6ö×&—6öâÒD6öçFW‡Bæ6ö×&—6öà¢FFFVE6WBÒ·Ð¢G&VÖ÷fVE6WBÒ·Ð¢GVæ¶æ÷vå6WBÒ·Ð¢f÷&V6‚‚FæÖR–â„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâvFFVE6†VWG2r‚’’’’²FFFVE6WEµ·7G&–æuÒFæÖUÒÒGG'VRÐ¢f÷&V6‚‚FæÖR–â„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâw&VÖ÷fVE6†VWG2r‚’’’’²G&VÖ÷fVE6WEµ·7G&–æuÒFæÖUÒÒGG'VRÐ¢f÷&V6‚‚FæÖR–â„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâwVæ¶æ÷vå6†VWG2r‚’’’’²GVæ¶æ÷vå6WEµ·7G&–æuÒFæÖUÒÒGG'VRÐ ¢F—FV×2Ò‚¢G6VVâÒ·Ð¢f÷&V6‚‚Fw&÷W–â€¢¶÷&FW&VEÔ²¶–æBÒvÖöF–f–VBs²æÖW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâv6†ævVE6†VWG2r‚’’’ÒÀ¢¶÷&FW&VEÔ²¶–æBÒvFFVBs²æÖW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâvFFVE6†VWG2r‚’’’ÒÀ¢¶÷&FW&VEÔ²¶–æBÒw&VÖ÷fVBs²æÖW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâw&VÖ÷fVE6†VWG2r‚’’’ÒÀ¢¶÷&FW&VEÔ²¶–æBÒwVæ¶æ÷vâs²æÖW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâwVæ¶æ÷vå6†VWG2r‚’’’ÒÀ¢¶÷&FW&VEÔ²¶–æBÒwVæ6†ævVBs²æÖW2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6ö×&—6öâwVæ6†ævVE6†VWG2r‚’’’Ð¢’’°¢f÷&V6‚‚G&tæÖR–â‚Fw&÷WææÖW2’’°¢FæÖRÒ·7G&–æuÒG&tæÖP¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FæÖR’Ö÷"G6VVâä6öçF–ç4¶W’‚FæÖR’’²6öçF–çVRÐ¢–b…·7G&–æuÒFw&÷Wæ¶–æBÖWvÖöF–f–VBrÖæB‚FFFVE6WBä6öçF–ç4¶W’‚FæÖR’Ö÷"G&VÖ÷fVE6WBä6öçF–ç4¶W’‚FæÖR’Ö÷"GVæ¶æ÷vå6WBä6öçF–ç4¶W’‚FæÖR’’’²6öçF–çVRÐ¢G6VVå²FæÖUÒÒGG'VP¢F—FV×2³Ò·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ°¢6†VWDæÖRÒFæÖP¢6†VWD¶W’ÒvWBÔF–fe6†VWD¶W’FæÖP¢¶–æBÒ·7G&–æuÒFw&÷Wæ¶–æ@¢&Vf÷&UvW2Ò ¢gFW%vW2Ò ¢vT6÷VçBÒ ¢&Vv–öä6÷VçBÒ ¢7FGW2ÒB†–b…·7G&–æuÒFw&÷Wæ¶–æBÖWwVæ6†ævVBr’²vFVfW'&VBrÒVÇ6R²wVæF–ærrÒ¢ÖW76vRÒB†–b…·7G&–æuÒFw&÷Wæ¶–æBÖWwVæ6†ævVBr’²~ZHži»N8®8~8+~8;Î88Ž8îyK¾X8þ8þ8˜Žh©î8~8þ8Ž8Þ8¾KÙÎh‰8~8î8ž8"rÒVÇ6R²rrÒ¢6öæf—&ÖVBÒFfÇ6P¢vW2Ò‚¢Ð¢Ð¢Ð¢F7W'&VçD†6†W2ÒFçVÆÀ¢F&6VÆ–æT†6†W2ÒFçVÆÀ¢2jùN‹È>{YiéÎ8Î8î8xJ8NX‰ÞY¹åDnKÙÎh‰y»N[èÎ8þ86öçFW‡N8îx˜„”N8Îz›®8î8î8à¢2Væf–Æ&Æ^8).‹ùN8ž8.z›¤”N8).[^jÛN898+ž™j.i[8ŽkŠ8~8cC8¾8~8®8N8 ¢–b…¶&ööÅÒD6öçFW‡Bæf–Æ&ÆR’°¢F7W'&VçD†6†W2ÒvWBÕf—7VÄ†6†W2DÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒD6öçFW‡Bæ7W'&VçE6æ6†÷D–B’…·7G&–æuÒD6öçFW‡Bæ7W'&VçEfW'6–öä–B¢F&6VÆ–æT†6†W2ÒvWBÕf—7VÄ†6†W2DÆæwVvR…·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–B’…·7G&–æuÒD6öçFW‡Bæ&6VÆ–æU6æ6†÷D–B’…·7G&–æuÒD6öçFW‡Bæ&6VÆ–æUfW'6–öä–B¢Ð¢F7W'&VçDÖÒvWBÔF–fd†6…6†VWDÖF7W'&VçD†6†W0¢F&6VÆ–æTÖÒvWBÔF–fd†6…6†VWDÖF&6VÆ–æT†6†W0¢f÷&V6‚‚F—FVÒ–âF—FV×2’°¢–b‚F&6VÆ–æTÖä6öçF–ç4¶W’…·7G&–æuÒF—FVÒç6†VWDæÖR’’²F—FVÒæ&Vf÷&UvW2ÒvWBÔ–çDFF&÷W'G’F&6VÆ–æTÖµ·7G&–æuÒF—FVÒç6†VWDæÖUÒwvT6÷VçBrÐ¢–b‚F7W'&VçDÖä6öçF–ç4¶W’…·7G&–æuÒF—FVÒç6†VWDæÖR’’²F—FVÒægFW%vW2ÒvWBÔ–çDFF&÷W'G’F7W'&VçDÖµ·7G&–æuÒF—FVÒç6†VWDæÖUÒwvT6÷VçBrÐ¢F—FVÒçvT6÷VçBÒ´ÖF…Ó£¤Ö‚…¶–çEÒF—FVÒæ&Vf÷&UvW2Â¶–çEÒF—FVÒægFW%vW2¢Ð¢FÖöF–f–VD6÷VçBÒ‚F—FV×2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ¶–æBÖWvÖöF–f–VBrÒ’ä6÷Vç@¢FFFVD6÷VçBÒ‚F—FV×2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ¶–æBÖWvFFVBrÒ’ä6÷Vç@¢G&VÖ÷fVD6÷VçBÒ‚F—FV×2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ¶–æBÖWw&VÖ÷fVBrÒ’ä6÷Vç@¢GVæ¶æ÷vä6÷VçBÒ‚F—FV×2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ¶–æBÖWwVæ¶æ÷vârÒ’ä6÷Vç@¢GVæ6†ævVD6÷VçBÒ‚F—FV×2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ¶–æBÖWwVæ6†ævVBrÒ’ä6÷Vç@¢&WGW&â·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ°¢66†VÖfW'6–öâÒ¢Æv÷&—F†ÕfW'6–öâÒE67&—C¤F–fdFWF–ÄÆv÷&—F†ÕfW'6–öà¢7FGW2ÒB†–b…¶&ööÅÒD6öçFW‡Bæf–Æ&ÆR’²væ÷BÖvVæW&FVBrÒVÇ6R²wVæf–Æ&ÆRrÒ¢ÖW76vRÒ·7G&–æuÒD6öçFW‡BæÖW76vP¢v÷&¶&öö´–BÒ·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´–@¢v÷&¶&öö´æÖRÒ·7G&–æuÒD6öçFW‡Bçv÷&¶&öö´æÖP¢6ö×&—6öâÒ¶÷&FW&VEÔ°¢&6VÆ–æU6æ6†÷D–BÒ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æU6æ6†÷D–@¢&6VÆ–æUfW'6–öä–BÒ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æUfW'6–öä–@¢7W'&VçE6æ6†÷D–BÒ·7G&–æuÒD6öçFW‡Bæ7W'&VçE6æ6†÷D–@¢7W'&VçEfW'6–öä–BÒ·7G&–æuÒD6öçFW‡Bæ7W'&VçEfW'6–öä–@¢&6VÆ–æTBÒ·7G&–æuÒD6öçFW‡Bæ&6VÆ–æT@¢7W'&VçDBÒ·7G&–æuÒD6öçFW‡Bæ7W'&VçD@¢6ö×&VDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6ö×&—6öâv6ö×&VDBrrr¢ÖWF†öBÒ·7G&–æuÒD6öçFW‡BæÖWF†ö@¢66÷RÒ·7G&–æuÒD6öçFW‡Bç66÷P¢6öæf–FVæ6RÒ¶F÷V&ÆUÒ„vWBÔFF&÷W'G’F6ö×&—6öâv6öæf–FVæ6Rrã¢Ð¢7VÖÖ'’Ò¶÷&FW&VEÔ°¢6†ævVBÒFÖöF–f–VD6÷Vç@¢FFVBÒFFFVD6÷Vç@¢&VÖ÷fVBÒG&VÖ÷fVD6÷Vç@¢Væ¶æ÷vâÒGVæ¶æ÷vä6÷Vç@¢Væ6†ævVBÒGVæ6†ævVD6÷Vç@¢Ð¢vVæW&F–öâÒ¶÷&FW&VEÔ²7FGW2Òv–FÆRs²¦ö$–BÒrs²W&6VçBÒ²ÖW76vRÒrs²7W'&VçE6†VWBÒrrÐ¢6†VWG2Ò‚F—FV×2¢vVæW&FVDBÒrp¢Ð§Ð ¦gVæ7F–öâvWBÔF–fdFWF–Â€¢·7G&–æuÒDÆæwVvRÀ¢·7G&–æuÒEv÷&¶&öö´–BÀ¢·7G&–æuÒD&6VÆ–æU6æ6†÷D–BÒrrÀ¢·7G&–æuÒD7W'&VçE6æ6†÷D–BÒrp¢’°¢F6öçFW‡BÒvWBÔF–fdFWF–Ä6öçFW‡BDÆæwVvREv÷&¶&öö´–BD&6VÆ–æU6æ6†÷D–BD7W'&VçE6æ6†÷D–@¢FFWF–ÂÒæWrÔF–fdFWF–Å6¶VÆWFöâDÆæwVvRF6öçFW‡@¢–b‚Öæ÷B¶&ööÅÒF6öçFW‡Bæf–Æ&ÆR’²&WGW&âFFWF–ÂÐ¢F66†TF—"ÒvWBÔF–fdFWF–Ä66†TF—$f÷$ÆæwVvRDÆæwVvRF6öçFW‡@¢FFWF–ÅF‚Ò¦ö–âÕF‚F66†TF—"vF–fbÖFWF–Âæ§6öâp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FFWF–ÅF‚’°¢G'’°¢G7F÷&VBÒ&VBÔ§6öäf–ÆRFFWF–ÅF‚FçVÆÀ¢–b…FW7BÔF–fdFWF–ÄÖF6†W46öçFW‡BG7F÷&VBF6öçFW‡B’°¢&WGW&âG7F÷&V@¢Ð¢Ò6F6‚²Ð¢Ð¢Gö–çFW%F‚Ò¦ö–âÕF‚F66†TF—"vF–fbÖ¦ö"æ§6öâp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚Gö–çFW%F‚’°¢G'’°¢Gö–çFW"Ò&VBÔ§6öäf–ÆRGö–çFW%F‚FçVÆÀ¢F¦ö$–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gö–çFW"v¦ö$–Brrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F¦ö$–B’’°¢F¦ö"Ò&VBÕ&VæFW$¦ö%7FGW2DÆæwVvRF¦ö$–@¢F¦ö%7FGW2Ò·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"w7FGW2rrr¢GFW&Ö–æÂÒ‚v6ö×ÆWFVBrÂv6ö×ÆWFVB×v—F‚ÖW'&÷'2rÂvf–ÆVBrÂvÖ—76–ærrÂv6æ6VÆÆVBr’Ö6öçF–ç2F¦ö%7FGW0¢2v÷&¶W.8öF–fbÖFWF–Âæ§6öî8).KùÞZÙŽ8~8n8¾8(—7FGW>8).{X.zºþ8Ži»Nik8ž8(¾8 ¢2{X.zºþ8®8î8¾{YiéÎ89^8*8*N8:¾8ÎxJ8NZNYŽ8þ8ÎyIþh‰KŠÞ8Þ8Žh‹¾8^8®8XhÞŠšnŠÎXúþˆ;Þ8®ZKiY~8Ž8~8n‹ùN8ž8 ¢FFWF–Âç7FGW2ÒB†–b‚GFW&Ö–æÂ’²vf–ÆVBrÒVÇ6R²vvVæW&F–ærrÒ¢F¦ö$ÖW76vRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"vÖW76vRrrr¢FFWF–ÂæÖW76vRÒB†–b‚GFW&Ö–æÂÖæBF¦ö%7FGW2Ö–â‚v6ö×ÆWFVBrÂv6ö×ÆWFVB×v—F‚ÖW'&÷'2r’’°¢~[zîXˆnyK¾X8þ8îKÙÎh‰Xznyn8þ{X.K¨n8~8î8~8þ8Î8{YiéÎ8).ŠªÞ8þ‹ëÎ8(8î8¾8)>8~8~8þ8.XhÞŠšnŠÎ8~8n8þ88^8N8"p¢ÒVÇ6R²F¦ö$ÖW76vRÒ¢FFWF–ÂævVæW&F–öâÒ¶÷&FW&VEÔ°¢7FGW2ÒF¦ö%7FGW0¢¦ö$–BÒF¦ö$–@¢W&6VçBÒvWBÔ–çDFF&÷W'G’F¦ö"wW&6VçBr ¢ÖW76vRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"vÖW76vRrrr¢7W'&VçE6†VWBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"v7W'&VçE6†VWBrrr¢Ð¢Ð¢Ò6F6‚²Ð¢Ð¢&WGW&âFFWF–À§Ð  ¦gVæ7F–öâ&W6öÇfRÔF–fd6öçFVçEFeF‚…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒE6æ6†÷D–BÂ·7G&–æuÒEfW'6–öä–BÂ·7G&–æuÒE6†VWDæÖR’°¢27G&–7B–FVçF—G“¢æWfW"fÆÂ&6²Fòæ÷F†W"&VæFW"fW'6–öââ†6†W2æBF—7Æ–VBDb×W7B&RF†R6ÖRvVæW&F–öâà¢G6fU6æ6†÷D–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBE6æ6†÷D–Bw6æ6†÷D–Bp¢G6fUfW'6–öä–BÒ76W'BÕ6fU7F÷&vU6VvÖVçBEfW'6–öä–BwfW'6–öä–Bp¢–b„„vWBÕ&VæFW%fW'6–öä–G2DÆæwVvREv÷&¶&öö´–BG6fU6æ6†÷D–B’Öæ÷F6öçF–ç2G6fUfW'6–öä–B’²&WGW&ârrÐ¢&WGW&â…&W6öÇfRÔ6öçFVçEFe6†VWEF„W†7BDÆæwVvREv÷&¶&öö´–BG6fUfW'6–öä–BE6†VWDæÖR§Ð ¦gVæ7F–öâ–çfö¶RÔF–fd–ÖvUvTvVæW&F–öâ…·7G&–æuÒD&Vf÷&UFbÂ·7G&–æuÒDgFW%FbÂ·7G&–æuÒD÷WGWDF—&V7F÷'’Â·7G&–æuÒD¶–æB’°¢G67&—EF‚Ò¦ö–âÕF‚E67&—C¤&ö÷BwFööÇ5ÆF–fbÖ–ÖvR×vW2ç3p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G67&—EF‚’’²F‡&÷r~[zîXˆnyK¾X8þyIþh‰88N8;Î8:¾8ÎŠh¾8N8¾8(®8î8¾8)>8"rÐ¢F&wVÖVçG2Ò°¢÷WGWDF—&V7F÷'’ÒD÷WGWDF—&V7F÷'¢¶–æBÒD¶–æ@¢G’ÒE67&—C¤F–fdFWF–ÄG¢F‡&W6†öÆBÒE67&—C¤F–fdFWF–ÅF‡&W6†öÆ@¢Ö–æ–×VÕ&Vv–öå—†VÇ2ÒE67&—C¤F–fdFWF–ÄÖ–æ–×VÕ&Vv–öå—†VÇ0¢FF–ærÒE67&—C¤F–fdFWF–ÅFF–æp¢Ð¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚D&Vf÷&UFb’’²F&wVÖVçG2ä&Vf÷&UFbÒD&Vf÷&UFbÐ¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚DgFW%Fb’’²F&wVÖVçG2ägFW%FbÒDgFW%FbÐ¢G&rÒ‚bG67&—EF‚&wVÖVçG2Âf÷$V6‚Ôö&¦V7B²·7G&–æuÒEòÒ¢GFW‡BÒ‚G&rÖ¦ö–ârr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚GFW‡B’’²F‡&÷r~[zîXˆnyK¾X8þyIþh‰{YiéÎ8).Xùn[é~8~8Þ8î8¾8)>8~8~8þ8"rÐ¢&WGW&â‚GFW‡BÂ6öçfW'Dg&öÒÔ§6öâ§Ð ¦gVæ7F–öâ–çfö¶RÔF–fd–ÖvT&F6„vVæW&F–öâ‚D—FV×2’°¢G67&—EF‚Ò¦ö–âÕF‚E67&—C¤&ö÷BwFööÇ5ÆF–fbÖ–ÖvRÖ&F6‚ç3p¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G67&—EF‚’’²F‡&÷r~[zîXˆnyK¾X8þKˆhºÎyIþh‰88N8;Î8:¾8ÎŠh¾8N8¾8(®8î8¾8)>8"rÐ¢G&WVW7EF‚Ò¦ö–âÕF‚…´”òåF…Ó£¤vWEFV×F‚‚’’‚w&"ÖF–fb×&WVW7BÒr²´wV–EÓ£¤æWtwV–B‚’åFõ7G&–ær‚târ’²ræ§6öâr¢G'’°¢w&—FRÔ§6öäf–ÆRG&WVW7EF‚…¶÷&FW&VEÔ²66†VÖfW'6–öâÒ²—FV×2Ò‚D—FV×2’Ò¢G&rÒ‚bG67&—EF‚Õ&WVW7EF‚G&WVW7EF‚ÔG’E67&—C¤F–fdFWF–ÄG’ ¢ÕF‡&W6†öÆBE67&—C¤F–fdFWF–ÅF‡&W6†öÆBÔÖ–æ–×VÕ&Vv–öå—†VÇ2E67&—C¤F–fdFWF–ÄÖ–æ–×VÕ&Vv–öå—†VÇ2 ¢ÕFF–ærE67&—C¤F–fdFWF–ÅFF–ærÂf÷$V6‚Ôö&¦V7B²·7G&–æuÒEòÒ¢GFW‡BÒ‚G&rÖ¦ö–ârr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚GFW‡B’’²F‡&÷r~[zîXˆnyK¾X8þKˆhºÎyIþh‰{YiéÎ8).Xùn[é~8~8Þ8î8¾8)>8~8~8þ8"rÐ¢G&W7VÇBÒGFW‡BÂ6öçfW'Dg&öÒÔ§6öà¢–b‚Öæ÷B¶&ööÅÒ„vWBÔFF&÷W'G’G&W7VÇBvö²rFfÇ6R’’²F‡&÷r~[zîXˆnyK¾X8þ8îKˆhºÎyIþh‰8¾ZKiY~8~8î8~8þ8"rÐ¢&WGW&âG&W7VÇ@¢Òf–æÆÇ’°¢&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚G&WVW7EF‚Ôf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVP¢Ð§Ð  ¦gVæ7F–öâ7F'BÔF–fdFWF–Ä¦ö"€¢·7G&–æuÒDÆæwVvRÀ¢·7G&–æuÒEv÷&¶&öö´–BÀ¢·7G&–æuÒD&6VÆ–æU6æ6†÷D–BÒrrÀ¢·7G&–æuÒD7W'&VçE6æ6†÷D–BÒrrÀ¢·7G&–æuÒE6†VWD¶W’Òrp¢’°¢F6öçFW‡BÒvWBÔF–fdFWF–Ä6öçFW‡BDÆæwVvREv÷&¶&öö´–BD&6VÆ–æU6æ6†÷D–BD7W'&VçE6æ6†÷D–@¢–b‚Öæ÷B¶&ööÅÒF6öçFW‡Bæf–Æ&ÆR’°¢&WGW&â·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ²ö²ÒGG'VS²¦ö$–BÒrs²7FGW2ÒwVæf–Æ&ÆRs²W&6VçBÒ²ÖW76vRÒ·7G&–æuÒF6öçFW‡BæÖW76vRÐ¢Ð¢G6fU6†VWD¶W’Òrp¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E6†VWD¶W’’’²G6fU6†VWD¶W’Ò76W'BÕ6fU7F÷&vU6VvÖVçBE6†VWD¶W’w6†VWD¶W’rÐ¢FÆVæ6„Æö6²ÒvWBÔF–fdÆVæ6„Æö6µF‚DÆæwVvRF6öçFW‡@¢&WGW&â–çfö¶RÕv—F„Æö6²FÆVæ6„Æö6²°¢Fg&W6„6öçFW‡BÒvWBÔF–fdFWF–Ä6öçFW‡BDÆæwVvREv÷&¶&öö´–BD&6VÆ–æU6æ6†÷D–BD7W'&VçE6æ6†÷D–@¢–b‚Öæ÷B¶&ööÅÒFg&W6„6öçFW‡Bæf–Æ&ÆR’²F‡&÷r·7G&–æuÒFg&W6„6öçFW‡BæÖW76vRÐ¢f÷&V6‚‚Ff–VÆB–â‚w66÷RrÂv7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–BrÂv&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–Br’’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’F6öçFW‡BFf–VÆBrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’Fg&W6„6öçFW‡BFf–VÆBrr’’°¢F‡&÷r~jùN‹È>Zûî‹8Îi»Nik8^8(Î8î8~8þ8.[zîXˆnŠ›>{K8).™h¾8Þy»N8~8n8þ88^8N8"p¢Ð¢Ð¢F6öçFW‡BÒFg&W6„6öçFW‡@¢G6¶VÆWFöâÒæWrÔF–fdFWF–Å6¶VÆWFöâDÆæwVvRF6öçFW‡@¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6fU6†VWD¶W’’Öæ@¢‚G6¶VÆWFöâç6†VWG2Âv†W&RÔö&¦V7B²·7G&–æuÒEòç6†VWD¶W’ÖWG6fU6†VWD¶W’Ò’ä6÷VçBÖW’°¢F‡&÷r~hÈ~Zé®8~8þ8+~8;Î88Ž8þjùN‹È>Zûî‹8¾Y
+¾8î8(Î8n8N8î8¾8)>8"p¢Ð¢F66†TF—"ÒvWBÔF–fdFWF–Ä66†TF—$f÷$ÆæwVvRDÆæwVvRF6öçFW‡@¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚F66†TF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚F66†TF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢FFWF–ÅF‚Ò¦ö–âÕF‚F66†TF—"vF–fbÖFWF–Âæ§6öâp¢FW†—7F–ærÒFçVÆÀ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FFWF–ÅF‚’²G'’²FW†—7F–ærÒ&VBÔ§6öäf–ÆRFFWF–ÅF‚FçVÆÂÒ6F6‚²ÒÐ¢–b…FW7BÔF–fdFWF–ÄÖF6†W46öçFW‡BFW†—7F–ærF6öçFW‡B’°¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6fU6†VWD¶W’’ÖæB·7G&–æuÒ„vWBÔFF&÷W'G’FW†—7F–ærw7FGW2rrr’ÖWw&VG’r’°¢&WGW&â·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ²ö²ÒGG'VS²¦ö$–BÒrs²7FGW2Òv6ö×ÆWFVBs²W&6VçBÒ²ÖW76vRÒ~[zîXˆnŠ›>{K8þKÙÎh‰kˆŽ8þ8~8ž8"s²FWF–Å&VG’ÒGG'VRÐ¢Ð¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6fU6†VWD¶W’’’°¢GF&vWBÒ„vWBÔ'&’FW†—7F–ærç6†VWG2Âv†W&RÔö&¦V7B²·7G&–æuÒEòç6†VWD¶W’ÖWG6fU6†VWD¶W’ÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚GF&vWBä6÷VçBÖwBÖæB·7G&–æuÒ„vWBÔFF&÷W'G’GF&vWE³Òw7FGW2rrr’ÖWw&VG’r’°¢&WGW&â·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ²ö²ÒGG'VS²¦ö$–BÒrs²7FGW2Òv6ö×ÆWFVBs²W&6VçBÒ²ÖW76vRÒ~8>8î8+~8;Î88Ž8î[zîXˆnyK¾X8þ8þKÙÎh‰kˆŽ8þ8~8ž8"s²FWF–Å&VG’ÒGG'VRÐ¢Ð¢Ð¢Ð¢Gö–çFW%F‚Ò¦ö–âÕF‚F66†TF—"vF–fbÖ¦ö"æ§6öâp¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚Gö–çFW%F‚’°¢G'’°¢Gö–çFW"Ò&VBÔ§6öäf–ÆRGö–çFW%F‚FçVÆÀ¢F7F—fT–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’Gö–çFW"v¦ö$–Brrr¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F7F—fT–B’’°¢F7F—fRÒ&VBÕ&VæFW$¦ö%7FGW2DÆæwVvRF7F—fT–@¢–b„‚v6ö×ÆWFVBrÂv6ö×ÆWFVB×v—F‚ÖW'&÷'2rÂvf–ÆVBrÂvÖ—76–ærrÂv6æ6VÆÆVBr’Öæ÷F6öçF–ç2·7G&–æuÒ„vWBÔFF&÷W'G’F7F—fRw7FGW2rrr’’°¢6WBÔæ÷FU&÷W'G’F7F—fRv¦ö–æVDW†—7F–ætF–fd¦ö"rGG'VP¢&WGW&âF7F—fP¢Ð¢Ð¢Ò6F6‚²Ð¢Ð¢F¦ö$–BÒv¦ö%òr²„vWBÔFFR’åFõ7G&–ær‚w———”ÔÖFEô„†Ö×72r’²uòr²…´wV–EÓ£¤æWtwV–B‚’åFõ7G&–ær‚târ’å7V'7G&–ærƒÃ‚’¢FÆV6W2Ò„æWrÔF–fd¦ö$ÆV6W2DÆæwVvRF6öçFW‡BF¦ö$–B¢F¦ö$F—"ÒvWBÕ&VæFW$¦ö$F—"DÆæwVvP¢F–çWEF‚Ò¦ö–âÕF‚F¦ö$F—""F¦ö$–BæF–fbæ–çWBæ§6öâ ¢G7FGW5F‚Ò¦ö–âÕF‚F¦ö$F—""F¦ö$–Bç7FGW2æ§6öâ ¢G7FF÷WEF‚Ò¦ö–âÕF‚F¦ö$F—""F¦ö$–BæF–fbæ÷WBæÆör ¢G7FFW'%F‚Ò¦ö–âÕF‚F¦ö$F—""F¦ö$–BæF–fbæW'"æÆör ¢G6†VWD6÷VçBÒ–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G6fU6†VWD¶W’’’°¢‚G6¶VÆWFöâç6†VWG2Âv†W&RÔö&¦V7B²·7G&–æuÒEòæ¶–æBÖæRwVæ6†ævVBrÒ’ä6÷Vç@¢ÒVÇ6R²Ð¢F–æ—F–ÂÒ·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ°¢ö²ÒGG'VS²¦ö%G—RÒvF–fbÖFWF–Âs²¦ö$–BÒF¦ö$–C²7FGW2ÒwVWVVBs²F÷FÂÒG6†VWD6÷Vç@¢6ö×ÆWFVBÒ²f–ÆVBÒ²W&6VçBÒ²ÖW76vRÒ~[zîXˆnŠ›>{K8).k©nX)ž8~8n8N8î8ž8"p¢7W'&VçEv÷&¶&öö´–BÒ·7G&–æuÒF6öçFW‡Bçv÷&¶&öö´–C²7W'&VçEv÷&¶&öö´æÖRÒ·7G&–æuÒF6öçFW‡Bçv÷&¶&öö´æÖP¢7W'&VçE6†VWBÒrs²&ö6W74–BÒ²7FF÷WEF‚ÒG7FF÷WEFƒ²7FFW'%F‚ÒG7FFW'%F€¢&W7VÇG2Ò‚“²W'&÷'2Ò‚“²7F'FVDBÒæWrÔæ÷t—6ó²WFFVDBÒæWrÔæ÷t—6ó²7FFU6fVDBÒrp¢Ð¢G'’°¢–b…·7G&–æuÒF6öçFW‡Bç66÷RÖWv†—7F÷'’rÖæBÖæ÷B¶&ööÅÒF6öçFW‡Bæ6ö×&—6öåW'6—7FVB’°¢G6fVBÒ6fRÔ†—7F÷&–6Å6æ6†÷D6ö×&—6öâDÆæwVvR…·7G&–æuÒF6öçFW‡Bçv÷&¶&öö´–B’F6öçFW‡Bæ6ö×&—6öà¢F6öçFW‡Bæ6ö×&—6öâÒG6fV@¢F6öçFW‡Bæ6ö×&—6öåW'6—7FVBÒGG'VP¢Ð¢w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚F–æ—F–À¢w&—FRÔ§6öäf–ÆRF–çWEF‚…¶÷&FW&VEÔ°¢¦ö$–BÒF¦ö$–C²ÖöFRÒDÆæwVvS²v÷&¶&öö´–BÒ·7G&–æuÒF6öçFW‡Bçv÷&¶&öö´–@¢7W'&VçE6æ6†÷D–BÒ·7G&–æuÒF6öçFW‡Bæ7W'&VçE6æ6†÷D–C²7W'&VçEfW'6–öä–BÒ·7G&–æuÒF6öçFW‡Bæ7W'&VçEfW'6–öä–@¢&6VÆ–æU6æ6†÷D–BÒ·7G&–æuÒF6öçFW‡Bæ&6VÆ–æU6æ6†÷D–C²&6VÆ–æUfW'6–öä–BÒ·7G&–æuÒF6öçFW‡Bæ&6VÆ–æUfW'6–öä–@¢66÷RÒ·7G&–æuÒF6öçFW‡Bç66÷S²6†VWD¶W’ÒG6fU6†VWD¶W¢66†TF—"ÒF66†TF—#²FWF–ÅF‚ÒFFWF–ÅFƒ²7FGW5F‚ÒG7FGW5F€¢7FF÷WEF‚ÒG7FF÷WEFƒ²7FFW'%F‚ÒG7FFW'%Fƒ²ÆV6W2Ò‚FÆV6W2¢vVæW&F–öäÆö6µF‚Ò„vWBÔF–fdvVæW&F–öäÆö6µF‚DÆæwVvRF6öçFW‡B¢Ò¢w&—FRÔ§6öäf–ÆRGö–çFW%F‚…¶÷&FW&VEÔ²¦ö$–BÒF¦ö$–C²6†VWD¶W’ÒG6fU6†VWD¶W“²7&VFVDBÒæWrÔæ÷t—6òÒ¢G4W†RÒ¦ö–âÕF‚FVçc¥7—7FVÕ&ö÷Bu7—7FVÓ3%Åv–æF÷w5÷vW%6†VÆÅÇcãÇ÷vW'6†VÆÂæW†Rp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚G4W†R’’²G4W†RÒw÷vW'6†VÆÂæW†RrÐ¢G6W'fW%67&—BÒ¦ö–âÕF‚E67&—C¤&ö÷Bw6W'fW"ç3p¢F6öÖÖæBÒ"brB‚G6W'fW%67&—Bå&WÆ6R‚"r"Â"rr"’’rÔÖöFRrB‚DÆæwVvRå&WÆ6R‚"r"Â"rr"’’rÔF–fd¦ö%F‚rB‚F–çWEF‚å&WÆ6R‚"r"Â"rr"’’r ¢G&ö2Ò7F'BÔ†–FFVå÷vW%6†VÆÄ6†–ÆBG4W†RF6öÖÖæBG7FF÷WEF‚G7FFW'%F€¢–b‚Öæ÷BG&ö2Ö÷"Öæ÷BG&ö2ä–B’²F‡&÷r~[zîXˆnyK¾X8þ8îKÙÎh‰89~8:Þ8+¾8+””N8).Xùn[é~8~8Þ8î8¾8)>8~8~8þ8"rÐ¢F–æ—F–Âç&ö6W74–BÒ¶–çEÒG&ö2ä–C²F–æ—F–Âç7FGW2ÒvÆVæ6†–ærs²F–æ—F–ÂçW&6VçBÒ ¢F–æ—F–ÂæÖW76vRÒ~[zîXˆnyK¾X8þ8îKÙÎh‰89~8:Þ8+¾8+ž8).‹[~X¹^8~8î8~8þ8"p¢w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚F–æ—F–À¢&WGW&âF–æ—F–À¢Ò6F6‚°¢F–æ—F–Âç7FGW2Òvf–ÆVBs²F–æ—F–ÂçW&6VçBÒ²F–æ—F–ÂæÖW76vRÒ~[zîXˆnyK¾X8þ8îKÙÎh‰89~8:Þ8+¾8+ž8).‹[~X¹^8~8Þ8î8¾8)>8~8~8þ8"p¢F–æ—F–ÂæW'&÷'2Ò…¶÷&FW&VEÔ²W'&÷"ÒEòäW†6WF–öâäÖW76vS²FWF–ÂÒvWBÔW'&÷$FWF–ÂEòÒ¢G'’²w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚F–æ—F–ÂÒ6F6‚²Ð¢&VÖ÷fRÔF–fd¦ö$ÆV6W2…·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ²ÖöFSÒDÆæwVvS²v÷&¶&öö´–CÕ·7G&–æuÒF6öçFW‡Bçv÷&¶&öö´–C²ÆV6W3Ô‚FÆV6W2’Ò¢F‡&÷p¢Ð¢Ð§Ð  ¦gVæ7F–öâ–çfö¶RÔF–fdFWF–Ä¦ö$6÷&R‚D¦ö"’°¢FÆæwVvRÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"vÖöFRrDÖöFR¢Gv÷&¶&öö´–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"wv÷&¶&öö´–Brrr¢G7FGW5F‚Ò·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"w7FGW5F‚rrr¢FFWF–ÅF‚Ò·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"vFWF–ÅF‚rrr¢F66†TF—"Ò´”òåF…Ó£¤vWDgVÆÅF‚…·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"v66†TF—"rrr’¢F¦ö$–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"v¦ö$–Brrr¢G&WVW7FVE6†VWD¶W’Ò·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"w6†VWD¶W’rrr¢G7FGW2Ò·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ°¢ö²ÒGG'VS²¦ö%G—RÒvF–fbÖFWF–Âs²¦ö$–BÒF¦ö$–C²7FGW2Òw'Vææ–ærs²F÷FÂÒ²6ö×ÆWFVBÒ²f–ÆVBÒ ¢W&6VçBÒ3²ÖW76vRÒ~jùN‹È>Zûî‹8).z+®Š¨Þ8~8n8N8î8ž8"s²7W'&VçEv÷&¶&öö´–BÒGv÷&¶&öö´–C²7W'&VçEv÷&¶&öö´æÖRÒrp¢7W'&VçE6†VWBÒrs²&ö6W74–BÒµ7—7FVÒäF–væ÷7F–72å&ö6W75Ó£¤vWD7W'&VçE&ö6W72‚’ä–@¢&W7VÇG2Ò‚“²W'&÷'2Ò‚“²7F'FVDBÒæWrÔæ÷t—6ó²WFFVDBÒæWrÔæ÷t—6ó²7FFU6fVDBÒrp¢Ð¢w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0¢FFWF–ÂÒFçVÆÀ¢G'’°¢&Vg&W6‚ÔF–fd¦ö$ÆV6W2D¦ö ¢F¦ö%66÷RÒ·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"w66÷RrvWFöÖF–2r¢F6öçFW‡BÒ–b‚F¦ö%66÷RÖWv†—7F÷'’r’°¢vWBÔF–fdFWF–Ä6öçFW‡BFÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒD¦ö"æ&6VÆ–æU6æ6†÷D–B’…·7G&–æuÒD¦ö"æ7W'&VçE6æ6†÷D–B¢ÒVÇ6R²vWBÔF–fdFWF–Ä6öçFW‡BFÆæwVvRGv÷&¶&öö´–BÐ¢–b‚Öæ÷B¶&ööÅÒF6öçFW‡Bæf–Æ&ÆR’²F‡&÷r·7G&–æuÒF6öçFW‡BæÖW76vRÐ¢f÷&V6‚‚Ff–VÆB–â‚v7W'&VçE6æ6†÷D–BrÂv7W'&VçEfW'6–öä–BrÂv&6VÆ–æU6æ6†÷D–BrÂv&6VÆ–æUfW'6–öä–BrÂw66÷Rr’’°¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’D¦ö"Ff–VÆBrr’ÖæR·7G&–æuÒ„vWBÔFF&÷W'G’F6öçFW‡BFf–VÆBrr’’°¢F‡&÷r~jùN‹È>Zûî‹8Îi»Nik8^8(Î8î8~8þ8.ZHži»N8988>8+Ž8).™h¾8Þy»N8~8n8þ88^8N8"p¢Ð¢Ð¢FW‡V7FVD66†RÒ´”òåF…Ó£¤vWDgVÆÅF‚‚„vWBÔF–fdFWF–Ä66†TF—$f÷$ÆæwVvRFÆæwVvRF6öçFW‡B’¢–b‚FW‡V7FVD66†RÖæRF66†TF—"’²F‡&÷r~[zîXˆn8*Þ8:>88>8+~8:^8îKùÞZÙŽXXŽ8ÎKˆÞjÚ>8~8ž8"rÐ¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚F66†TF—"’’²æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚F66†TF—"Ôf÷&6RÂ÷WBÔçVÆÂÐ¢2XZŽKÙ>XhÞŠšnŠÎ8~8(.iz.ZÙŽŠ›>{K8).ŠªÞ8þ‹ëÎ8þ8f–ÆVN8¾8®8>8þZHži»N8®8~8+~8;Î88Ž8).KùÞhÈ8ž8(¾8 ¢2ŠªÞ8þ‹ëÎ8)>8Xh^Zëž8þy»N[èÎ8åFW7BÔF–fdFWF–ÄÖF6†W46öçFW‡N8~jùN‹È>Zûî‹8Ž8îZèÎXZŽKˆˆ{N8).jIÎŠ‹Î8ž8(¾8 ¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚FFWF–ÅF‚’°¢FFWF–ÂÒ&VBÔ§6öäf–ÆRFFWF–ÅF‚FçVÆÀ¢Ð¢–b‚Öæ÷B…FW7BÔF–fdFWF–ÄÖF6†W46öçFW‡BFFWF–ÂF6öçFW‡B’’°¢FFWF–ÂÒæWrÔF–fdFWF–Å6¶VÆWFöâFÆæwVvRF6öçFW‡@¢Ð¢FÆÅ6†VWG2Ò„vWBÔ'&’FFWF–Âç6†VWG2¢Gv÷&´–æFW†W2Ò‚¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&WVW7FVE6†VWD¶W’’’°¢f÷"‚FâÒ²FâÖÇBFÆÅ6†VWG2ä6÷VçC²Fâ²²’°¢G6†VWD¶–æBÒ·7G&–æuÒ„vWBÔFF&÷W'G’FÆÅ6†VWG5²FåÒv¶–æBrrr¢G6†VWE7FGW2Ò·7G&–æuÒ„vWBÔFF&÷W'G’FÆÅ6†VWG5²FåÒw7FGW2rrr¢–b‚G6†VWD¶–æBÖæRwVæ6†ævVBrÖ÷"G6†VWE7FGW2ÖWvf–ÆVBr’²Gv÷&´–æFW†W2³ÒFâÐ¢VÇ6V–b‚G6†VWE7FGW2ÖæRw&VG’r’°¢FÆÅ6†VWG5²FåÒç7FGW2ÒvFVfW'&VBp¢FÆÅ6†VWG5²FåÒæÖW76vRÒ~ZHži»N8®8~8+~8;Î88Ž8îyK¾X8þ8þ8˜Žh©î8~8þ8Ž8Þ8¾KÙÎh‰8~8î8ž8"p¢Ð¢Ð¢ÒVÇ6R°¢f÷"‚FâÒ²FâÖÇBFÆÅ6†VWG2ä6÷VçC²Fâ²²’²–b…·7G&–æuÒFÆÅ6†VWG5²FåÒç6†VWD¶W’ÖWG&WVW7FVE6†VWD¶W’’²Gv÷&´–æFW†W2³ÒFã²'&V²ÒÐ¢–b‚Gv÷&´–æFW†W2ä6÷VçBÖW’²F‡&÷r~hÈ~Zé®8~8þ8+~8;Î88Ž8þjùN‹È>Zûî‹8¾Y
+¾8î8(Î8n8N8î8¾8)>8"rÐ¢Ð¢FFWF–Âç6†VWG2Ò‚FÆÅ6†VWG2¢FFWF–Âç7FGW2ÒvvVæW&F–ærp¢FFWF–ÂævVæW&F–öâÒ¶÷&FW&VEÔ²7FGW2Òw'Vææ–ærs²¦ö$–BÒF¦ö$–C²W&6VçBÒ3²ÖW76vRÒ~[zîXˆnyK¾X8þ8).KÙÎh‰8~8n8N8î8ž8"s²7W'&VçE6†VWBÒrrÐ¢w&—FRÔ§6öäf–ÆRFFWF–ÅF‚FFWF–À¢G7FGW2çF÷FÂÒGv÷&´–æFW†W2ä6÷VçC²G7FGW2æ7W'&VçEv÷&¶&öö´æÖRÒ·7G&–æuÒF6öçFW‡Bçv÷&¶&öö´æÖP¢w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0 ¢2ZHži»N8+~8;Î88Ž8N8Ž8²¦fõDd&÷‚8)#.Y¹î‹[~X¹^8~8n8N8þiz~{XÎ‹zþ8).˜þ88(¾8 ¢2XZŽ8+~8;Î88Ž8îikizuDn8)#8N8ä¥dÞ8ŽkŠ8~8iÈZJsNKŠnX‰~8~8:ž8+ž8+þ8:ž8*N8+®8~8n8¾8(žKˆhºÎŠz>ié8ž8(¾8 ¢F&F6…&WVW7BÒ‚¢F&F6„–D'”–æFW‚Ò·Ð¢F&F6…&W&F–öäW'&÷'2Ò·Ð¢f÷"‚G÷6—F–öâÒ²G÷6—F–öâÖÇBGv÷&´–æFW†W2ä6÷VçC²G÷6—F–öâ²²’°¢F’Ò¶–çEÒGv÷&´–æFW†W5²G÷6—F–öåÐ¢G6†VWBÒFFWF–Âç6†VWG5²F•Ð¢FæÖRÒ·7G&–æuÒG6†VWBç6†VWDæÖP¢F¶–æBÒ·7G&–æuÒG6†VWBæ¶–æ@¢G'’°¢F&Vf÷&UFbÒrs²FgFW%FbÒrp¢–b‚F¶–æBÖæRvFFVBr’²F&Vf÷&UFbÒ&W6öÇfRÔF–fd6öçFVçEFeF‚FÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒF6öçFW‡Bæ&6VÆ–æU6æ6†÷D–B’…·7G&–æuÒF6öçFW‡Bæ&6VÆ–æUfW'6–öä–B’FæÖRÐ¢–b‚F¶–æBÖæRw&VÖ÷fVBr’²FgFW%FbÒ&W6öÇfRÔF–fd6öçFVçEFeF‚FÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒF6öçFW‡Bæ7W'&VçE6æ6†÷D–B’…·7G&–æuÒF6öçFW‡Bæ7W'&VçEfW'6–öä–B’FæÖRÐ¢FÖ—76–ærÒ‚‚F¶–æBÖ–â‚vÖöF–f–VBrÂwVæ6†ævVBr’ÖæB…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&Vf÷&UFb’Ö÷"·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FgFW%Fb’’’Ö÷ ¢‚F¶–æBÖWvFFVBrÖæB·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FgFW%Fb’’Ö÷"‚F¶–æBÖWw&VÖ÷fVBrÖæB·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&Vf÷&UFb’’¢–b‚FÖ—76–ær’²F‡&÷r~YÎKˆ8:Î8;>888:®8;>8+K‰nKº>8æ6öçFVçBDn8ÎŠh¾8N8¾8(®8î8¾8)>8"rÐ¢–b‚F¶–æBÖWwVæ¶æ÷vârÖæB·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&Vf÷&UFb’ÖæB·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚FgFW%Fb’’²F‡&÷r~jùN‹È>XX>8;¾jùN‹È>XXŽ8åDn8).z+®Š¨Þ8~8Þ8î8¾8)>8"rÐ¢G6†VWDF—"Ò¦ö–âÕF‚F66†TF—"„¦ö–âÕF‚wr…·7G&–æuÒG6†VWBç6†VWD¶W’’¢–b…FW7BÕF‚ÔÆ—FW&ÅF‚G6†VWDF—"’²&VÖ÷fRÔ—FVÒÔÆ—FW&ÅF‚G6†VWDF—"Õ&V7W'6RÔf÷&6RÔW'&÷$7F–öâ6–ÆVçFÇ”6öçF–çVRÐ¢æWrÔ—FVÒÔ—FVÕG—RF—&V7F÷'’ÕF‚G6†VWDF—"Ôf÷&6RÂ÷WBÔçVÆÀ¢F&F6„–BÒv’r²G÷6—F–öâåFõ7G&–ær‚sr¢F&F6„–D'”–æFW…µ·7G&–æuÒF•ÒÒF&F6„–@¢F&F6…&WVW7B³Ò¶÷&FW&VEÔ°¢–BÒF&F6„–@¢&Vf÷&UFbÒF&Vf÷&UF`¢gFW%FbÒFgFW%F`¢&Vf÷&U&7FW$F—&V7F÷'’ÒB†–b‚F¶–æBÖæRvFFVBr’°¢vWBÕ&VæFW%&7FW%6†VWDF—"FÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒF6öçFW‡Bæ&6VÆ–æU6æ6†÷D–B’…·7G&–æuÒF6öçFW‡Bæ&6VÆ–æUfW'6–öä–B’FæÖP¢ÒVÇ6R²rrÒ¢gFW%&7FW$F—&V7F÷'’ÒB†–b‚F¶–æBÖæRw&VÖ÷fVBr’°¢vWBÕ&VæFW%&7FW%6†VWDF—"FÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒF6öçFW‡Bæ7W'&VçE6æ6†÷D–B’…·7G&–æuÒF6öçFW‡Bæ7W'&VçEfW'6–öä–B’FæÖP¢ÒVÇ6R²rrÒ¢&Vf÷&UvT6÷VçBÒvWBÔ–çDFF&÷W'G’G6†VWBv&Vf÷&UvW2r ¢gFW%vT6÷VçBÒvWBÔ–çDFF&÷W'G’G6†VWBvgFW%vW2r ¢÷WGWDF—&V7F÷'’ÒG6†VWDF— ¢¶–æBÒF¶–æ@¢Ð¢Ò6F6‚°¢F&F6…&W&F–öäW'&÷'5µ·7G&–æuÒF•ÒÒEòäW†6WF–öâäÖW76vP¢Ð¢Ð¢F&F6…&W7VÇDÖÒ·Ð¢F&F6…F–Ö–æw2ÒFçVÆÀ¢–b‚F&F6…&WVW7Bä6÷VçBÖwB’°¢&Vg&W6‚ÔF–fd¦ö$ÆV6W2D¦ö ¢G7FGW2æÖW76vRÒ.ikizuDn8).8î8Ž8(8nyK¾X8þXÉn8;¾Šz>ié8~8n8N8î8žûÈ‚B‚F&F6…&WVW7Bä6÷VçBž8+~8;Î88ŽûÈž8" ¢G7FGW2æ7W'&VçE6†VWBÒrp¢G7FGW2çW&6VçBÒP¢FFWF–ÂævVæW&F–öâÒ¶÷&FW&VEÔ²7FGW2Òw'Vææ–ærs²¦ö$–BÒF¦ö$–C²W&6VçBÒS²ÖW76vRÒG7FGW2æÖW76vS²7W'&VçE6†VWBÒrrÐ¢w&—FRÔ§6öäf–ÆRFFWF–ÅF‚FFWF–Ã²w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0¢F&F6„vVæW&FVBÒ–çfö¶RÔF–fd–ÖvT&F6„vVæW&F–öâF&F6…&WVW7@¢F&F6…F–Ö–æw2ÒvWBÔFF&÷W'G’F&F6„vVæW&FVBwF–Ö–æw2rFçVÆÀ¢f÷&V6‚‚F&F6„—FVÒ–â„vWBÔ'&’„vWBÔFF&÷W'G’F&F6„vVæW&FVBv—FV×2r‚’’’’°¢F&F6…&W7VÇDÖµ·7G&–æuÒ„vWBÔFF&÷W'G’F&F6„—FVÒv–Brrr•ÒÒF&F6„—FVÐ¢Ð¢Ð ¢f÷"‚G÷6—F–öâÒ²G÷6—F–öâÖÇBGv÷&´–æFW†W2ä6÷VçC²G÷6—F–öâ²²’°¢&Vg&W6‚ÔF–fd¦ö$ÆV6W2D¦ö ¢F’Ò¶–çEÒGv÷&´–æFW†W5²G÷6—F–öåÐ¢G6†VWBÒFFWF–Âç6†VWG5²F•Ð¢FæÖRÒ·7G&–æuÒG6†VWBç6†VWDæÖS²F¶–æBÒ·7G&–æuÒG6†VWBæ¶–æ@¢G6†VWBç7FGW2ÒvvVæW&F–ærs²G6†VWBæÖW76vRÒrp¢G7FGW2æ7W'&VçE6†VWBÒFæÖP¢G7FGW2æÖW76vRÒ.[zîXˆnyK¾X8þ8).KÙÎh‰8~8n8N8î8“¢B‚G÷6—F–öâ²’òB‚Gv÷&´–æFW†W2ä6÷VçB’8+~8;Î88‚FæÖR ¢G7FGW2çW&6VçBÒ¶–çEÕ´ÖF…Ó£¤Ö‚ƒRÂ´ÖF…Ó£¤Ö–âƒ“RÂ´ÖF…Ó£¤fÆö÷"‚‚…¶F÷V&ÆUÒG÷6—F–öâ’ò´ÖF…Ó£¤Ö‚ƒÂGv÷&´–æFW†W2ä6÷VçB’’¢“’²R’¢w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0¢G'’°¢–b‚F&F6…&W&F–öäW'&÷'2ä6öçF–ç4¶W’…·7G&–æuÒF’’’²F‡&÷r·7G&–æuÒF&F6…&W&F–öäW'&÷'5µ·7G&–æuÒF•ÒÐ¢F&F6„–BÒ·7G&–æuÒF&F6„–D'”–æFW…µ·7G&–æuÒF•Ð¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚F&F6„–B’Ö÷"Öæ÷BF&F6…&W7VÇDÖä6öçF–ç4¶W’‚F&F6„–B’’°¢F‡&÷r~[zîXˆnyK¾X8þKˆhºÎyIþh‰{YiéÎ8¾Zûî‹8+~8;Î88Ž8Î8.8(®8î8¾8)>8"p¢Ð¢FvVæW&FVBÒF&F6…&W7VÇDÖ²F&F6„–EÐ¢–b‚Öæ÷B¶&ööÅÒ„vWBÔFF&÷W'G’FvVæW&FVBvö²rFfÇ6R’’°¢F‡&÷r·7G&–æuÒ„vWBÔFF&÷W'G’FvVæW&FVBvÖW76vRr~[zîXˆnyK¾X8þ8).yIþh‰8~8Þ8î8¾8)>8~8~8þ8"r¢Ð¢GvW2Ò‚“²G&Vv–öåF÷FÂÒ²F†5Væ¶æ÷våvRÒFfÇ6P¢f÷&V6‚‚GvR–â„vWBÔ'&’FvVæW&FVBçvW2’’°¢G&Vv–öç2Ò„vWBÔ'&’„vWBÔFF&÷W'G’GvRw&Vv–öç2r‚’’“²G&Vv–öåF÷FÂ³ÒG&Vv–öç2ä6÷Vç@¢–b…·7G&–æuÒ„vWBÔFF&÷W'G’GvRw7FGW2rrr’ÖWwVæ¶æ÷vâr’²F†5Væ¶æ÷våvRÒGG'VRÐ¢GvW2³Ò·67W7FöÖö&¦V7EÕ¶÷&FW&VEÔ°¢vTçVÖ&W"ÒvWBÔ–çDFF&÷W'G’GvRwvTçVÖ&W"r²v–GF‚ÒvWBÔ–çDFF&÷W'G’GvRwv–GF‚r²†V–v‡BÒvWBÔ–çDFF&÷W'G’GvRv†V–v‡Br ¢vU6—¦T6†ævVBÒ¶&ööÅÒ„vWBÔFF&÷W'G’GvRwvU6—¦T6†ævVBrFfÇ6R“²7FGW2Ò·7G&–æuÒ„vWBÔFF&÷W'G’GvRw7FGW2rw&VG’r¢ÖW76vRÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRvÖW76vRrrr“²6öæf–FVæ6RÒ¶F÷V&ÆUÒ„vWBÔFF&÷W'G’GvRv6öæf–FVæ6Rr¢6†ævVE&F–òÒ¶F÷V&ÆUÒ„vWBÔFF&÷W'G’GvRv6†ævVE&F–òr“²&Vf÷&T76WBÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRv&Vf÷&Tf–ÆRrrr¢gFW$76WBÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRvgFW$f–ÆRrrr“²&Vf÷&TÖ6´76WBÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRv&Vf÷&TÖ6´f–ÆRrrr¢&Vf÷&T÷fW&Æ”76WBÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRv&Vf÷&T÷fW&Æ”f–ÆRrrr“²Ö6´76WBÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRvgFW$Ö6´f–ÆRrrr¢÷fW&Æ”76WBÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvRvgFW$÷fW&Æ”f–ÆRrrr“²&Vv–öç2Ò‚G&Vv–öç2¢Ð¢Ð¢G6†VWBçvW2Ò‚GvW2“²G6†VWBæ&Vf÷&UvW2ÒvWBÔ–çDFF&÷W'G’FvVæW&FVBv&Vf÷&UvT6÷VçBr ¢G6†VWBægFW%vW2ÒvWBÔ–çDFF&÷W'G’FvVæW&FVBvgFW%vT6÷VçBr ¢G6†VWBçvT6÷VçBÒ´ÖF…Ó£¤Ö‚…¶–çEÒG6†VWBæ&Vf÷&UvW2Â¶–çEÒG6†VWBægFW%vW2“²G6†VWBç&Vv–öä6÷VçBÒG&Vv–öåF÷FÀ¢G6†VWBç7FGW2ÒB†–b‚F¶–æBÖWwVæ¶æ÷vârÖ÷"F†5Væ¶æ÷våvR’²wVæ¶æ÷vârÒVÇ6R²w&VG’rÒ¢–b‚F¶–æBÖWwVæ¶æ÷vâr’²G6†VWBæÖW76vRÒ~KúšÎ8~8Þ8(¾[zîXˆnš	ŽYùþ8).XŠNZé®8~8Þ8®8N8þ8(8[Ë~Š«þŠŽzK®8þŠÎ8N8î8¾8)>8"rÐ¢Ò6F6‚°¢2yK¾X8þyIþh‰8Þ8î8(.8î8îZKiY~8þ8jùN‹È>Kˆ®8î8ÎXŠNZé®KˆÞˆ;Þ8Þ8ŽXË®XŠ^8ž8(¾8 ¢2f–ÆVB8î8î8îjè¾8ž8>8Ž8~8XZŽKÙ>XhÞŠšnŠÎ8î8þ8þ8+~8;Î88ŽXhÞ˜Žh©î8¾8(žXhÞyIþh‰8~8Þ8(¾8 ¢G6†VWBç7FGW2Òvf–ÆVBs²G6†VWBæÖW76vRÒEòäW†6WF–öâäÖW76vS²G6†VWBçvW2Ò‚“²G6†VWBç&Vv–öä6÷VçBÒ ¢G7FGW2æf–ÆVB²³²G7FGW2æW'&÷'2Ò‚G7FGW2æW'&÷'2’²…¶÷&FW&VEÔ²6†VWDæÖRÒFæÖS²W'&÷"ÒEòäW†6WF–öâäÖW76vS²FWF–ÂÒvWBÔW'&÷$FWF–ÂEòÒ¢Ð¢G7FGW2æ6ö×ÆWFVBÒG÷6—F–öâ²¢G7FGW2çW&6VçBÒ¶–çEÕ´ÖF…Ó£¤Ö‚ƒ‚Â´ÖF…Ó£¤Ö–âƒ“‚Â´ÖF…Ó£¤fÆö÷"‚‚…¶F÷V&ÆUÒ‚G÷6—F–öâ²’’ò´ÖF…Ó£¤Ö‚ƒÂGv÷&´–æFW†W2ä6÷VçB’’¢“2’²R’¢FFWF–Âç6†VWG5²F•ÒÒG6†VW@¢FFWF–ÂævVæW&F–öâÒ¶÷&FW&VEÔ²7FGW2Òw'Vææ–ærs²¦ö$–BÒF¦ö$–C²W&6VçBÒG7FGW2çW&6VçC²ÖW76vRÒG7FGW2æÖW76vS²7W'&VçE6†VWBÒFæÖRÐ¢w&—FRÔ§6öäf–ÆRFFWF–ÅF‚FFWF–Ã²w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0¢Ð¢28+~8;Î88Ž888î˜^[»nyIþh‰8~8("w&VG’r8).i»Ž8N8n8N8þ8þ8(8XZŽ8+~8;Î88ŽyIþh‰8Î˜	NKŠÞ8~ZKiY~8~8þ[èÎ8°¢28ÎZHži»N8®8~8Þ8+~8;Î88Ž8)#K»n™h¾8þ8‚7FGW28Â&VG’8¾Kˆ®i»Ž8Þ8^8(Î8VæF–ær8î8î8îjè¾8>8ð¢28+~8;Î88Ž8ÎK¨Î[ªn8ŽyIþh‰8~8Þ8®8þ8®8>8n8N8ò…7F'BÔF–fdFWF–Ä¦ö"8Î8ÎKÙÎh‰kˆŽ8þ8Þ8).‹ùN8’ž8 ¢2Zéþ™©¾8îjè¾K»n8¾8(’7FGW28).k®8(8(¾8 ¢GVæF–æu6†VWG2Ò„vWBÔ'&’FFWF–Âç6†VWG2Âv†W&RÔö&¦V7B²‚wVæF–ærrÂvvVæW&F–ærr’Ö6öçF–ç2·7G&–æuÒ„vWBÔFF&÷W'G’Eòw7FGW2rrr’Ò’ä6÷Vç@¢Ff–ÆVE6†VWG2Ò„vWBÔ'&’FFWF–Âç6†VWG2Âv†W&RÔö&¦V7B²·7G&–æuÒ„vWBÔFF&÷W'G’Eòw7FGW2rrr’ÖWvf–ÆVBrÒ’ä6÷Vç@¢–b‚GVæF–æu6†VWG2ÖWÖæBFf–ÆVE6†VWG2ÖW’°¢FFWF–Âç7FGW2Òw&VG’s²FFWF–ÂæÖW76vRÒrp¢ÒVÇ6R°¢FFWF–Âç7FGW2Òvf–ÆVBp¢G'G2Ò‚¢–b‚GVæF–æu6†VWG2ÖwB’²G'G2³Ò.iÊ®KÙÎh‰GVæF–æu6†VWG2K»b"Ð¢–b‚Ff–ÆVE6†VWG2ÖwB’²G'G2³Ò.KÙÎh‰ZKiYrFf–ÆVE6†VWG2K»b"Ð¢FFWF–ÂæÖW76vRÒ‚~[zîXˆnyK¾X8þ8¾iÊ®ZèÎK¨n8î8+~8;Î88Ž8Î8.8(®8î8žûÈ‚r²‚G'G2Ö¦ö–â~8r’²~ûÈž8.XhÞŠšnŠÎ8~8n8þ88^8N8"r¢Ð¢FFWF–ÂævVæW&FVDBÒæWrÔæ÷t—6ð¢6WBÔæ÷FU&÷W'G’FFWF–ÂwW&f÷&Öæ6RrF&F6…F–Ö–æw0¢FFWF–ÂævVæW&F–öâÒ¶÷&FW&VEÔ²7FGW2Òv6ö×ÆWFVBs²¦ö$–BÒF¦ö$–C²W&6VçBÒ²ÖW76vRÒ~[zîXˆnŠ›>{K8).KÙÎh‰8~8î8~8þ8"s²7W'&VçE6†VWBÒrrÐ¢w&—FRÔ§6öäf–ÆRFFWF–ÅF‚FFWF–À¢G7FGW2ç7FGW2ÒB†–b‚G7FGW2æf–ÆVBÖwB’²v6ö×ÆWFVB×v—F‚ÖW'&÷'2rÒVÇ6R²v6ö×ÆWFVBrÒ“²G7FGW2çW&6VçBÒ²G7FGW2æ7W'&VçE6†VWBÒrp¢G7FGW2æÖW76vRÒB†–b‚G7FGW2æf–ÆVBÖwB’²~Kˆ˜:Ž8î8+~8;Î88Ž8).™šN8Þ8[zîXˆnŠ›>{K8).KÙÎh‰8~8î8~8þ8"rÒVÇ6R²~[zîXˆnŠ›>{K8).KÙÎh‰8~8î8~8þ8"rÒ¢G7FGW2ç&W7VÇG2Ò…¶÷&FW&VEÔ²v÷&¶&öö´–BÒGv÷&¶&öö´–C²FWF–ÅF‚ÒFFWF–ÅFƒ²6†VWD6÷VçBÒGv÷&´–æFW†W2ä6÷VçC²W&f÷&Öæ6RÒF&F6…F–Ö–æw2Ò¢w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0¢Ò6F6‚°¢G7FGW2ç7FGW2Òvf–ÆVBs²G7FGW2çW&6VçBÒ²G7FGW2æÖW76vRÒ~[zîXˆnŠ›>{K8).KÙÎh‰8~8Þ8î8¾8)>8~8~8þ8"p¢G7FGW2æW'&÷'2Ò…¶÷&FW&VEÔ²W'&÷"ÒEòäW†6WF–öâäÖW76vS²FWF–ÂÒvWBÔW'&÷$FWF–ÂEòÒ“²w&—FRÕ&VæFW$¦ö%7FGW2G7FGW5F‚G7FGW0¢–b‚FçVÆÂÖæRFFWF–Â’°¢G'’°¢FFWF–Âç7FGW2Òvf–ÆVBp¢–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&WVW7FVE6†VWD¶W’’’°¢GF&vWBÒ„vWBÔ'&’FFWF–Âç6†VWG2Âv†W&RÔö&¦V7B²·7G&–æuÒ„vWBÔFF&÷W'G’Eòw6†VWD¶W’rrr’ÖWG&WVW7FVE6†VWD¶W’ÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚GF&vWBä6÷VçBÖwB’°¢GF&vWE³Òç7FGW2Òvf–ÆVBp¢GF&vWE³ÒæÖW76vRÒEòäW†6WF–öâäÖW76vP¢GF&vWE³ÒçvW2Ò‚¢GF&vWE³Òç&Vv–öä6÷VçBÒ ¢Ð¢Ð¢FFWF–ÂæÖW76vRÒEòäW†6WF–öâäÖW76vP¢FFWF–ÂævVæW&F–öâÒ¶÷&FW&VEÔ²7FGW2Òvf–ÆVBs²¦ö$–BÒF¦ö$–C²W&6VçBÒ²ÖW76vRÒEòäW†6WF–öâäÖW76vS²7W'&VçE6†VWBÒrrÐ¢w&—FRÔ§6öäf–ÆRFFWF–ÅF‚FFWF–À¢Ò6F6‚²Ð¢Ð¢Ð§Ð  ¦gVæ7F–öâ–çfö¶RÔF–fdFWF–Ä¦ö$g&öÔf–ÆR…·7G&–æuÒD¦ö%F‚’°¢F¦ö"Ò&VBÔ§6öäf–ÆRD¦ö%F‚FçVÆÀ¢–b‚FçVÆÂÖWF¦ö"’²F‡&÷r$F–fb¦ö"f–ÆR—2æ÷B&VF&ÆS¢D¦ö%F‚"Ð¢G'’°¢FÆæwVvRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"vÖöFRrDÖöFR¢Gv÷&¶&öö´–BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"wv÷&¶&öö´–Brrr¢F¦ö%66÷RÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"w66÷RrvWFöÖF–2r¢F6öçFW‡BÒ–b‚F¦ö%66÷RÖWv†—7F÷'’r’°¢vWBÔF–fdFWF–Ä6öçFW‡BFÆæwVvRGv÷&¶&öö´–B…·7G&–æuÒF¦ö"æ&6VÆ–æU6æ6†÷D–B’…·7G&–æuÒF¦ö"æ7W'&VçE6æ6†÷D–B¢ÒVÇ6R²vWBÔF–fdFWF–Ä6öçFW‡BFÆæwVvRGv÷&¶&öö´–BÐ¢–b‚Öæ÷B¶&ööÅÒF6öçFW‡Bæf–Æ&ÆR’²F‡&÷r·7G&–æuÒF6öçFW‡BæÖW76vRÐ¢FW‡V7FVDÆö6²Ò´”òåF…Ó£¤vWDgVÆÅF‚‚„vWBÔF–fdvVæW&F–öäÆö6µF‚FÆæwVvRF6öçFW‡B’¢G&÷f–FVDÆö6µFW‡BÒ·7G&–æuÒ„vWBÔFF&÷W'G’F¦ö"vvVæW&F–öäÆö6µF‚rrr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚G&÷f–FVDÆö6µFW‡B’’²F‡&÷r~[zîXˆnyIþh‰8:Þ88>8*þ8îKùÞZÙŽXXŽ8Î8.8(®8î8¾8)>8"rÐ¢G&÷f–FVDÆö6²Ò´”òåF…Ó£¤vWDgVÆÅF‚‚G&÷f–FVDÆö6µFW‡B¢–b‚FW‡V7FVDÆö6²ÖæRG&÷f–FVDÆö6²’²F‡&÷r~[zîXˆnyIþh‰8:Þ88>8*þ8îKùÞZÙŽXXŽ8ÎKˆÞjÚ>8~8ž8"rÐ¢–çfö¶RÕv—F„Æö6²FW‡V7FVDÆö6²²–çfö¶RÔF–fdFWF–Ä¦ö$6÷&RF¦ö"Ð¢Òf–æÆÇ’°¢&VÖ÷fRÔF–fd¦ö$ÆV6W2F¦ö ¢Ð§Ð ¦gVæ7F–öâ6W'fRÔF–fevR‚D6öçFW‡BÂ·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂ·7G&–æuÒD7W'&VçE6æ6†÷D–BÂ·7G&–æuÒD&6VÆ–æU6æ6†÷D–BÂ·7G&–æuÒE6†VWD¶W’Â·7G&–æuÒEvTçVÖ&W%FW‡BÂ·7G&–æuÒD76WBÂ·7G&–æuÒE66÷RÒvWFöÖF–2r’°¢FÆÆ÷vVD76WG2Ò‚v&Vf÷&RrÂvgFW"rÂv&Vf÷&RÖÖ6²rÂv&Vf÷&RÖ÷fW&Æ’rÂvÖ6²rÂv÷fW&Æ’r¢–b‚FÆÆ÷vVD76WG2Öæ÷F6öçF–ç2D76WB’²F‡&÷r´&wVÖVçDW†6WF–öåÓ£¦æWr‚v76WB8ÎKˆÞjÚ>8~8ž8"r’Ð¢GvTçVÖ&W"Ò ¢–b‚Öæ÷B¶–çEÓ£¥G'•'6R‚EvTçVÖ&W%FW‡BÂ·&VeÒGvTçVÖ&W"’Ö÷"GvTçVÖ&W"ÖÆR’°¢F‡&÷r´&wVÖVçDW†6WF–öåÓ£¦æWr‚wvTçVÖ&W"8ÎKˆÞjÚ>8~8ž8"r¢Ð¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E66÷R’’²E66÷RÒvWFöÖF–2rÐ¢–b‚E66÷RÖæ÷F–â‚vWFöÖF–2rÂv†—7F÷'’r’’²F‡&÷r´&wVÖVçDW†6WF–öåÓ£¦æWr‚w66÷R8ÎKˆÞjÚ>8~8ž8"r’Ð¢FF–fd6öçFW‡BÒ–b‚E66÷RÖWv†—7F÷'’r’°¢vWBÔF–fdFWF–Ä6öçFW‡BDÆæwVvREv÷&¶&öö´–BD&6VÆ–æU6æ6†÷D–BD7W'&VçE6æ6†÷D–@¢ÒVÇ6R°¢vWBÔF–fdFWF–Ä6öçFW‡BDÆæwVvREv÷&¶&öö´–@¢Ð¢–b‚Öæ÷B¶&ööÅÒFF–fd6öçFW‡Bæf–Æ&ÆR’²F‡&÷r·7G&–æuÒFF–fd6öçFW‡BæÖW76vRÐ¢–b‚„76W'BÕ6fU7F÷&vU6VvÖVçBD7W'&VçE6æ6†÷D–Bv7W'&VçE6æ6†÷D–Br’ÖæR·7G&–æuÒFF–fd6öçFW‡Bæ7W'&VçE6æ6†÷D–BÖ÷ ¢„76W'BÕ6fU7F÷&vU6VvÖVçBD&6VÆ–æU6æ6†÷D–Bv&6VÆ–æU6æ6†÷D–Br’ÖæR·7G&–æuÒFF–fd6öçFW‡Bæ&6VÆ–æU6æ6†÷D–B’°¢F‡&÷r~jùN‹È>Zûî‹8Îi»Nik8^8(Î8î8~8þ8.[zîXˆnŠ›>{K8).™h¾8Þy»N8~8n8þ88^8N8"p¢Ð¢G6fU6†VWD¶W’Ò76W'BÕ6fU7F÷&vU6VvÖVçBE6†VWD¶W’w6†VWD¶W’p¢F66†TF—"ÒvWBÔF–fdFWF–Ä66†TF—$f÷$ÆæwVvRDÆæwVvRFF–fd6öçFW‡@¢FFWF–ÅF‚Ò¦ö–âÕF‚F66†TF—"vF–fbÖFWF–Âæ§6öâp¢–b‚Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FFWF–ÅF‚’’²F‡&÷r~[zîXˆnŠ›>{K8þ8î8KÙÎh‰8^8(Î8n8N8î8¾8)>8"rÐ¢FFWF–ÂÒ&VBÔ§6öäf–ÆRFFWF–ÅF‚FçVÆÀ¢–b‚Öæ÷B…FW7BÔF–fdFWF–ÄÖF6†W46öçFW‡BFFWF–ÂFF–fd6öçFW‡B’’°¢F‡&÷r~[zîXˆnŠ›>{K8îjùN‹È>Zûî‹8ÎKˆˆ{N8~8î8¾8)>8.[zîXˆnŠ›>{K8).XhÞKÙÎh‰8~8n8þ88^8N8"p¢Ð¢G6†VWBÒ„vWBÔ'&’FFWF–Âç6†VWG2Âv†W&RÔö&¦V7B²·7G&–æuÒEòç6†VWD¶W’ÖWG6fU6†VWD¶W’ÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚G6†VWBä6÷VçBÖW’²F‡&÷r~hÈ~Zé®8~8þ8+~8;Î88Ž8þjùN‹È>Zûî‹8¾Y
+¾8î8(Î8n8N8î8¾8)>8"rÐ¢GvRÒ„vWBÔ'&’G6†VWE³ÒçvW2Âv†W&RÔö&¦V7B²„vWBÔ–çDFF&÷W'G’EòwvTçVÖ&W"r’ÖWGvTçVÖ&W"ÒÂ6VÆV7BÔö&¦V7BÔf—'7B¢–b‚GvRä6÷VçBÖW’²F‡&÷r~hÈ~Zé®8~8þ89®8;Î8+Ž8þjùN‹È>Zûî‹8¾Y
+¾8î8(Î8n8N8î8¾8)>8"rÐ¢G&÷W'G’Ò7v—F6‚‚D76WB’°¢v&Vf÷&Rr²v&Vf÷&T76WBrÐ¢vgFW"r²vgFW$76WBrÐ¢v&Vf÷&RÖÖ6²r²v&Vf÷&TÖ6´76WBrÐ¢v&Vf÷&RÖ÷fW&Æ’r²v&Vf÷&T÷fW&Æ”76WBrÐ¢vÖ6²r²vÖ6´76WBrÐ¢v÷fW&Æ’r²v÷fW&Æ”76WBrÐ¢Ð¢Ff–ÆTæÖRÒ·7G&–æuÒ„vWBÔFF&÷W'G’GvU³ÒG&÷W'G’rr¢–b…·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚Ff–ÆTæÖR’Ö÷"Ff–ÆTæÖRÖæ÷FÖF6‚uå´Õ¦×£Ó’åòÕÒµÂçærBr’²F‡&÷r~[zîXˆnyK¾X8þ8Î8.8(®8î8¾8)>8"rÐ¢FgVÆÂÒ´”òåF…Ó£¤vWDgVÆÅF‚‚„¦ö–âÕF‚F66†TF—"„¦ö–âÕF‚wr„¦ö–âÕF‚G6fU6†VWD¶W’Ff–ÆTæÖR’’’¢G&ö÷BÒ´”òåF…Ó£¤vWDgVÆÅF‚‚F66†TF—"¢–b‚Öæ÷BG&ö÷BäVæG5v—F‚…´”òåF…Ó£¤F—&V7F÷'•6W&F÷$6†"’’²G&ö÷B³Ò´”òåF…Ó£¤F—&V7F÷'•6W&F÷$6†"Ð¢–b‚Öæ÷BFgVÆÂå7F'G5v—F‚‚G&ö÷BÂµ7G&–æt6ö×&—6öåÓ£¤÷&F–æÄ–væ÷&T66R’Ö÷"Öæ÷B…FW7BÕF‚ÔÆ—FW&ÅF‚FgVÆÂ’’°¢F‡&÷r~[zîXˆnyK¾X8þ8ÎŠh¾8N8¾8(®8î8¾8)>8"p¢Ð¢w&—FRÔ'—FW5&W7öç6RD6öçFW‡B#…´”òäf–ÆUÓ£¥&VDÆÄ'—FW2‚FgVÆÂ’’v–ÖvR÷ærp§Ð ¦gVæ7F–öâvWBÕv÷&¶&öö´6†ævU7VÖÖ'’…·7G&–æuÒDÆæwVvRÂ·7G&–æuÒEv÷&¶&öö´–BÂEv÷&¶&öö²ÒFçVÆÂ’°¢F6×ÒvWBÔÆFW7D6ö×&—6öâDÆæwVvREv÷&¶&öö´–BEv÷&¶&öö°¢–b‚FçVÆÂÖWF6×’²&WGW&âFçVÆÂÐ¢&WGW&â¶÷&FW&VEÔ°¢7FGW2Ò·7G&–æuÒ„vWBÔFF&÷W'G’F6×w7FGW2rrr¢ÖWF†öBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6×vÖWF†öBrrr¢6†ævVE6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6×v6†ævVE6†VWG2r‚’’¢Væ6†ævVE6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6×wVæ6†ævVE6†VWG2r‚’’¢Væ¶æ÷vå6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6×wVæ¶æ÷vå6†VWG2r‚’’¢2cRÕ‚3“¢‹ûÞXª8;¾X˜®™šN8+~8;Î88Ž8("7FFR8¾‹Èž8¾8(¾8.jùN‹È>{YiéÎ8þhÈ8>8n8N8(¾8î8¾8>8>8~hÚŽ8n8n8N8þ8 ¢FFVE6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6×vFFVE6†VWG2r‚’’¢&VÖ÷fVE6†VWG2Ò„vWBÔ'&’„vWBÔFF&÷W'G’F6×w&VÖ÷fVE6†VWG2r‚’’¢ÖW76vRÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6×vÖW76vRrrr¢6ö×&VDBÒ·7G&–æuÒ„vWBÔFF&÷W'G’F6×v6ö×&VDBrrr¢Ð§Ð ¦gVæ7F–öâ–çfö¶RÕ7F'GW&V6÷fW'’…·7G&–æuÒDÆæwVvR’°¢G'’²6ÆV"ÔW‡—&VDÆV6W2DÆæwVvRÒ6F6‚²Ð¢G'’²6ÆV"Õ7FÆTW†VÖW&Ä6÷–W2DÆæwVvRÒ6F6‚²Ð¢G'’²&V6÷fW"ÔWFõ7FFW2DÆæwVvRÒ6F6‚²Ð¢G'’²&V6÷fW"Ôf–æÅG&ç67F–öç2DÆæwVvRÒ6F6‚²Ð¢G'’²–çfö¶RÔ–çWD†—7F÷'”6ÆVçWDÆæwVvRÒ6F6‚²Ð§Ð ¢2cRÕ¢8+ž8+8+Ž8:^8;Î8:ž8;Î8:.8;Î88ž8.8>8(Î8ÎxJ8N8ŽZÙ89~8:Þ8+¾8+ž8Î˜	®[‹Ž8+^8;Î898;Î8Ž8~8n‹[~X¹^8~8¢28^8(ž8¾ZÚ¾8+ž8+8+Ž8:^8;Î8:ž8;Î8).‹[~X¹^8~8nxJ™™8¾Z)~jén8ž8(¾8.˜	®[‹Ž8+^8;Î898;ÎX‰ÞiÉþXÉn8(Ž8(®X˜Þ8¾{Úî8þ8>8Ž8 ¦–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚DWFõ66†VGVÆW%F‚’’°¢–çfö¶RÔWFõ66†VGVÆW$g&öÔf–ÆRÔ6öçG&öÅF‚DWFõ66†VGVÆW%F‚Õ&VçE&ö6W74–BE&VçE&ö6W74–@¢&WGW&à§Ð ¦–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚DF–fd¦ö%F‚’’°¢–çfö¶RÔF–fdFWF–Ä¦ö$g&öÔf–ÆRDF–fd¦ö%F€¢&WGW&à§Ð ¦–b‚Öæ÷B·7G&–æuÓ£¤—4çVÆÄ÷%v†—FU76R‚E&VæFW$¦ö%F‚’’°¢–çfö¶RÕ&VæFW$¦ö$g&öÔf–ÆRE&VæFW$¦ö%F€¢&WGW&à§Ð ¦–b‚E÷'BÖÆR’²E÷'BÒvWBÔg&VU÷'BÐ¢F6öæf–sÒvWBÔ6öæf–p¢F6öæf–sæÆ7DÖöFRÒDÖöFP¥6fRÔ6öæf–rF6öæf–s §G'’²G7F'GWF‡3ÔvWBÕF‡3²–b‚G7F'GWF‡2æFFF—"ÖæB…FW7BÕF‚ÔÆ—FW&ÅF‚…·7G&–æuÒG7F'GWF‡2æFFF—"’’—´Vç7W&RÕ6¶vRG7F'GWF‡7ÒÒ6F6‚²w&—FRÕv&æ–ærEòäW†6WF–öâäÖW76vRÐ ¢2cS¢‹[~X¹^i˜.8:®8*¾898:®8;ÂŽiÉþ™™Xˆ~8(ÆÆV6^8ZÚNXY8îKˆi˜.8+>89N8;Î8ˆz®X¹^x«nhX¾8iÊ®ZèÎK¨n88Ž8:ž8;>8+n8*þ8+~8:~8;>8[^jÛN8îhè>™šB§G'’²–çfö¶RÕ7F'GW&V6÷fW'’„vWBÔVffV7F—fTÆæwVvR’Ò6F6‚²w&—FRÕv&æ–ærEòäW†6WF–öâäÖW76vRÐ§G'’²·fö–EÒ…7F'BÔWFõ66†VGVÆW%&ö6W72„vWBÔVffV7F—fTÆæwVvR’’Ò6F6‚²w&—FRÕv&æ–ærEòäW†6WF–öâäÖW76vRÐ ¢G&Vf—‚Ò&‡GG¢òó#rããã¢E÷'Bò ¢GW&ÂÒ‚&‡GG¢òó#rããã§³Òó÷Fö¶Vã×³ÒfÖöFS×³'Ò"ÖbE÷'BÂE67&—C¥Fö¶VâÂDÖöFR ¢2W6R6ÖÆÂF7Æ—7FVæW"Ö&6VB…EE6W'fW"–ç7FVBöb‡GGÆ—7FVæW"à¢2F†—2fö–G2U$Â4ÂòFÖ–æ—7G&F÷"×&–v‡G2—77VW2öâÆö6¶VBÖF÷vâv–æF÷w272à¥7F'BÔÆö6ÅF76W'fW"E÷'BGW&Â…¶&ööÅÒDæô÷Vâ 
