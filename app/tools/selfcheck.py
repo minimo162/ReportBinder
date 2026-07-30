@@ -673,4 +673,18 @@ for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAV
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 
+# V5.1: history comparison must be a first-class destination and list actions must be visible before the list.
+for needed in ['data-view-nav="history"', 'data-view-panel="history"', '<h2>履歴・比較</h2>', '任意の2時点を視覚比較', 'class="list-action-bar"']:
+    if needed not in html: raise SystemExit(f'history/list action UX missing: {needed}')
+if html.index('id="register-selected-btn"') > html.index('id="file-list"'):
+    raise SystemExit('unregistered Excel actions must appear before the file list')
+if "history: '履歴・比較'" not in appjs or "activeView === 'history'" not in appjs:
+    raise SystemExit('history navigation is not wired')
+
+# Final PDF names must use the selected category, not a category inherited from an Excel file name.
+for needed in ['function Get-CategoryProjectId', 'Get-OutputFileName $Volume $projectId $cat', 'Get-OutputFileName $v ([string]$snapshots[$v].projectId) $Category']:
+    if needed not in server: raise SystemExit(f'category-aware final filename missing: {needed}')
+if '$outName=Get-OutputFileName $Volume $projectId;' in server:
+    raise SystemExit('legacy final output still omits category')
+
 print('selfcheck ok')

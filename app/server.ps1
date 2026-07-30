@@ -1108,12 +1108,26 @@ function Get-ProjectIdFromWorkbooks($Workbooks) {
     return 'ReportBinder'
 }
 
-function Get-OutputFileName([string]$Volume, [string]$ProjectId) {
+function Get-CategoryProjectId([string]$ProjectId, [string]$Category) {
+    $cat = Require-WorkbookCategory $Category
+    $categoryLabel = $cat.ToUpperInvariant()
+    $base = ([string]$ProjectId).Trim()
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = 'ReportBinder' }
+    if ($base -match '^(?<prefix>.*?)(?:[_-](?:ECM|BOD|DMM))$') {
+        $prefix = (([string]$matches['prefix']) -replace '[_-]+$','')
+        if ([string]::IsNullOrWhiteSpace($prefix)) { return $categoryLabel }
+        return "${prefix}_${categoryLabel}"
+    }
+    return "${base}_${categoryLabel}"
+}
+
+function Get-OutputFileName([string]$Volume, [string]$ProjectId, [string]$Category) {
+    $namedProjectId = Get-CategoryProjectId $ProjectId $Category
     switch ($Volume) {
-        'ja-main' { return "${ProjectId}_J_本体.pdf" }
-        'ja-appendix' { return "${ProjectId}_J_補足.pdf" }
-        'en-main' { return "${ProjectId}_E_Main.pdf" }
-        'en-appendix' { return "${ProjectId}_E_Appendix.pdf" }
+        'ja-main' { return "${namedProjectId}_J_本体.pdf" }
+        'ja-appendix' { return "${namedProjectId}_J_補足.pdf" }
+        'en-main' { return "${namedProjectId}_E_Main.pdf" }
+        'en-appendix' { return "${namedProjectId}_E_Appendix.pdf" }
         default { throw "未知の成果物: $Volume" }
     }
 }
@@ -3440,7 +3454,7 @@ function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Categor
         $composerJar=Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar';$pdfboxJar=Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar';if(-not(Test-Path $composerJar)){throw 'ReportPdfComposer.jar がありません。'};if(-not(Test-Path $pdfboxJar)){throw 'pdfbox-app.jar がありません。'}
         $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
         if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
-        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=Get-OutputFileName $Volume $projectId;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
+        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=Get-OutputFileName $Volume $projectId $cat;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
         if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の最終PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
         $manifest=[ordered]@{schemaVersion=2;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
         $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath);$exit=[int]$run.exitCode;$text=[string]$run.text;if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '最終PDFを作成できませんでした。'}
@@ -6428,7 +6442,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             # 5. 出力先PDFが開かれていないかを、対象すべてまとめて確認
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
-                $outName = Get-OutputFileName $v ([string]$snapshots[$v].projectId)
+                $outName = Get-OutputFileName $v ([string]$snapshots[$v].projectId) $Category
                 $outPath = Join-Path ([string]$paths.outputDir) $outName
                 Set-NoteProperty $t 'finalPath' $outPath
                 Set-NoteProperty $t 'existed' ([bool](Test-Path -LiteralPath $outPath))

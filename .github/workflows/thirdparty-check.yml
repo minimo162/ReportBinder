@@ -3,48 +3,47 @@ name: Third-party dependency check
 on:
   pull_request:
     paths:
-      - '.github/apply_ui_fix.py'
+      - 'app/tools/install-thirdparty.ps1'
+      - 'app/tools/verify-thirdparty.ps1'
+      - 'app/tools/package-release.ps1'
+      - 'app/tools/selfcheck.py'
+      - 'app/lib/pdfbox/**'
+      - 'app/web/pdfjs/**'
+      - 'docs/THIRD_PARTY_SETUP.md'
+      - 'THIRD_PARTY_NOTICES.md'
       - '.github/workflows/thirdparty-check.yml'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply-history-ui-and-category-filename:
-    if: github.head_ref == 'agent/improve-history-and-fix-bod-filename'
+  verify-on-windows-powershell-51:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - name: Check out working branch
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: agent/improve-history-and-fix-bod-filename
-          fetch-depth: 0
 
-      - name: Apply product fixes
+      - name: Install and verify all external dependencies
         shell: powershell
         run: |
-          py -3 .github\apply_ui_fix.py
+          $PSVersionTable.PSVersion
+          .\app\tools\install-thirdparty.ps1 -Force
+          .\app\tools\verify-thirdparty.ps1 -RequirePdfJs -RequirePortableJava
 
-      - name: Validate PowerShell and repository checks
+      - name: Rebuild ReportPdfComposer against downloaded PDFBox
         shell: powershell
         run: |
-          $tokens = $null
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\app\server.ps1), [ref]$tokens, [ref]$errors)
-          if ($errors.Count -gt 0) {
-            $errors | Format-List | Out-String | Write-Error
-            exit 1
-          }
+          .\app\lib\pdfbox\build.ps1
+
+      - name: Remove transient download and build caches
+        shell: powershell
+        run: |
+          Remove-Item -LiteralPath .\app\thirdparty-cache -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath .\app\lib\pdfbox\classes -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Run repository self-check
+        shell: powershell
+        run: |
           py -3 .\app\tools\selfcheck.py
-
-      - name: Commit validated product changes
-        shell: powershell
-        run: |
-          git checkout origin/main -- .github/workflows/thirdparty-check.yml
-          Remove-Item -LiteralPath .github/apply_ui_fix.py -Force
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Improve history navigation and category filenames"
-          git push origin HEAD:agent/improve-history-and-fix-bod-filename
