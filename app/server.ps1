@@ -5537,8 +5537,10 @@ function Stop-AutoSchedulerProcess {
 # V5 Stage 4 — Phase 2B: 画像ハッシュと比較
 # =====================================================================
 
-$Script:VisualHashProfileVersion = 1
-$Script:VisualHashDpi = 150
+$Script:VisualHashProfileVersion = 2
+$Script:VisualHashPageDistanceLimit = 0.075
+$Script:VisualHashAverageDistanceLimit = 0.040
+$Script:VisualHashDpi = 120
 
 function Get-RenderRecordDir([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
     return (Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) (Join-Path 'renders' $VersionId))
@@ -5556,6 +5558,45 @@ function Get-VisualHashProfile {
         dpi = $Script:VisualHashDpi
         colorMode = 'RGB'
     }
+}
+
+function Get-HexHammingRatio([string]$Left, [string]$Right) {
+    $a = ([string]$Left).Trim().ToUpperInvariant()
+    $b = ([string]$Right).Trim().ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($a) -or $a.Length -ne $b.Length) { return 1.0 }
+    $differentBits = 0
+    for ($i = 0; $i -lt $a.Length; $i++) {
+        try {
+            $xor = ([Convert]::ToInt32($a[$i].ToString(), 16) -bxor [Convert]::ToInt32($b[$i].ToString(), 16))
+        } catch { return 1.0 }
+        while ($xor -gt 0) {
+            $differentBits += ($xor -band 1)
+            $xor = $xor -shr 1
+        }
+    }
+    return ([double]$differentBits / [Math]::Max(1, $a.Length * 4))
+}
+
+function Test-SheetVisualEquivalent($Before, $After) {
+    if ($null -eq $Before -or $null -eq $After) { return $false }
+    if ((Get-IntDataProperty $Before 'pageCount' -1) -ne (Get-IntDataProperty $After 'pageCount' -2)) { return $false }
+    $beforeText = Normalize-FileHash ([string](Get-DataProperty $Before 'textHash' ''))
+    $afterText = Normalize-FileHash ([string](Get-DataProperty $After 'textHash' ''))
+    $hasComparableText = -not [string]::IsNullOrWhiteSpace($beforeText) -and -not [string]::IsNullOrWhiteSpace($afterText)
+    if ($hasComparableText -and $beforeText -ne $afterText) { return $false }
+
+    $beforePages = @(Get-Array (Get-DataProperty $Before 'pagePerceptualHashes' @()))
+    $afterPages = @(Get-Array (Get-DataProperty $After 'pagePerceptualHashes' @()))
+    if ($beforePages.Count -eq 0 -or $beforePages.Count -ne $afterPages.Count) { return $false }
+    $total = 0.0
+    $pageLimit = $(if ($hasComparableText) { $Script:VisualHashPageDistanceLimit } else { 0.035 })
+    $averageLimit = $(if ($hasComparableText) { $Script:VisualHashAverageDistanceLimit } else { 0.020 })
+    for ($i = 0; $i -lt $beforePages.Count; $i++) {
+        $distance = Get-HexHammingRatio ([string]$beforePages[$i]) ([string]$afterPages[$i])
+        if ($distance -gt $pageLimit) { return $false }
+        $total += $distance
+    }
+    return (($total / [Math]::Max(1, $beforePages.Count)) -le $averageLimit)
 }
 
 function Test-PdfPageAnalyzerAvailable {
@@ -5939,7 +5980,12 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
     if ($null -ne $base -and -not [string]::IsNullOrWhiteSpace($baseVer)) {
         $baseAvailability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $baseSnap $baseVer
     }
-    $environmentChanged = ($null -ne $base -and [string](Get-DataProperty $base 'renderEnvironmentFingerprint' '') -ne $curEnv)
+    $curProfile = Get-DataProperty $cur 'visualHashProfile' $null
+    $baseProfile = $(if ($null -ne $base) { Get-DataProperty $base 'visualHashProfile' $null } else { $null })
+    $environmentChanged = ($null -ne $base -and (
+        [string](Get-DataProperty $base 'renderEnvironmentFingerprint' '') -ne $curEnv -or
+        (Get-IntDataProperty $base 'analyzerVersion' 0) -ne (Get-IntDataProperty $cur 'analyzerVersion' 0) -or
+        (Get-IntDataProperty $baseProfile 'profileVersion' 0) -ne (Get-IntDataProperty $curProfile 'profileVersion' 0)))
     $assetsMissing = ($null -eq $baseAvailability -or -not [bool]$baseAvailability.ready)
     $method = 'stored-hash'
     if ($null -eq $base -or $environmentChanged -or $assetsMissing) {
@@ -5971,7 +6017,8 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
         if (-not $baseMap.ContainsKey($name)) { $added += $name; continue }
         $b = $baseMap[$name]
         if ([string](Get-DataProperty $b 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if ((Normalize-FileHash ([string](Get-DataProperty $b 'sheetVisualHash' ''))) -eq (Normalize-FileHash ([string](Get-DataProperty $s 'sheetVisualHash' '')))) { $unchanged += $name }
+        if ((Normalize-FileHash ([string](Get-DataProperty $b 'sheetVisualHash' ''))) -eq (Normalize-FileHash ([string](Get-DataProperty $s 'sheetVisualHash' ''))) -or
+            (Test-SheetVisualEquivalent $b $s)) { $unchanged += $name }
         else { $changed += $name }
     }
     $result.status = 'complete'
@@ -6910,11 +6957,11 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 6
-$Script:DiffDetailDpi = 150
-$Script:DiffDetailThreshold = 18
-$Script:DiffDetailMinimumRegionPixels = 16
-$Script:DiffDetailPadding = 6
+$Script:DiffDetailAlgorithmVersion = 7
+$Script:DiffDetailDpi = 120
+$Script:DiffDetailThreshold = 24
+$Script:DiffDetailMinimumRegionPixels = 24
+$Script:DiffDetailPadding = 5
 
 function Get-DiffSnapshotDate([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$Fallback = '') {
     try {
@@ -6992,7 +7039,8 @@ function New-HistoricalSnapshotComparison(
         $before = $baseMap[$name]
         if ([string](Get-DataProperty $before 'status' '') -ne 'ok') { $unknown += $name; continue }
         if ((Normalize-FileHash ([string](Get-DataProperty $before 'sheetVisualHash' ''))) -eq
-            (Normalize-FileHash ([string](Get-DataProperty $sheet 'sheetVisualHash' '')))) { $unchanged += $name } else { $changed += $name }
+            (Normalize-FileHash ([string](Get-DataProperty $sheet 'sheetVisualHash' ''))) -or
+            (Test-SheetVisualEquivalent $before $sheet)) { $unchanged += $name } else { $changed += $name }
     }
     foreach ($name in @($baseMap.Keys)) { if (-not $currentNames.ContainsKey([string]$name)) { $removed += [string]$name } }
     $result.status = 'complete'

@@ -5,10 +5,10 @@
     [string]$OutputDirectory,
     [ValidateSet('modified','changed','added','removed','unknown','unchanged')]
     [string]$Kind = 'modified',
-    [int]$Dpi = 150,
-    [int]$Threshold = 18,
-    [int]$MinimumRegionPixels = 16,
-    [int]$Padding = 6
+    [int]$Dpi = 120,
+    [int]$Threshold = 24,
+    [int]$MinimumRegionPixels = 24,
+    [int]$Padding = 5
 )
 
 $ErrorActionPreference = 'Stop'

@@ -41,7 +41,9 @@ public sealed class ReportBinderDiffPage
 
 public static class ReportBinderDiffEngine
 {
-    private const int MaximumRegionsPerPage = 400;
+    private const int MaximumRegionsPerPage = 120;
+    private const int MaximumModifiedLabelsPerPage = 12;
+    private const int MaximumAlignmentOffset = 4;
 
     private sealed class PixelRegion
     {
@@ -151,6 +153,17 @@ public static class ReportBinderDiffEngine
         string maskPath = Path.Combine(outputDirectory, maskName);
         string overlayPath = Path.Combine(outputDirectory, overlayName);
 
+        if (regions.Count == 0)
+        {
+            using (Bitmap empty = new Bitmap(1, 1, PixelFormat.Format32bppArgb))
+            {
+                empty.SetPixel(0, 0, Color.Transparent);
+                empty.Save(maskPath, ImageFormat.Png);
+                empty.Save(overlayPath, ImageFormat.Png);
+            }
+            return;
+        }
+
         using (Bitmap mask = new Bitmap(width, height, PixelFormat.Format32bppArgb))
         using (Bitmap overlay = new Bitmap(width, height, PixelFormat.Format32bppArgb))
         using (Graphics mg = Graphics.FromImage(mask))
@@ -177,8 +190,10 @@ public static class ReportBinderDiffEngine
                     og.DrawRectangle(pen, rect);
                 }
 
+                bool drawLabel = region.kind != "modified" || regions.Count <= MaximumModifiedLabelsPerPage;
+                if (!drawLabel) continue;
                 string label = RegionLabel(region.kind);
-                float labelSize = Math.Max(18f, Math.Min(30f, width / 45f));
+                float labelSize = Math.Max(13f, Math.Min(22f, width / 70f));
                 RectangleF labelBox = new RectangleF(rect.Left, Math.Max(0, rect.Top - labelSize), labelSize, labelSize);
                 if (rect.Top < labelSize) labelBox.Y = rect.Top;
                 using (Brush labelFill = new SolidBrush(color))
@@ -255,6 +270,118 @@ public static class ReportBinderDiffEngine
         return result;
     }
 
+    private static int PixelDifference(byte[] before, byte[] after, int beforeIndex, int afterIndex)
+    {
+        int bp = beforeIndex * 3;
+        int ap = afterIndex * 3;
+        return Math.Max(
+            Math.Abs(before[bp] - after[ap]),
+            Math.Max(Math.Abs(before[bp + 1] - after[ap + 1]), Math.Abs(before[bp + 2] - after[ap + 2])));
+    }
+
+    private static void FindBestOffset(byte[] before, byte[] after, int width, int height, out int bestDx, out int bestDy)
+    {
+        bestDx = 0;
+        bestDy = 0;
+        long bestScore = long.MaxValue;
+        int step = Math.Max(6, Math.Min(width, height) / 250);
+        int border = MaximumAlignmentOffset + step;
+        for (int dy = -MaximumAlignmentOffset; dy <= MaximumAlignmentOffset; dy++)
+        {
+            for (int dx = -MaximumAlignmentOffset; dx <= MaximumAlignmentOffset; dx++)
+            {
+                long score = 0;
+                int samples = 0;
+                for (int y = border; y < height - border; y += step)
+                {
+                    int by = y + dy;
+                    for (int x = border; x < width - border; x += step)
+                    {
+                        int bx = x + dx;
+                        int diff = PixelDifference(before, after, by * width + bx, y * width + x);
+                        score += Math.Min(64, diff);
+                        samples++;
+                    }
+                }
+                if (samples > 0) score = (score * 1000L) / samples;
+                score += (Math.Abs(dx) + Math.Abs(dy)) * 2L;
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestDx = dx;
+                    bestDy = dy;
+                }
+            }
+        }
+    }
+
+    private static byte[] AlignBefore(byte[] before, int width, int height, int dx, int dy)
+    {
+        if (dx == 0 && dy == 0) return before;
+        byte[] aligned = new byte[before.Length];
+        for (int i = 0; i < aligned.Length; i++) aligned[i] = 255;
+        int copyPixels = width - Math.Abs(dx);
+        if (copyPixels <= 0) return aligned;
+        int copyBytes = copyPixels * 3;
+        int sourceX = Math.Max(0, dx);
+        int targetX = Math.Max(0, -dx);
+        for (int y = 0; y < height; y++)
+        {
+            int sourceY = y + dy;
+            if (sourceY < 0 || sourceY >= height) continue;
+            Buffer.BlockCopy(before, (sourceY * width + sourceX) * 3, aligned, (y * width + targetX) * 3, copyBytes);
+        }
+        return aligned;
+    }
+
+    private static bool RegionsAreNear(PixelRegion a, PixelRegion b, int gap)
+    {
+        return a.minX <= b.maxX + gap && b.minX <= a.maxX + gap &&
+               a.minY <= b.maxY + gap && b.minY <= a.maxY + gap;
+    }
+
+    private static void FinalizeRegion(PixelRegion region)
+    {
+        if (region.added >= region.count * 0.65) region.kind = "added";
+        else if (region.removed >= region.count * 0.65) region.kind = "removed";
+        else region.kind = "modified";
+        double mean = region.count == 0 ? 0 : (double)region.diffTotal / region.count;
+        region.confidence = Math.Max(0.45, Math.Min(0.99, 0.45 + (mean / 255.0) * 0.65));
+    }
+
+    private static List<PixelRegion> MergeNearbyRegions(List<PixelRegion> source, int gap)
+    {
+        List<PixelRegion> merged = new List<PixelRegion>(source);
+        bool changed;
+        do
+        {
+            changed = false;
+            for (int i = 0; i < merged.Count && !changed; i++)
+            {
+                for (int j = i + 1; j < merged.Count; j++)
+                {
+                    PixelRegion a = merged[i];
+                    PixelRegion b = merged[j];
+                    if (!RegionsAreNear(a, b, gap)) continue;
+                    a.minX = Math.Min(a.minX, b.minX);
+                    a.minY = Math.Min(a.minY, b.minY);
+                    a.maxX = Math.Max(a.maxX, b.maxX);
+                    a.maxY = Math.Max(a.maxY, b.maxY);
+                    a.count += b.count;
+                    a.added += b.added;
+                    a.removed += b.removed;
+                    a.modified += b.modified;
+                    a.diffTotal += b.diffTotal;
+                    FinalizeRegion(a);
+                    merged.RemoveAt(j);
+                    changed = true;
+                    break;
+                }
+            }
+        } while (changed);
+        return merged;
+    }
+
     private static List<PixelRegion> FindRegions(
         byte[] before,
         byte[] after,
@@ -267,6 +394,10 @@ public static class ReportBinderDiffEngine
         out double averageDifference)
     {
         int pixels = width * height;
+        int alignmentX;
+        int alignmentY;
+        FindBestOffset(before, after, width, height, out alignmentX, out alignmentY);
+        before = AlignBefore(before, width, height, alignmentX, alignmentY);
         bool[] raw = new bool[pixels];
         byte[] pixelKind = new byte[pixels];
         int rawCount = 0;
@@ -358,23 +489,31 @@ public static class ReportBinderDiffEngine
                 }
             }
             if (region.count < minimumRegionPixels || region.maxX < 0) continue;
-            if (region.added >= region.count * 0.65) region.kind = "added";
-            else if (region.removed >= region.count * 0.65) region.kind = "removed";
-            else region.kind = "modified";
-            double mean = region.count == 0 ? 0 : (double)region.diffTotal / region.count;
-            region.confidence = Math.Max(0.45, Math.Min(0.99, 0.45 + (mean / 255.0) * 0.65));
+            FinalizeRegion(region);
             region.minX = Math.Max(0, region.minX - padding);
             region.minY = Math.Max(0, region.minY - padding);
             region.maxX = Math.Min(width - 1, region.maxX + padding);
             region.maxY = Math.Min(height - 1, region.maxY + padding);
             regions.Add(region);
         }
+        regions = MergeNearbyRegions(regions, Math.Max(padding * 2, Math.Min(width, height) / 130));
         regions.Sort(delegate (PixelRegion a, PixelRegion b)
         {
             int byY = a.minY.CompareTo(b.minY);
             return byY != 0 ? byY : a.minX.CompareTo(b.minX);
         });
         return regions;
+    }
+
+    private static void SaveBaseImage(string sourcePath, Bitmap source, Bitmap normalized, string destination)
+    {
+        if (!String.IsNullOrWhiteSpace(sourcePath) && File.Exists(sourcePath) &&
+            source != null && source.Width == normalized.Width && source.Height == normalized.Height)
+        {
+            File.Copy(sourcePath, destination, true);
+            return;
+        }
+        normalized.Save(destination, ImageFormat.Png);
     }
 
     public static ReportBinderDiffPage ComparePage(
@@ -404,8 +543,8 @@ public static class ReportBinderDiffEngine
                 string stem = pageNumber.ToString("0000");
                 string beforeName = stem + "-b.png";
                 string afterName = stem + "-a.png";
-                before.Save(Path.Combine(outputDirectory, beforeName), ImageFormat.Png);
-                after.Save(Path.Combine(outputDirectory, afterName), ImageFormat.Png);
+                SaveBaseImage(beforePath, beforeSource, before, Path.Combine(outputDirectory, beforeName));
+                SaveBaseImage(afterPath, afterSource, after, Path.Combine(outputDirectory, afterName));
 
                 List<PixelRegion> pixelRegions = new List<PixelRegion>();
                 double changedRatio = 0;
@@ -440,11 +579,19 @@ public static class ReportBinderDiffEngine
                         Math.Max(0, padding),
                         out changedRatio,
                         out averageDifference);
-                    if (!sizeChanged && changedRatio > 0.35 && averageDifference < 30)
+                    bool sparseFullPage = false;
+                    foreach (PixelRegion region in pixelRegions)
+                    {
+                        double area = (double)(region.maxX - region.minX + 1) * (region.maxY - region.minY + 1);
+                        double areaRatio = area / Math.Max(1.0, (double)width * height);
+                        double density = region.count / Math.Max(1.0, area);
+                        if (areaRatio > 0.72 && density < 0.08) { sparseFullPage = true; break; }
+                    }
+                    if ((!sizeChanged && changedRatio > 0.28 && averageDifference < 36) || sparseFullPage)
                     {
                         pixelRegions.Clear();
                         status = "unknown";
-                        message = "描画差が広範囲に検出されたため、領域の強調を停止しました。";
+                        message = "微小な描画差がページ全体へ広がっているため、誤解を招く全ページ強調を停止しました。";
                     }
                     else if (pixelRegions.Count > MaximumRegionsPerPage)
                     {
