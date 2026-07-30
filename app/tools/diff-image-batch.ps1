@@ -29,6 +29,9 @@ if ($items.Count -eq 0) {
 $rasterRoot = Join-Path ([IO.Path]::GetTempPath()) ('rb-diff-batch-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $rasterRoot -Force | Out-Null
 $tsvPath = Join-Path $rasterRoot 'requests.tsv'
+$totalWatch = [Diagnostics.Stopwatch]::StartNew()
+$rasterMs = 0
+$analysisMs = 0
 
 function ConvertTo-PathBase64([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
@@ -56,6 +59,7 @@ try {
     $threads = [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount))
     $nativeOutput = @()
     $nativeExitCode = -1
+    $rasterWatch = [Diagnostics.Stopwatch]::StartNew()
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
@@ -68,11 +72,14 @@ try {
     if ($nativeExitCode -ne 0) {
         throw ("PDF一括画像化に失敗しました。`n" + ($nativeOutput -join "`n"))
     }
+    $rasterWatch.Stop()
+    $rasterMs = [int64]$rasterWatch.ElapsedMilliseconds
 
     if (-not ('ReportBinderDiffEngine' -as [type])) {
         Add-Type -Path $engineSource -ReferencedAssemblies @('System.Drawing')
     }
 
+    $analysisWatch = [Diagnostics.Stopwatch]::StartNew()
     $results = @()
     foreach ($item in $items) {
         $id = [string]$item.id
@@ -114,12 +121,16 @@ try {
         }
         $results += [pscustomobject]$result
     }
+    $analysisWatch.Stop()
+    $analysisMs = [int64]$analysisWatch.ElapsedMilliseconds
+    $totalWatch.Stop()
     [ordered]@{
         ok = $true
         dpi = $Dpi
         threshold = $Threshold
         minimumRegionPixels = $MinimumRegionPixels
         padding = $Padding
+        timings = [ordered]@{ totalMs = [int64]$totalWatch.ElapsedMilliseconds; rasterMs = $rasterMs; analysisMs = $analysisMs }
         items = @($results)
     } | ConvertTo-Json -Depth 12 -Compress
 } finally {
