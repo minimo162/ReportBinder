@@ -36,6 +36,12 @@ jobs:
         run: |
           .\app\lib\pdfbox\build.ps1
 
+      - name: Remove transient download and build caches
+        shell: powershell
+        run: |
+          Remove-Item -LiteralPath .\app\thirdparty-cache -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath .\app\lib\pdfbox\classes -Recurse -Force -ErrorAction SilentlyContinue
+
       - name: Run repository self-check
         shell: powershell
         run: |
