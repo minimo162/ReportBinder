@@ -6,6 +6,7 @@ on:
       - 'app/tools/install-thirdparty.ps1'
       - 'app/tools/verify-thirdparty.ps1'
       - 'app/tools/package-release.ps1'
+      - 'app/tools/selfcheck.py'
       - 'app/lib/pdfbox/**'
       - 'app/web/pdfjs/**'
       - 'docs/THIRD_PARTY_SETUP.md'
