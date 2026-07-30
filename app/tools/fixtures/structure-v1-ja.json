@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "language": "ja",
+  "workbooks": [
+    {"workbookId":"ecm-sample","fileName":"SAMPLE_J_1_ECM.xlsx","category":"ecm"},
+    {"workbookId":"bod-sample","fileName":"SAMPLE_J_1_BOD.xlsx","category":"bod"}
+  ],
+  "pages": [
+    {"pageId":"ecm-sample-1","workbookId":"ecm-sample","sheetName":"1","volume":"ja-main","order":100001,"enabled":true},
+    {"pageId":"ecm-sample-2","workbookId":"ecm-sample","sheetName":"2","volume":"ja-main","order":20,"enabled":true},
+    {"pageId":"bod-sample-1","workbookId":"bod-sample","sheetName":"1","volume":"ja-main","order":100001,"enabled":true}
+  ],
+  "volumes": {
+    "ja-main":{"status":"built","lastBuiltAt":"2026-07-01T10:00:00+09:00","outputPdf":"X:\\sample.pdf"},
+    "ja-appendix":{"status":"not-built"}
+  }
+}

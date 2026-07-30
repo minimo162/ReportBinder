@@ -1,0 +1,2 @@
+﻿Apache PDFBox 2.0.36
+pdfbox-app.jar copied from pdfbox-app-2.0.36.jar

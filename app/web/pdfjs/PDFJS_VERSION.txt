@@ -1,0 +1,2 @@
+﻿Mozilla PDF.js / pdfjs-dist 5.7.284
+Files: pdf.min.mjs, pdf.worker.min.mjs

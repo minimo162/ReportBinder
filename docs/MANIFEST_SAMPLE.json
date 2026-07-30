@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "volume": "ja-main",
+  "outputPdf": "C:\\Reports\\FY160-4Q\\出力\\FY160-4Q_ECM_J_本体.pdf",
+  "createdAt": "2026-05-26T10:15:00+09:00",
+  "pageNumber": {
+    "font": "Arial",
+    "fontSize": 9,
+    "bottomPt": 18,
+    "format": "hyphenated",
+    "countHidden": true
+  },
+  "pages": [
+    {
+      "pageId": "cover-1",
+      "title": "表紙",
+      "sourcePdf": "C:\\Reports\\FY160-4Q\\_reportbinder\\ja\\content-pdf\\cover\\v20260526_101500\\1.pdf",
+      "numberingMode": "none",
+      "punchShiftPt": 8.504
+    },
+    {
+      "pageId": "main-1",
+      "title": "CA1 売上実績",
+      "sourcePdf": "C:\\Reports\\FY160-4Q\\_reportbinder\\ja\\content-pdf\\ca1\\v20260526_101500\\1.pdf",
+      "numberingMode": "visible",
+      "punchShiftPt": 8.504
+    }
+  ]
+}

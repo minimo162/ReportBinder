@@ -1,0 +1,7 @@
+{
+  "language":"ja",
+  "category":"ecm",
+  "volume":"ja-main",
+  "orders":[100001,20,300004,10],
+  "expected":[10,20,30,40]
+}

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "lastSubmissionDir": "",
+  "lastDataDir": "",
+  "lastOutputDir": "",
+  "lastMode": "ja",
+  "inputHistory": {
+    "retainSourceVersions": 5,
+    "retainContentPdfVersions": 3,
+    "sourceRetentionDaysAfterBuild": null,
+    "softCapMegabytes": 5120,
+    "warnAtPercent": 80,
+    "ephemeralCopyMaxAgeMinutes": 30
+  },
+  "autoRender": {
+    "enabled": false,
+    "quietPeriodSeconds": 180,
+    "requireStableHashCount": 2,
+    "deferWhileExcelInUse": true
+  }
+}

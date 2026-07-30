@@ -1,0 +1,10 @@
+ReportPdfComposer.jar is included prebuilt for Java 8+ runtime compatibility.
+It was compiled from src/ReportPdfComposer.java, src/BatchPdfSplitter.java,
+and src/PdfPageAnalyzer.java without bundling Apache PDFBox.
+Runtime still requires pdfbox-app.jar in this same directory.
+This build uses PDFMergerUtility append + content wrapping for faster final PDF creation, formats page numbers as "- n -", and counts hidden-number pages in the page sequence, and uses Arial 8pt page numbers when the manifest does not override it.
+To rebuild from source, install an OpenJDK/JDK that provides javac and run build.ps1.
+
+BatchPdfSplitter.class is also included. It lets ReportBinder export multiple selected Excel sheets to one temporary PDF and split it back into per-sheet content PDFs, reducing repeated Excel ExportAsFixedFormat calls.
+PdfPageAnalyzer.class is included. It produces RGB visual hashes and normalized
+text hashes for the V5 workbook-difference workflow.

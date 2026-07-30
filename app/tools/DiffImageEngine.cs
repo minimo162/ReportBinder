@@ -1,0 +1,512 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public sealed class ReportBinderDiffRegion
+{
+    public string regionId;
+    public string kind;
+    public double x;
+    public double y;
+    public double width;
+    public double height;
+    public double confidence;
+    public int pixelCount;
+}
+
+public sealed class ReportBinderDiffPage
+{
+    public int pageNumber;
+    public int width;
+    public int height;
+    public bool pageSizeChanged;
+    public string status;
+    public string message;
+    public double confidence;
+    public double changedRatio;
+    public int regionCount;
+    public ReportBinderDiffRegion[] regions;
+    public string beforeFile;
+    public string afterFile;
+    public string beforeMaskFile;
+    public string beforeOverlayFile;
+    public string afterMaskFile;
+    public string afterOverlayFile;
+}
+
+public static class ReportBinderDiffEngine
+{
+    private const int MaximumRegionsPerPage = 400;
+
+    private sealed class PixelRegion
+    {
+        public int minX;
+        public int minY;
+        public int maxX;
+        public int maxY;
+        public int count;
+        public int added;
+        public int removed;
+        public int modified;
+        public long diffTotal;
+        public string kind;
+        public double confidence;
+    }
+
+    private static Bitmap LoadImage(string path)
+    {
+        if (String.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
+        using (Image src = Image.FromFile(path))
+        {
+            return new Bitmap(src);
+        }
+    }
+
+    private static Bitmap Normalize(Bitmap source, int width, int height)
+    {
+        Bitmap normalized = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+        normalized.SetResolution(150, 150);
+        using (Graphics g = Graphics.FromImage(normalized))
+        {
+            g.Clear(Color.White);
+            // DrawImageUnscaled scales by the source DPI metadata despite its name.
+            // An explicit destination rectangle keeps this 1:1 in pixels even when
+            // PDFBox omits or changes the PNG resolution metadata.
+            if (source != null) g.DrawImage(source, new Rectangle(0, 0, source.Width, source.Height));
+        }
+        return normalized;
+    }
+
+    private static byte[] ReadBgr(Bitmap bitmap)
+    {
+        Rectangle rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+        BitmapData data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        try
+        {
+            int stride = Math.Abs(data.Stride);
+            byte[] raw = new byte[stride * bitmap.Height];
+            Marshal.Copy(data.Scan0, raw, 0, raw.Length);
+            if (stride == bitmap.Width * 3) return raw;
+            byte[] packed = new byte[bitmap.Width * bitmap.Height * 3];
+            for (int y = 0; y < bitmap.Height; y++)
+                Buffer.BlockCopy(raw, y * stride, packed, y * bitmap.Width * 3, bitmap.Width * 3);
+            return packed;
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
+        }
+    }
+
+    private static bool IsWhite(byte b, byte g, byte r)
+    {
+        return b >= 246 && g >= 246 && r >= 246;
+    }
+
+    private static Color RegionColor(string kind)
+    {
+        if (kind == "added") return Color.FromArgb(28, 103, 190);
+        if (kind == "removed") return Color.FromArgb(200, 48, 55);
+        if (kind == "unknown") return Color.FromArgb(105, 113, 124);
+        return Color.FromArgb(212, 132, 0);
+    }
+
+    private static string RegionLabel(string kind)
+    {
+        if (kind == "added") return "A";
+        if (kind == "removed") return "D";
+        if (kind == "unknown") return "?";
+        return "M";
+    }
+
+    private static bool VisibleOnSide(string kind, bool before)
+    {
+        if (kind == "modified" || kind == "unknown") return true;
+        if (kind == "added") return !before;
+        if (kind == "removed") return before;
+        return true;
+    }
+
+    private static void SaveLayerImages(
+        string outputDirectory,
+        int pageNumber,
+        int width,
+        int height,
+        IList<PixelRegion> regions,
+        bool before,
+        out string maskName,
+        out string overlayName)
+    {
+        // Short names on purpose: the cache lives under
+        // input-history\<workbookId>\<snapshotId>\renders\<versionId>\comparisons\d<key>\p\<sheetKey>\
+        // and Windows PowerShell 5.1 still enforces MAX_PATH on the deep submission folders.
+        string prefix = pageNumber.ToString("0000") + (before ? "-b" : "-a");
+        maskName = prefix + "m.png";
+        overlayName = prefix + "o.png";
+        string maskPath = Path.Combine(outputDirectory, maskName);
+        string overlayPath = Path.Combine(outputDirectory, overlayName);
+
+        using (Bitmap mask = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+        using (Bitmap overlay = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+        using (Graphics mg = Graphics.FromImage(mask))
+        using (Graphics og = Graphics.FromImage(overlay))
+        {
+            mg.Clear(Color.Transparent);
+            og.Clear(Color.Transparent);
+            og.SmoothingMode = SmoothingMode.AntiAlias;
+            og.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+            foreach (PixelRegion region in regions)
+            {
+                if (!VisibleOnSide(region.kind, before)) continue;
+                Color color = RegionColor(region.kind);
+                Rectangle rect = Rectangle.FromLTRB(region.minX, region.minY, region.maxX + 1, region.maxY + 1);
+                using (Brush fill = new SolidBrush(Color.FromArgb(255, color)))
+                {
+                    mg.FillRectangle(fill, rect);
+                }
+                using (Pen pen = new Pen(color, Math.Max(3f, width / 520f)))
+                {
+                    if (region.kind == "removed") pen.DashStyle = DashStyle.Dash;
+                    else if (region.kind == "unknown") pen.DashStyle = DashStyle.Dot;
+                    og.DrawRectangle(pen, rect);
+                }
+
+                string label = RegionLabel(region.kind);
+                float labelSize = Math.Max(18f, Math.Min(30f, width / 45f));
+                RectangleF labelBox = new RectangleF(rect.Left, Math.Max(0, rect.Top - labelSize), labelSize, labelSize);
+                if (rect.Top < labelSize) labelBox.Y = rect.Top;
+                using (Brush labelFill = new SolidBrush(color))
+                using (Font font = new Font("Arial", Math.Max(10f, labelSize * 0.52f), FontStyle.Bold, GraphicsUnit.Pixel))
+                using (StringFormat format = new StringFormat())
+                {
+                    format.Alignment = StringAlignment.Center;
+                    format.LineAlignment = StringAlignment.Center;
+                    og.FillRectangle(labelFill, labelBox);
+                    og.DrawString(label, font, Brushes.White, labelBox, format);
+                }
+            }
+            mask.Save(maskPath, ImageFormat.Png);
+            overlay.Save(overlayPath, ImageFormat.Png);
+        }
+    }
+
+    private static PixelRegion FullPageRegion(int width, int height, string kind)
+    {
+        int inset = Math.Max(6, Math.Min(width, height) / 250);
+        return new PixelRegion
+        {
+            minX = inset,
+            minY = inset,
+            maxX = Math.Max(inset, width - inset - 1),
+            maxY = Math.Max(inset, height - inset - 1),
+            count = width * height,
+            kind = kind,
+            confidence = 1.0
+        };
+    }
+
+    private static bool[] Dilate(bool[] source, int width, int height, int radius)
+    {
+        // Separable Chebyshev dilation (two sliding-window passes per axis).
+        // Used only to decide which change pixels belong to the same region, so that
+        // the digits of one changed number do not become one box per digit.
+        if (radius <= 0) return source;
+        bool[] horizontal = new bool[source.Length];
+        for (int y = 0; y < height; y++)
+        {
+            int rowStart = y * width;
+            int run = 0;
+            for (int x = 0; x < width; x++)
+            {
+                if (source[rowStart + x]) run = radius + 1;
+                if (run > 0) { horizontal[rowStart + x] = true; run--; }
+            }
+            run = 0;
+            for (int x = width - 1; x >= 0; x--)
+            {
+                if (source[rowStart + x]) run = radius + 1;
+                if (run > 0) { horizontal[rowStart + x] = true; run--; }
+            }
+        }
+        bool[] result = new bool[source.Length];
+        for (int x = 0; x < width; x++)
+        {
+            int run = 0;
+            for (int y = 0; y < height; y++)
+            {
+                int index = y * width + x;
+                if (horizontal[index]) run = radius + 1;
+                if (run > 0) { result[index] = true; run--; }
+            }
+            run = 0;
+            for (int y = height - 1; y >= 0; y--)
+            {
+                int index = y * width + x;
+                if (horizontal[index]) run = radius + 1;
+                if (run > 0) { result[index] = true; run--; }
+            }
+        }
+        return result;
+    }
+
+    private static List<PixelRegion> FindRegions(
+        byte[] before,
+        byte[] after,
+        int width,
+        int height,
+        int threshold,
+        int minimumRegionPixels,
+        int padding,
+        out double changedRatio,
+        out double averageDifference)
+    {
+        int pixels = width * height;
+        bool[] raw = new bool[pixels];
+        byte[] pixelKind = new byte[pixels];
+        int rawCount = 0;
+        long rawDiff = 0;
+        for (int i = 0; i < pixels; i++)
+        {
+            int p = i * 3;
+            int db = Math.Abs(before[p] - after[p]);
+            int dg = Math.Abs(before[p + 1] - after[p + 1]);
+            int dr = Math.Abs(before[p + 2] - after[p + 2]);
+            int max = Math.Max(db, Math.Max(dg, dr));
+            if (max < threshold) continue;
+            raw[i] = true;
+            rawCount++;
+            rawDiff += max;
+            bool beforeWhite = IsWhite(before[p], before[p + 1], before[p + 2]);
+            bool afterWhite = IsWhite(after[p], after[p + 1], after[p + 2]);
+            pixelKind[i] = beforeWhite && !afterWhite ? (byte)1 : (!beforeWhite && afterWhite ? (byte)2 : (byte)3);
+        }
+        changedRatio = pixels == 0 ? 0 : (double)rawCount / pixels;
+        averageDifference = rawCount == 0 ? 0 : (double)rawDiff / rawCount;
+
+        bool[] candidate = new bool[pixels];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int index = y * width + x;
+                if (!raw[index]) continue;
+                int neighbors = 0;
+                for (int yy = Math.Max(0, y - 2); yy <= Math.Min(height - 1, y + 2) && neighbors < 3; yy++)
+                    for (int xx = Math.Max(0, x - 2); xx <= Math.Min(width - 1, x + 2) && neighbors < 3; xx++)
+                        if (raw[yy * width + xx]) neighbors++;
+                candidate[index] = neighbors >= 3;
+            }
+        }
+
+        // Group change pixels that are within 2x padding of each other. Without this the
+        // connected-component pass returns one region per glyph, so a single edited number
+        // produced five overlapping "M" boxes and a shifted row produced thousands.
+        bool[] grouped = Dilate(candidate, width, height, padding);
+        bool[] visited = new bool[pixels];
+        int[] queue = new int[pixels];
+        List<PixelRegion> regions = new List<PixelRegion>();
+        for (int seed = 0; seed < pixels; seed++)
+        {
+            if (!grouped[seed] || visited[seed]) continue;
+            int head = 0;
+            int tail = 0;
+            queue[tail++] = seed;
+            visited[seed] = true;
+            PixelRegion region = new PixelRegion
+            {
+                minX = int.MaxValue,
+                maxX = -1,
+                minY = int.MaxValue,
+                maxY = -1
+            };
+            while (head < tail)
+            {
+                int index = queue[head++];
+                int x = index % width;
+                int y = index / width;
+                if (candidate[index])
+                {
+                    region.count++;
+                    if (x < region.minX) region.minX = x;
+                    if (x > region.maxX) region.maxX = x;
+                    if (y < region.minY) region.minY = y;
+                    if (y > region.maxY) region.maxY = y;
+                    if (pixelKind[index] == 1) region.added++;
+                    else if (pixelKind[index] == 2) region.removed++;
+                    else region.modified++;
+                    int p = index * 3;
+                    region.diffTotal += Math.Max(
+                        Math.Abs(before[p] - after[p]),
+                        Math.Max(Math.Abs(before[p + 1] - after[p + 1]), Math.Abs(before[p + 2] - after[p + 2])));
+                }
+
+                for (int yy = Math.Max(0, y - 1); yy <= Math.Min(height - 1, y + 1); yy++)
+                {
+                    for (int xx = Math.Max(0, x - 1); xx <= Math.Min(width - 1, x + 1); xx++)
+                    {
+                        int next = yy * width + xx;
+                        if (!grouped[next] || visited[next]) continue;
+                        visited[next] = true;
+                        queue[tail++] = next;
+                    }
+                }
+            }
+            if (region.count < minimumRegionPixels || region.maxX < 0) continue;
+            if (region.added >= region.count * 0.65) region.kind = "added";
+            else if (region.removed >= region.count * 0.65) region.kind = "removed";
+            else region.kind = "modified";
+            double mean = region.count == 0 ? 0 : (double)region.diffTotal / region.count;
+            region.confidence = Math.Max(0.45, Math.Min(0.99, 0.45 + (mean / 255.0) * 0.65));
+            region.minX = Math.Max(0, region.minX - padding);
+            region.minY = Math.Max(0, region.minY - padding);
+            region.maxX = Math.Min(width - 1, region.maxX + padding);
+            region.maxY = Math.Min(height - 1, region.maxY + padding);
+            regions.Add(region);
+        }
+        regions.Sort(delegate (PixelRegion a, PixelRegion b)
+        {
+            int byY = a.minY.CompareTo(b.minY);
+            return byY != 0 ? byY : a.minX.CompareTo(b.minX);
+        });
+        return regions;
+    }
+
+    public static ReportBinderDiffPage ComparePage(
+        string beforePath,
+        string afterPath,
+        string outputDirectory,
+        int pageNumber,
+        string forcedKind,
+        int threshold,
+        int minimumRegionPixels,
+        int padding)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        Bitmap beforeSource = LoadImage(beforePath);
+        Bitmap afterSource = LoadImage(afterPath);
+        try
+        {
+            int width = Math.Max(beforeSource == null ? 0 : beforeSource.Width, afterSource == null ? 0 : afterSource.Width);
+            int height = Math.Max(beforeSource == null ? 0 : beforeSource.Height, afterSource == null ? 0 : afterSource.Height);
+            if (width <= 0) width = 1240;
+            if (height <= 0) height = 1754;
+            bool sizeChanged = beforeSource != null && afterSource != null &&
+                (beforeSource.Width != afterSource.Width || beforeSource.Height != afterSource.Height);
+            using (Bitmap before = Normalize(beforeSource, width, height))
+            using (Bitmap after = Normalize(afterSource, width, height))
+            {
+                string stem = pageNumber.ToString("0000");
+                string beforeName = stem + "-b.png";
+                string afterName = stem + "-a.png";
+                before.Save(Path.Combine(outputDirectory, beforeName), ImageFormat.Png);
+                after.Save(Path.Combine(outputDirectory, afterName), ImageFormat.Png);
+
+                List<PixelRegion> pixelRegions = new List<PixelRegion>();
+                double changedRatio = 0;
+                double averageDifference = 0;
+                string status = "ready";
+                string message = "";
+
+                if (forcedKind == "added")
+                {
+                    pixelRegions.Add(FullPageRegion(width, height, "added"));
+                    changedRatio = 1;
+                }
+                else if (forcedKind == "removed")
+                {
+                    pixelRegions.Add(FullPageRegion(width, height, "removed"));
+                    changedRatio = 1;
+                }
+                else if (forcedKind == "unknown")
+                {
+                    status = "unknown";
+                    message = "信頼できる差分領域を判定できません。";
+                }
+                else
+                {
+                    pixelRegions = FindRegions(
+                        ReadBgr(before),
+                        ReadBgr(after),
+                        width,
+                        height,
+                        Math.Max(1, threshold),
+                        Math.Max(1, minimumRegionPixels),
+                        Math.Max(0, padding),
+                        out changedRatio,
+                        out averageDifference);
+                    if (!sizeChanged && changedRatio > 0.35 && averageDifference < 30)
+                    {
+                        pixelRegions.Clear();
+                        status = "unknown";
+                        message = "描画差が広範囲に検出されたため、領域の強調を停止しました。";
+                    }
+                    else if (pixelRegions.Count > MaximumRegionsPerPage)
+                    {
+                        // A shifted row can change almost every glyph on the page. Drawing that many
+                        // boxes makes the overlay unreadable and the region navigation unusable.
+                        pixelRegions.Clear();
+                        status = "unknown";
+                        message = "変更領域が多すぎるため、領域の強調を停止しました。左右の表示で確認してください。";
+                    }
+                }
+
+                string beforeMask;
+                string beforeOverlay;
+                string afterMask;
+                string afterOverlay;
+                SaveLayerImages(outputDirectory, pageNumber, width, height, pixelRegions, true, out beforeMask, out beforeOverlay);
+                SaveLayerImages(outputDirectory, pageNumber, width, height, pixelRegions, false, out afterMask, out afterOverlay);
+
+                List<ReportBinderDiffRegion> publicRegions = new List<ReportBinderDiffRegion>();
+                double confidenceTotal = 0;
+                for (int i = 0; i < pixelRegions.Count; i++)
+                {
+                    PixelRegion region = pixelRegions[i];
+                    confidenceTotal += region.confidence;
+                    publicRegions.Add(new ReportBinderDiffRegion
+                    {
+                        regionId = "p" + pageNumber.ToString("0000") + "-r" + (i + 1).ToString("0000"),
+                        kind = region.kind,
+                        x = (double)region.minX / width,
+                        y = (double)region.minY / height,
+                        width = (double)(region.maxX - region.minX + 1) / width,
+                        height = (double)(region.maxY - region.minY + 1) / height,
+                        confidence = region.confidence,
+                        pixelCount = region.count
+                    });
+                }
+
+                return new ReportBinderDiffPage
+                {
+                    pageNumber = pageNumber,
+                    width = width,
+                    height = height,
+                    pageSizeChanged = sizeChanged,
+                    status = status,
+                    message = message,
+                    confidence = publicRegions.Count == 0 ? (status == "unknown" ? 0 : 1) : confidenceTotal / publicRegions.Count,
+                    changedRatio = changedRatio,
+                    regionCount = publicRegions.Count,
+                    regions = publicRegions.ToArray(),
+                    beforeFile = beforeName,
+                    afterFile = afterName,
+                    beforeMaskFile = beforeMask,
+                    beforeOverlayFile = beforeOverlay,
+                    afterMaskFile = afterMask,
+                    afterOverlayFile = afterOverlay
+                };
+            }
+        }
+        finally
+        {
+            if (beforeSource != null) beforeSource.Dispose();
+            if (afterSource != null) afterSource.Dispose();
+        }
+    }
+}
