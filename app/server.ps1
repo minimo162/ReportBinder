@@ -3469,6 +3469,45 @@ function Get-AllFinalReadiness($Structure,[string]$Language) {
     $result=[ordered]@{};foreach($cat in @('ecm','bod','dmm')){$vols=[ordered]@{};foreach($volume in @(Get-VolumeList $Language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $Structure $Language $volume $cat};$result[$cat]=[ordered]@{volumes=$vols}};return $result
 }
 
+function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Category='') {
+    if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
+    $cat=Require-WorkbookCategory $Category;$paths=Get-Paths;$workspace=Get-WorkspacePath $Language;try{[void](Scan-Updates $Language $null $false)}catch{}
+    $lockPath=Join-Path $workspace "locks\volume_${Volume}_${cat}.lock"
+    return Invoke-WithLock $lockPath {
+        $composerJar=Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar';$pdfboxJar=Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar';if(-not(Test-Path $composerJar)){throw 'ReportPdfComposer.jar がありません。'};if(-not(Test-Path $pdfboxJar)){throw 'pdfbox-app.jar がありません。'}
+        $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
+        if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
+        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=Get-OutputFileName $Volume $projectId $cat;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
+        if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の最終PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
+        $manifest=[ordered]@{schemaVersion=2;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
+        $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath);$exit=[int]$run.exitCode;$text=[string]$run.text;if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '最終PDFを作成できませんでした。'}
+        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'excel-updated' '元Excelが更新されたため、PDFを再作成後に最終PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
+        if($commit.changed){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'PDF作成中にページ構成またはPDF入力が変更されました。最新の状態で再度出力してください。'}
+        return [ordered]@{volume=$Volume;category=$cat;outputPdf=$outPath;inputFingerprint=$fpBefore;message=$text;readiness=$commit.readiness}
+    }
+}
+
+
+function Invoke-FinalBuildAllLegacy([string]$Language, [string]$Category, [string[]]$Volumes) {
+    # V4.1互換実装。現在のルートからは呼ばないが、旧形式の復旧・仕様照合用に保持する。
+    # V4.1 経路(Build-FinalPdfLegacy)を巻ごとに回す。
+    # トランザクション版と同様、ページが無い巻はスキップし、本当のブロッカーは Build-FinalPdfLegacy 側で送出する。
+    $cat = Require-WorkbookCategory $Category
+    $allowed = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
+    $requested = @($Volumes | Where-Object { $allowed -contains $_ })
+    if ($requested.Count -eq 0) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
+    $built = @()
+    $skipped = @()
+    foreach ($v in $requested) {
+        $structure = Get-Structure $Language
+        $rd = Get-FinalBuildReadiness $structure $Language $v $cat
+        if ([int]$rd.pageCount -le 0) { $skipped += $v; continue }
+        $built += @(Build-FinalPdfLegacy $Language $v $cat)
+    }
+    return [ordered]@{ built = @($built); skipped = @($skipped); message = (if ($built.Count -eq 0) { '出力対象がありません。' } else { '' }) }
+}
+
+
 function Build-FinalPdf([string]$Language,[string]$Volume,[string]$Category='') {
     # category は fail closed。ここでも明示的に検証する。
     $cat = Require-WorkbookCategory $Category
