@@ -1407,34 +1407,6 @@ function diffHistoryPdfParams(side,sheet){
   const before=side==='before';
   return {workbookId:diffViewState.workbookId,snapshotId:String(before?cmp.baselineSnapshotId||'':cmp.currentSnapshotId||''),versionId:String(before?cmp.baselineVersionId||'':cmp.currentVersionId||''),sheetName:String(sheet?.sheetName||'')};
 }
-async function renderDiffRasterPage(side,sheet,pageNumber,serial){
-  const params={...diffHistoryPdfParams(side,sheet),pageNumber};
-  const res=await fetch(apiUrl('/api/history/render-page',params),{
-    cache:'force-cache',
-    headers:{'X-ReportBinder-Token':token,'Accept':'image/png,application/json'}
-  });
-  const contentType=String(res.headers.get('content-type')||'').toLowerCase();
-  if(!res.ok||!contentType.includes('image/png'))throw new Error('saved-raster-unavailable');
-  const blob=await res.blob();
-  if(!blob.size)throw new Error('saved-raster-empty');
-  const bitmap=await createImageBitmap(blob);
-  try{
-    if(serial!==diffBrowserRenderSerial)return null;
-    const canvas=createWhiteDiffCanvas(bitmap.width,bitmap.height);
-    canvas.getContext('2d',{alpha:false}).drawImage(bitmap,0,0);
-    return canvas;
-  }finally{bitmap.close?.();}
-}
-async function renderDiffSourcePage(side,sheet,pageNumber,serial){
-  try{return await renderDiffRasterPage(side,sheet,pageNumber,serial);}
-  catch(error){
-    if(serial!==diffBrowserRenderSerial)return null;
-    // 古い履歴やラスタ欠落時だけPDF.jsへフォールバックする。
-    setDiffBrowserProgress(true,'保存済みページがないためPDFを描画しています。',35);
-    return renderDiffPdfPage(side,sheet,pageNumber,serial);
-  }
-}
-
 async function fetchDiffPdfDocument(side,sheet){
   const key=diffPdfDocumentKey(side,sheet);
   if(diffPdfDocumentCache.has(key)){
@@ -1563,8 +1535,8 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   const pageNumber=pageIndex+1,kind=String(sheet?.kind||'modified');
   const needBefore=kind!=='added'&&pageNumber<=Math.max(Number(sheet?.beforePages||0),1);
   const needAfter=kind!=='removed'&&pageNumber<=Math.max(Number(sheet?.afterPages||0),1);
-  setDiffBrowserProgress(true,'保存済みの比較ページを読み込んでいます。',20);
-  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffSourcePage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffSourcePage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
+  setDiffBrowserProgress(true,'PDFを表示用に描画しています。',25);
+  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
   if(serial!==diffBrowserRenderSerial)return null;
   const width=Math.max(beforeRaw?.width||0,afterRaw?.width||0),height=Math.max(beforeRaw?.height||0,afterRaw?.height||0);
   if(!width||!height)throw new Error('表示できるPDFページがありません。');
@@ -1802,8 +1774,8 @@ function renderDiffPage(){
     diffBrowserPageCache.delete(key);diffBrowserPageCache.set(key,cached);
     setDiffBrowserProgress(false);paintDiffBrowserPage(cached);renderDiffSheetList();return;
   }
-  setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:'比較ページを読み込んでいます…');
-  setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:'比較ページを読み込んでいます…');
+  setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:'PDFを読み込んでいます…');
+  setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:'PDFを読み込んでいます…');
   void buildDiffBrowserPage(sheet,diffViewState.pageIndex,serial).then(result=>{
     if(!result||serial!==diffBrowserRenderSerial||!isDiffModalOpen())return;
     cacheDiffBrowserPage(key,result);setDiffBrowserProgress(false);paintDiffBrowserPage(result);renderDiffSheetList();
@@ -1889,10 +1861,9 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   if($('diff-sheet-list'))$('diff-sheet-list').innerHTML='<div class="empty-state">読み込んでいます。</div>';
   setDiffPaneEmpty('before','比較情報を読み込んでいます。');setDiffPaneEmpty('after','比較情報を読み込んでいます。');$('diff-close')?.focus();
   const requestPath=diffDetailRequestPath();
-  // 比較情報の取得中に差分Workerだけを準備する。PDF.jsはラスタ欠落時まで読み込まない。
+  // 比較情報の取得と並行してPDF.js・差分Workerを準備し、初回ページの開始待ちを短くする。
   const detailRequest=fetchDiffDetailResponse(requestPath,id);
-  // 保存済み120 DPIラスタが使える通常経路ではPDF.jsを読み込まない。
-  // ラスタ欠落時だけ renderDiffSourcePage から遅延初期化する。
+  void ensureDiffPdfJs().catch(()=>{});
   try{getDiffAnalysisWorker();}catch{}
   try{const loaded=await detailRequest;if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail(loaded.detail);}
   catch(error){renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
