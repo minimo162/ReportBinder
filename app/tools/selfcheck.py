@@ -85,8 +85,11 @@ if 'Resolve-ContentPdfSheetPathExact' not in _resolve_diff:
     raise SystemExit('diff content PDF lookup must use exact render-version resolution')
 for forbidden in ['contentPdfRetained','candidateVersion','foreach ($ver in $versions)']:
     if forbidden in _resolve_diff: raise SystemExit(f'diff content PDF lookup must not fall back: {forbidden}')
+_pdf_index=server.split('function Get-ContentPdfSheetIndex',1)[1].split('\nfunction ',1)[0]
+if '[void]$Script:ContentPdfSheetIndexCache.Remove($oldestKey)' not in _pdf_index:
+    raise SystemExit('PDF index cache eviction must not leak a Boolean into the function pipeline')
 _availability=server.split('function Get-HistoryRenderVersionAvailability',1)[1].split('\nfunction ',1)[0]
-for needed in ['visualHashAvailable','contentPdfAvailable','missingSheets','Resolve-ContentPdfSheetPathExact']:
+for needed in ['visualHashAvailable','contentPdfAvailable','missingSheets','Get-ContentPdfSheetIndex','Resolve-ContentPdfSheetPathFromIndex']:
     if needed not in _availability: raise SystemExit(f'history visual-compare readiness missing: {needed}')
 
 # Pair generation is cross-PC serialized and both inputs are leased until finally cleanup.
@@ -107,7 +110,7 @@ _skeleton=server.split('function New-DiffDetailSkeleton',1)[1].split('\nfunction
 for needed in ["status = 'ready'", 'unchangedPageNumbers', '表示したページをブラウザで比較します。']:
     if needed not in _skeleton: raise SystemExit(f'browser comparison skeleton missing: {needed}')
 _get_detail=server.split('function Get-DiffDetail(',1)[1].split('\nfunction ',1)[0]
-if 'return (New-DiffDetailSkeleton $Language $context)' not in _get_detail:
+if '$detail = New-DiffDetailSkeleton $Language $context' not in _get_detail or "'performance'" not in _get_detail:
     raise SystemExit('diff detail must return metadata without starting or reading a comparison-image job')
 for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
@@ -482,7 +485,8 @@ for needed in ['function addedSheetSet', '追加 ${added}', "badge('追加','att
 # Detailed visual diff is rendered from the source PDFs in the browser.
 for needed in ['function Get-DiffDetailContext', 'function Serve-HistoryContentPdf',
                '$Script:VisualHashDpi = 120', 'Resolve-ContentPdfSheetPathExact',
-               "Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'"]:
+               'function Get-ContentPdfSheetIndex', 'function Write-FileResponse',
+               "Write-FileResponse $Context 200 $full 'application/pdf' $false 'private, max-age=31536000, immutable'"]:
     if needed not in server:
         raise SystemExit(f'browser PDF comparison server support missing: {needed}')
 for needed in ['diffDetailRequestPath', 'diffHistoryPdfParams', 'fetchDiffPdfDocument',
@@ -708,7 +712,7 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 13' not in server:
+if '$Script:DiffDetailAlgorithmVersion = 14' not in server:
     raise SystemExit('browser PDF comparison changes must bump DiffDetailAlgorithmVersion to 13')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
@@ -728,7 +732,7 @@ if 'Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors $CacheCont
     raise SystemExit('diff asset cache policy must reach the TcpListener response path')
 appjs = (root/'app/web/app.js').read_text(encoding='utf-8-sig')
 diff_worker = (root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ["canvas.style.visibility='hidden'", 'beginDiffBrowserRender', 'task.cancel()', 'DIFF_PAGE_CACHE_LIMIT = 4', 'setDiffBrowserProgress', 'PDFを読み込んでいます…']:
+for needed in ["canvas.style.visibility='hidden'", 'beginDiffBrowserRender', 'task.cancel()', 'DIFF_PAGE_CACHE_LIMIT = 6', 'setDiffBrowserProgress', 'PDFを読み込んでいます…']:
     if needed not in appjs:
         raise SystemExit(f'browser page-switch responsiveness missing: {needed}')
 for needed in ['getImageData(0,0,width,height)', 'postMessage({id,width,height', 'diffAnalysisPending']:
@@ -767,7 +771,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 13',
+    '$Script:DiffDetailAlgorithmVersion = 14',
 ]:
     if needed not in server:
         raise SystemExit(f'comparison tolerance/browser setting missing: {needed}')
@@ -818,9 +822,15 @@ for needed in ['$preferredIndex', '$workIndexes += $preferredIndex', '1ジョブ
         raise SystemExit(f'one-sheet lazy generation missing: {needed}')
 if "$sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed'" in _diff_core:
     raise SystemExit('diff job must not eagerly queue every changed sheet')
-for needed in ['ensureDiffPdfJs', 'renderDiffPdfPage', 'analyzeDiffCanvases', 'buildDiffBrowserPage', 'clearDiffBrowserResources']:
+for needed in ['ensureDiffPdfJs', 'renderDiffPdfPage', 'analyzeDiffCanvases', 'buildDiffBrowserPage',
+               'clearDiffBrowserResources', 'fetchDiffDetailResponse', 'disableRange:false',
+               'disableStream:false', 'clearDiffBrowserResources(true)']:
     if needed not in appjs:
         raise SystemExit(f'browser on-demand PDF comparison missing: {needed}')
+_fetch_pdf = appjs.split('async function fetchDiffPdfDocument', 1)[1].split('\nfunction ', 1)[0]
+for forbidden in ["cache:'no-store'", 'arrayBuffer()']:
+    if forbidden in _fetch_pdf:
+        raise SystemExit(f'PDF fetch must stream and remain browser-cacheable: {forbidden}')
 for forbidden in ['prepareDiffDetail(', 'diffPrepareRequestBody(', 'diffAssetUrl(', 'setDiffImage(']:
     if forbidden in appjs:
         raise SystemExit(f'legacy server-image comparison remains in browser: {forbidden}')
@@ -845,7 +855,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v55', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v56', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
