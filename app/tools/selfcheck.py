@@ -295,9 +295,19 @@ _insert = server.split('function Insert-PageInSheetOrder', 1)[1].split('\nfuncti
 if 'pages=@($ordered)' in _insert or 'pages=$ordered.ToArray()' not in _insert:
     raise SystemExit('generic page list must use ToArray() for Windows PowerShell 5.1')
 
-# Approval is a workspace-level policy; personal config must not gate it.
-for fn in ['function Get-WorkspacePolicy', 'function Test-InputHistoryEnabled', 'function Test-SourceRetentionEnabled']:
+# History/diff is enabled by default; the old workspace policy gate must not return.
+for fn in ['function Test-InputHistoryEnabled', 'function Test-SourceRetentionEnabled']:
     if fn not in server: raise SystemExit('missing: ' + fn)
+if 'function Get-WorkspacePolicy' in server or '$Script:WorkspacePolicyCache' in server:
+    raise SystemExit('legacy policy.json gate/cache must be removed')
+_history_enabled = server.split('function Test-InputHistoryEnabled', 1)[1].split('\nfunction ', 1)[0]
+if 'return $true' not in _history_enabled:
+    raise SystemExit('input history and diff must be enabled without policy.json')
+_source_retention = server.split('function Test-SourceRetentionEnabled', 1)[1].split('\nfunction ', 1)[0]
+if 'StartsWith($sub, [StringComparison]::OrdinalIgnoreCase)' not in _source_retention:
+    raise SystemExit('source retention must remain limited to dataDir under submissionDir')
+if (root/'docs/POLICY_SAMPLE.json').exists():
+    raise SystemExit('obsolete POLICY_SAMPLE.json must not be distributed')
 if 'function Merge-ConfigDefaults' not in server:
     raise SystemExit('Get-AppConfig must merge default-config so existing users receive new keys')
 
@@ -426,13 +436,13 @@ _ensure = server.split('function Ensure-SnapshotMetadata', 1)[1].split('\nfuncti
 if "'manifest.json'" in _ensure: raise SystemExit('Ensure-SnapshotMetadata must write manifest.pending.json')
 if 'function Complete-Snapshot' not in server: raise SystemExit('missing Complete-Snapshot')
 
-# An unapproved workspace must behave exactly like V4.1.
+# Final PDF output always uses the transactional history/archive path.
 _bfp = server.split('function Build-FinalPdf(', 1)[1].split('\nfunction ', 1)[0]
-if 'Build-FinalPdfLegacy' not in _bfp:
-    raise SystemExit('unapproved workspaces must fall back to the V4.1 build path')
-for fn in ['function Write-HistoryEvent', 'function Save-LayoutSnapshot']:
-    blk = server.split(fn, 1)[1].split('\nfunction ', 1)[0]
-    if 'Test-InputHistoryEnabled' not in blk: raise SystemExit(f'{fn} must be gated on approval')
+if 'Invoke-FinalBuildTransaction' not in _bfp or 'Build-FinalPdfLegacy' in _bfp:
+    raise SystemExit('Build-FinalPdf must always use the transactional path')
+_build_all_route = server.split("'/api/final/build-all'", 1)[1].split("'/api/", 1)[0]
+if 'Invoke-FinalBuildAllLegacy' in _build_all_route:
+    raise SystemExit('build-all route must not fall back to the legacy path')
 
 # Archive failures must roll the transaction back, not be swallowed.
 _arch = server.split('function New-FinalArchive', 1)[1].split('\nfunction ', 1)[0]
@@ -506,7 +516,6 @@ if '$Script:ConfigMergeChanged' not in _cfg:
 if '$Script:AppConfigCache' not in _cfg:
     raise SystemExit('Get-AppConfig must cache its result')
 for fn, cache in [('function Get-Paths', '$Script:PathsCache'),
-                  ('function Get-WorkspacePolicy', '$Script:WorkspacePolicyCache'),
                   ('function Get-InputHistorySizeMb', '$Script:HistorySizeCache')]:
     blk = server.split(fn, 1)[1].split('\nfunction ', 1)[0]
     if cache not in blk: raise SystemExit(f'{fn} must be cached ({cache})')
@@ -695,8 +704,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 10' not in server:
-    raise SystemExit('parallel comparison changes must bump DiffDetailAlgorithmVersion to 10')
+if '$Script:DiffDetailAlgorithmVersion = 11' not in server:
+    raise SystemExit('exact-page fast path must bump DiffDetailAlgorithmVersion to 11')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -755,7 +764,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 10',
+    '$Script:DiffDetailAlgorithmVersion = 11',
     '$Script:DiffDetailDpi = 120',
     '$Script:DiffDetailThreshold = 24',
     '$Script:DiffDetailMinimumRegionPixels = 24',
@@ -777,7 +786,7 @@ for needed in [
     if needed not in diff_engine:
         raise SystemExit(f'diff-region noise control missing: {needed}')
 analyzer = (root/'app/lib/pdfbox/src/PdfPageAnalyzer.java').read_text(encoding='utf-8-sig')
-for needed in ['ANALYZER_VERSION = 2', 'pagePerceptualHashes', 'perceptualHash']:
+for needed in ['ANALYZER_VERSION = 2', 'pageHashes', 'normalizedPixelHash', 'pagePerceptualHashes', 'perceptualHash']:
     if needed not in analyzer:
         raise SystemExit(f'perceptual visual hash missing: {needed}')
 
@@ -793,6 +802,16 @@ for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster']:
 for needed in ['ReportBinderDiffBatchPageRequest', 'ComparePages(', 'analysisThreads', 'analyzedPages']:
     if needed not in batch_script:
         raise SystemExit(f'parallel diff analysis missing: {needed}')
+for needed in ['unchangedPageNumbers', "pageKind = 'unchanged'", 'unchangedPagesSkipped', 'fullyAnalyzedPages']:
+    if needed not in batch_script:
+        raise SystemExit(f'exact-page diff fast path missing from batch script: {needed}')
+for needed in ['CopyUnchangedPage', 'String.Equals(forcedKind, "unchanged"', 'File.Copy(beforePath']:
+    if needed not in diff_engine:
+        raise SystemExit(f'exact-page diff fast path missing from engine: {needed}')
+_diff_skeleton = server.split('function New-DiffDetailSkeleton', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['pageHashes', 'Normalize-FileHash', 'unchangedPageNumbers']:
+    if needed not in _diff_skeleton:
+        raise SystemExit(f'exact page hash propagation missing: {needed}')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
 for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
     if needed not in batch_java:
