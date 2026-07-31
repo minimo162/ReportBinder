@@ -47,6 +47,13 @@ $Script:StructureReadCache = @{}
 $Script:StructureReadCacheLimit = 4
 $Script:LatestComparisonCache = @{}
 $Script:LatestComparisonCacheLimit = 256
+$Script:SnapshotManifestCache = @{}
+$Script:VisualHashCache = @{}
+$Script:SnapshotIdCache = @{}
+$Script:SnapshotSummaryCache = @{}
+$Script:DiffDetailResponseCache = @{}
+$Script:LocalRuntimeCacheRoot = Join-Path $Script:LocalConfigRoot 'runtime-cache'
+if (-not (Test-Path -LiteralPath $Script:LocalRuntimeCacheRoot)) { New-Item -ItemType Directory -Path $Script:LocalRuntimeCacheRoot -Force | Out-Null }
 # 最小化コンソールで起動されたとき、何のウィンドウか分かるようにタイトルを付ける。
 try { $host.UI.RawUI.WindowTitle = "ReportBinder サーバー ($Mode) - このウィンドウを閉じると終了します" } catch { }
 $Script:AutoRenderInProgress = $false
@@ -3339,7 +3346,7 @@ function Reorder-Pages([string]$Language, $Body) {
         foreach ($volume in $allowed) { [void](Renumber-VolumeOrder $structure $volume $cat) }
         Apply-DefaultNumberingPerVolume $Language $structure $cat
         if ($affected.Count -gt 0) { Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました' }
-        return [ordered]@{ pages=$structure.pages; affectedVolumes=@($affected); updatedAt=(New-NowIso) }
+        return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; affectedVolumes=@($affected); updatedAt=(New-NowIso) }
     }
 }
 
@@ -3358,7 +3365,7 @@ function Update-Page([string]$Language, $Body) {
         if($null -ne $Body.enabled){Set-NoteProperty $p 'enabled' ([bool]$Body.enabled);$structural=$true}
         Set-NoteProperty $p 'updatedAt' (New-NowIso);foreach($vol in @(Get-VolumeList $Language)){[void](Renumber-VolumeOrder $structure $vol $cat)};Apply-DefaultNumberingPerVolume $Language $structure $cat
         if($structural){$affected=@($beforeVol,[string]$p.volume)|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique;Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました'}
-        return $p
+        return [ordered]@{ page=$p; volumes=$structure.volumes }
     }
 }
 
@@ -3411,7 +3418,7 @@ function Sort-PagesBySheet([string]$Language, $Body) {
         if ($affected.Count -gt 0) {
             Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページをシート名順に並べ替えました'
         }
-        return [ordered]@{ pages=$structure.pages; category=$cat; affectedVolumes=@($affected) }
+        return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; category=$cat; affectedVolumes=@($affected) }
     }
 }
 
@@ -3482,15 +3489,15 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
 
 function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty $Snapshot 'fingerprint' '') }
 
-function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[string]$Category) {
-    $cat=Require-WorkbookCategory $Category;$snap=Get-FinalBuildInputSnapshot $Structure $Language $Volume $cat;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $Structure.volumes $key (New-EmptyVolumeState);$built=[string](Get-DataProperty $v 'builtFingerprint' '');$current=[string]$snap.fingerprint;$out=[string](Get-DataProperty $v 'outputPdf' '');$exists=(-not [string]::IsNullOrWhiteSpace($out))-and(Test-Path -LiteralPath $out);$status='not-built';if($built){if($built -ne $current -or $snap.blockers.Count -gt 0){$status='needs-rebuild'}else{$status='built'}};$display=if($snap.blockers.Count -gt 0){'blocked'}elseif(-not $built){'not-built'}elseif($built -ne $current){'needs-rebuild'}elseif(-not $exists){'output-missing'}else{'built'}
+function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[string]$Category,[bool]$CheckOutputExists = $true) {
+    $cat=Require-WorkbookCategory $Category;$snap=Get-FinalBuildInputSnapshot $Structure $Language $Volume $cat;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $Structure.volumes $key (New-EmptyVolumeState);$built=[string](Get-DataProperty $v 'builtFingerprint' '');$current=[string]$snap.fingerprint;$out=[string](Get-DataProperty $v 'outputPdf' '');$exists=(-not [string]::IsNullOrWhiteSpace($out));if($exists -and $CheckOutputExists){$exists=Test-Path -LiteralPath $out};$status='not-built';if($built){if($built -ne $current -or $snap.blockers.Count -gt 0){$status='needs-rebuild'}else{$status='built'}};$display=if($snap.blockers.Count -gt 0){'blocked'}elseif(-not $built){'not-built'}elseif($built -ne $current){'needs-rebuild'}elseif(-not $exists){'output-missing'}else{'built'}
     Set-NoteProperty $v 'status' $status
     $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='最終PDFの入力が変更されました'})}
     return [ordered]@{canBuild=($snap.blockers.Count -eq 0 -and $snap.pageCount -gt 0);pageCount=$snap.pageCount;status=$status;displayState=$display;builtFingerprint=$built;currentFingerprint=$current;outputPdf=$out;outputPdfExists=[bool]$exists;lastBuiltAt=(Get-DataProperty $v 'lastBuiltAt' $null);blockers=@($snap.blockers);staleReasons=@($reasons);snapshot=$snap}
 }
 
-function Get-AllFinalReadiness($Structure,[string]$Language) {
-    $result=[ordered]@{};foreach($cat in @('ecm','bod','dmm')){$vols=[ordered]@{};foreach($volume in @(Get-VolumeList $Language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $Structure $Language $volume $cat};$result[$cat]=[ordered]@{volumes=$vols}};return $result
+function Get-AllFinalReadiness($Structure,[string]$Language,[bool]$CheckOutputExists = $true) {
+    $result=[ordered]@{};foreach($cat in @('ecm','bod','dmm')){$vols=[ordered]@{};foreach($volume in @(Get-VolumeList $Language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $Structure $Language $volume $cat $CheckOutputExists};$result[$cat]=[ordered]@{volumes=$vols}};return $result
 }
 
 function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Category='') {
@@ -3575,24 +3582,23 @@ function Get-StatePayload([string]$Language) {
         foreach ($cat in @('ecm','bod','dmm')) {
             foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
                 $key=Get-VolumeStateKey $volume $cat; $v=Get-DataProperty $structure.volumes $key $null
-                if ($null -ne $v) { $out=[string](Get-DataProperty $v 'outputPdf' ''); Set-NoteProperty $v 'outputPdfExists' ((-not [string]::IsNullOrWhiteSpace($out)) -and (Test-Path -LiteralPath $out)) }
+                if ($null -ne $v) { $out=[string](Get-DataProperty $v 'outputPdf' ''); Set-NoteProperty $v 'outputPdfExists' (-not [string]::IsNullOrWhiteSpace($out)) }
             }
         }
     }
-    # V5: シート単位の変更判定を state に載せる(履歴が承認されている場合のみ)。
+    # 初期表示では共有フォルダー上の比較JSONをExcel件数分読まない。
+    # PDF作成時にstructureへ保存した小さな要約だけを返す。
     $changeSummaries = [ordered]@{}
     $inputHistoryOn = $false
     try { $inputHistoryOn = (Test-InputHistoryEnabled) } catch { }
     if ($configured -and -not $structureLoadError -and $inputHistoryOn) {
         foreach ($w in $workbooks) {
-            try {
-                $cs = Get-WorkbookChangeSummary $Language ([string]$w.workbookId) $w
-                if ($null -ne $cs) { $changeSummaries[[string]$w.workbookId] = $cs }
-            } catch { }
+            $cs = Get-DataProperty $w 'latestComparisonSummary' $null
+            if ($null -ne $cs) { $changeSummaries[[string]$w.workbookId] = $cs }
         }
     }
     $autoSummary = $null
-    try { if ($configured) { $autoSummary = Get-AutoStateSummary $Language } } catch { }
+    try { if ($configured) { $autoSummary = Get-AutoStateSummary $Language -Fast } } catch { }
 
     $pdfjsDir = Join-Path $Script:WebRoot 'pdfjs'
     $pdfjsClassic = ((Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.min.js')) -and (Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.worker.min.js')))
@@ -3608,7 +3614,7 @@ function Get-StatePayload([string]$Language) {
         paths = $paths
         structure = $structure
         structureLoadError = $structureLoadError
-        finalReadiness = $(if ($configured -and -not $structureLoadError) { Get-AllFinalReadiness $structure $Language } else { [ordered]@{} })
+        finalReadiness = $(if ($configured -and -not $structureLoadError) { Get-AllFinalReadiness $structure $Language $false } else { [ordered]@{} })
         summary = $summary
         recentErrors = @(Get-Array $workbooks | Where-Object { [string]$_.status -eq 'render-error' -or -not [string]::IsNullOrWhiteSpace([string]$_.lastError) } | ForEach-Object { [ordered]@{ workbookId = [string]$_.workbookId; fileName = [string]$_.fileName; displayName = [string]$_.displayName; message = [string]$_.lastErrorUser; detail = [string]$_.lastError; at = [string]$_.lastErrorAt } })
         pdfjsPresent = ($pdfjsClassic -or $pdfjsModule)
@@ -3831,7 +3837,7 @@ function Serve-ContentPdfByValues($Context, [string]$Language, [string]$PageId, 
     if (-not $full.StartsWith($workspaceFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'ワークスペース外のファイルは表示できません。' }
     if (-not (Test-Path -LiteralPath $full)) { throw 'PDFファイルが見つかりません。PDF作成をやり直してください。' }
     if ((Get-Item -LiteralPath $full).Length -le 0) { throw 'PDFファイルが空です。PDF作成をやり直してください。' }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
+    Write-FileResponse $Context 200 $full 'application/pdf' $false 'no-store'
 }
 
 function Resolve-ContentPdfFullPath([string]$Workspace, [string]$RelativePdf) {
@@ -4053,19 +4059,16 @@ function Handle-Api($Context) {
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/reorder') {
             $body = Read-BodyJson $Context.Request
-            [void](Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'reorder')
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Reorder-Pages $language $body) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/sort-by-sheet') {
             $body=Read-BodyJson $Context.Request
-            [void](Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'sort-by-sheet')
             Write-JsonResponse $Context 200 ([ordered]@{ok=$true;result=(Sort-PagesBySheet $language $body)});return
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/update') {
             $body = Read-BodyJson $Context.Request
-            # V5: 出力先・ページ番号・出力対象・タイトルの変更もレイアウト履歴に残す。
-            [void](Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'page-update')
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; page = (Update-Page $language $body) }); return
+            $pageResult = Update-Page $language $body
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; page = $pageResult.page; result = $pageResult }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/confirm') {
             $body = Read-BodyJson $Context.Request
@@ -4149,6 +4152,7 @@ function Handle-Api($Context) {
             if (-not (New-SnapshotPin $language $wbId $snapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
                 throw '履歴の保護情報を保存できませんでした。'
             }
+            Clear-SnapshotSummaryCache $language $wbId
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/history/unpin') {
@@ -4156,6 +4160,7 @@ function Handle-Api($Context) {
             $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
             $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
             Remove-SnapshotPin $language $wbId $snapshotId 'manual'
+            Clear-SnapshotSummaryCache $language $wbId
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/layout/snapshots') {
@@ -4585,34 +4590,39 @@ function Get-EphemeralJobRoot([string]$Language) {
 }
 
 function Write-HistoryEvent([string]$Language, [string]$Type, $Data) {
-    # V5-§4.3: 1イベント1ファイル。共有ドライブ上でのJSONL追記は行が混ざるため使わない。
-    if (-not (Test-InputHistoryEnabled)) { return }
-    try {
-        $dir = Join-Path (Get-WorkspacePath $Language) 'history\events'
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $safeType = [regex]::Replace([string]$Type, '[^A-Za-z0-9._-]+', '-')
-        $name = ('{0}_{1}.json' -f (New-RbId), $safeType)
-        $payload = [ordered]@{
-            schemaVersion = 1; eventType = [string]$Type; at = New-NowIso
-            pcName = $env:COMPUTERNAME; userName = "$env:USERDOMAIN\$env:USERNAME"
-            data = $Data
-        }
-        Write-JsonFile (Join-Path $dir $name) $payload
-    } catch { }
+    # 履歴タイムラインUIを廃止したため、共有フォルダーへの1イベント1ファイル書込も行わない。
+    # 版比較に必要なsnapshot/manifest/comparisonは別経路で保持される。
+    return
 }
 
 function Get-SnapshotManifest([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
-    $path = Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) 'manifest.json'
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $cacheKey = ($Language + '|' + $safeWorkbookId + '|' + $safeSnapshotId).ToLowerInvariant()
+    if ($Script:SnapshotManifestCache.ContainsKey($cacheKey)) { return $Script:SnapshotManifestCache[$cacheKey] }
+    $path = Join-Path (Get-SnapshotDir $Language $safeWorkbookId $safeSnapshotId) 'manifest.json'
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { return (Read-JsonFile $path $null) } catch { return $null }
+    try {
+        $manifest = Read-JsonFile $path $null
+        if ($null -ne $manifest) { $Script:SnapshotManifestCache[$cacheKey] = $manifest }
+        return $manifest
+    } catch { return $null }
 }
 
 function Get-SnapshotIds([string]$Language, [string]$WorkbookId) {
-    $dir = Get-WorkbookHistoryDir $Language $WorkbookId
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $dir = Get-WorkbookHistoryDir $Language $safeWorkbookId
     if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
-             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') } |
+    $stamp = [IO.Directory]::GetLastWriteTimeUtc($dir).Ticks
+    $cacheKey = ($Language + '|' + $safeWorkbookId).ToLowerInvariant()
+    $cached = $Script:SnapshotIdCache[$cacheKey]
+    if ($null -ne $cached -and [Int64](Get-DataProperty $cached 'stamp' -1) -eq $stamp) {
+        return @(Get-Array (Get-DataProperty $cached 'ids' @()))
+    }
+    $ids = @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
              Sort-Object Name | ForEach-Object { [string]$_.Name })
+    $Script:SnapshotIdCache[$cacheKey] = [pscustomobject][ordered]@{ stamp = $stamp; ids = $ids }
+    return $ids
 }
 
 function Find-SnapshotBySourceHash([string]$Language, [string]$WorkbookId, [string]$SourceHash) {
@@ -5811,9 +5821,18 @@ function Write-RenderRecord([string]$Language, [string]$WorkbookId, [string]$Sna
 }
 
 function Get-VisualHashes([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
-    $p = Join-Path (Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId) 'visual-hashes.json'
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
+    $cacheKey = ($Language + '|' + $safeWorkbookId + '|' + $safeSnapshotId + '|' + $safeVersionId).ToLowerInvariant()
+    if ($Script:VisualHashCache.ContainsKey($cacheKey)) { return $Script:VisualHashCache[$cacheKey] }
+    $p = Join-Path (Get-RenderRecordDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId) 'visual-hashes.json'
     if (-not (Test-Path -LiteralPath $p)) { return $null }
-    try { return (Read-JsonFile $p $null) } catch { return $null }
+    try {
+        $hashes = Read-JsonFile $p $null
+        if ($null -ne $hashes) { $Script:VisualHashCache[$cacheKey] = $hashes }
+        return $hashes
+    } catch { return $null }
 }
 
 function Get-RenderVersionIds([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
@@ -6162,6 +6181,9 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
         Remove-Item -LiteralPath $comparisonPath -Force -ErrorAction SilentlyContinue
         throw
     }
+    try { Publish-LatestComparisonCaches $Language $WorkbookId $saved $cur $base } catch {
+        Write-Warning ('比較情報のローカルキャッシュ作成に失敗しました: ' + $_.Exception.Message)
+    }
     Write-HistoryEvent $Language 'compare.completed' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $CurrentSnapshotId; changed = @($changed); unknown = @($unknown) })
     return $saved
 }
@@ -6190,6 +6212,7 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
         Write-RenderRecord $Language $WorkbookId $SnapshotId $VersionId 'normal' $true $parsed
         if ($null -eq $parsed) { return $null }
         $cmp = Compare-SnapshotVisual $Language $WorkbookId $SnapshotId $VersionId
+        Clear-SnapshotSummaryCache $Language $WorkbookId
         # complete/unavailableのどちらでも解析結果を版の記録へ残す。
         # 非同期解析の競合や環境差で比較できない場合に、理由を後から確認できる。
         try {
@@ -6225,7 +6248,24 @@ function Get-LatestComparison([string]$Language, [string]$WorkbookId, $Workbook 
         if ($Script:LatestComparisonCache.ContainsKey($cacheKey)) {
             return $Script:LatestComparisonCache[$cacheKey]
         }
-        $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $snap $ver) 'comparisons'
+        # 既存データも比較フォルダーを列挙せず、レンダリング時の確定ファイルを直接読む。
+        $recordDir = Get-RenderRecordDir $Language $WorkbookId $snap $ver
+        $analysisPath = Join-Path $recordDir 'comparison-analysis.json'
+        if (Test-Path -LiteralPath $analysisPath) {
+            try {
+                $candidate = Read-JsonFile $analysisPath $null
+                $scope = [string](Get-DataProperty $candidate 'scope' '')
+                $candidateSnapshot = [string](Get-DataProperty $candidate 'currentSnapshotId' '')
+                $candidateVersion = [string](Get-DataProperty $candidate 'currentVersionId' '')
+                if ($null -ne $candidate -and ([string]::IsNullOrWhiteSpace($scope) -or $scope -eq 'automatic') -and
+                    ([string]::IsNullOrWhiteSpace($candidateSnapshot) -or $candidateSnapshot -eq $snap) -and
+                    ([string]::IsNullOrWhiteSpace($candidateVersion) -or $candidateVersion -eq $ver)) {
+                    $Script:LatestComparisonCache[$cacheKey] = $candidate
+                    return $candidate
+                }
+            } catch { }
+        }
+        $dir = Join-Path $recordDir 'comparisons'
         if (-not (Test-Path -LiteralPath $dir)) { return $null }
         foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
             try {
@@ -6733,8 +6773,8 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             $built = @()
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
-                $archive = New-FinalArchive $Language $cat $v ([string]$t.buildId) ([string]$t.finalPath) (Get-DataProperty $t 'manifest' $null) $snapshots[$v]
-                Save-LayoutSnapshot $Language $cat 'final-build' | Out-Null
+                # 保存済み出力・ページ構成履歴は廃止。共有フォルダーへの複製を作らない。
+                $archive = ''
                 Write-HistoryEvent $Language 'final.built' ([ordered]@{ category = $cat; volume = $v; buildId = [string]$t.buildId; outputPdf = [string]$t.finalPath })
                 $built += [ordered]@{ volume = $v; category = $cat; outputPdf = [string]$t.finalPath; buildId = [string]$t.buildId; archivePath = $archive; inputFingerprint = [string]$journal.beforeFingerprints[$v] }
             }
@@ -6884,13 +6924,11 @@ function Get-ContentPdfSheetIndex([string]$Language, [string]$WorkbookId, [strin
     $workspace = Get-WorkspacePath $Language
     $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
     $dir = Get-ContentPdfVersionDir $workspace $WorkbookId $safeVersionId
-    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @{} }
-    $stamp = [IO.Directory]::GetLastWriteTimeUtc($dir).Ticks
     $cacheKey = ([IO.Path]::GetFullPath($dir)).ToLowerInvariant()
     $cached = $Script:ContentPdfSheetIndexCache[$cacheKey]
-    if ($null -ne $cached -and [Int64](Get-DataProperty $cached 'stamp' -1) -eq $stamp) {
-        return (Get-DataProperty $cached 'index' @{})
-    }
+    if ($null -ne $cached) { return (Get-DataProperty $cached 'index' @{}) }
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @{} }
+    $stamp = [IO.Directory]::GetLastWriteTimeUtc($dir).Ticks
     $root = [IO.Path]::GetFullPath($workspace)
     if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
     $index = @{}
@@ -6965,47 +7003,80 @@ function Get-HistoryRenderVersionAvailability([string]$Language, [string]$Workbo
 }
 
 
+function Get-LocalSnapshotSummaryCachePath([string]$Language, [string]$WorkbookId) {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    return (Join-Path $Script:LocalRuntimeCacheRoot ("snapshots-{0}-{1}.json" -f $Language, $safeWorkbookId))
+}
+
+function Clear-SnapshotSummaryCache([string]$Language, [string]$WorkbookId) {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $cacheKey = ($Language + '|' + $safeWorkbookId).ToLowerInvariant()
+    [void]$Script:SnapshotSummaryCache.Remove($cacheKey)
+    [void]$Script:SnapshotIdCache.Remove($cacheKey)
+    try {
+        $path = Get-LocalSnapshotSummaryCachePath $Language $safeWorkbookId
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    } catch { }
+}
+
 function Get-SnapshotSummaries([string]$Language, [string]$WorkbookId) {
     if ([string]::IsNullOrWhiteSpace($WorkbookId)) { return @() }
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $historyDir = Get-WorkbookHistoryDir $Language $safeWorkbookId
+    if (-not (Test-Path -LiteralPath $historyDir)) { return @() }
+    $stamp = [IO.Directory]::GetLastWriteTimeUtc($historyDir).Ticks
+    $cacheKey = ($Language + '|' + $safeWorkbookId).ToLowerInvariant()
+    $memory = $Script:SnapshotSummaryCache[$cacheKey]
+    if ($null -ne $memory -and [Int64](Get-DataProperty $memory 'stamp' -1) -eq $stamp) {
+        return @(Get-Array (Get-DataProperty $memory 'summaries' @()))
+    }
+    $localPath = Get-LocalSnapshotSummaryCachePath $Language $safeWorkbookId
+    try {
+        if (Test-Path -LiteralPath $localPath) {
+            $local = Read-JsonFile $localPath $null
+            if ($null -ne $local -and [Int64](Get-DataProperty $local 'stamp' -1) -eq $stamp) {
+                $summaries = @(Get-Array (Get-DataProperty $local 'summaries' @()))
+                $Script:SnapshotSummaryCache[$cacheKey] = [pscustomobject][ordered]@{ stamp = $stamp; summaries = $summaries }
+                return $summaries
+            }
+        }
+    } catch { }
     $out = @()
-    foreach ($id in (Get-SnapshotIds $Language $WorkbookId)) {
-        $m = Get-SnapshotManifest $Language $WorkbookId $id
+    # 画面では直近40版に絞り、古い履歴の全検査で共有フォルダーを占有しない。
+    foreach ($id in @((Get-SnapshotIds $Language $safeWorkbookId) | Select-Object -Last 40)) {
+        $m = Get-SnapshotManifest $Language $safeWorkbookId $id
         if ($null -eq $m) { continue }
-        $state = Get-SnapshotSourceState $Language $WorkbookId $id
-        $versions = @(Get-RenderVersionIds $Language $WorkbookId $id)
-        $preferred = ''
-        $visualAvailable = $false
-        $contentAvailable = $false
+        $state = Get-SnapshotSourceState $Language $safeWorkbookId $id
+        $versions = @(Get-RenderVersionIds $Language $safeWorkbookId $id)
+        $preferred = ''; $visualAvailable = $false; $contentAvailable = $false
         $reason = 'PDF作成済みの比較可能な版がありません。'
         foreach ($versionId in @($versions | Sort-Object -Descending)) {
-            $availability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $id ([string]$versionId)
+            $availability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $id ([string]$versionId)
             if ([bool]$availability.visualHashAvailable) { $visualAvailable = $true }
             if ([bool]$availability.contentPdfAvailable) { $contentAvailable = $true }
             if ([string]::IsNullOrWhiteSpace($preferred) -and [bool]$availability.ready) {
-                $preferred = [string]$versionId
-                $reason = ''
+                $preferred = [string]$versionId; $reason = ''
             } elseif ([string]::IsNullOrWhiteSpace($preferred) -and -not [string]::IsNullOrWhiteSpace([string]$availability.reason)) {
                 $reason = [string]$availability.reason
             }
         }
         $out += [ordered]@{
-            snapshotId = $id
-            detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
+            snapshotId = $id; detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
             captureReason = [string](Get-DataProperty $m 'captureReason' '')
             sourceHash = [string](Get-DataProperty $m 'sourceHash' '')
             sourceRetained = [bool]$state.sourceRetained
-            pins = @(Get-SnapshotPins $Language $WorkbookId $id)
-            renderVersionIds = @($versions)
-            visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
-            preferredVersionId = $preferred
-            visualHashAvailable = $visualAvailable
-            contentPdfAvailable = $contentAvailable
-            unavailableReason = $reason
+            pins = @(Get-SnapshotPins $Language $safeWorkbookId $id)
+            renderVersionIds = @($versions); visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
+            preferredVersionId = $preferred; visualHashAvailable = $visualAvailable
+            contentPdfAvailable = $contentAvailable; unavailableReason = $reason
         }
     }
-    return @($out | Sort-Object { [string]$_.snapshotId } -Descending)
+    $summaries = @($out | Sort-Object { [string]$_.snapshotId } -Descending)
+    $record = [pscustomobject][ordered]@{ schemaVersion = 1; stamp = $stamp; summaries = $summaries; savedAt = New-NowIso }
+    $Script:SnapshotSummaryCache[$cacheKey] = $record
+    try { Write-JsonFile $localPath $record } catch { }
+    return $summaries
 }
-
 
 function Get-StoredComparison(
     [string]$Language,
@@ -7067,16 +7138,25 @@ function Serve-HistoryContentPdf($Context, [string]$Language, [string]$WorkbookI
 }
 
 
-function Get-AutoStateSummary([string]$Language) {
+function Get-AutoStateSummary([string]$Language, [switch]$Fast) {
     $settings = Get-AutoRenderSettings
+    $historySettings = Get-InputHistorySettings
+    if ($Fast) {
+        return [ordered]@{
+            enabled = [bool]$settings.enabled; inputHistoryApproved = $true
+            sourceRetentionApproved = [bool](Test-SourceRetentionEnabled)
+            quietPeriodSeconds = [int]$settings.quietPeriodSeconds
+            schedulerRunning = $false; historySizeMb = 0
+            softCapMegabytes = [int]$historySettings.softCapMegabytes; items = @()
+        }
+    }
     $items = @()
     try {
         $dir = Get-AutoStateDir $Language
         if (Test-Path -LiteralPath $dir) {
             foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
                 $j = Read-JsonFile $f.FullName $null
-                if ($null -eq $j) { continue }
-                if ([string](Get-DataProperty $j 'state' '') -eq 'idle') { continue }
+                if ($null -eq $j -or [string](Get-DataProperty $j 'state' '') -eq 'idle') { continue }
                 $items += [ordered]@{
                     workbookId = [string](Get-DataProperty $j 'workbookId' $f.BaseName)
                     state = [string](Get-DataProperty $j 'state' '')
@@ -7089,15 +7169,12 @@ function Get-AutoStateSummary([string]$Language) {
         }
     } catch { }
     return [ordered]@{
-        enabled = [bool]$settings.enabled
-        # 旧Web UIとの互換性のためプロパティ名を維持する。policy.json の値ではない。
-        inputHistoryApproved = $true
+        enabled = [bool]$settings.enabled; inputHistoryApproved = $true
         sourceRetentionApproved = [bool](Test-SourceRetentionEnabled)
         quietPeriodSeconds = [int]$settings.quietPeriodSeconds
         schedulerRunning = (Test-AutoSchedulerProcessRunning)
         historySizeMb = (Get-InputHistorySizeMb $Language)
-        softCapMegabytes = [int](Get-InputHistorySettings).softCapMegabytes
-        items = @($items)
+        softCapMegabytes = [int]$historySettings.softCapMegabytes; items = @($items)
     }
 }
 
@@ -7118,7 +7195,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 16
+$Script:DiffDetailAlgorithmVersion = 17
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7340,13 +7417,8 @@ function Get-DiffDetailContext(
     # 個別PDFは表示要求時に Serve-HistoryContentPdf が厳密に検証する。
     $currentHashes = Get-VisualHashes $Language $safeWorkbookId $currentSnapshotId $currentVersionId
     $baselineHashes = Get-VisualHashes $Language $safeWorkbookId $baselineSnapshotId $baselineVersionId
-    $workspace = Get-WorkspacePath $Language
-    $currentPdfDir = Get-ContentPdfVersionDir $workspace $safeWorkbookId $currentVersionId
-    $baselinePdfDir = Get-ContentPdfVersionDir $workspace $safeWorkbookId $baselineVersionId
-    if ($null -eq $currentHashes -or $null -eq $baselineHashes -or
-        -not (Test-Path -LiteralPath $currentPdfDir -PathType Container) -or
-        -not (Test-Path -LiteralPath $baselinePdfDir -PathType Container)) {
-        $baseResult.message = '自動比較に使った画像ハッシュまたはcontent PDF世代が保持されていません。PDFを再作成してください。'
+    if ($null -eq $currentHashes -or $null -eq $baselineHashes) {
+        $baseResult.message = '自動比較に使った画像ハッシュが保持されていません。PDFを再作成してください。'
         return [pscustomobject]$baseResult
     }
     $baseResult.currentVisualHashes = $currentHashes
@@ -7354,8 +7426,8 @@ function Get-DiffDetailContext(
     $baseResult.available = $true; $baseResult.status = 'available'; $baseResult.comparison = $comparison; $baseResult.comparisonPersisted = $true
     $baseResult.currentSnapshotId = $currentSnapshotId; $baseResult.currentVersionId = $currentVersionId
     $baseResult.baselineSnapshotId = $baselineSnapshotId; $baseResult.baselineVersionId = $baselineVersionId
-    $baseResult.currentAt = Get-DiffSnapshotDate $Language $safeWorkbookId $currentSnapshotId ([string](Get-DataProperty $workbook 'lastRenderedAt' ''))
-    $baseResult.baselineAt = Get-DiffSnapshotDate $Language $safeWorkbookId $baselineSnapshotId ''
+    $baseResult.currentAt = [string](Get-DataProperty $workbook 'lastRenderedAt' ([string](Get-DataProperty $comparison 'comparedAt' '')))
+    $baseResult.baselineAt = [string](Get-DataProperty $comparison 'baselineAt' '')
     $baseResult.method = [string](Get-DataProperty $comparison 'method' '')
     return [pscustomobject]$baseResult
 }
@@ -7534,12 +7606,105 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
     }
 }
 
+function Get-LocalDiffDetailCachePath([string]$Language, [string]$WorkbookId, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '') {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $pair = 'automatic'
+    if (-not [string]::IsNullOrWhiteSpace($BaselineSnapshotId) -and -not [string]::IsNullOrWhiteSpace($CurrentSnapshotId)) {
+        $pair = (Get-Sha256Text ("history|{0}|{1}" -f $BaselineSnapshotId, $CurrentSnapshotId)).Substring(7, 16)
+    }
+    return (Join-Path $Script:LocalRuntimeCacheRoot ("diff-{0}-{1}-{2}.json" -f $Language, $safeWorkbookId, $pair))
+}
+
+function Save-LocalDiffDetailCache([string]$Language, $Detail, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '') {
+    if ($null -eq $Detail) { return }
+    $workbookId = [string](Get-DataProperty $Detail 'workbookId' '')
+    if ([string]::IsNullOrWhiteSpace($workbookId)) { return }
+    $path = Get-LocalDiffDetailCachePath $Language $workbookId $BaselineSnapshotId $CurrentSnapshotId
+    $cacheKey = ([IO.Path]::GetFullPath($path)).ToLowerInvariant()
+    $Script:DiffDetailResponseCache[$cacheKey] = $Detail
+    try { Write-JsonFile $path $Detail } catch { }
+}
+
+function Get-LocalDiffDetailCache([string]$Language, [string]$WorkbookId, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '') {
+    $path = Get-LocalDiffDetailCachePath $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
+    $cacheKey = ([IO.Path]::GetFullPath($path)).ToLowerInvariant()
+    $detail = $Script:DiffDetailResponseCache[$cacheKey]
+    if ($null -eq $detail -and (Test-Path -LiteralPath $path)) {
+        try { $detail = Read-JsonFile $path $null } catch { $detail = $null }
+        if ($null -ne $detail) { $Script:DiffDetailResponseCache[$cacheKey] = $detail }
+    }
+    if ($null -eq $detail -or (Get-IntDataProperty $detail 'algorithmVersion' 0) -ne $Script:DiffDetailAlgorithmVersion -or
+        [string](Get-DataProperty $detail 'workbookId' '') -ne $WorkbookId) { return $null }
+    $comparison = Get-DataProperty $detail 'comparison' $null
+    if ($null -eq $comparison) { return $null }
+    if (-not [string]::IsNullOrWhiteSpace($BaselineSnapshotId) -or -not [string]::IsNullOrWhiteSpace($CurrentSnapshotId)) {
+        if ([string](Get-DataProperty $comparison 'baselineSnapshotId' '') -ne $BaselineSnapshotId -or
+            [string](Get-DataProperty $comparison 'currentSnapshotId' '') -ne $CurrentSnapshotId) { return $null }
+        return $detail
+    }
+    $structure = Get-Structure $Language
+    $workbook = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
+    if ($workbook.Count -eq 0 -or
+        [string](Get-DataProperty $comparison 'currentSnapshotId' '') -ne [string](Get-DataProperty $workbook[0] 'lastRenderedSnapshotId' '') -or
+        [string](Get-DataProperty $comparison 'currentVersionId' '') -ne [string](Get-DataProperty $workbook[0] 'lastRenderedVersionId' '')) { return $null }
+    return $detail
+}
+
+function Publish-LatestComparisonCaches([string]$Language, [string]$WorkbookId, $Comparison, $CurrentHashes, $BaselineHashes) {
+    if ($null -eq $Comparison -or [string](Get-DataProperty $Comparison 'status' '') -ne 'complete') { return }
+    $summary = [ordered]@{
+        status = [string](Get-DataProperty $Comparison 'status' '')
+        method = [string](Get-DataProperty $Comparison 'method' '')
+        changedSheets = @(Get-Array (Get-DataProperty $Comparison 'changedSheets' @()))
+        unchangedSheets = @(Get-Array (Get-DataProperty $Comparison 'unchangedSheets' @()))
+        unknownSheets = @(Get-Array (Get-DataProperty $Comparison 'unknownSheets' @()))
+        addedSheets = @(Get-Array (Get-DataProperty $Comparison 'addedSheets' @()))
+        removedSheets = @(Get-Array (Get-DataProperty $Comparison 'removedSheets' @()))
+        message = [string](Get-DataProperty $Comparison 'message' '')
+        comparedAt = [string](Get-DataProperty $Comparison 'comparedAt' '')
+    }
+    $workbook = Update-StructureLocked $Language {
+        param($structure)
+        $matches = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
+        if ($matches.Count -eq 0) { return $null }
+        Set-NoteProperty $matches[0] 'latestComparisonSummary' $summary
+        return $matches[0]
+    }
+    if ($null -eq $workbook) { return }
+    $displayName = [string](Get-DataProperty $workbook 'displayName' '')
+    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = [string](Get-DataProperty $workbook 'fileName' $WorkbookId) }
+    $context = [pscustomobject][ordered]@{
+        available = $true; status = 'available'; message = ''
+        workbookId = $WorkbookId; workbookName = $displayName; workbook = $workbook
+        comparison = $Comparison; comparisonPersisted = $true
+        currentSnapshotId = [string]$Comparison.currentSnapshotId
+        currentVersionId = [string]$Comparison.currentVersionId
+        baselineSnapshotId = [string]$Comparison.baselineSnapshotId
+        baselineVersionId = [string]$Comparison.baselineVersionId
+        currentVisualHashes = $CurrentHashes; baselineVisualHashes = $BaselineHashes
+        currentAt = Get-DiffSnapshotDate $Language $WorkbookId ([string]$Comparison.currentSnapshotId) ([string]$Comparison.comparedAt)
+        baselineAt = Get-DiffSnapshotDate $Language $WorkbookId ([string]$Comparison.baselineSnapshotId) ''
+        method = [string](Get-DataProperty $Comparison 'method' '')
+        scope = 'automatic'
+    }
+    $detail = New-DiffDetailSkeleton $Language $context
+    Save-LocalDiffDetailCache $Language $detail
+    $latestKey = ($Language + '|' + $WorkbookId + '|' + [string]$Comparison.currentSnapshotId + '|' + [string]$Comparison.currentVersionId).ToLowerInvariant()
+    $Script:LatestComparisonCache[$latestKey] = $Comparison
+    Clear-SnapshotSummaryCache $Language $WorkbookId
+}
+
 function Get-DiffDetail(
     [string]$Language,
     [string]$WorkbookId,
     [string]$BaselineSnapshotId = '',
     [string]$CurrentSnapshotId = ''
 ) {
+    $cached = Get-LocalDiffDetailCache $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
+    if ($null -ne $cached) {
+        Set-NoteProperty $cached 'performance' ([ordered]@{ contextMs = 0; skeletonMs = 0; totalMs = 0; source = 'local-cache' })
+        return $cached
+    }
     # 比較PNGと差分JSONは事前生成しない。対象版・シート・ページ数だけを返し、
     # 表示中の1ページをPDF.jsとWeb Workerでブラウザ内比較する。
     $totalTimer = [Diagnostics.Stopwatch]::StartNew()
@@ -7551,7 +7716,13 @@ function Get-DiffDetail(
         contextMs = $contextMs
         skeletonMs = [Math]::Max(0, $totalTimer.ElapsedMilliseconds - $contextMs)
         totalMs = $totalTimer.ElapsedMilliseconds
+        source = 'shared-fallback'
     })
+    Save-LocalDiffDetailCache $Language $detail $BaselineSnapshotId $CurrentSnapshotId
+    if ([string]::IsNullOrWhiteSpace($BaselineSnapshotId) -and [string]::IsNullOrWhiteSpace($CurrentSnapshotId) -and
+        [bool]$context.available -and [string]$context.scope -eq 'automatic') {
+        try { Publish-LatestComparisonCaches $Language $WorkbookId $context.comparison $context.currentVisualHashes $context.baselineVisualHashes } catch { }
+    }
     return $detail
 }
 

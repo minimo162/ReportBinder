@@ -546,8 +546,77 @@ if '$Workbook = $null' not in _glc:
 for needed in ['$Script:LatestComparisonCache', '$cacheKey', '$snap', '$ver']:
     if needed not in _glc:
         raise SystemExit(f'latest automatic comparison cache missing: {needed}')
-if 'Get-WorkbookChangeSummary $Language ([string]$w.workbookId) $w' not in server:
-    raise SystemExit('Get-StatePayload must pass the loaded workbook into the change summary')
+_state_payload = server.split('function Get-StatePayload', 1)[1].split('\nfunction ', 1)[0]
+if 'Get-WorkbookChangeSummary' in _state_payload:
+    raise SystemExit('initial state must not read one comparison file per workbook')
+for needed in ["Get-DataProperty $w 'latestComparisonSummary'", 'Get-AutoStateSummary $Language -Fast',
+               'Get-AllFinalReadiness $structure $Language $false']:
+    if needed not in _state_payload:
+        raise SystemExit(f'fast initial state path missing: {needed}')
+
+
+# Background scans are throttled and history data is not requested twice per render.
+for needed in ['300000', 'lastUpdateScanAt', "setTimeout(() => scanUpdatesSilently({withFiles:true}), 30000)"]:
+    if needed not in appjs:
+        raise SystemExit(f'shared-folder scan throttle missing: {needed}')
+_render_all = appjs.split('function renderAll', 1)[1].split('\nfunction ', 1)[0]
+if "if(activeView==='history')loadHistoryPanels()" in _render_all:
+    raise SystemExit('renderAll must not duplicate the history request already started by setActiveView')
+if "const previewUrl=apiUrl('/api/history/content-pdf'" not in appjs:
+    raise SystemExit('history PDF preview must use direct browser streaming')
+
+# Obsolete timeline/layout/archive UI no longer creates shared-folder files.
+_history_writer = server.split('function Write-HistoryEvent', 1)[1].split('\nfunction ', 1)[0]
+if 'return' not in _history_writer or 'Write-JsonFile' in _history_writer:
+    raise SystemExit('obsolete history timeline must not write event files')
+_transaction = server.split('function Invoke-FinalBuildTransaction', 1)[1].split('\nfunction ', 1)[0]
+if 'New-FinalArchive $Language $cat $v' in _transaction or "Save-LayoutSnapshot $Language $cat 'final-build'" in _transaction:
+    raise SystemExit('final build must not create removed archive/layout-history artifacts')
+
+# Existing automatic comparisons use their deterministic analysis file and skip redundant SMB validation.
+_glc = server.split('function Get-LatestComparison([string]', 1)[1].split('\nfunction ', 1)[0]
+if "Join-Path $recordDir 'comparison-analysis.json'" not in _glc or _glc.index('comparison-analysis.json') > _glc.index("Join-Path $recordDir 'comparisons'"):
+    raise SystemExit('existing automatic comparison must use the direct analysis file before directory enumeration')
+_diff_context = server.split('function Get-DiffDetailContext', 1)[1].split('\nfunction ', 1)[0]
+_auto_context = _diff_context.split("$status = [string]", 1)[1]
+for forbidden in ['currentPdfDir', 'baselinePdfDir', 'Get-DiffSnapshotDate $Language $safeWorkbookId $currentSnapshotId',
+                  'Get-DiffSnapshotDate $Language $safeWorkbookId $baselineSnapshotId']:
+    if forbidden in _auto_context:
+        raise SystemExit(f'automatic comparison open still performs redundant SMB validation: {forbidden}')
+
+# Shared-folder hot paths use local immutable caches and mutation responses.
+for needed in ['$Script:SnapshotManifestCache', '$Script:VisualHashCache', '$Script:SnapshotSummaryCache',
+               '$Script:LocalRuntimeCacheRoot', 'function Get-LocalSnapshotSummaryCachePath',
+               'function Get-LocalDiffDetailCache', 'function Publish-LatestComparisonCaches',
+               "source = 'local-cache'"]:
+    if needed not in server:
+        raise SystemExit(f'local shared-folder cache missing: {needed}')
+_snapshot_ids = server.split('function Get-SnapshotIds', 1)[1].split('\nfunction ', 1)[0]
+if "Where-Object { Test-Path" in _snapshot_ids:
+    raise SystemExit('snapshot listing must not stat every manifest')
+_pdf_index = server.split('function Get-ContentPdfSheetIndex', 1)[1].split('\nfunction ', 1)[0]
+if _pdf_index.index('$cached =') > _pdf_index.index('Test-Path -LiteralPath $dir'):
+    raise SystemExit('immutable content PDF index must be checked before SMB directory access')
+_preview = server.split('function Serve-ContentPdfByValues', 1)[1].split('\nfunction ', 1)[0]
+if "Write-FileResponse $Context 200 $full 'application/pdf'" not in _preview or 'ReadAllBytes($full)' in _preview:
+    raise SystemExit('page preview must stream the PDF instead of buffering it')
+for route_marker in [
+    "Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'reorder'",
+    "Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'sort-by-sheet'",
+    "Save-LayoutSnapshot $language (Require-WorkbookCategory ([string]$body.category)) 'page-update'",
+]:
+    if route_marker in server:
+        raise SystemExit(f'page mutation still writes obsolete layout history: {route_marker}')
+for needed in ['function applyPageMutationResult', 'applyPageMutationResult(response)',
+               "const previewUrl=apiUrl('/api/file'", 'function loadFinalReadiness']:
+    if needed not in appjs:
+        raise SystemExit(f'client-side fast mutation/preview path missing: {needed}')
+_history_loader = appjs.split('function loadHistoryPanels', 1)[1].split('\n}', 1)[0]
+if 'loadSnapshotHistory()' not in _history_loader or any(x in _history_loader for x in ['loadHistoryTimeline', 'loadLayoutSnapshots', 'loadFinalArchives']):
+    raise SystemExit('history view must load only the selected workbook versions')
+for obsolete in ['id="history-timeline"', 'id="layout-history"', 'id="final-archives"']:
+    if obsolete in html:
+        raise SystemExit(f'obsolete history panel remains: {obsolete}')
 
 # The scheduler child must be stopped explicitly, not only by parent-PID polling.
 _srv = server.split('function Start-LocalTcpServer', 1)[1].split('\nfunction ', 1)[0]
@@ -721,8 +790,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 16' not in server:
-    raise SystemExit('direct-PDF comparison changes must bump DiffDetailAlgorithmVersion to 16')
+if '$Script:DiffDetailAlgorithmVersion = 17' not in server:
+    raise SystemExit('direct-PDF comparison changes must bump DiffDetailAlgorithmVersion to 17')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -780,7 +849,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 16',
+    '$Script:DiffDetailAlgorithmVersion = 17',
 ]:
     if needed not in server:
         raise SystemExit(f'comparison tolerance/browser setting missing: {needed}')
@@ -873,7 +942,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v58', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v59', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:

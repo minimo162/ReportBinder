@@ -38,6 +38,7 @@ let currentPreviewObjectUrl = '';
 let updateMonitorTimer = null;
 let updateMonitorInFlight = false;
 let updateVisibilityBound = false;
+let lastUpdateScanAt = 0;
 let renderJobActive = false;
 let folderPickerBusy = false;
 let activeView = (() => { try { return sessionStorage.getItem('ReportBinderView') || 'dashboard'; } catch { return 'dashboard'; } })();
@@ -109,6 +110,7 @@ function setActiveView(view, options = {}) {
   });
   if (!options.noScroll) window.scrollTo({top: 0, behavior: options.instant ? 'auto' : 'smooth'});
   if (activeView === 'history' && state) loadHistoryPanels();
+  if (activeView === 'final' && state) void loadFinalReadiness();
 }
 
 function formatDateTime(value) {
@@ -641,18 +643,32 @@ async function scanUpdatesSilently({withFiles=false}={}) {
     renderAll({preserveEditors:true});
   } catch (e) {
     log('更新確認でエラー', e.detail || e.stack || e.message);
-  } finally { updateMonitorInFlight = false; }
+  } finally { lastUpdateScanAt=Date.now(); updateMonitorInFlight = false; }
 }
 
 function startUpdateMonitor() {
   if (updateMonitorTimer) clearInterval(updateMonitorTimer);
-  updateMonitorTimer = setInterval(() => scanUpdatesSilently({withFiles:true}), 30000);
+  // 共有フォルダー全走査は5分間隔。必要なときは画面の更新ボタンで即時確認できる。
+  updateMonitorTimer = setInterval(() => scanUpdatesSilently({withFiles:true}), 300000);
   if (!updateVisibilityBound) {
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) scanUpdatesSilently({withFiles:true});
+      if (!document.hidden && Date.now()-lastUpdateScanAt>=300000) scanUpdatesSilently({withFiles:true});
     });
     updateVisibilityBound = true;
   }
+}
+
+let finalReadinessInFlight = null;
+async function loadFinalReadiness(){
+  if(!state||!configured())return;
+  const preset=activePreset;
+  if(finalReadinessInFlight)return finalReadinessInFlight;
+  finalReadinessInFlight=api(`/api/final/readiness?category=${encodeURIComponent(preset)}`).then(r=>{
+    state.finalReadiness=state.finalReadiness||{};
+    state.finalReadiness[preset]={volumes:r.volumes||{}};
+    if(activeView==='final'&&activePreset===preset){renderGlobalHeader();renderNavBadges();renderFinalOverview();}
+  }).catch(e=>log('最終PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
+  return finalReadinessInFlight;
 }
 
 async function refresh() {
@@ -721,7 +737,6 @@ function renderAll(options={}) {
   renderPageOverview();
   renderFinalOverview();
   renderAutoStatus();
-  if(activeView==='history')loadHistoryPanels();
   renderVolumeLinks();
   updateBulkSelectionLabel();
   if (!preserve) {
@@ -1132,7 +1147,7 @@ async function moveSelectedPagesToVolume(volume, btn) {
     const main=mainVolume(),appendix=appendixVolume();const volumes={[main]:[],[appendix]:[],none:[]};const selected=new Set(ids);
     for(const p of [...pagesForActivePreset()].sort(pageSort)){const id=resolvedPageId(p);if(!id||selected.has(id))continue;const v=(p.enabled===false||String(p.volume||main)==='none')?'none':String(p.volume||main);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
     if(!volumes[target])volumes[target]=[];volumes[target].push(...ids);
-    await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes}});selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';await refresh();
+    const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes}});applyPageMutationResult(response);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
     showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${volumeLabel(target)}に設定しました。`,null,[{label:'最終PDFへ',view:'final'}]);
   });
 }
@@ -2294,22 +2309,66 @@ function collectBoardVolumes() {
   });
   return volumes;
 }
-function scheduleBoardSave() { clearTimeout(boardSaveTimer); boardSaveTimer = setTimeout(saveBoardOrder, 250); }
-async function saveBoardOrder() {
-  try{await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes:collectBoardVolumes()}});lastPageBoardRenderSignature='';await refresh();showMessage('ok','ページ構成を保存しました','本体・補足の並びを反映しました。',null,[{label:'最終PDFへ',view:'final'}]);}
-  catch(e){showMessage('danger','並び替えを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);lastPageBoardRenderSignature='';await refresh();}
+function applyPageMutationResult(payload){
+  const result=payload?.result||payload||{};
+  const structure=state?.structure;
+  if(!structure)return;
+  if(Array.isArray(result.pages))structure.pages=result.pages;
+  else if(result.page){
+    const id=resolvedPageId(result.page);
+    const index=asArray(structure.pages).findIndex(p=>resolvedPageId(p)===id);
+    if(index>=0)structure.pages[index]=result.page;else structure.pages.push(result.page);
+  }
+  if(result.volumes)structure.volumes=result.volumes;
+  const pages=asArray(structure.pages);
+  state.summary=state.summary||{};
+  state.summary.totalPages=pages.length;
+  state.summary.confirmedPages=pages.filter(p=>String(p.status||'')==='confirmed').length;
+  state.summary.uncheckedPages=pages.filter(p=>['rendered','stale','not-rendered'].includes(String(p.status||''))).length;
+  state.summary.pdfReadyPages=pages.filter(p=>String(p.contentPdf||'').trim()).length;
+  lastPageBoardRenderSignature='';
+  renderNavBadges();renderPageOverview();renderFinalOverview();renderPages();
 }
 
-async function savePageFromRow(row, numberingChanged=false) {
-  if(!row)return;const pageId=row.getAttribute('data-page-id'),page=getPage(pageId);const body={category:activePreset,pageId,title:row.querySelector('[data-page-title]')?.value||page?.title||''};const numbering=row.querySelector('[data-page-numbering]')?.value||'auto';if(numberingChanged){if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering;body.numberingManual=true;}}
-  try{await api('/api/pages/update',{method:'POST',body});lastPageBoardRenderSignature='';await refresh();}catch(e){showMessage('danger','ページを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+function scheduleBoardSave() { clearTimeout(boardSaveTimer); boardSaveTimer = setTimeout(saveBoardOrder, 250); }
+async function saveBoardOrder() {
+  try{
+    const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes:collectBoardVolumes()}});
+    applyPageMutationResult(response);
+    showMessage('ok','ページ構成を保存しました','本体・補足の並びを反映しました。',null,[{label:'最終PDFへ',view:'final'}]);
+  }catch(e){
+    showMessage('danger','並び替えを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);
+    lastPageBoardRenderSignature='';
+  }
 }
+
+
+
+async function savePageFromRow(row, numberingChanged=false) {
+  if(!row)return;
+  const pageId=row.getAttribute('data-page-id'),page=getPage(pageId);
+  const body={category:activePreset,pageId,title:row.querySelector('[data-page-title]')?.value||page?.title||''};
+  const numbering=row.querySelector('[data-page-numbering]')?.value||'auto';
+  if(numberingChanged){if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering;body.numberingManual=true;}}
+  try{
+    const response=await api('/api/pages/update',{method:'POST',body});
+    applyPageMutationResult(response);
+  }catch(e){showMessage('danger','ページを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+}
+
+
 
 
 async function sortPagesBySheet(btn=null) {
   if(!confirm('本体・補足・出力しないの割り当てはそのままで、それぞれの表の中だけをシート名の数字順に並べ替えます。よろしいですか？'))return;
-  await runBusy(btn||$('sort-by-sheet-btn'),async()=>{await api('/api/pages/sort-by-sheet',{method:'POST',body:{category:activePreset,volumes:[mainVolume(),appendixVolume(),'none']}});lastPageBoardRenderSignature='';await refresh();showMessage('ok','シート名順に並べ替えました','本体・補足・出力しないの各表を整列しました。',null,[{label:'最終PDFへ',view:'final'}]);});
+  await runBusy(btn||$('sort-by-sheet-btn'),async()=>{
+    const response=await api('/api/pages/sort-by-sheet',{method:'POST',body:{category:activePreset,volumes:[mainVolume(),appendixVolume(),'none']}});
+    applyPageMutationResult(response);
+    showMessage('ok','シート名順に並べ替えました','本体・補足・出力しないの各表を整列しました。',null,[{label:'最終PDFへ',view:'final'}]);
+  });
 }
+
+
 
 function pageFallbackFromRow(row) {
   return {
@@ -2332,10 +2391,27 @@ async function previewSelectedPage(btn) {
   await previewPage(resolvedPageId(page), page);
 }
 async function previewPage(pageId, fallback={}) {
-  const page=getPage(pageId)||getPageByWorkbookSheet(fallback.workbookId,fallback.sheetName);const pid=resolvedPageId(page)||String(pageId||'').trim();const contentPdf=String(page?.contentPdf||fallback.contentPdf||'').trim();if(!contentPdf){showMessage('warn','PDF未作成です','登録済みExcelを選択して「PDF作成」を押してください。');return;}
-  modalReturnFocus=document.activeElement;const wb=getWorkbook(page?.workbookId||fallback.workbookId);$('preview-title').textContent=page?.title||fallback.title||'PDF確認';$('preview-subtitle').textContent=`${wb?.displayName||wb?.fileName||''}${(page?.sheetName||fallback.sheetName)?' / シート '+(page?.sheetName||fallback.sheetName):''}`;$('preview-open-new').removeAttribute('href');$('pdf-frame').src='about:blank';$('preview-modal').classList.remove('hidden');$('preview-close').focus();
-  try{clearPreviewObjectUrl();currentPreviewObjectUrl=await fetchPdfObjectUrl('/api/file',{pageId:pid,id:pid,workbookId:page?.workbookId||fallback.workbookId||'',sheetName:page?.sheetName||fallback.sheetName||'',contentPdf});$('preview-open-new').href=currentPreviewObjectUrl;$('pdf-frame').src=`${currentPreviewObjectUrl}#toolbar=1&navpanes=0`;}catch(e){closePreview();showMessage('danger','PDFプレビューを開けません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+  const page=getPage(pageId)||getPageByWorkbookSheet(fallback.workbookId,fallback.sheetName);
+  const pid=resolvedPageId(page)||String(pageId||'').trim();
+  const contentPdf=String(page?.contentPdf||fallback.contentPdf||'').trim();
+  if(!contentPdf){showMessage('warn','PDF未作成です','登録済みExcelを選択して「PDF作成」を押してください。');return;}
+  modalReturnFocus=document.activeElement;
+  const wb=getWorkbook(page?.workbookId||fallback.workbookId);
+  $('preview-title').textContent=page?.title||fallback.title||'PDF確認';
+  $('preview-subtitle').textContent=`${wb?.displayName||wb?.fileName||''}${(page?.sheetName||fallback.sheetName)?' / シート '+(page?.sheetName||fallback.sheetName):''}`;
+  clearPreviewObjectUrl();
+  const previewUrl=apiUrl('/api/file',{
+    pageId:pid,
+    workbookId:page?.workbookId||fallback.workbookId||'',
+    sheetName:page?.sheetName||fallback.sheetName||''
+  });
+  $('preview-open-new').href=previewUrl;
+  $('pdf-frame').src=`${previewUrl}#toolbar=1&navpanes=0`;
+  $('preview-modal').classList.remove('hidden');
+  $('preview-close').focus();
 }
+
+
 
 
 function closePreview() {
@@ -2482,7 +2558,7 @@ const changedOnlyToggle=$('changed-only-toggle');
 if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;renderPages();});
 bind('history-refresh-btn','click',()=>loadHistoryPanels());
 // V5-P1(#12): 版履歴パネルの対象Excel切り替え。
-bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';loadSnapshotHistory();});
+bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',snapshotHistoryState.workbookId);}catch{}snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';loadSnapshotHistory();});
 bind('final-main-fix','click',()=>setActiveView('excel'));bind('final-appendix-fix','click',()=>setActiveView('excel'));
 bind('open-main-link','click',e=>{e.preventDefault();openFinalVolume(mainVolume(),activePreset);});bind('open-appendix-link','click',e=>{e.preventDefault();openFinalVolume(appendixVolume(),activePreset);});
 bind('mode-badge','click',()=>{const pop=$('language-popover'),btn=$('mode-badge');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));});
@@ -2537,7 +2613,7 @@ window.addEventListener('keydown',e=>{
     }
     // Heavy update checks can make the first folder/dialog action feel unresponsive on a single local server thread.
     // Run the first scan after the user has had time to interact; normal monitoring continues afterwards.
-    setTimeout(() => scanUpdatesSilently({withFiles:true}), 8000);
+    setTimeout(() => scanUpdatesSilently({withFiles:true}), 30000);
   }
 })();
 
@@ -2640,7 +2716,9 @@ async function loadFinalArchives(){
 }
 
 // ---- V5-P1(#12): 版の履歴・差分・保護（手動pin / 2版差分 / 過去content-pdf表示）----
-let snapshotHistoryState = { workbookId:'', snapshots:[], fromId:'', toId:'' };
+let lastSnapshotHistoryWorkbook = '';
+try { lastSnapshotHistoryWorkbook = sessionStorage.getItem('ReportBinderSnapshotWorkbook') || ''; } catch {}
+let snapshotHistoryState = { workbookId:lastSnapshotHistoryWorkbook, snapshots:[], fromId:'', toId:'' };
 
 function renderSnapshotHistorySelectionHint(){
   const box=$('snapshot-history-diff');if(!box)return;
@@ -2672,6 +2750,7 @@ async function loadSnapshotHistory(){
   populateSnapshotHistoryWorkbooks();
   const wbId=String(snapshotHistoryState.workbookId||'');
   if(!wbId){box.innerHTML='<div class="caption">対象Excelを選ぶと、版の一覧・差分・保護を表示します。</div>';if(diffBox)diffBox.innerHTML='';return;}
+  box.innerHTML='<div class="caption">版の一覧を読み込んでいます。</div>';
   try{
     const r=await api(`/api/history/snapshots?workbookId=${encodeURIComponent(wbId)}`);
     const list=asArray(r.snapshots);snapshotHistoryState.snapshots=list;
@@ -2722,18 +2801,16 @@ async function viewHistoryContentPdf(workbookId, snapshotId, versionId, sheetNam
   const wb=getWorkbook(workbookId);
   $('preview-title').textContent='過去の版のPDF';
   $('preview-subtitle').textContent=`${wb?.displayName||wb?.fileName||''} / シート ${sheetName}`;
-  $('preview-open-new').removeAttribute('href');$('pdf-frame').src='about:blank';$('preview-modal').classList.remove('hidden');$('preview-close').focus();
-  try{
-    clearPreviewObjectUrl();
-    currentPreviewObjectUrl=await fetchPdfObjectUrl('/api/history/content-pdf',{workbookId,versionId,sheetName,snapshotId});
-    $('preview-open-new').href=currentPreviewObjectUrl;
-    $('pdf-frame').src=`${currentPreviewObjectUrl}#toolbar=1&navpanes=0`;
-  }catch(e){closePreview();showMessage('danger','過去のPDFを開けません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+  clearPreviewObjectUrl();
+  const previewUrl=apiUrl('/api/history/content-pdf',{workbookId,versionId,sheetName,snapshotId});
+  $('preview-open-new').href=previewUrl;
+  $('pdf-frame').src=`${previewUrl}#toolbar=1&navpanes=0`;
+  $('preview-modal').classList.remove('hidden');
+  $('preview-close').focus();
 }
 
+
+
 function loadHistoryPanels(){
-  loadHistoryTimeline();
-  loadLayoutSnapshots();
-  loadFinalArchives();
   loadSnapshotHistory();
 }
