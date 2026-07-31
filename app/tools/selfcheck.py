@@ -708,12 +708,20 @@ for needed in ['workbookId', 'scope', 'baselineSnapshotId', 'baselineVersionId',
 _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ', 1)[0]
 if 'Test-DiffDetailMatchesContext $detail $diffContext' not in _serve_diff:
     raise SystemExit('diff page assets must validate the stored detail identity before serving')
+if "'private, max-age=31536000, immutable'" not in _serve_diff:
+    raise SystemExit('immutable diff page assets must opt into browser caching')
+_bytes_response = server.split('function Write-BytesResponse', 1)[1].split('\nfunction ', 1)[0]
+if 'Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors $CacheControl' not in _bytes_response:
+    raise SystemExit('diff asset cache policy must reach the TcpListener response path')
 appjs = (root/'app/web/app.js').read_text(encoding='utf-8-sig')
 if "addEventListener('click',prepareDiffDetail)" in appjs:
     raise SystemExit('diff retry click must not pass MouseEvent as sheetKey')
 for needed in ["addEventListener('click',()=>prepareDiffDetail())", "if(selected&&['deferred','failed'].includes", "!['deferred','failed'].includes(targetStatus)", "targetStatus==='failed'&&!joinedExisting", "sheetStatus==='failed'"]:
     if needed not in appjs:
         raise SystemExit(f'diff retry UI regression: {needed}')
+for needed in ["img.style.visibility='hidden'", "img.removeAttribute('src')", "画像を読み込んでいます…", "v:String(diffViewState.detail?.algorithmVersion||0)", 'scheduleDiffPrefetch', 'prefetchDiffPageAssets(adjacent,0)', 'resetDiffPrefetch']:
+    if needed not in appjs:
+        raise SystemExit(f'diff sheet switch responsiveness missing: {needed}')
 
 # Third-party installation must stay reproducible and fail closed.
 installer = (root/'app/tools/install-thirdparty.ps1').read_text(encoding='utf-8-sig')
@@ -796,7 +804,7 @@ for needed in ['function Invoke-DiffImageBatchGeneration', '$batchRequest', '$ba
 for needed in ['function Get-RenderRasterSheetDir', 'rasterDirectory', 'beforeRasterDirectory', 'afterRasterDirectory']:
     if needed not in server:
         raise SystemExit(f'render-time raster cache wiring missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260730_v52']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:

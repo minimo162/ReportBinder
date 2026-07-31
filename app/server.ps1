@@ -3662,12 +3662,14 @@ function Write-JsonResponse($Context, [int]$Status, $Object, [bool]$AllowCors = 
     Write-TextResponse $Context $Status $json 'application/json; charset=utf-8' $AllowCors
 }
 
-function Write-BytesResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$ContentType, [bool]$AllowCors = $false) {
+function Write-BytesResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$ContentType, [bool]$AllowCors = $false, [string]$CacheControl = 'no-store') {
     Touch-ResponseActivity
-    if (Test-TcpContext $Context) { Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors; return }
+    if ([string]::IsNullOrWhiteSpace($CacheControl)) { $CacheControl = 'no-store' }
+    $CacheControl = $CacheControl -replace "[\r\n]", ''
+    if (Test-TcpContext $Context) { Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors $CacheControl; return }
     $Context.Response.StatusCode = $Status
     $Context.Response.ContentType = $ContentType
-    $Context.Response.Headers['Cache-Control'] = 'no-store'
+    $Context.Response.Headers['Cache-Control'] = $CacheControl
     if ($AllowCors) { $Context.Response.Headers['Access-Control-Allow-Origin'] = '*' }
     $Context.Response.ContentLength64 = $Bytes.Length
     $Context.Response.OutputStream.Write($Bytes, 0, $Bytes.Length)
@@ -4180,15 +4182,17 @@ function Get-HttpStatusText([int]$Status) {
     }
 }
 
-function Write-TcpResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$ContentType, [bool]$AllowCors = $false) {
+function Write-TcpResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$ContentType, [bool]$AllowCors = $false, [string]$CacheControl = 'no-store') {
     try {
         $statusText = Get-HttpStatusText $Status
+        if ([string]::IsNullOrWhiteSpace($CacheControl)) { $CacheControl = 'no-store' }
+        $CacheControl = $CacheControl -replace "[\r\n]", ''
         # CORSヘッダーは起動待ちページ(file://)が読む必要のある軽量エンドポイントだけに付ける。
         # トークン保護APIに Access-Control-Allow-Origin: * を付けると、トークン漏えい時に
         # 任意のWebページから応答を読めてしまうため、既定では付けない（同一オリジンには不要）。
         $corsHeader = ''
         if ($AllowCors) { $corsHeader = "Access-Control-Allow-Origin: *`r`n" }
-        $header = "HTTP/1.1 $Status $statusText`r`nContent-Type: $ContentType`r`nContent-Length: $($Bytes.Length)`r`nCache-Control: no-store`r`n${corsHeader}Connection: close`r`n`r`n"
+        $header = "HTTP/1.1 $Status $statusText`r`nContent-Type: $ContentType`r`nContent-Length: $($Bytes.Length)`r`nCache-Control: $CacheControl`r`n${corsHeader}Connection: close`r`n`r`n"
         $headerBytes = [Text.Encoding]::ASCII.GetBytes($header)
         $stream = $Context.TcpStream
         $stream.Write($headerBytes, 0, $headerBytes.Length)
@@ -7911,7 +7915,9 @@ function Serve-DiffPage($Context, [string]$Language, [string]$WorkbookId, [strin
     if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $full)) {
         throw '差分画像が見つかりません。'
     }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'image/png'
+    # The URL contains both immutable snapshot identities and the algorithm-scoped
+    # sheet/page asset key, so the browser may safely reuse it for this comparison.
+    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'image/png' $false 'private, max-age=31536000, immutable'
 }
 
 function Get-WorkbookChangeSummary([string]$Language, [string]$WorkbookId, $Workbook = $null) {
