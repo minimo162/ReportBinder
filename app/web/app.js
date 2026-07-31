@@ -1889,8 +1889,7 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   if($('diff-sheet-list'))$('diff-sheet-list').innerHTML='<div class="empty-state">読み込んでいます。</div>';
   setDiffPaneEmpty('before','比較情報を読み込んでいます。');setDiffPaneEmpty('after','比較情報を読み込んでいます。');$('diff-close')?.focus();
   const requestPath=diffDetailRequestPath();
-  // メタデータ取得とPDF.js/Worker初期化を並行し、比較情報の取得後に
-  // ライブラリ読込が直列で追加されないようにする。
+  // 比較情報の取得中に差分Workerだけを準備する。PDF.jsはラスタ欠落時まで読み込まない。
   const detailRequest=fetchDiffDetailResponse(requestPath,id);
   // 保存済み120 DPIラスタが使える通常経路ではPDF.jsを読み込まない。
   // ラスタ欠落時だけ renderDiffSourcePage から遅延初期化する。
