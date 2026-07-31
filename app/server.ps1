@@ -6869,7 +6869,7 @@ function Get-ContentPdfSheetIndex([string]$Language, [string]$WorkbookId, [strin
     if (-not $Script:ContentPdfSheetIndexCache.ContainsKey($cacheKey) -and
         $Script:ContentPdfSheetIndexCache.Count -ge $Script:ContentPdfSheetIndexCacheLimit) {
         $oldestKey = @($Script:ContentPdfSheetIndexCache.Keys)[0]
-        if ($null -ne $oldestKey) { $Script:ContentPdfSheetIndexCache.Remove($oldestKey) }
+        if ($null -ne $oldestKey) { [void]$Script:ContentPdfSheetIndexCache.Remove($oldestKey) }
     }
     $Script:ContentPdfSheetIndexCache[$cacheKey] = [pscustomobject][ordered]@{ stamp = $stamp; index = $index }
     return $index
