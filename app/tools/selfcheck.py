@@ -955,4 +955,41 @@ with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
     if 'PdfBatchRasterizer.class' not in set(zf.namelist()):
         raise SystemExit('ReportPdfComposer.jar must contain PdfBatchRasterizer.class')
 
+# 2026-07-31 comparison/final-output pipeline fixes ---------------------------
+_render_job = server.split('function Invoke-RenderJobFromFile', 1)[1].split('\nfunction ', 1)[0]
+if _render_job.index("$status.status = 'analyzing'") > _render_job.index('Invoke-PostRenderAnalysis'):
+    raise SystemExit('render job must announce comparison analysis before running deferred analysis')
+if _render_job.rindex("$status.status = 'completed'") < _render_job.rindex('Invoke-PostRenderAnalysis'):
+    raise SystemExit('render job must not announce completion before comparison analysis is saved')
+for needed in ['$renderLoopSucceeded', '比較情報を準備しています']:
+    if needed not in _render_job:
+        raise SystemExit(f'render comparison handoff is missing: {needed}')
+_capture_input = server.split('function Capture-RenderInput', 1)[1].split('\nfunction ', 1)[0]
+_render_workbook = server.split('function Render-Workbook', 1)[1].split('\nfunction ', 1)[0]
+if 'verified = $true' not in _capture_input or '$inputHashVerified' not in _render_workbook:
+    raise SystemExit('verified render input hash reuse is missing')
+_post_analysis = server.split('function Invoke-PostRenderAnalysis', 1)[1].split('\nfunction ', 1)[0]
+if '$pdf -and $name -and (Test-Path' in _post_analysis:
+    raise SystemExit('post-render analysis must not repeat one SMB stat per rendered sheet')
+_final_build = server.split('function Invoke-FinalBuildTransaction', 1)[1].split('\nfunction ', 1)[0]
+for forbidden in ['Scan-Updates $Language', 'exports\\manifest_', '$ready = Get-FinalBuildReadiness']:
+    if forbidden in _final_build:
+        raise SystemExit(f'final build still contains redundant shared-folder work: {forbidden}')
+for needed in ['Assert-FinalBuildSourcesUnchanged $snapshots $targets',
+               '$initialSnapshots = Update-StructureLocked',
+               '$afterStructure = Get-Structure $Language',
+               '[IO.Path]::GetTempPath()']:
+    if needed not in _final_build:
+        raise SystemExit(f'optimized final build path is missing: {needed}')
+if 'function Assert-FinalBuildSourcesUnchanged' not in server:
+    raise SystemExit('targeted final-build Excel metadata validation is missing')
+if 'signal: options.signal' not in appjs or 'DIFF_DETAIL_TIMEOUT_MS = 15000' not in appjs:
+    raise SystemExit('comparison metadata request timeout is missing')
+_fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
+    if needed not in _fetch_detail:
+        raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
+if 'app.js?v=20260731_v60' not in html:
+    raise SystemExit('comparison request fix must bump the app cache version')
+
 print('selfcheck ok')
