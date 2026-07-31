@@ -4181,7 +4181,7 @@ function Handle-Api($Context) {
             if (-not (New-SnapshotPin $language $wbId $snapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
                 throw '履歴の保護情報を保存できませんでした。'
             }
-            Clear-SnapshotSummaryCache $language $wbId
+            [void](Update-SnapshotSummaryCacheEntry $language $wbId $snapshotId)
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/history/unpin') {
@@ -4189,7 +4189,7 @@ function Handle-Api($Context) {
             $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
             $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
             Remove-SnapshotPin $language $wbId $snapshotId 'manual'
-            Clear-SnapshotSummaryCache $language $wbId
+            [void](Update-SnapshotSummaryCacheEntry $language $wbId $snapshotId)
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/layout/snapshots') {
@@ -6243,7 +6243,11 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
         Write-RenderRecord $Language $WorkbookId $SnapshotId $VersionId 'normal' $true $parsed
         if ($null -eq $parsed) { return $null }
         $cmp = Compare-SnapshotVisual $Language $WorkbookId $SnapshotId $VersionId
-        Clear-SnapshotSummaryCache $Language $WorkbookId
+        # complete の経路は Publish-LatestComparisonCaches が索引を更新する。
+        # baselineなし等の unavailable 版も、該当1版だけを更新する。
+        if ([string](Get-DataProperty $cmp 'status' '') -ne 'complete') {
+            [void](Update-SnapshotSummaryCacheEntry $Language $WorkbookId $SnapshotId)
+        }
         # complete/unavailableのどちらでも解析結果を版の記録へ残す。
         # 非同期解析の競合や環境差で比較できない場合に、理由を後から確認できる。
         try {
@@ -7097,6 +7101,77 @@ function Clear-SnapshotSummaryCache([string]$Language, [string]$WorkbookId) {
     } catch { }
 }
 
+function Get-SnapshotSummaryEntry([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $m = Get-SnapshotManifest $Language $safeWorkbookId $safeSnapshotId
+    if ($null -eq $m) { return $null }
+    $state = Get-SnapshotSourceState $Language $safeWorkbookId $safeSnapshotId
+    $versions = @(Get-RenderVersionIds $Language $safeWorkbookId $safeSnapshotId)
+    $preferred = ''; $visualAvailable = $false; $contentAvailable = $false
+    $reason = 'PDF作成済みの比較可能な版がありません。'
+    foreach ($versionId in @($versions | Sort-Object -Descending)) {
+        $availability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $safeSnapshotId ([string]$versionId)
+        if ([bool]$availability.visualHashAvailable) { $visualAvailable = $true }
+        if ([bool]$availability.contentPdfAvailable) { $contentAvailable = $true }
+        if ([string]::IsNullOrWhiteSpace($preferred) -and [bool]$availability.ready) {
+            $preferred = [string]$versionId; $reason = ''
+        } elseif ([string]::IsNullOrWhiteSpace($preferred) -and -not [string]::IsNullOrWhiteSpace([string]$availability.reason)) {
+            $reason = [string]$availability.reason
+        }
+    }
+    return [pscustomobject][ordered]@{
+        snapshotId = $safeSnapshotId; detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
+        captureReason = [string](Get-DataProperty $m 'captureReason' '')
+        sourceHash = [string](Get-DataProperty $m 'sourceHash' '')
+        sourceRetained = [bool]$state.sourceRetained
+        pins = @(Get-SnapshotPins $Language $safeWorkbookId $safeSnapshotId)
+        renderVersionIds = @($versions); visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
+        preferredVersionId = $preferred; visualHashAvailable = $visualAvailable
+        contentPdfAvailable = $contentAvailable; unavailableReason = $reason
+    }
+}
+
+function Update-SnapshotSummaryCacheEntry([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
+    # PDF作成やpin変更で影響する通常1版だけを差し替え、履歴画面で40版を再走査しない。
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $historyDir = Get-WorkbookHistoryDir $Language $safeWorkbookId
+    if (-not (Test-Path -LiteralPath $historyDir)) { Clear-SnapshotSummaryCache $Language $safeWorkbookId; return $false }
+    $cacheKey = ($Language + '|' + $safeWorkbookId).ToLowerInvariant()
+    $record = $Script:SnapshotSummaryCache[$cacheKey]
+    $localPath = Get-LocalSnapshotSummaryCachePath $Language $safeWorkbookId
+    if ($null -eq $record) {
+        try { if (Test-Path -LiteralPath $localPath) { $record = Read-JsonFile $localPath $null } } catch { $record = $null }
+    }
+    $entry = Get-SnapshotSummaryEntry $Language $safeWorkbookId $safeSnapshotId
+    if ($null -eq $entry) { Clear-SnapshotSummaryCache $Language $safeWorkbookId; return $false }
+
+    # 新規版追加や期限整理も反映するため、軽量な版ID一覧だけは1回確認する。
+    [void]$Script:SnapshotIdCache.Remove($cacheKey)
+    $recentIds = @((Get-SnapshotIds $Language $safeWorkbookId) | Select-Object -Last 40)
+    $map = @{}
+    foreach ($old in @(Get-Array (Get-DataProperty $record 'summaries' @()))) {
+        $oldId = [string](Get-DataProperty $old 'snapshotId' '')
+        if (-not [string]::IsNullOrWhiteSpace($oldId)) { $map[$oldId] = $old }
+    }
+    $map[$safeSnapshotId] = $entry
+    $summaries = @()
+    foreach ($id in @($recentIds | Sort-Object -Descending)) {
+        $key = [string]$id
+        if (-not $map.ContainsKey($key)) {
+            Clear-SnapshotSummaryCache $Language $safeWorkbookId
+            return $false
+        }
+        $summaries += $map[$key]
+    }
+    $stamp = [IO.Directory]::GetLastWriteTimeUtc($historyDir).Ticks
+    $updated = [pscustomobject][ordered]@{ schemaVersion = 1; stamp = $stamp; summaries = @($summaries); savedAt = New-NowIso }
+    $Script:SnapshotSummaryCache[$cacheKey] = $updated
+    try { Write-JsonFile $localPath $updated } catch { }
+    return $true
+}
+
 function Get-SnapshotSummaries([string]$Language, [string]$WorkbookId) {
     if ([string]::IsNullOrWhiteSpace($WorkbookId)) { return @() }
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
@@ -7120,34 +7195,9 @@ function Get-SnapshotSummaries([string]$Language, [string]$WorkbookId) {
         }
     } catch { }
     $out = @()
-    # 画面では直近40版に絞り、古い履歴の全検査で共有フォルダーを占有しない。
     foreach ($id in @((Get-SnapshotIds $Language $safeWorkbookId) | Select-Object -Last 40)) {
-        $m = Get-SnapshotManifest $Language $safeWorkbookId $id
-        if ($null -eq $m) { continue }
-        $state = Get-SnapshotSourceState $Language $safeWorkbookId $id
-        $versions = @(Get-RenderVersionIds $Language $safeWorkbookId $id)
-        $preferred = ''; $visualAvailable = $false; $contentAvailable = $false
-        $reason = 'PDF作成済みの比較可能な版がありません。'
-        foreach ($versionId in @($versions | Sort-Object -Descending)) {
-            $availability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $id ([string]$versionId)
-            if ([bool]$availability.visualHashAvailable) { $visualAvailable = $true }
-            if ([bool]$availability.contentPdfAvailable) { $contentAvailable = $true }
-            if ([string]::IsNullOrWhiteSpace($preferred) -and [bool]$availability.ready) {
-                $preferred = [string]$versionId; $reason = ''
-            } elseif ([string]::IsNullOrWhiteSpace($preferred) -and -not [string]::IsNullOrWhiteSpace([string]$availability.reason)) {
-                $reason = [string]$availability.reason
-            }
-        }
-        $out += [ordered]@{
-            snapshotId = $id; detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
-            captureReason = [string](Get-DataProperty $m 'captureReason' '')
-            sourceHash = [string](Get-DataProperty $m 'sourceHash' '')
-            sourceRetained = [bool]$state.sourceRetained
-            pins = @(Get-SnapshotPins $Language $safeWorkbookId $id)
-            renderVersionIds = @($versions); visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
-            preferredVersionId = $preferred; visualHashAvailable = $visualAvailable
-            contentPdfAvailable = $contentAvailable; unavailableReason = $reason
-        }
+        $entry = Get-SnapshotSummaryEntry $Language $safeWorkbookId ([string]$id)
+        if ($null -ne $entry) { $out += $entry }
     }
     $summaries = @($out | Sort-Object { [string]$_.snapshotId } -Descending)
     $record = [pscustomobject][ordered]@{ schemaVersion = 1; stamp = $stamp; summaries = $summaries; savedAt = New-NowIso }
@@ -7769,7 +7819,7 @@ function Publish-LatestComparisonCaches([string]$Language, [string]$WorkbookId, 
     Save-LocalDiffDetailCache $Language $detail
     $latestKey = ($Language + '|' + $WorkbookId + '|' + [string]$Comparison.currentSnapshotId + '|' + [string]$Comparison.currentVersionId).ToLowerInvariant()
     $Script:LatestComparisonCache[$latestKey] = $Comparison
-    Clear-SnapshotSummaryCache $Language $WorkbookId
+    [void](Update-SnapshotSummaryCacheEntry $Language $WorkbookId ([string]$Comparison.currentSnapshotId))
 }
 
 function Get-DiffDetail(
