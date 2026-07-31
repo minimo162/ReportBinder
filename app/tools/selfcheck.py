@@ -4,7 +4,7 @@ import json, os, re, subprocess, zipfile
 root = Path(__file__).resolve().parents[2]
 required = [
     '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/launch.ps1',
-    'app/web/index.html','app/web/style.css','app/web/app.js','app/lib/pdfbox/ReportPdfComposer.jar',
+    'app/web/index.html','app/web/style.css','app/web/app.js','app/web/diff-worker.js','app/lib/pdfbox/ReportPdfComposer.jar',
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
@@ -102,15 +102,23 @@ _baseline=server.split('function Set-ComparisonBaseline',1)[1].split('\n# ---- �
 for needed in ['New-ContentPdfPin','Remove-ContentPdfPin','Get-HistoryRenderVersionAvailability','Get-ContentPdfMaintenanceLockPath']:
     if needed not in _baseline: raise SystemExit(f'automatic comparison baseline protection missing: {needed}')
 
-# Every sheet is lazy, and concurrent selected-sheet requests are retried after the active pair job.
+# Comparison metadata is returned immediately; the browser renders and analyzes only the visible page.
 _skeleton=server.split('function New-DiffDetailSkeleton',1)[1].split('\nfunction Get-DiffDetail',1)[0]
-if "status = 'deferred'" not in _skeleton: raise SystemExit('all comparison sheets must start deferred')
-_worker=server.split('function Invoke-DiffDetailJobCore',1)[1].split('\nfunction ',1)[0]
-for needed in ['requestedSheetKey', '$preferredIndex', '$workIndexes += $preferredIndex']:
-    if needed not in _worker: raise SystemExit(f'one-sheet lazy worker missing: {needed}')
+for needed in ["status = 'ready'", 'unchangedPageNumbers', '表示したページをブラウザで比較します。']:
+    if needed not in _skeleton: raise SystemExit(f'browser comparison skeleton missing: {needed}')
+_get_detail=server.split('function Get-DiffDetail(',1)[1].split('\nfunction ',1)[0]
+if 'return (New-DiffDetailSkeleton $Language $context)' not in _get_detail:
+    raise SystemExit('diff detail must return metadata without starting or reading a comparison-image job')
+for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
+    if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
-for needed in ['for(let attempt=0;attempt<3;attempt++)', 'joinedExistingDiffJob', "!['deferred','failed'].includes(targetStatus)", "targetStatus==='failed'&&!joinedExisting"]:
-    if needed not in _appjs_early: raise SystemExit(f'lazy diff retry missing: {needed}')
+_diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260731_v1'"]:
+    if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
+for needed in ['chooseAlignment', 'threshold=24', 'block=4', 'minPixels=24', 'self.onmessage']:
+    if needed not in _diff_worker: raise SystemExit(f'browser diff worker missing: {needed}')
+for forbidden in ['prepareDiffDetail(', "api('/api/history/diff/prepare'", '/api/history/diff-page']:
+    if forbidden in _appjs_early: raise SystemExit(f'browser still starts server comparison-image generation: {forbidden}')
 for needle in ['function New-HistoricalSnapshotComparison',
                "scope = 'history'",
                'function Get-PreferredHistoryRenderVersion',
@@ -166,7 +174,7 @@ java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit=Update-
 if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commit order is invalid')
 
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
-for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','/api/history/diff/prepare']:
+for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage']:
     if needle not in appjs: raise SystemExit(f'ui feature not found: {needle}')
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
@@ -471,22 +479,18 @@ for needed in ['function addedSheetSet', '追加 ${added}', "badge('追加','att
     if needed not in appjs:
         raise SystemExit(f'added sheets must appear in the change column/filter: {needed}')
 
-# Detailed visual diff must be background-generated, cache-addressed by IDs,
-# and serve only manifest-listed PNG assets.
-for needed in ['function Get-DiffDetailContext', 'function Start-DiffDetailJob',
-               'function Invoke-DiffDetailJobFromFile', 'function Serve-DiffPage',
-               '$Script:DiffDetailThreshold = 24', '$Script:DiffDetailDpi = 120',
-               'Assert-SafeStorageSegment $CurrentSnapshotId',
-               "allowedAssets = @('before','after','before-mask','before-overlay','mask','overlay')"]:
+# Detailed visual diff is rendered from the source PDFs in the browser.
+for needed in ['function Get-DiffDetailContext', 'function Serve-HistoryContentPdf',
+               '$Script:VisualHashDpi = 120', 'Resolve-ContentPdfSheetPathExact',
+               "Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'"]:
     if needed not in server:
-        raise SystemExit(f'detailed visual diff feature missing: {needed}')
-for needed in ['diffDetailRequestPath', 'diffPrepareRequestBody',
-               'fromSnapshotId:from', 'toSnapshotId:to', 'body.sheetKey=sheetKey',
+        raise SystemExit(f'browser PDF comparison server support missing: {needed}')
+for needed in ['diffDetailRequestPath', 'diffHistoryPdfParams', 'fetchDiffPdfDocument',
+               'fromSnapshotId:from', 'toSnapshotId:to',
                '選んだ2版を視覚比較', '比較元と比較先を入れ替え',
-               'renderSnapshotHistorySelectionHint', 'visualCompareReady', 'unavailableReason',
-               "scope:String(cmp.scope||'automatic')", "['deferred','failed'].includes"]:
+               'renderSnapshotHistorySelectionHint', 'visualCompareReady', 'unavailableReason']:
     if needed not in appjs:
-        raise SystemExit(f'historical visual diff UI missing: {needed}')
+        raise SystemExit(f'historical browser PDF comparison UI missing: {needed}')
 if "if (-not [string]::IsNullOrWhiteSpace($DiffJobPath))" not in server:
     raise SystemExit('diff-detail job child mode is missing')
 diff_script=(root/'app/tools/diff-image-pages.ps1').read_text(encoding='utf-8-sig')
@@ -704,8 +708,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 12' not in server:
-    raise SystemExit('lazy/raster-reuse changes must bump DiffDetailAlgorithmVersion to 12')
+if '$Script:DiffDetailAlgorithmVersion = 13' not in server:
+    raise SystemExit('browser PDF comparison changes must bump DiffDetailAlgorithmVersion to 13')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -723,14 +727,13 @@ _bytes_response = server.split('function Write-BytesResponse', 1)[1].split('\nfu
 if 'Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors $CacheControl' not in _bytes_response:
     raise SystemExit('diff asset cache policy must reach the TcpListener response path')
 appjs = (root/'app/web/app.js').read_text(encoding='utf-8-sig')
-if "addEventListener('click',prepareDiffDetail)" in appjs:
-    raise SystemExit('diff retry click must not pass MouseEvent as sheetKey')
-for needed in ["addEventListener('click',()=>prepareDiffDetail())", "if(selected&&['deferred','failed'].includes", "!['deferred','failed'].includes(targetStatus)", "targetStatus==='failed'&&!joinedExisting", "sheetStatus==='failed'"]:
+diff_worker = (root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
+for needed in ["canvas.style.visibility='hidden'", 'beginDiffBrowserRender', 'task.cancel()', 'DIFF_PAGE_CACHE_LIMIT = 4', 'setDiffBrowserProgress', 'PDFを読み込んでいます…']:
     if needed not in appjs:
-        raise SystemExit(f'diff retry UI regression: {needed}')
-for needed in ["img.style.visibility='hidden'", "img.removeAttribute('src')", "画像を読み込んでいます…", "v:String(diffViewState.detail?.algorithmVersion||0)", 'scheduleDiffPrefetch', 'prefetchDiffPageAssets(adjacent,0)', 'resetDiffPrefetch']:
+        raise SystemExit(f'browser page-switch responsiveness missing: {needed}')
+for needed in ['getImageData(0,0,width,height)', 'postMessage({id,width,height', 'diffAnalysisPending']:
     if needed not in appjs:
-        raise SystemExit(f'diff sheet switch responsiveness missing: {needed}')
+        raise SystemExit(f'non-blocking browser diff analysis missing: {needed}')
 
 # Third-party installation must stay reproducible and fail closed.
 installer = (root/'app/tools/install-thirdparty.ps1').read_text(encoding='utf-8-sig')
@@ -759,18 +762,15 @@ for needed in ['function Get-CategoryProjectId', 'Get-OutputFileName $Volume $pr
 if '$outName=Get-OutputFileName $Volume $projectId;' in server:
     raise SystemExit('legacy final output still omits category')
 
-# V5.2: comparison noise tolerance, bounded annotations, and lower-cost raster output.
+# V5.2/V5.4: stable visual hashes plus browser-side PDF rendering and diff analysis.
 for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 12',
-    '$Script:DiffDetailDpi = 120',
-    '$Script:DiffDetailThreshold = 24',
-    '$Script:DiffDetailMinimumRegionPixels = 24',
+    '$Script:DiffDetailAlgorithmVersion = 13',
 ]:
     if needed not in server:
-        raise SystemExit(f'comparison tolerance/performance setting missing: {needed}')
+        raise SystemExit(f'comparison tolerance/browser setting missing: {needed}')
 diff_engine = (root/'app/tools/DiffImageEngine.cs').read_text(encoding='utf-8-sig')
 for needed in [
     'MaximumModifiedLabelsPerPage = 12',
@@ -809,20 +809,21 @@ for needed in ['BuildSimplePage', 'forcedKind == "unchanged"', 'TryGetImageSize'
     if needed not in diff_engine:
         raise SystemExit(f'non-analysis diff fast path missing from engine: {needed}')
 _diff_skeleton = server.split('function New-DiffDetailSkeleton', 1)[1].split('\nfunction ', 1)[0]
-for needed in ['pageHashes', 'Normalize-FileHash', 'unchangedPageNumbers', "status = 'deferred'"]:
+for needed in ['pageHashes', 'Normalize-FileHash', 'unchangedPageNumbers', "status = 'ready'"]:
     if needed not in _diff_skeleton:
-        raise SystemExit(f'exact page hash/lazy propagation missing: {needed}')
+        raise SystemExit(f'exact page hash/browser propagation missing: {needed}')
 _diff_core = server.split('function Invoke-DiffDetailJobCore', 1)[1].split('\nfunction ', 1)[0]
 for needed in ['$preferredIndex', '$workIndexes += $preferredIndex', '1ジョブにつき1シートだけ処理する']:
     if needed not in _diff_core:
         raise SystemExit(f'one-sheet lazy generation missing: {needed}')
 if "$sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed'" in _diff_core:
     raise SystemExit('diff job must not eagerly queue every changed sheet')
-for needed in ['requestedKey', 'diffPrepareRequestBody(requestedKey)', 'prepareDiffDetail(diffViewState.selectedSheetKey)']:
+for needed in ['ensureDiffPdfJs', 'renderDiffPdfPage', 'analyzeDiffCanvases', 'buildDiffBrowserPage', 'clearDiffBrowserResources']:
     if needed not in appjs:
-        raise SystemExit(f'browser one-sheet lazy generation missing: {needed}')
-if "if(status==='not-generated')await prepareDiffDetail();" in appjs:
-    raise SystemExit('browser must not start an all-sheet diff job')
+        raise SystemExit(f'browser on-demand PDF comparison missing: {needed}')
+for forbidden in ['prepareDiffDetail(', 'diffPrepareRequestBody(', 'diffAssetUrl(', 'setDiffImage(']:
+    if forbidden in appjs:
+        raise SystemExit(f'legacy server-image comparison remains in browser: {forbidden}')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
 for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
     if needed not in batch_java:
@@ -844,9 +845,9 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v54']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v55', 'style.css?v=20260731_v53']:
     if needed not in html:
-        raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')
+        raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
     if needed not in appjs:
         raise SystemExit(f'browser region rendering missing: {needed}')

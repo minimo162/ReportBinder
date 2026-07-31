@@ -7010,7 +7010,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 12
+$Script:DiffDetailAlgorithmVersion = 13
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7324,9 +7324,9 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
                 pageCount = 0
                 unchangedPageNumbers = @()
                 regionCount = 0
-                # 全シートを一括生成せず、最初に表示するシートと選択されたシートだけを作成する。
-                status = 'deferred'
-                message = 'このシートの画像は、選択したときに作成します。'
+                # PDFはそのまま保持し、表示中のページだけをブラウザで描画・比較する。
+                status = 'ready'
+                message = '表示したページをブラウザで比較します。'
                 confirmed = $false
                 pages = @()
             }
@@ -7378,7 +7378,7 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
     return [pscustomobject][ordered]@{
         schemaVersion = 1
         algorithmVersion = $Script:DiffDetailAlgorithmVersion
-        status = $(if ([bool]$Context.available) { 'not-generated' } else { 'unavailable' })
+        status = $(if ([bool]$Context.available) { 'ready' } else { 'unavailable' })
         message = [string]$Context.message
         workbookId = [string]$Context.workbookId
         workbookName = [string]$Context.workbookName
@@ -7401,7 +7401,7 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
             unknown = $unknownCount
             unchanged = $unchangedCount
         }
-        generation = [ordered]@{ status = 'idle'; jobId = ''; percent = 0; message = ''; currentSheet = '' }
+        generation = [ordered]@{ status = 'completed'; jobId = ''; percent = 100; message = '表示ページをブラウザで比較します。'; currentSheet = '' }
         sheets = @($items)
         generatedAt = ''
     }
@@ -7413,48 +7413,11 @@ function Get-DiffDetail(
     [string]$BaselineSnapshotId = '',
     [string]$CurrentSnapshotId = ''
 ) {
+    # 比較PNGと差分JSONは事前生成しない。対象版・シート・ページ数だけを返し、
+    # 表示中の1ページをPDF.jsとWeb Workerでブラウザ内比較する。
     $context = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
-    $detail = New-DiffDetailSkeleton $Language $context
-    if (-not [bool]$context.available) { return $detail }
-    $cacheDir = Get-DiffDetailCacheDirForLanguage $Language $context
-    $detailPath = Join-Path $cacheDir 'diff-detail.json'
-    if (Test-Path -LiteralPath $detailPath) {
-        try {
-            $stored = Read-JsonFile $detailPath $null
-            if (Test-DiffDetailMatchesContext $stored $context) {
-                return $stored
-            }
-        } catch { }
-    }
-    $pointerPath = Join-Path $cacheDir 'diff-job.json'
-    if (Test-Path -LiteralPath $pointerPath) {
-        try {
-            $pointer = Read-JsonFile $pointerPath $null
-            $jobId = [string](Get-DataProperty $pointer 'jobId' '')
-            if (-not [string]::IsNullOrWhiteSpace($jobId)) {
-                $job = Read-RenderJobStatus $Language $jobId
-                $jobStatus = [string](Get-DataProperty $job 'status' '')
-                $terminal = @('completed','completed-with-errors','failed','missing','cancelled') -contains $jobStatus
-                # Workerはdiff-detail.jsonを保存してからstatusを終端へ更新する。
-                # 終端なのに結果ファイルが無い場合は「生成中」へ戻さず、再試行可能な失敗として返す。
-                $detail.status = $(if ($terminal) { 'failed' } else { 'generating' })
-                $jobMessage = [string](Get-DataProperty $job 'message' '')
-                $detail.message = $(if ($terminal -and $jobStatus -in @('completed','completed-with-errors')) {
-                    '差分画像の作成処理は終了しましたが、結果を読み込めませんでした。再試行してください。'
-                } else { $jobMessage })
-                $detail.generation = [ordered]@{
-                    status = $jobStatus
-                    jobId = $jobId
-                    percent = Get-IntDataProperty $job 'percent' 0
-                    message = [string](Get-DataProperty $job 'message' '')
-                    currentSheet = [string](Get-DataProperty $job 'currentSheet' '')
-                }
-            }
-        } catch { }
-    }
-    return $detail
+    return (New-DiffDetailSkeleton $Language $context)
 }
-
 
 function Resolve-DiffContentPdfPath([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$SheetName) {
     # Strict identity: never fall back to another render version. Hashes and displayed PDF must be the same generation.

@@ -49,10 +49,17 @@ let modalReturnFocus = null;
 let diffReturnFocus = null;
 let diffPollToken = 0;
 let diffSyncingScroll = false;
-let diffImageLoadSerial = 0;
-let diffPrefetchTimer = null;
-const diffPrefetchInFlight = new Map();
-const diffPrefetchedAssets = new Set();
+let diffBrowserRenderSerial = 0;
+let diffPdfJsPromise = null;
+let diffAnalysisWorker = null;
+let diffAnalysisRequestSerial = 0;
+const diffAnalysisPending = new Map();
+const diffActiveRenderTasks = new Set();
+const diffPdfDocumentCache = new Map();
+const diffBrowserPageCache = new Map();
+const DIFF_RENDER_SCALE = 120 / 72;
+const DIFF_PAGE_CACHE_LIMIT = 4;
+const DIFF_PDF_CACHE_LIMIT = 8;
 const diffViewState = {
   workbookId: '',
   fromSnapshotId: '',
@@ -1351,23 +1358,207 @@ function diffCurrentSheet(){
   const sheets=asArray(diffViewState.detail?.sheets);
   return sheets.find(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey)||null;
 }
+function ensureDiffPdfJs(){
+  if(diffPdfJsPromise)return diffPdfJsPromise;
+  diffPdfJsPromise=(async()=>{
+    let lib=null;
+    if(String(state?.pdfjsMode||'')==='classic'){
+      if(!window.pdfjsLib){
+        await new Promise((resolve,reject)=>{
+          const script=document.createElement('script');
+          script.src=new URL('pdfjs/pdf.min.js',location.href).href;
+          script.onload=resolve;
+          script.onerror=()=>reject(new Error('PDF.jsを読み込めませんでした。'));
+          document.head.appendChild(script);
+        });
+      }
+      lib=window.pdfjsLib;
+      if(lib?.GlobalWorkerOptions)lib.GlobalWorkerOptions.workerSrc=new URL('pdfjs/pdf.worker.min.js',location.href).href;
+    }else{
+      lib=await import(new URL('pdfjs/pdf.min.mjs',location.href).href);
+      if(lib?.GlobalWorkerOptions)lib.GlobalWorkerOptions.workerSrc=new URL('pdfjs/pdf.worker.min.mjs',location.href).href;
+    }
+    if(!lib?.getDocument)throw new Error('PDF.jsを利用できません。外部ライブラリを再配置してください。');
+    return lib;
+  })().catch(error=>{diffPdfJsPromise=null;throw error;});
+  return diffPdfJsPromise;
+}
+function diffComparisonIdentity(){
+  const cmp=diffViewState.detail?.comparison||{};
+  return [diffViewState.workbookId,cmp.scope||'automatic',cmp.baselineSnapshotId||'',cmp.baselineVersionId||'',cmp.currentSnapshotId||'',cmp.currentVersionId||''].join('|');
+}
+function diffSheetPageCount(sheet){
+  return Math.max(0,Number(sheet?.pageCount||0),Number(sheet?.beforePages||0),Number(sheet?.afterPages||0),asArray(sheet?.pages).length);
+}
+function diffBrowserPageKey(sheet,pageIndex){
+  return `${diffComparisonIdentity()}|${String(sheet?.sheetKey||'')}|${Number(pageIndex||0)}`;
+}
 function diffCurrentPage(){
   const sheet=diffCurrentSheet();
-  return asArray(sheet?.pages)[diffViewState.pageIndex]||null;
+  return sheet?(diffBrowserPageCache.get(diffBrowserPageKey(sheet,diffViewState.pageIndex))?.page||null):null;
 }
-function diffAssetUrl(sheet,page,asset){
+function diffPdfDocumentKey(side,sheet){
+  return `${diffComparisonIdentity()}|${side}|${String(sheet?.sheetKey||'')}`;
+}
+function diffHistoryPdfParams(side,sheet){
   const cmp=diffViewState.detail?.comparison||{};
-  const params=new URLSearchParams({
-    workbookId:diffViewState.workbookId,
-    currentSnapshotId:String(cmp.currentSnapshotId||''),
-    baselineSnapshotId:String(cmp.baselineSnapshotId||''),
-    sheetKey:String(sheet?.sheetKey||''),
-    pageNumber:String(page?.pageNumber||1),
-    asset,
-    scope:String(cmp.scope||'automatic'),
-    v:String(diffViewState.detail?.algorithmVersion||0)
+  const before=side==='before';
+  return {workbookId:diffViewState.workbookId,snapshotId:String(before?cmp.baselineSnapshotId||'':cmp.currentSnapshotId||''),versionId:String(before?cmp.baselineVersionId||'':cmp.currentVersionId||''),sheetName:String(sheet?.sheetName||'')};
+}
+async function fetchDiffPdfDocument(side,sheet){
+  const key=diffPdfDocumentKey(side,sheet);
+  if(diffPdfDocumentCache.has(key))return diffPdfDocumentCache.get(key);
+  const promise=(async()=>{
+    const lib=await ensureDiffPdfJs();
+    const res=await fetch(apiUrl('/api/history/content-pdf',diffHistoryPdfParams(side,sheet)),{cache:'no-store',headers:{'X-ReportBinder-Token':token,'Accept':'application/pdf,application/json'}});
+    const contentType=String(res.headers.get('content-type')||'').toLowerCase();
+    if(!res.ok||contentType.includes('application/json')){
+      let message=`PDFを取得できませんでした。HTTP ${res.status}`;
+      try{const detail=await res.json();message=detail.error||detail.message||message;}catch{}
+      throw new Error(message);
+    }
+    const bytes=new Uint8Array(await res.arrayBuffer());
+    if(!bytes.byteLength)throw new Error('比較対象のPDFが空です。');
+    return lib.getDocument({data:bytes}).promise;
+  })();
+  diffPdfDocumentCache.set(key,promise);
+  while(diffPdfDocumentCache.size>DIFF_PDF_CACHE_LIMIT){
+    const oldest=diffPdfDocumentCache.keys().next().value;
+    if(oldest===key)break;
+    const oldPromise=diffPdfDocumentCache.get(oldest);
+    diffPdfDocumentCache.delete(oldest);
+    Promise.resolve(oldPromise).then(doc=>doc?.destroy?.()).catch(()=>{});
+  }
+  try{return await promise;}catch(error){diffPdfDocumentCache.delete(key);throw error;}
+}
+function beginDiffBrowserRender(){
+  diffBrowserRenderSerial++;
+  for(const task of diffActiveRenderTasks){try{task.cancel();}catch{}}
+  diffActiveRenderTasks.clear();
+  return diffBrowserRenderSerial;
+}
+function clearDiffCanvas(id){
+  const canvas=$(id);if(!canvas)return;
+  canvas.style.visibility='hidden';canvas.style.opacity='';
+  canvas.width=1;canvas.height=1;
+  canvas.getContext('2d')?.clearRect(0,0,1,1);
+}
+function copyDiffCanvas(id,source){
+  const canvas=$(id);if(!canvas||!source)return;
+  canvas.width=source.width;canvas.height=source.height;
+  const context=canvas.getContext('2d',{alpha:false});
+  context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);context.drawImage(source,0,0);
+  canvas.style.visibility='';
+}
+function createWhiteDiffCanvas(width,height){
+  const canvas=document.createElement('canvas');
+  canvas.width=Math.max(1,width);canvas.height=Math.max(1,height);
+  const context=canvas.getContext('2d',{alpha:false});
+  context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);
+  return canvas;
+}
+async function renderDiffPdfPage(side,sheet,pageNumber,serial){
+  const configuredPages=Number(side==='before'?sheet?.beforePages||0:sheet?.afterPages||0);
+  if(configuredPages>0&&pageNumber>configuredPages)return null;
+  const doc=await fetchDiffPdfDocument(side,sheet);
+  if(serial!==diffBrowserRenderSerial||pageNumber>doc.numPages)return null;
+  const page=await doc.getPage(pageNumber);
+  if(serial!==diffBrowserRenderSerial)return null;
+  const viewport=page.getViewport({scale:DIFF_RENDER_SCALE});
+  const canvas=createWhiteDiffCanvas(Math.ceil(viewport.width),Math.ceil(viewport.height));
+  const task=page.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport,background:'rgb(255,255,255)'});
+  diffActiveRenderTasks.add(task);
+  try{await task.promise;}finally{diffActiveRenderTasks.delete(task);}
+  return serial===diffBrowserRenderSerial?canvas:null;
+}
+function getDiffAnalysisWorker(){
+  if(diffAnalysisWorker)return diffAnalysisWorker;
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260731_v1',location.href));
+  diffAnalysisWorker.onmessage=event=>{
+    const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
+    if(!pending)return;
+    diffAnalysisPending.delete(payload.id);
+    if(payload.error)pending.reject(new Error(payload.error));else pending.resolve(payload);
+  };
+  diffAnalysisWorker.onerror=event=>{
+    const error=new Error(event.message||'ブラウザ内の差分解析に失敗しました。');
+    for(const pending of diffAnalysisPending.values())pending.reject(error);
+    diffAnalysisPending.clear();
+    try{diffAnalysisWorker.terminate();}catch{}
+    diffAnalysisWorker=null;
+  };
+  return diffAnalysisWorker;
+}
+function analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height){
+  const before=beforeCanvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,width,height);
+  const after=afterCanvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,width,height);
+  const id=++diffAnalysisRequestSerial;
+  return new Promise((resolve,reject)=>{
+    diffAnalysisPending.set(id,{resolve,reject});
+    try{getDiffAnalysisWorker().postMessage({id,width,height,before:before.data.buffer,after:after.data.buffer},[before.data.buffer,after.data.buffer]);}
+    catch(error){diffAnalysisPending.delete(id);reject(error);}
   });
-  return withToken(`/api/history/diff-page?${params.toString()}`);
+}
+function fullDiffRegion(kind,width,height){
+  const inset=Math.max(6,Math.floor(Math.min(width,height)/250));
+  return {regionId:'browser-r0001',kind,x:inset/width,y:inset/height,width:Math.max(1,width-inset*2)/width,height:Math.max(1,height-inset*2)/height,confidence:1,pixelCount:width*height};
+}
+function cacheDiffBrowserPage(key,result){
+  if(diffBrowserPageCache.has(key))diffBrowserPageCache.delete(key);
+  diffBrowserPageCache.set(key,result);
+  while(diffBrowserPageCache.size>DIFF_PAGE_CACHE_LIMIT)diffBrowserPageCache.delete(diffBrowserPageCache.keys().next().value);
+}
+function setDiffBrowserProgress(active,message='',percent=0){
+  const box=$('diff-progress');
+  box?.classList.toggle('hidden',!active);
+  if($('diff-progress-text'))$('diff-progress-text').textContent=message||'表示ページを比較しています。';
+  if($('diff-progress-fill'))$('diff-progress-fill').style.width=`${Math.max(0,Math.min(100,Number(percent)||0))}%`;
+}
+function clearDiffBrowserResources(){
+  beginDiffBrowserRender();
+  for(const pending of diffAnalysisPending.values())pending.reject(new Error('比較画面を閉じました。'));
+  diffAnalysisPending.clear();
+  if(diffAnalysisWorker){try{diffAnalysisWorker.terminate();}catch{}diffAnalysisWorker=null;}
+  for(const promise of diffPdfDocumentCache.values())Promise.resolve(promise).then(doc=>doc?.destroy?.()).catch(()=>{});
+  diffPdfDocumentCache.clear();diffBrowserPageCache.clear();setDiffBrowserProgress(false);
+  for(const id of ['diff-before-base','diff-after-underlay','diff-after-base'])clearDiffCanvas(id);
+}
+async function buildDiffBrowserPage(sheet,pageIndex,serial){
+  const pageNumber=pageIndex+1,kind=String(sheet?.kind||'modified');
+  const needBefore=kind!=='added'&&pageNumber<=Math.max(Number(sheet?.beforePages||0),1);
+  const needAfter=kind!=='removed'&&pageNumber<=Math.max(Number(sheet?.afterPages||0),1);
+  setDiffBrowserProgress(true,'PDFを表示用に描画しています。',25);
+  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
+  if(serial!==diffBrowserRenderSerial)return null;
+  const width=Math.max(beforeRaw?.width||0,afterRaw?.width||0),height=Math.max(beforeRaw?.height||0,afterRaw?.height||0);
+  if(!width||!height)throw new Error('表示できるPDFページがありません。');
+  const beforeCanvas=createWhiteDiffCanvas(width,height),afterCanvas=createWhiteDiffCanvas(width,height);
+  if(beforeRaw)beforeCanvas.getContext('2d',{alpha:false}).drawImage(beforeRaw,0,0);
+  if(afterRaw)afterCanvas.getContext('2d',{alpha:false}).drawImage(afterRaw,0,0);
+  let regions=[],status='ready',message='';
+  const exactSame=asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber);
+  if(kind==='added')regions=[fullDiffRegion('added',width,height)];
+  else if(kind==='removed')regions=[fullDiffRegion('removed',width,height)];
+  else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message='信頼できる差分領域を判定できません。';}
+  else if(kind!=='unchanged'&&!exactSame){
+    setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
+    try{const analyzed=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analyzed.regions);}
+    catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
+  }
+  const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.width!==afterRaw.width||beforeRaw.height!==afterRaw.height),status,message,confidence:status==='unknown'?0:1,changedRatio:regions.length?1:0,regionCount:regions.length,regions};
+  return {sheetKey:String(sheet?.sheetKey||''),pageIndex,page,beforeCanvas,afterCanvas};
+}
+function paintDiffBrowserPage(result){
+  if(!result)return;
+  copyDiffCanvas('diff-before-base',result.beforeCanvas);copyDiffCanvas('diff-after-underlay',result.beforeCanvas);copyDiffCanvas('diff-after-base',result.afterCanvas);
+  const page=result.page;
+  renderDiffRegionLayer('before',page.regions);renderDiffRegionLayer('after',page.regions);
+  if(diffViewState.regionIndex>=page.regions.length)diffViewState.regionIndex=-1;
+  if($('diff-region-count'))$('diff-region-count').textContent=page.regions.length?(diffViewState.regionIndex>=0?`${diffViewState.regionIndex+1} / ${page.regions.length}件`:`${page.regions.length}件`):'0件';
+  $('diff-prev-region').disabled=!diffRegionTargets().length;$('diff-next-region').disabled=!diffRegionTargets().length;
+  setDiffPaneEmpty('before',diffCurrentSheet()?.kind==='added'?'前回版には存在しません':'');
+  setDiffPaneEmpty('after',diffCurrentSheet()?.kind==='removed'?'現在版では削除されています':'');
+  applyDiffHighlightSettings();applyDiffMode();updateDiffStageScale();
 }
 function diffDetailRequestPath(){
   const params=new URLSearchParams({workbookId:diffViewState.workbookId});
@@ -1376,15 +1567,6 @@ function diffDetailRequestPath(){
     params.set('toSnapshotId',diffViewState.toSnapshotId);
   }
   return `/api/history/diff-detail?${params.toString()}`;
-}
-function diffPrepareRequestBody(sheetKey=''){
-  const body={workbookId:diffViewState.workbookId};
-  if(diffViewState.fromSnapshotId&&diffViewState.toSnapshotId){
-    body.fromSnapshotId=diffViewState.fromSnapshotId;
-    body.toSnapshotId=diffViewState.toSnapshotId;
-  }
-  if(sheetKey)body.sheetKey=sheetKey;
-  return body;
 }
 function updateDiffProgress(generation={}){
   const box=$('diff-progress');
@@ -1415,8 +1597,6 @@ function renderDiffSummary(){
       diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
     }
     renderDiffSummary();renderDiffSheetList();renderDiffPage();
-    const selected=visible.find(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey);
-    if(selected&&['deferred','failed'].includes(String(selected.status||'')))void selectDiffSheet(selected.sheetKey,false);
   }));
 }
 function renderDiffSheetList(){
@@ -1427,7 +1607,8 @@ function renderDiffSheetList(){
     const meta=diffKindMeta(sheet.kind);
     const pages=Math.max(Number(sheet.beforePages||0),Number(sheet.afterPages||0),asArray(sheet.pages).length);
     const sheetStatus=String(sheet.status||'');
-    const detail=sheetStatus==='unknown'?(sheet.message||'判定不能'):sheetStatus==='failed'?'作成失敗・再選択で再試行':sheetStatus==='deferred'?'選択時に画像を作成':sheetStatus==='generating'?'画像を作成中':`${pages}ページ・${Number(sheet.regionCount||0)}領域`;
+    const cached=[...diffBrowserPageCache.values()].filter(item=>item.sheetKey===String(sheet.sheetKey||'')).length;
+    const detail=sheetStatus==='unknown'?(sheet.message||'判定不能'):`${pages}ページ・ブラウザ比較${cached?`済 ${cached}`:'（表示時）'}`;
     return `<button class="diff-sheet-item ${String(sheet.sheetKey||'')===diffViewState.selectedSheetKey?'active':''}" type="button" data-diff-sheet="${escapeAttr(sheet.sheetKey||'')}" title="${escapeAttr(sheet.sheetName||'')}"><span class="diff-sheet-kind ${escapeAttr(sheet.kind||'unknown')}">${escapeHtml(meta.mark)}</span><span class="diff-sheet-copy"><strong>${escapeHtml(sheet.sheetName||'')}</strong><small>${escapeHtml(meta.label)}・${escapeHtml(detail)}</small></span></button>`;
   }).join('');
   box.querySelectorAll('[data-diff-sheet]').forEach(btn=>{
@@ -1442,65 +1623,12 @@ function renderDiffSheetList(){
     });
   });
 }
-const diffSheetPrepareInFlight=new Set();
-async function selectDiffSheet(sheetKey,focusList=true){
+function selectDiffSheet(sheetKey,focusList=true){
   const sheet=asArray(diffViewState.detail?.sheets).find(s=>String(s.sheetKey||'')===String(sheetKey||''));
   if(!sheet)return;
-  diffViewState.selectedSheetKey=String(sheet.sheetKey||'');
-  diffViewState.pageIndex=0;
-  diffViewState.regionIndex=-1;
-  sheet.confirmed=true;
-  renderDiffSheetList();
-  renderDiffPage();
+  diffViewState.selectedSheetKey=String(sheet.sheetKey||'');diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
+  renderDiffSheetList();renderDiffPage();
   if(focusList)$('diff-before-viewport')?.focus();
-  if(['deferred','failed'].includes(String(sheet.status||''))&&!diffSheetPrepareInFlight.has(String(sheet.sheetKey||''))){
-    const key=String(sheet.sheetKey||'');
-    diffSheetPrepareInFlight.add(key);
-    sheet.status='generating';sheet.message='このシートの画像を準備しています。';
-    renderDiffSheetList();renderDiffPage();
-    try{await prepareDiffDetail(key);}finally{diffSheetPrepareInFlight.delete(key);}
-  }
-}
-function setDiffImage(id,src,alt,onload,onerror){
-  const img=$(id);if(!img)return;
-  const source=String(src||'');
-  const loadId=String(++diffImageLoadSerial);
-  img.alt=alt||'';
-  img.dataset.diffLoadId=loadId;
-  img.onload=null;img.onerror=null;
-  if(!source){
-    img.style.visibility='hidden';
-    img.removeAttribute('src');
-    delete img.dataset.diffSource;
-    return;
-  }
-  if(img.dataset.diffSource===source&&img.complete&&img.naturalWidth>0){
-    img.style.visibility='';
-    if(typeof onload==='function')onload();
-    return;
-  }
-  // Hide and detach the old bitmap before starting the new request. Without this,
-  // Edge keeps painting the previous sheet until the replacement PNG finishes.
-  img.style.visibility='hidden';
-  img.removeAttribute('src');
-  img.dataset.diffSource=source;
-  img.onload=()=>{
-    if(img.dataset.diffLoadId!==loadId||img.dataset.diffSource!==source)return;
-    img.style.visibility='';
-    if(typeof onload==='function')onload();
-  };
-  img.onerror=()=>{
-    if(img.dataset.diffLoadId!==loadId)return;
-    img.style.visibility='hidden';
-    img.removeAttribute('src');
-    delete img.dataset.diffSource;
-    if(typeof onerror==='function')onerror();
-  };
-  // Give the browser one paint to remove the previous sheet and show the loading
-  // message before PNG I/O/decoding begins.
-  requestAnimationFrame(()=>{
-    if(img.dataset.diffLoadId===loadId&&img.dataset.diffSource===source)img.src=source;
-  });
 }
 function setDiffPaneEmpty(side,message){
   const stage=$(`diff-${side}-stage`),empty=$(`diff-${side}-empty`);
@@ -1583,100 +1711,44 @@ function applyDiffMode(){
 function renderDiffPage(){
   const sheet=diffCurrentSheet();
   const historical=String(diffViewState.detail?.comparison?.scope||'')==='history';
-  const beforeLabel=historical?'比較元':'前回版';
-  const afterLabel=historical?'比較先':'現在版';
-  const messageBox=$('diff-state-message');
+  const beforeLabel=historical?'比較元':'前回版',afterLabel=historical?'比較先':'現在版';
+  const messageBox=$('diff-state-message'),serial=beginDiffBrowserRender();
+  for(const id of ['diff-before-base','diff-after-underlay','diff-after-base'])clearDiffCanvas(id);
+  renderDiffRegionLayer('before',[]);renderDiffRegionLayer('after',[]);
   if(!sheet){
+    setDiffBrowserProgress(false);
     if(messageBox){messageBox.textContent=diffViewState.detail?.message||'比較対象のシートがありません。';messageBox.classList.remove('hidden');}
-    setDiffImage('diff-before-base','','');setDiffImage('diff-after-underlay','','');setDiffImage('diff-after-base','','');
-    setDiffPaneEmpty('before','比較するページがありません。');setDiffPaneEmpty('after','比較するページがありません。');
-    renderDiffRegionLayer('before',[]);renderDiffRegionLayer('after',[]);
-    return;
+    setDiffPaneEmpty('before','比較するページがありません。');setDiffPaneEmpty('after','比較するページがありません。');return;
   }
-  const pages=asArray(sheet.pages);
-  diffViewState.pageIndex=Math.max(0,Math.min(diffViewState.pageIndex,Math.max(0,pages.length-1)));
-  const page=pages[diffViewState.pageIndex]||null;
-  const sheetStatus=String(sheet.status||'');
-  const sheetMessage=sheetStatus==='unknown'?String(sheet.message||'信頼できる差分領域を判定できません。'):sheetStatus==='failed'?String(sheet.message||'差分画像を作成できませんでした。シートを再選択して再試行してください。'):'';
-  const pageMessage=String(page?.message||'');
-  const sizeMessage=page?.pageSizeChanged?'ページサイズが異なるため、左上を基準に揃えて表示しています。':'';
-  const visibleMessage=[sheetMessage,pageMessage,sizeMessage].filter(Boolean).join(' ');
-  if(messageBox){messageBox.textContent=visibleMessage;messageBox.classList.toggle('hidden',!visibleMessage);}
-  if(!page){
-    const pending=sheetStatus==='deferred'?'このシートを選択すると画像を作成します。':sheetStatus==='failed'?(sheet.message||'差分画像を作成できませんでした。シートを再選択して再試行してください。'):sheetStatus==='generating'||String(diffViewState.detail?.status||'')==='generating'?'差分画像を準備しています。':'表示できるページ画像がありません。';
-    setDiffImage('diff-before-base','','');setDiffImage('diff-after-underlay','','');setDiffImage('diff-after-base','','');
-    setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:pending);
-    setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:pending);
-    if($('diff-page-count'))$('diff-page-count').textContent=`0 / ${Math.max(Number(sheet.pageCount||0),0)}ページ`;
-    if($('diff-region-count'))$('diff-region-count').textContent='0件';
-    renderDiffRegionLayer('before',[]);renderDiffRegionLayer('after',[]);
-    return;
+  const pageTotal=diffSheetPageCount(sheet);
+  diffViewState.pageIndex=Math.max(0,Math.min(diffViewState.pageIndex,Math.max(0,pageTotal-1)));
+  const pageNumber=diffViewState.pageIndex+1;
+  if($('diff-before-page-label'))$('diff-before-page-label').textContent=`${pageNumber} / ${pageTotal}ページ`;
+  if($('diff-after-page-label'))$('diff-after-page-label').textContent=`${pageNumber} / ${pageTotal}ページ`;
+  if($('diff-page-count'))$('diff-page-count').textContent=`${pageNumber} / ${pageTotal}ページ`;
+  $('diff-prev-page').disabled=diffViewState.pageIndex<=0;$('diff-next-page').disabled=diffViewState.pageIndex>=pageTotal-1;
+  diffViewState.regionIndex=-1;if($('diff-region-count'))$('diff-region-count').textContent='0件';
+  $('diff-prev-region').disabled=true;$('diff-next-region').disabled=true;
+  if(messageBox){messageBox.textContent='';messageBox.classList.add('hidden');}
+  if(!pageTotal){
+    setDiffBrowserProgress(false);
+    setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:'表示できるPDFページがありません。');
+    setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:'表示できるPDFページがありません。');return;
   }
-  const beforeEmpty=sheet.kind==='added'?`${beforeLabel}には存在しません`:'';
-  const afterEmpty=sheet.kind==='removed'?`${afterLabel}では削除されています`:'';
-  const pageNo=Number(page.pageNumber||diffViewState.pageIndex+1);
-  const pageTotal=pages.length;
-  if($('diff-before-page-label'))$('diff-before-page-label').textContent=`${pageNo} / ${pageTotal}ページ`;
-  if($('diff-after-page-label'))$('diff-after-page-label').textContent=`${pageNo} / ${pageTotal}ページ`;
-  if($('diff-page-count'))$('diff-page-count').textContent=`${pageNo} / ${pageTotal}ページ`;
-  $('diff-prev-page').disabled=diffViewState.pageIndex<=0;
-  $('diff-next-page').disabled=diffViewState.pageIndex>=pageTotal-1;
-  const altBase=`${sheet.sheetName}、${pageNo}ページ`;
-  const beforeUrl=page.beforeAsset?diffAssetUrl(sheet,page,'before'):'';
-  const afterUrl=page.afterAsset?diffAssetUrl(sheet,page,'after'):'';
-  setDiffPaneEmpty('before',beforeEmpty||(beforeUrl?'画像を読み込んでいます…':'表示できる画像がありません。'));
-  setDiffPaneEmpty('after',afterEmpty||(afterUrl?'画像を読み込んでいます…':'表示できる画像がありません。'));
-  setDiffImage('diff-before-base',beforeEmpty?'':beforeUrl,`${beforeLabel}、${altBase}`,()=>{
-    setDiffPaneEmpty('before','');updateDiffStageScale();
-  },()=>setDiffPaneEmpty('before','画像を読み込めませんでした。シートを選び直してください。'));
-  setDiffImage('diff-after-underlay',beforeUrl,'');
-  setDiffImage('diff-after-base',afterEmpty?'':afterUrl,`${afterLabel}、${altBase}`,()=>{
-    setDiffPaneEmpty('after','');updateDiffStageScale();
-  },()=>setDiffPaneEmpty('after','画像を読み込めませんでした。シートを選び直してください。'));
-  const regions=asArray(page.regions);
-  renderDiffRegionLayer('before',regions);renderDiffRegionLayer('after',regions);
-  if(diffViewState.regionIndex>=regions.length)diffViewState.regionIndex=-1;
-  if($('diff-region-count'))$('diff-region-count').textContent=regions.length?(diffViewState.regionIndex>=0?`${diffViewState.regionIndex+1} / ${regions.length}件`:`${regions.length}件`):'0件';
-  $('diff-prev-region').disabled=!diffRegionTargets().length;
-  $('diff-next-region').disabled=!diffRegionTargets().length;
-  applyDiffHighlightSettings();applyDiffMode();updateDiffStageScale();
-  scheduleDiffPrefetch(sheet,diffViewState.pageIndex);
-}
-function prefetchDiffAsset(url){
-  const source=String(url||'');if(!source||diffPrefetchedAssets.has(source)||diffPrefetchInFlight.has(source))return;
-  const img=new Image();
-  img.decoding='async';
-  diffPrefetchInFlight.set(source,img);
-  img.onload=()=>{diffPrefetchInFlight.delete(source);diffPrefetchedAssets.add(source);};
-  img.onerror=()=>{diffPrefetchInFlight.delete(source);};
-  img.src=source;
-}
-function prefetchDiffPageAssets(sheet,index){
-  const page=asArray(sheet?.pages)[index];if(!page)return;
-  if(page.beforeAsset)prefetchDiffAsset(diffAssetUrl(sheet,page,'before'));
-  if(page.afterAsset)prefetchDiffAsset(diffAssetUrl(sheet,page,'after'));
-}
-function resetDiffPrefetch(){
-  if(diffPrefetchTimer){clearTimeout(diffPrefetchTimer);diffPrefetchTimer=null;}
-  for(const img of diffPrefetchInFlight.values()){img.onload=null;img.onerror=null;img.removeAttribute('src');}
-  diffPrefetchInFlight.clear();diffPrefetchedAssets.clear();
-}
-function scheduleDiffPrefetch(sheet,pageIndex){
-  if(diffPrefetchTimer)clearTimeout(diffPrefetchTimer);
-  diffPrefetchTimer=setTimeout(()=>{
-    diffPrefetchTimer=null;
-    if(!isDiffModalOpen()||diffCurrentSheet()!==sheet)return;
-    // Warm the next page and the first page of neighbouring sheets after the
-    // selected page has started loading. Immutable HTTP caching makes later
-    // tab switches reuse these bytes without another shared-drive read.
-    prefetchDiffPageAssets(sheet,pageIndex+1);
-    const sheets=diffFilteredSheets();
-    const current=sheets.findIndex(item=>String(item.sheetKey||'')===String(sheet.sheetKey||''));
-    for(const offset of [1,-1]){
-      const adjacent=sheets[current+offset];
-      if(adjacent&&!['deferred','failed','generating'].includes(String(adjacent.status||'')))prefetchDiffPageAssets(adjacent,0);
-    }
-  },750);
+  const key=diffBrowserPageKey(sheet,diffViewState.pageIndex),cached=diffBrowserPageCache.get(key);
+  if(cached){setDiffBrowserProgress(false);paintDiffBrowserPage(cached);renderDiffSheetList();return;}
+  setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:'PDFを読み込んでいます…');
+  setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:'PDFを読み込んでいます…');
+  void buildDiffBrowserPage(sheet,diffViewState.pageIndex,serial).then(result=>{
+    if(!result||serial!==diffBrowserRenderSerial||!isDiffModalOpen())return;
+    cacheDiffBrowserPage(key,result);setDiffBrowserProgress(false);paintDiffBrowserPage(result);renderDiffSheetList();
+    const messages=[result.page.message,result.page.pageSizeChanged?'ページサイズが異なるため、左上を基準に揃えて表示しています。':''].filter(Boolean);
+    if(messageBox){messageBox.textContent=messages.join(' ');messageBox.classList.toggle('hidden',!messages.length);}
+  }).catch(error=>{
+    if(serial!==diffBrowserRenderSerial||!isDiffModalOpen())return;
+    setDiffBrowserProgress(false);setDiffPaneEmpty('before','PDFを表示できませんでした。');setDiffPaneEmpty('after','PDFを表示できませんでした。');
+    if(messageBox){messageBox.textContent=userFriendlyError(error.message);messageBox.classList.remove('hidden');}
+  });
 }
 function focusCurrentDiffRegion(){
   const page=diffCurrentPage(),region=asArray(page?.regions)[diffViewState.regionIndex]||null;
@@ -1698,11 +1770,10 @@ function focusCurrentDiffRegion(){
   }
 }
 function diffRegionTargets(){
+  const order=new Map(asArray(diffViewState.detail?.sheets).map((sheet,index)=>[String(sheet.sheetKey||''),index]));
   const targets=[];
-  for(const sheet of asArray(diffViewState.detail?.sheets)){
-    asArray(sheet.pages).forEach((page,pageIndex)=>asArray(page.regions).forEach((region,regionIndex)=>targets.push({sheetKey:String(sheet.sheetKey||''),pageIndex,regionIndex,region})));
-  }
-  return targets;
+  for(const item of diffBrowserPageCache.values())asArray(item.page?.regions).forEach((region,regionIndex)=>targets.push({sheetKey:item.sheetKey,pageIndex:item.pageIndex,regionIndex,region}));
+  return targets.sort((x,y)=>(order.get(x.sheetKey)||0)-(order.get(y.sheetKey)||0)||x.pageIndex-y.pageIndex||x.regionIndex-y.regionIndex);
 }
 function moveDiffRegion(direction){
   const targets=diffRegionTargets();if(!targets.length)return;
@@ -1717,11 +1788,8 @@ function moveDiffRegion(direction){
   setTimeout(focusCurrentDiffRegion,80);
 }
 function setDiffPage(index){
-  const pages=asArray(diffCurrentSheet()?.pages);
-  if(!pages.length)return;
-  diffViewState.pageIndex=Math.max(0,Math.min(pages.length-1,index));
-  diffViewState.regionIndex=-1;
-  renderDiffPage();
+  const count=diffSheetPageCount(diffCurrentSheet());if(!count)return;
+  diffViewState.pageIndex=Math.max(0,Math.min(count-1,index));diffViewState.regionIndex=-1;renderDiffPage();
 }
 function renderDiffDetail(detail){
   diffViewState.detail=detail||null;
@@ -1729,124 +1797,41 @@ function renderDiffDetail(detail){
   if(stateBox){stateBox.textContent='';stateBox.classList.add('hidden');}
   const workbookName=String(detail?.workbookName||getWorkbook(diffViewState.workbookId)?.displayName||'Excel');
   if($('diff-title'))$('diff-title').textContent=`差分詳細：${workbookName}`;
-  const cmp=detail?.comparison||{};
-  const historical=String(cmp.scope||'')==='history';
-  if($('diff-subtitle'))$('diff-subtitle').textContent=`${historical?'比較元':'前回版'} ${formatDateTime(cmp.baselineAt)} → ${historical?'比較先':'現在版'} ${formatDateTime(cmp.currentAt)}`;
+  const cmp=detail?.comparison||{},historical=String(cmp.scope||'')==='history';
+  if($('diff-subtitle'))$('diff-subtitle').textContent=`${historical?'比較元':'前回版'} ${formatDateTime(cmp.baselineAt)} → ${historical?'比較先':'現在版'} ${formatDateTime(cmp.currentAt)} ・ 表示ページをブラウザで比較`;
   if($('diff-before-label'))$('diff-before-label').textContent=historical?'比較元':'前回版';
   if($('diff-after-label'))$('diff-after-label').textContent=historical?'比較先':'現在版';
   const tabs=$('diff-mobile-tabs')?.querySelectorAll('button');
   if(tabs?.[0])tabs[0].textContent=historical?'比較元':'前回版';
   if(tabs?.[1])tabs[1].textContent=historical?'比較先':'現在版';
-  updateDiffProgress(detail?.generation||{});
+  setDiffBrowserProgress(false);
   const sheets=asArray(detail?.sheets);
   if(!sheets.some(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey)){
     const preferred=sheets.find(s=>['modified','added','removed','unknown'].includes(String(s.kind||'')))||sheets[0];
-    diffViewState.selectedSheetKey=String(preferred?.sheetKey||'');
-    diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
+    diffViewState.selectedSheetKey=String(preferred?.sheetKey||'');diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
   }
   renderDiffSummary();renderDiffSheetList();renderDiffPage();
-  if(['unavailable','failed'].includes(String(detail?.status||''))){
-    const box=$('diff-state-message');
-    if(box){
-      const retry=String(detail?.status||'')==='failed';
-      box.innerHTML=`<span>${escapeHtml(detail?.message||'差分詳細を表示できません。')}</span>${retry?' <button class="btn secondary compact" type="button" data-diff-retry>再試行</button>':''}`;
-      box.classList.remove('hidden');
-      box.querySelector('[data-diff-retry]')?.addEventListener('click',()=>prepareDiffDetail());
-    }
-  }
+  if(['unavailable','failed'].includes(String(detail?.status||''))&&stateBox){stateBox.textContent=detail?.message||'差分詳細を表示できません。';stateBox.classList.remove('hidden');}
 }
-async function pollDiffJob(jobId,tokenId){
-  while(isDiffModalOpen()&&tokenId===diffPollToken){
-    const job=await api(`/api/jobs/status?jobId=${encodeURIComponent(jobId)}`);
-    updateDiffProgress(job);
-    const status=String(job.status||'');
-    if(['completed','completed-with-errors','failed','cancelled','missing'].includes(status)){
-      const loaded=await api(diffDetailRequestPath());
-      if(tokenId===diffPollToken&&isDiffModalOpen())renderDiffDetail(loaded.detail);
-      return loaded.detail||null;
-    }
-    await sleep(700);
-  }
-  return null;
-}
-async function prepareDiffDetail(sheetKey=''){
-  if(!diffViewState.workbookId)return;
-  // 比較画面を開いただけで全変更シートを作らない。現在選択中の1シートだけを要求する。
-  const requestedKey=String(sheetKey||diffViewState.selectedSheetKey||'');
-  if(!requestedKey)return;
-  try{
-    // 別シートの遅延生成がpair lockを所有していれば完了を待ち、このシートを再要求する。
-    for(let attempt=0;attempt<3;attempt++){
-      const started=await api('/api/history/diff/prepare',{method:'POST',body:diffPrepareRequestBody(requestedKey)});
-      const job=started.job||{};
-      const joinedExisting=!!job.joinedExistingDiffJob;
-      let detail=null;
-      if(job.jobId){
-        const tokenId=++diffPollToken;
-        updateDiffProgress(job);
-        detail=await pollDiffJob(job.jobId,tokenId);
-      }else{
-        const loaded=await api(diffDetailRequestPath());
-        detail=loaded.detail||null;
-        renderDiffDetail(detail);
-      }
-      const target=asArray(detail?.sheets).find(s=>String(s.sheetKey||'')===requestedKey);
-      const targetStatus=String(target?.status||'');
-      if(!target||!['deferred','failed'].includes(targetStatus))return;
-      if(targetStatus==='failed'&&!joinedExisting)return;
-      if(attempt<2)await sleep(150);
-    }
-    throw new Error('選択したシートの画像作成を開始できませんでした。もう一度選択してください。');
-  }catch(e){
-    renderDiffDetail(Object.assign({},diffViewState.detail||{},{status:'failed',message:userFriendlyError(e.message),generation:{status:'failed'}}));
-  }
-}
-
 async function openDiffDetail(workbookId,opener,historyRange=null){
   const id=String(workbookId||'');if(!id)return;
-  diffReturnFocus=opener||document.activeElement;
-  diffViewState.workbookId=id;
-  diffViewState.fromSnapshotId=String(historyRange?.fromSnapshotId||'');
-  diffViewState.toSnapshotId=String(historyRange?.toSnapshotId||'');
+  diffReturnFocus=opener||document.activeElement;clearDiffBrowserResources();
+  diffViewState.workbookId=id;diffViewState.fromSnapshotId=String(historyRange?.fromSnapshotId||'');diffViewState.toSnapshotId=String(historyRange?.toSnapshotId||'');
   diffViewState.detail=null;diffViewState.selectedSheetKey='';diffViewState.pageIndex=0;diffViewState.regionIndex=-1;diffViewState.filter='all';diffViewState.mode='side';diffViewState.mobileTab='before';
-  resetDiffPrefetch();
-  $('diff-modal')?.classList.remove('hidden');
-  document.body.style.overflow='hidden';
+  $('diff-modal')?.classList.remove('hidden');document.body.style.overflow='hidden';
   if($('diff-title'))$('diff-title').textContent=`差分詳細：${workbookDisplayName(getWorkbook(id))}`;
   if($('diff-subtitle'))$('diff-subtitle').textContent='比較情報を読み込んでいます。';
   if($('diff-sheet-list'))$('diff-sheet-list').innerHTML='<div class="empty-state">読み込んでいます。</div>';
-  setDiffPaneEmpty('before','比較情報を読み込んでいます。');setDiffPaneEmpty('after','比較情報を読み込んでいます。');
-  $('diff-close')?.focus();
-  try{
-    const loaded=await api(diffDetailRequestPath());
-    if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;
-    renderDiffDetail(loaded.detail);
-    const status=String(loaded.detail?.status||'');
-    const selected=asArray(loaded.detail?.sheets).find(sheet=>String(sheet.sheetKey||'')===String(diffViewState.selectedSheetKey||''));
-    if(status==='not-generated'||['deferred','failed'].includes(String(selected?.status||''))){
-      await prepareDiffDetail(diffViewState.selectedSheetKey);
-    }else if(status==='generating'&&loaded.detail?.generation?.jobId){
-      const tokenId=++diffPollToken;
-      await pollDiffJob(loaded.detail.generation.jobId,tokenId);
-    }
-  }catch(e){
-    renderDiffDetail({status:'failed',message:userFriendlyError(e.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});
-  }
+  setDiffPaneEmpty('before','比較情報を読み込んでいます。');setDiffPaneEmpty('after','比較情報を読み込んでいます。');$('diff-close')?.focus();
+  try{const loaded=await api(diffDetailRequestPath());if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail(loaded.detail);}
+  catch(error){renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
 }
 function closeDiffDetail(){
   if(!isDiffModalOpen())return;
-  diffPollToken++;
-  resetDiffPrefetch();
-  setDiffImage('diff-before-base','','');setDiffImage('diff-after-underlay','','');setDiffImage('diff-after-base','','');
-  $('diff-modal')?.classList.add('hidden');
-  document.body.style.overflow='';
+  diffPollToken++;clearDiffBrowserResources();$('diff-modal')?.classList.add('hidden');document.body.style.overflow='';
   let target=diffReturnFocus;
-  if(!target?.isConnected){
-    const workbookId=String(diffViewState.workbookId||'');
-    target=[...document.querySelectorAll('[data-open-diff]')].find(el=>String(el.dataset.openDiff||'')===workbookId)||null;
-  }
-  diffReturnFocus=null;
-  if(target&&typeof target.focus==='function')target.focus();
+  if(!target?.isConnected){const workbookId=String(diffViewState.workbookId||'');target=[...document.querySelectorAll('[data-open-diff]')].find(el=>String(el.dataset.openDiff||'')===workbookId)||null;}
+  diffReturnFocus=null;if(target&&typeof target.focus==='function')target.focus();
 }
 function syncDiffScroll(source,target){
   if(diffSyncingScroll||diffViewState.mode!=='side'||!source||!target)return;
@@ -2509,7 +2494,7 @@ window.addEventListener('keydown',e=>{
   }
 })();
 
-window.addEventListener('pagehide', () => { for (const u of [...pdfObjectUrls]) revokePdfObjectUrl(u); });
+window.addEventListener('pagehide', () => { clearDiffBrowserResources(); for (const u of [...pdfObjectUrls]) revokePdfObjectUrl(u); });
 
 
 // ---- V5: 自動処理の状態表示と履歴タイムライン ----
