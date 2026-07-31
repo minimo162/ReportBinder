@@ -804,7 +804,7 @@ for needed in ['function Invoke-DiffImageBatchGeneration', '$batchRequest', '$ba
 for needed in ['function Get-RenderRasterSheetDir', 'rasterDirectory', 'beforeRasterDirectory', 'afterRasterDirectory']:
     if needed not in server:
         raise SystemExit(f'render-time raster cache wiring missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260730_v52']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
