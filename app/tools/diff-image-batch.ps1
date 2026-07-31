@@ -34,6 +34,7 @@ $rasterMs = 0
 $analysisMs = 0
 $cacheHitSides = 0
 $rasterizedSides = 0
+$unchangedPagesSkipped = 0
 
 function ConvertTo-PathBase64([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
@@ -114,6 +115,11 @@ try {
     foreach ($item in $items) {
         $id = [string]$item.id
         $kind = [string]$item.kind
+        $unchangedPageSet = @{}
+        foreach ($rawPageNumber in @($item.unchangedPageNumbers)) {
+            $samePageNumber = [int]$rawPageNumber
+            if ($samePageNumber -gt 0) { $unchangedPageSet[$samePageNumber] = $true }
+        }
         $itemRasterDir = Join-Path $rasterRoot $id
         $result = [ordered]@{ id = $id; ok = $false; message = ''; beforePageCount = 0; afterPageCount = 0; pages = @() }
         try {
@@ -140,6 +146,11 @@ try {
                 if ($kind -notin @('added','removed','unknown')) {
                     if ([string]::IsNullOrWhiteSpace($beforeImage)) { $pageKind = 'added' }
                     elseif ([string]::IsNullOrWhiteSpace($afterImage)) { $pageKind = 'removed' }
+                    elseif ($unchangedPageSet.ContainsKey($i + 1)) {
+                        # SHA-256が完全一致するページは、C#側で画像の複製だけを行う。
+                        $pageKind = 'unchanged'
+                        $unchangedPagesSkipped++
+                    }
                 }
                 $pageRequests.Add([ReportBinderDiffBatchPageRequest]@{
                     itemId = $id
@@ -200,6 +211,8 @@ try {
             analysisMs = $analysisMs
             analysisThreads = $threads
             analyzedPages = $pageRequests.Count
+            fullyAnalyzedPages = [Math]::Max(0, $pageRequests.Count - $unchangedPagesSkipped)
+            unchangedPagesSkipped = $unchangedPagesSkipped
             cacheHitSides = $cacheHitSides
             rasterizedSides = $rasterizedSides
         }
