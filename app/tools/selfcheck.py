@@ -612,7 +612,7 @@ for needed in ['function applyPageMutationResult', 'applyPageMutationResult(resp
     if needed not in appjs:
         raise SystemExit(f'client-side fast mutation/preview path missing: {needed}')
 _history_loader = appjs.split('function loadHistoryPanels', 1)[1].split('\n}', 1)[0]
-if 'loadSnapshotHistory()' not in _history_loader or any(x in _history_loader for x in ['loadHistoryTimeline', 'loadLayoutSnapshots', 'loadFinalArchives']):
+if 'loadSnapshotHistory(' not in _history_loader or any(x in _history_loader for x in ['loadHistoryTimeline', 'loadLayoutSnapshots', 'loadFinalArchives']):
     raise SystemExit('history view must load only the selected workbook versions')
 for obsolete in ['id="history-timeline"', 'id="layout-history"', 'id="final-archives"']:
     if obsolete in html:
