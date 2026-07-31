@@ -7010,7 +7010,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 11
+$Script:DiffDetailAlgorithmVersion = 12
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7324,8 +7324,9 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
                 pageCount = 0
                 unchangedPageNumbers = @()
                 regionCount = 0
-                status = $(if ([string]$group.kind -eq 'unchanged') { 'deferred' } else { 'pending' })
-                message = $(if ([string]$group.kind -eq 'unchanged') { '変更なしシートの画像は、選択したときに作成します。' } else { '' })
+                # 全シートを一括生成せず、最初に表示するシートと選択されたシートだけを作成する。
+                status = 'deferred'
+                message = 'このシートの画像は、選択したときに作成します。'
                 confirmed = $false
                 pages = @()
             }
@@ -7567,9 +7568,8 @@ function Start-DiffDetailJob(
         $statusPath = Join-Path $jobDir "$jobId.status.json"
         $stdoutPath = Join-Path $jobDir "$jobId.diff.out.log"
         $stderrPath = Join-Path $jobDir "$jobId.diff.err.log"
-        $sheetCount = if ([string]::IsNullOrWhiteSpace($safeSheetKey)) {
-            @($skeleton.sheets | Where-Object { [string]$_.kind -ne 'unchanged' }).Count
-        } else { 1 }
+        # 比較画像はシート単位で遅延生成するため、1ジョブの対象は最大1シート。
+        $sheetCount = $(if ($skeleton.sheets.Count -gt 0) { 1 } else { 0 })
         $initial = [pscustomobject][ordered]@{
             ok = $true; jobType = 'diff-detail'; jobId = $jobId; status = 'queued'; total = $sheetCount
             completed = 0; failed = 0; percent = 1; message = '差分詳細を準備しています。'
@@ -7657,15 +7657,24 @@ function Invoke-DiffDetailJobCore($Job) {
         $allSheets = @(Get-Array $detail.sheets)
         $workIndexes = @()
         if ([string]::IsNullOrWhiteSpace($requestedSheetKey)) {
+            # 旧Web UIなどsheetKeyを送らない呼び出しでも、全シート一括生成には戻さない。
+            # 変更シートを優先し、1ジョブにつき1シートだけ処理する。
+            $preferredIndex = -1
             for ($n = 0; $n -lt $allSheets.Count; $n++) {
                 $sheetKind = [string](Get-DataProperty $allSheets[$n] 'kind' '')
                 $sheetStatus = [string](Get-DataProperty $allSheets[$n] 'status' '')
-                if ($sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed') { $workIndexes += $n }
-                elseif ($sheetStatus -ne 'ready') {
-                    $allSheets[$n].status = 'deferred'
-                    $allSheets[$n].message = '変更なしシートの画像は、選択したときに作成します。'
+                if ($sheetKind -ne 'unchanged' -and @('pending','deferred','failed') -contains $sheetStatus) {
+                    $preferredIndex = $n
+                    break
                 }
             }
+            if ($preferredIndex -lt 0) {
+                for ($n = 0; $n -lt $allSheets.Count; $n++) {
+                    $sheetStatus = [string](Get-DataProperty $allSheets[$n] 'status' '')
+                    if (@('pending','deferred','failed') -contains $sheetStatus) { $preferredIndex = $n; break }
+                }
+            }
+            if ($preferredIndex -ge 0) { $workIndexes += $preferredIndex }
         } else {
             for ($n = 0; $n -lt $allSheets.Count; $n++) { if ([string]$allSheets[$n].sheetKey -eq $requestedSheetKey) { $workIndexes += $n; break } }
             if ($workIndexes.Count -eq 0) { throw '指定したシートは比較対象に含まれていません。' }
@@ -7896,15 +7905,30 @@ function Serve-DiffPage($Context, [string]$Language, [string]$WorkbookId, [strin
         'overlay' { 'overlayAsset' }
     }
     $fileName = [string](Get-DataProperty $page[0] $property '')
-    if ([string]::IsNullOrWhiteSpace($fileName) -or $fileName -notmatch '^[A-Za-z0-9._-]+\.png$') { throw '差分画像がありません。' }
-    $full = [IO.Path]::GetFullPath((Join-Path $cacheDir (Join-Path 'p' (Join-Path $safeSheetKey $fileName))))
-    $root = [IO.Path]::GetFullPath($cacheDir)
+    if ([string]::IsNullOrWhiteSpace($fileName)) { throw '差分画像がありません。' }
+
+    $full = ''
+    $root = ''
+    if ($Asset -in @('before','after') -and $fileName -eq 'render.png') {
+        # レンダリング時に保存した120 DPI PNGを直接返し、比較キャッシュへの重複コピーを省く。
+        $sheetName = [string](Get-DataProperty $sheet[0] 'sheetName' '')
+        if ($Asset -eq 'before') {
+            $rasterDir = Get-RenderRasterSheetDir $Language ([string]$diffContext.workbookId) ([string]$diffContext.baselineSnapshotId) ([string]$diffContext.baselineVersionId) $sheetName
+        } else {
+            $rasterDir = Get-RenderRasterSheetDir $Language ([string]$diffContext.workbookId) ([string]$diffContext.currentSnapshotId) ([string]$diffContext.currentVersionId) $sheetName
+        }
+        $root = [IO.Path]::GetFullPath($rasterDir)
+        $full = [IO.Path]::GetFullPath((Join-Path $root ('page-{0:0000}.png' -f $pageNumber)))
+    } else {
+        if ($fileName -notmatch '^[A-Za-z0-9._-]+\.png$' -or $fileName -eq 'render.png') { throw '差分画像がありません。' }
+        $root = [IO.Path]::GetFullPath($cacheDir)
+        $full = [IO.Path]::GetFullPath((Join-Path $cacheDir (Join-Path 'p' (Join-Path $safeSheetKey $fileName))))
+    }
     if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
     if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $full)) {
         throw '差分画像が見つかりません。'
     }
-    # The URL contains both immutable snapshot identities and the algorithm-scoped
-    # sheet/page asset key, so the browser may safely reuse it for this comparison.
+    # URLには比較元・比較先・アルゴリズム版が含まれるため、元ラスタを直接返す場合もimmutableでよい。
     Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'image/png' $false 'private, max-age=31536000, immutable'
 }
 
