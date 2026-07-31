@@ -4139,9 +4139,6 @@ function Handle-Api($Context) {
                 ([string]$Context.Request.QueryString['scope'])
             return
         }
-        if ($method -eq 'GET' -and $path -eq '/api/history/render-page') {
-            Serve-HistoryRasterPage $Context $language ([string]$Context.Request.QueryString['workbookId']) ([string]$Context.Request.QueryString['snapshotId']) ([string]$Context.Request.QueryString['versionId']) ([string]$Context.Request.QueryString['sheetName']) ([int]$Context.Request.QueryString['pageNumber']); return
-        }
         if ($method -eq 'GET' -and $path -eq '/api/history/content-pdf') {
             Serve-HistoryContentPdf $Context $language ([string]$Context.Request.QueryString['workbookId']) ([string]$Context.Request.QueryString['versionId']) ([string]$Context.Request.QueryString['sheetName']) ([string]$Context.Request.QueryString['snapshotId']); return
         }
@@ -7070,39 +7067,6 @@ function Serve-HistoryContentPdf($Context, [string]$Language, [string]$WorkbookI
 }
 
 
-function Serve-HistoryRasterPage(
-    $Context,
-    [string]$Language,
-    [string]$WorkbookId,
-    [string]$SnapshotId,
-    [string]$VersionId,
-    [string]$SheetName,
-    [int]$PageNumber
-) {
-    if ([string]::IsNullOrWhiteSpace($WorkbookId) -or [string]::IsNullOrWhiteSpace($SnapshotId) -or
-        [string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName) -or $PageNumber -lt 1 -or $PageNumber -gt 10000) {
-        throw [System.ArgumentException]::new('workbookId / snapshotId / versionId / sheetName / pageNumber が必要です。')
-    }
-    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
-    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
-    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
-    # snapshotとversionの組み合わせを直接検証し、別世代のラスタを混在させない。
-    $renderRecordDir = Get-RenderRecordDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId
-    if (-not (Test-Path -LiteralPath $renderRecordDir -PathType Container)) {
-        throw [System.ArgumentException]::new('指定したレンダリング世代が見つかりません。')
-    }
-    $rasterDir = Get-RenderRasterSheetDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId $SheetName
-    $root = [IO.Path]::GetFullPath($rasterDir)
-    $full = [IO.Path]::GetFullPath((Join-Path $root ('page-{0:0000}.png' -f $PageNumber)))
-    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
-    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
-        Write-JsonResponse $Context 404 ([ordered]@{ ok = $false; error = 'render-raster-not-found' })
-        return
-    }
-    # 比較時に再画像化は行わず、PDF作成後のハッシュ解析で保存済みの120 DPI PNGをそのまま返す。
-    Write-FileResponse $Context 200 $full 'image/png' $false 'private, max-age=31536000, immutable'
-}
-
 function Get-AutoStateSummary([string]$Language) {
     $settings = Get-AutoRenderSettings
     $items = @()
@@ -7154,7 +7118,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 15
+$Script:DiffDetailAlgorithmVersion = 16
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
