@@ -64,6 +64,12 @@ const DIFF_PAGE_CACHE_LIMIT = 6;
 const DIFF_PDF_CACHE_LIMIT = 16;
 const DIFF_DETAIL_CACHE_LIMIT = 12;
 const DIFF_DETAIL_TIMEOUT_MS = 15000;
+const SNAPSHOT_HISTORY_CACHE_MS = 60000;
+let historyPanelsInitialized = false;
+let snapshotHistoryLoadSerial = 0;
+let snapshotHistoryWorkbookOptionsSignature = '';
+const snapshotHistoryResponseCache = new Map();
+const snapshotHistoryRequestCache = new Map();
 const diffViewState = {
   workbookId: '',
   fromSnapshotId: '',
@@ -99,6 +105,7 @@ const VIEW_NAMES = {
 
 function setActiveView(view, options = {}) {
   const next = VIEW_NAMES[view] ? view : 'dashboard';
+  const viewChanged = next !== activeView;
   activeView = next;
   try { sessionStorage.setItem('ReportBinderView', activeView); } catch {}
   document.querySelectorAll('[data-view-panel]').forEach(panel => {
@@ -110,7 +117,11 @@ function setActiveView(view, options = {}) {
     if (on) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
   });
   if (!options.noScroll) window.scrollTo({top: 0, behavior: options.instant ? 'auto' : 'smooth'});
-  if (activeView === 'history' && state) loadHistoryPanels();
+  // renderAll also reapplies the active tab. Do not turn that DOM refresh into another
+  // shared-folder request; load only on first initialization, actual tab entry, or explicit refresh.
+  if (activeView === 'history' && state && (viewChanged || !historyPanelsInitialized || options.reloadPanels)) {
+    void loadHistoryPanels({force:!!options.reloadPanels});
+  }
   if (activeView === 'final' && state) void loadFinalReadiness();
 }
 
@@ -676,7 +687,10 @@ async function loadFinalReadiness(){
 async function refresh() {
   try {
     state = normalizeStatePayload(await api('/api/state'));
+    const reloadHistory = activeView === 'history' && historyPanelsInitialized;
+    snapshotHistoryResponseCache.clear();
     renderAll();
+    if (reloadHistory) void loadHistoryPanels({force:true});
     return state;
   } catch (e) {
     showMessage('danger', '状態を読み込めません', userFriendlyError(e.message), e.detail || e.stack || e.message);
@@ -1247,6 +1261,10 @@ async function applyPresetSelection(presetOrButton) {
   activePreset=preset;try{sessionStorage.setItem('ReportBinderCategory',activePreset);}catch{}
   selectedFiles.clear();selectedWorkbooks.clear();selectedPages.clear();lastFileRangeAnchor='';lastWorkbookRangeAnchor='';lastPageRangeAnchor='';lastPageBoardRenderSignature='';
   if(configured()&&!availableFiles.length)await loadFilesSilently();
+  if(activeView==='history'){
+    historyPanelsInitialized=false;
+    snapshotHistoryLoadSerial++;
+  }
   renderAll();
 }
 
@@ -2578,9 +2596,9 @@ bind('register-selected-btn','click',()=>registerSelected($('register-selected-b
 bind('build-main-btn','click',()=>buildVolume(mainVolume(),$('build-main-btn')));bind('build-appendix-btn','click',()=>buildVolume(appendixVolume(),$('build-appendix-btn')));bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
 const changedOnlyToggle=$('changed-only-toggle');
 if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;renderPages();});
-bind('history-refresh-btn','click',()=>loadHistoryPanels());
+bind('history-refresh-btn','click',()=>loadHistoryPanels({force:true}));
 // V5-P1(#12): 版履歴パネルの対象Excel切り替え。
-bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',snapshotHistoryState.workbookId);}catch{}snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';loadSnapshotHistory();});
+bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',snapshotHistoryState.workbookId);}catch{}snapshotHistoryState.snapshots=[];snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';void loadSnapshotHistory();});
 bind('final-main-fix','click',()=>setActiveView('excel'));bind('final-appendix-fix','click',()=>setActiveView('excel'));
 bind('open-main-link','click',e=>{e.preventDefault();openFinalVolume(mainVolume(),activePreset);});bind('open-appendix-link','click',e=>{e.preventDefault();openFinalVolume(appendixVolume(),activePreset);});
 bind('mode-badge','click',()=>{const pop=$('language-popover'),btn=$('mode-badge');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));});
@@ -2760,22 +2778,70 @@ function populateSnapshotHistoryWorkbooks(){
   if(!sel)return;
   const list=workbooksForActivePreset();
   const prev=snapshotHistoryState.workbookId || sel.value || '';
-  sel.innerHTML='<option value="">選択してください</option>'+list.map(w=>`<option value="${escapeAttr(w.workbookId)}">${escapeHtml(workbookDisplayName(w))}</option>`).join('');
+  const signature=JSON.stringify(list.map(w=>[String(w.workbookId||''),workbookDisplayName(w)]));
+  if(signature!==snapshotHistoryWorkbookOptionsSignature){
+    sel.innerHTML='<option value="">選択してください</option>'+list.map(w=>`<option value="${escapeAttr(w.workbookId)}">${escapeHtml(workbookDisplayName(w))}</option>`).join('');
+    snapshotHistoryWorkbookOptionsSignature=signature;
+  }
   if(prev && list.some(w=>String(w.workbookId)===String(prev))){ sel.value=prev; snapshotHistoryState.workbookId=String(prev); }
-  else { snapshotHistoryState.workbookId=''; }
+  else {
+    snapshotHistoryState.workbookId='';
+    snapshotHistoryState.snapshots=[];
+    snapshotHistoryState.fromId='';
+    snapshotHistoryState.toId='';
+    sel.value='';
+  }
 }
 
-async function loadSnapshotHistory(){
+function snapshotHistoryCachedRecord(workbookId){
+  const record=snapshotHistoryResponseCache.get(String(workbookId||''));
+  if(!record||Date.now()-Number(record.savedAt||0)>SNAPSHOT_HISTORY_CACHE_MS)return null;
+  return record;
+}
+
+async function fetchSnapshotHistoryList(workbookId,force=false){
+  const id=String(workbookId||'');
+  const cached=!force?snapshotHistoryCachedRecord(id):null;
+  if(cached)return cached.snapshots;
+  let promise=snapshotHistoryRequestCache.get(id);
+  // A forced refresh bypasses the completed cache, but still joins an identical
+  // request already in flight so the single-threaded local server is not queued twice.
+  if(!promise){
+    promise=api(`/api/history/snapshots?workbookId=${encodeURIComponent(id)}`);
+    snapshotHistoryRequestCache.set(id,promise);
+  }
+  try{
+    const response=await promise;
+    const list=asArray(response.snapshots);
+    snapshotHistoryResponseCache.set(id,{savedAt:Date.now(),snapshots:list});
+    return list;
+  }finally{
+    if(snapshotHistoryRequestCache.get(id)===promise)snapshotHistoryRequestCache.delete(id);
+  }
+}
+
+function syncSnapshotHistorySelectionInputs(){
+  document.querySelectorAll('input[name="snap-from"]').forEach(el=>{el.checked=String(el.value)===String(snapshotHistoryState.fromId);});
+  document.querySelectorAll('input[name="snap-to"]').forEach(el=>{el.checked=String(el.value)===String(snapshotHistoryState.toId);});
+  renderSnapshotHistorySelectionHint();
+}
+
+async function loadSnapshotHistory(options={}){
+  historyPanelsInitialized=true;
+  const force=!!options.force;
+  const requestSerial=++snapshotHistoryLoadSerial;
   const box=$('snapshot-history'), diffBox=$('snapshot-history-diff');
   if(!box)return;
-  if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴は無効です。</div>';if(diffBox)diffBox.innerHTML='';return;}
+  if(!state?.inputHistoryEnabled){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">変更履歴は無効です。</div>';if(diffBox)diffBox.innerHTML='';return;}
   populateSnapshotHistoryWorkbooks();
   const wbId=String(snapshotHistoryState.workbookId||'');
-  if(!wbId){box.innerHTML='<div class="caption">対象Excelを選ぶと、版の一覧・差分・保護を表示します。</div>';if(diffBox)diffBox.innerHTML='';return;}
-  box.innerHTML='<div class="caption">版の一覧を読み込んでいます。</div>';
+  if(!wbId){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">対象Excelを選ぶと、版の一覧・差分・保護を表示します。</div>';if(diffBox)diffBox.innerHTML='';return;}
+  const cached=!force?snapshotHistoryCachedRecord(wbId):null;
+  if(!cached)box.innerHTML='<div class="caption">版の一覧を読み込んでいます。</div>';
   try{
-    const r=await api(`/api/history/snapshots?workbookId=${encodeURIComponent(wbId)}`);
-    const list=asArray(r.snapshots);snapshotHistoryState.snapshots=list;
+    const list=await fetchSnapshotHistoryList(wbId,force);
+    if(requestSerial!==snapshotHistoryLoadSerial||String(snapshotHistoryState.workbookId||'')!==wbId)return;
+    snapshotHistoryState.snapshots=list;
     if(!list.length){box.innerHTML='<div class="caption">この Excel の保存された版はまだありません。</div>';if(diffBox)diffBox.innerHTML='';return;}
     const ready=list.filter(s=>!!s.visualCompareReady);
     if(!snapshotHistoryState.toId||!ready.some(s=>String(s.snapshotId)===String(snapshotHistoryState.toId)))snapshotHistoryState.toId=String(ready[0]?.snapshotId||'');
@@ -2791,17 +2857,21 @@ async function loadSnapshotHistory(){
     box.querySelectorAll('[data-snap-pin]').forEach(b=>b.addEventListener('click',()=>toggleSnapshotPin(wbId,b.getAttribute('data-snap-pin'),b.getAttribute('data-pinned')==='1')));
     box.querySelectorAll('input[name="snap-from"]').forEach(el=>el.addEventListener('change',()=>{snapshotHistoryState.fromId=el.value;renderSnapshotHistorySelectionHint();}));
     box.querySelectorAll('input[name="snap-to"]').forEach(el=>el.addEventListener('change',()=>{snapshotHistoryState.toId=el.value;renderSnapshotHistorySelectionHint();}));
-    const swap=$('snap-swap-btn');if(swap)swap.addEventListener('click',()=>{const previousFrom=snapshotHistoryState.fromId;snapshotHistoryState.fromId=snapshotHistoryState.toId;snapshotHistoryState.toId=previousFrom;loadSnapshotHistory();});
+    const swap=$('snap-swap-btn');if(swap)swap.addEventListener('click',()=>{const previousFrom=snapshotHistoryState.fromId;snapshotHistoryState.fromId=snapshotHistoryState.toId;snapshotHistoryState.toId=previousFrom;syncSnapshotHistorySelectionInputs();});
     const db=$('snap-diff-btn');if(db)db.addEventListener('click',()=>loadSnapshotDiff(wbId));
     renderSnapshotHistorySelectionHint();
-  }catch(e){box.innerHTML=`<div class="caption">版の履歴を読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
+  }catch(e){
+    if(requestSerial!==snapshotHistoryLoadSerial||String(snapshotHistoryState.workbookId||'')!==wbId)return;
+    box.innerHTML=`<div class="caption">版の履歴を読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;
+  }
 }
 
 async function toggleSnapshotPin(workbookId, snapshotId, pinned){
   try{
     await api(pinned?'/api/history/unpin':'/api/history/pin',{method:'POST',body:{workbookId,snapshotId}});
     showMessage('ok',pinned?'保護を解除しました':'この版を保護しました',pinned?'':'保存期限による自動削除から守ります。');
-    await loadSnapshotHistory();
+    snapshotHistoryResponseCache.delete(String(workbookId||''));
+    await loadSnapshotHistory({force:true});
   }catch(e){showMessage('danger','操作できません',userFriendlyError(e.message));}
 }
 
@@ -2833,6 +2903,7 @@ async function viewHistoryContentPdf(workbookId, snapshotId, versionId, sheetNam
 
 
 
-function loadHistoryPanels(){
-  loadSnapshotHistory();
+function loadHistoryPanels(options={}){
+  historyPanelsInitialized=true;
+  return loadSnapshotHistory(options);
 }
