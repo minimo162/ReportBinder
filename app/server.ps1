@@ -62,19 +62,16 @@ $Script:PdfPageAnalyzerAvailable = $null
 $Script:AutoSchedulerProcessId = 0
 $Script:AutoSchedulerProcess = $null
 $Script:AutoSchedulerControlPath = ''
-# V5-P2: 設定・パス・承認ポリシーは Get-WorkspacePath 経由でほぼ全関数から呼ばれる。
+# V5-P2: 設定・パス・履歴容量は Get-WorkspacePath 経由で頻繁に参照される。
 # 毎回ディスクを読む(さらに config は書く)と、共有ドライブ上で致命的に遅くなる。短時間だけキャッシュする。
 $Script:AppConfigCache = $null
 $Script:AppConfigCacheAtUtc = [DateTime]::MinValue
 $Script:PathsCache = $null
 $Script:PathsCacheAtUtc = [DateTime]::MinValue
-$Script:WorkspacePolicyCache = $null
-$Script:WorkspacePolicyCacheAtUtc = [DateTime]::MinValue
 $Script:HistorySizeCache = $null
 $Script:HistorySizeCacheKey = ''
 $Script:HistorySizeCacheAtUtc = [DateTime]::MinValue
 $Script:ConfigCacheSeconds = 2
-$Script:PolicyCacheSeconds = 5
 $Script:HistorySizeCacheSeconds = 60
 $Script:ConfigMergeChanged = $false
 
@@ -442,13 +439,11 @@ function Merge-ConfigDefaults($Target, $Defaults) {
 }
 
 function Reset-ConfigCaches {
-    # 設定・パス・ポリシーを変更したら必ず呼ぶ。
+    # 設定・パスを変更したら必ず呼ぶ。
     $Script:AppConfigCache = $null
     $Script:AppConfigCacheAtUtc = [DateTime]::MinValue
     $Script:PathsCache = $null
     $Script:PathsCacheAtUtc = [DateTime]::MinValue
-    $Script:WorkspacePolicyCache = $null
-    $Script:WorkspacePolicyCacheAtUtc = [DateTime]::MinValue
     # dataDir の切替時に旧ワークスペースの容量を返さない。
     $Script:HistorySizeCache = $null
     $Script:HistorySizeCacheKey = ''
@@ -486,39 +481,15 @@ function Get-AppConfig {
     return $merged
 }
 
-function Get-WorkspacePolicy {
-    # V5: 業務承認はワークスペース単位。個人設定からは上書きできない。
-    # 注意: これは技術的なアクセス制御ではなく運用フラグである。
-    #       共有dataDirへ書き込める利用者は policy.json も編集できる。
-    # V5-P2: Test-InputHistoryEnabled は Write-HistoryEvent などから多数回呼ばれる。
-    # 共有ドライブ上の policy.json を毎回読まないよう短時間キャッシュする。
-    if ($null -ne $Script:WorkspacePolicyCache -and (([DateTime]::UtcNow - $Script:WorkspacePolicyCacheAtUtc).TotalSeconds -lt $Script:PolicyCacheSeconds)) {
-        return $Script:WorkspacePolicyCache
-    }
-    $default = [ordered]@{ schemaVersion = 1; inputHistoryApproved = $false; sourceRetentionApproved = $false; approvedBy = ''; approvedAt = ''; minimumAppVersion = '' }
-    $result = $default
-    try {
-        $paths = Get-Paths
-        if (-not [string]::IsNullOrWhiteSpace([string]$paths.dataDir)) {
-            $path = Join-Path ([string]$paths.dataDir) 'common\policy.json'
-            if (Test-Path -LiteralPath $path) { $result = Read-JsonFile $path $default }
-        }
-    } catch { $result = $default }
-    $Script:WorkspacePolicyCache = $result
-    $Script:WorkspacePolicyCacheAtUtc = [DateTime]::UtcNow
-    return $result
-}
 
 function Test-InputHistoryEnabled {
-    return [bool](Get-DataProperty (Get-WorkspacePolicy) 'inputHistoryApproved' $false)
+    # 履歴・差分は既定で有効。旧 policy.json の承認フラグは参照しない。
+    return $true
 }
 
 function Test-SourceRetentionEnabled {
-    $policy = Get-WorkspacePolicy
-    if (-not [bool](Get-DataProperty $policy 'inputHistoryApproved' $false)) { return $false }
-    if (-not [bool](Get-DataProperty $policy 'sourceRetentionApproved' $false)) { return $false }
-    # 承認条件「同一の限定フォルダ配下のみ」をコードで確認する。
-    # dataDir が提出フォルダの外にある場合は現物を保存しない。
+    # 提出Excelの現物は、管理データが提出フォルダ配下にある場合だけ保持する。
+    # policy.json ではなく実パスを検証し、外部フォルダへの意図しない複製を防ぐ。
     try {
         $paths = Get-Paths
         $sub = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -532,14 +503,8 @@ function Test-SourceRetentionEnabled {
 function Get-AutoRenderSettings {
     $config = Get-AppConfig
     $auto = Get-DataProperty $config 'autoRender' $null
-    $enabled = [bool](Get-DataProperty $auto 'enabled' $false)
-    # 矛盾設定は拒否する: 履歴が未承認なら自動処理は動かさない。
-    if ($enabled -and -not (Test-InputHistoryEnabled)) {
-        $enabled = $false
-        Write-Warning 'autoRender.enabled が有効ですが、ワークスペースで入力履歴が承認されていません。自動処理を無効にします。'
-    }
     return [ordered]@{
-        enabled = $enabled
+        enabled = [bool](Get-DataProperty $auto 'enabled' $false)
         quietPeriodSeconds = [int](Get-DataProperty $auto 'quietPeriodSeconds' 180)
         requireStableHashCount = [int](Get-DataProperty $auto 'requireStableHashCount' 2)
         deferWhileExcelInUse = [bool](Get-DataProperty $auto 'deferWhileExcelInUse' $true)
@@ -3507,50 +3472,11 @@ function Get-AllFinalReadiness($Structure,[string]$Language) {
 function Build-FinalPdf([string]$Language,[string]$Volume,[string]$Category='') {
     # category は fail closed。ここでも明示的に検証する。
     $cat = Require-WorkbookCategory $Category
-    # V5-P0: 承認前は新しい出力経路を一切通さない。V4.1 と同じ挙動にする。
-    if (-not (Test-InputHistoryEnabled)) { return Build-FinalPdfLegacy $Language $Volume $cat }
-    # V5-§E: 承認済みなら単体出力もまとめて出力も同じトランザクションエンジンを通す。
+    # 単体出力もまとめて出力も、履歴とアーカイブを持つ同じトランザクションエンジンを通す。
     $r = Invoke-FinalBuildTransaction $Language $cat @($Volume)
     $built = @(Get-Array $r.built)
     if ($built.Count -eq 0) { throw [InvalidOperationException]::new('対象ページがありません。ページ構成を確認してください。') }
     return $built[0]
-}
-
-function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Category='') {
-    if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $cat=Require-WorkbookCategory $Category;$paths=Get-Paths;$workspace=Get-WorkspacePath $Language;try{[void](Scan-Updates $Language $null $false)}catch{}
-    $lockPath=Join-Path $workspace "locks\volume_${Volume}_${cat}.lock"
-    return Invoke-WithLock $lockPath {
-        $composerJar=Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar';$pdfboxJar=Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar';if(-not(Test-Path $composerJar)){throw 'ReportPdfComposer.jar がありません。'};if(-not(Test-Path $pdfboxJar)){throw 'pdfbox-app.jar がありません。'}
-        $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
-        if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
-        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=Get-OutputFileName $Volume $projectId $cat;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
-        if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の最終PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
-        $manifest=[ordered]@{schemaVersion=2;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
-        $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath);$exit=[int]$run.exitCode;$text=[string]$run.text;if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '最終PDFを作成できませんでした。'}
-        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'excel-updated' '元Excelが更新されたため、PDFを再作成後に最終PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
-        if($commit.changed){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'PDF作成中にページ構成またはPDF入力が変更されました。最新の状態で再度出力してください。'}
-        return [ordered]@{volume=$Volume;category=$cat;outputPdf=$outPath;inputFingerprint=$fpBefore;message=$text;readiness=$commit.readiness}
-    }
-}
-
-function Invoke-FinalBuildAllLegacy([string]$Language, [string]$Category, [string[]]$Volumes) {
-    # V5-P0(#2): 承認前の「まとめて出力」。新しいトランザクション/スナップショット機構を一切通さず、
-    # 単体出力と同じ V4.1 経路(Build-FinalPdfLegacy)を巻ごとに回す。
-    # トランザクション版と同様、ページが無い巻はスキップし、本当のブロッカーは Build-FinalPdfLegacy 側で送出する。
-    $cat = Require-WorkbookCategory $Category
-    $allowed = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
-    $requested = @($Volumes | Where-Object { $allowed -contains $_ })
-    if ($requested.Count -eq 0) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $built = @()
-    $skipped = @()
-    foreach ($v in $requested) {
-        $structure = Get-Structure $Language
-        $rd = Get-FinalBuildReadiness $structure $Language $v $cat
-        if ([int]$rd.pageCount -le 0) { $skipped += $v; continue }
-        $built += @(Build-FinalPdfLegacy $Language $v $cat)
-    }
-    return [ordered]@{ built = @($built); skipped = @($skipped); message = (if ($built.Count -eq 0) { '出力対象がありません。' } else { '' }) }
 }
 
 function Get-StatePayload([string]$Language) {
@@ -4060,9 +3986,7 @@ function Handle-Api($Context) {
             $body = Read-BodyJson $Context.Request
             $cat = Require-WorkbookCategory ([string]$body.category)
             $vols = @(Get-VolumeList $language | Where-Object { $_ -ne 'none' })
-            # V5-P0(#2): 承認前は「まとめて出力」も新トランザクション経路へ入れない。
-            # 単体出力(Build-FinalPdf)と同じく V4.1(legacy)で処理する。
-            $result = if (Test-InputHistoryEnabled) { Invoke-FinalBuildTransaction $language $cat $vols } else { Invoke-FinalBuildAllLegacy $language $cat $vols }
+            $result = Invoke-FinalBuildTransaction $language $cat $vols
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
         }
 
@@ -6998,7 +6922,6 @@ function Serve-HistoryContentPdf($Context, [string]$Language, [string]$WorkbookI
 
 function Get-AutoStateSummary([string]$Language) {
     $settings = Get-AutoRenderSettings
-    $policy = Get-WorkspacePolicy
     $items = @()
     try {
         $dir = Get-AutoStateDir $Language
@@ -7020,7 +6943,8 @@ function Get-AutoStateSummary([string]$Language) {
     } catch { }
     return [ordered]@{
         enabled = [bool]$settings.enabled
-        inputHistoryApproved = [bool](Get-DataProperty $policy 'inputHistoryApproved' $false)
+        # 旧Web UIとの互換性のためプロパティ名を維持する。policy.json の値ではない。
+        inputHistoryApproved = $true
         sourceRetentionApproved = [bool](Test-SourceRetentionEnabled)
         quietPeriodSeconds = [int]$settings.quietPeriodSeconds
         schedulerRunning = (Test-AutoSchedulerProcessRunning)
@@ -7047,7 +6971,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 10
+$Script:DiffDetailAlgorithmVersion = 11
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7359,6 +7283,7 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
                 beforePages = 0
                 afterPages = 0
                 pageCount = 0
+                unchangedPageNumbers = @()
                 regionCount = 0
                 status = $(if ([string]$group.kind -eq 'unchanged') { 'deferred' } else { 'pending' })
                 message = $(if ([string]$group.kind -eq 'unchanged') { '変更なしシートの画像は、選択したときに作成します。' } else { '' })
@@ -7378,9 +7303,32 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
     $currentMap = Get-DiffHashSheetMap $currentHashes
     $baselineMap = Get-DiffHashSheetMap $baselineHashes
     foreach ($item in $items) {
-        if ($baselineMap.ContainsKey([string]$item.sheetName)) { $item.beforePages = Get-IntDataProperty $baselineMap[[string]$item.sheetName] 'pageCount' 0 }
-        if ($currentMap.ContainsKey([string]$item.sheetName)) { $item.afterPages = Get-IntDataProperty $currentMap[[string]$item.sheetName] 'pageCount' 0 }
+        $beforeSheet = $null
+        $afterSheet = $null
+        if ($baselineMap.ContainsKey([string]$item.sheetName)) {
+            $beforeSheet = $baselineMap[[string]$item.sheetName]
+            $item.beforePages = Get-IntDataProperty $beforeSheet 'pageCount' 0
+        }
+        if ($currentMap.ContainsKey([string]$item.sheetName)) {
+            $afterSheet = $currentMap[[string]$item.sheetName]
+            $item.afterPages = Get-IntDataProperty $afterSheet 'pageCount' 0
+        }
         $item.pageCount = [Math]::Max([int]$item.beforePages, [int]$item.afterPages)
+
+        # 120 DPI・RGBの正規化画素ハッシュが完全一致するページは、差分領域解析を省略できる。
+        # 知覚ハッシュは使わずSHA-256の完全一致だけを採用するため、変更の見落としは発生しない。
+        $beforeHashes = @(Get-Array (Get-DataProperty $beforeSheet 'pageHashes' @()))
+        $afterHashes = @(Get-Array (Get-DataProperty $afterSheet 'pageHashes' @()))
+        $samePages = @()
+        $comparablePages = [Math]::Min($beforeHashes.Count, $afterHashes.Count)
+        for ($pageIndex = 0; $pageIndex -lt $comparablePages; $pageIndex++) {
+            $beforeHash = Normalize-FileHash ([string]$beforeHashes[$pageIndex])
+            $afterHash = Normalize-FileHash ([string]$afterHashes[$pageIndex])
+            if (-not [string]::IsNullOrWhiteSpace($beforeHash) -and $beforeHash -eq $afterHash) {
+                $samePages += ($pageIndex + 1)
+            }
+        }
+        $item.unchangedPageNumbers = @($samePages)
     }
     $modifiedCount = @($items | Where-Object { [string]$_.kind -eq 'modified' }).Count
     $addedCount = @($items | Where-Object { [string]$_.kind -eq 'added' }).Count
@@ -7725,6 +7673,7 @@ function Invoke-DiffDetailJobCore($Job) {
                     } else { '' })
                     beforePageCount = Get-IntDataProperty $sheet 'beforePages' 0
                     afterPageCount = Get-IntDataProperty $sheet 'afterPages' 0
+                    unchangedPageNumbers = @(Get-Array (Get-DataProperty $sheet 'unchangedPageNumbers' @()))
                     outputDirectory = $sheetDir
                     kind = $kind
                 }
