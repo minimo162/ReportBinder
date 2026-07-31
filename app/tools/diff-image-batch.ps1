@@ -34,6 +34,8 @@ $rasterMs = 0
 $analysisMs = 0
 $cacheHitSides = 0
 $rasterizedSides = 0
+$unchangedPagesSkipped = 0
+$reusedRasterPageAssets = 0
 
 function ConvertTo-PathBase64([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
@@ -76,7 +78,12 @@ try {
         elseif (-not [string]::IsNullOrWhiteSpace($beforePdf)) { $rasterizedSides++; $needsRaster = $true }
         if ($afterCached.Count -gt 0) { $cacheHitSides++ }
         elseif (-not [string]::IsNullOrWhiteSpace($afterPdf)) { $rasterizedSides++; $needsRaster = $true }
-        $cachedPagesById[$id] = [ordered]@{ before = @($beforeCached); after = @($afterCached) }
+        $cachedPagesById[$id] = [ordered]@{
+            before = @($beforeCached)
+            after = @($afterCached)
+            beforePersistent = ($beforeCached.Count -gt 0)
+            afterPersistent = ($afterCached.Count -gt 0)
+        }
         $lines += ($id + "`t" + (ConvertTo-PathBase64 $beforePdf) + "`t" + (ConvertTo-PathBase64 $afterPdf))
     }
     [IO.File]::WriteAllLines($tsvPath, $lines, [Text.UTF8Encoding]::new($false))
@@ -114,6 +121,11 @@ try {
     foreach ($item in $items) {
         $id = [string]$item.id
         $kind = [string]$item.kind
+        $unchangedPageSet = @{}
+        foreach ($rawPageNumber in @($item.unchangedPageNumbers)) {
+            $samePageNumber = [int]$rawPageNumber
+            if ($samePageNumber -gt 0) { $unchangedPageSet[$samePageNumber] = $true }
+        }
         $itemRasterDir = Join-Path $rasterRoot $id
         $result = [ordered]@{ id = $id; ok = $false; message = ''; beforePageCount = 0; afterPageCount = 0; pages = @() }
         try {
@@ -124,6 +136,8 @@ try {
                 }
             }
             $cached = $cachedPagesById[$id]
+            $beforePersistent = [bool]$cached.beforePersistent
+            $afterPersistent = [bool]$cached.afterPersistent
             $beforePages = @($cached.before)
             $afterPages = @($cached.after)
             if ($beforePages.Count -eq 0) { $beforePages = @(Get-RasterPages $itemRasterDir 'before') }
@@ -140,7 +154,16 @@ try {
                 if ($kind -notin @('added','removed','unknown')) {
                     if ([string]::IsNullOrWhiteSpace($beforeImage)) { $pageKind = 'added' }
                     elseif ([string]::IsNullOrWhiteSpace($afterImage)) { $pageKind = 'removed' }
+                    elseif ($unchangedPageSet.ContainsKey($i + 1)) {
+                        # SHA-256が完全一致するページは、C#側で画像の複製だけを行う。
+                        $pageKind = 'unchanged'
+                        $unchangedPagesSkipped++
+                    }
                 }
+                $copyBefore = (-not $beforePersistent) -or [string]::IsNullOrWhiteSpace($beforeImage)
+                $copyAfter = (-not $afterPersistent) -or [string]::IsNullOrWhiteSpace($afterImage)
+                if ($beforePersistent -and -not [string]::IsNullOrWhiteSpace($beforeImage)) { $reusedRasterPageAssets++ }
+                if ($afterPersistent -and -not [string]::IsNullOrWhiteSpace($afterImage)) { $reusedRasterPageAssets++ }
                 $pageRequests.Add([ReportBinderDiffBatchPageRequest]@{
                     itemId = $id
                     beforePath = $beforeImage
@@ -148,6 +171,8 @@ try {
                     outputDirectory = $outputDirectory
                     pageNumber = ($i + 1)
                     kind = $pageKind
+                    copyBefore = $copyBefore
+                    copyAfter = $copyAfter
                 })
             }
             $result.ok = $true
@@ -200,6 +225,9 @@ try {
             analysisMs = $analysisMs
             analysisThreads = $threads
             analyzedPages = $pageRequests.Count
+            fullyAnalyzedPages = [Math]::Max(0, $pageRequests.Count - $unchangedPagesSkipped)
+            unchangedPagesSkipped = $unchangedPagesSkipped
+            reusedRasterPageAssets = $reusedRasterPageAssets
             cacheHitSides = $cacheHitSides
             rasterizedSides = $rasterizedSides
         }

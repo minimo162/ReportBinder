@@ -48,6 +48,8 @@ public sealed class ReportBinderDiffBatchPageRequest
     public string outputDirectory;
     public int pageNumber;
     public string kind;
+    public bool copyBefore;
+    public bool copyAfter;
 }
 
 public sealed class ReportBinderDiffBatchPageResult
@@ -609,6 +611,110 @@ public static class ReportBinderDiffEngine
         normalized.Save(destination, ImageFormat.Png);
     }
 
+    private static bool TryGetImageSize(string path, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        if (String.IsNullOrWhiteSpace(path) || !File.Exists(path)) return false;
+        using (Image image = Image.FromFile(path))
+        {
+            width = image.Width;
+            height = image.Height;
+        }
+        return width > 0 && height > 0;
+    }
+
+    private static string PrepareBaseAsset(
+        string sourcePath,
+        string outputDirectory,
+        int pageNumber,
+        bool before,
+        bool copy,
+        int width,
+        int height)
+    {
+        if (!copy) return "render.png";
+        string name = pageNumber.ToString("0000") + (before ? "-b.png" : "-a.png");
+        string destination = Path.Combine(outputDirectory, name);
+        if (!String.IsNullOrWhiteSpace(sourcePath) && File.Exists(sourcePath))
+        {
+            File.Copy(sourcePath, destination, true);
+            return name;
+        }
+        using (Bitmap blank = new Bitmap(width, height, PixelFormat.Format24bppRgb))
+        using (Graphics graphics = Graphics.FromImage(blank))
+        {
+            graphics.Clear(Color.White);
+            blank.Save(destination, ImageFormat.Png);
+        }
+        return name;
+    }
+
+    private static ReportBinderDiffPage BuildSimplePage(
+        string beforePath,
+        string afterPath,
+        string outputDirectory,
+        int pageNumber,
+        string forcedKind,
+        bool copyBefore,
+        bool copyAfter)
+    {
+        int beforeWidth;
+        int beforeHeight;
+        int afterWidth;
+        int afterHeight;
+        bool hasBefore = TryGetImageSize(beforePath, out beforeWidth, out beforeHeight);
+        bool hasAfter = TryGetImageSize(afterPath, out afterWidth, out afterHeight);
+        int width = Math.Max(hasBefore ? beforeWidth : 0, hasAfter ? afterWidth : 0);
+        int height = Math.Max(hasBefore ? beforeHeight : 0, hasAfter ? afterHeight : 0);
+        if (width <= 0 || height <= 0) return null;
+        if (forcedKind == "unchanged" &&
+            (!hasBefore || !hasAfter || beforeWidth != afterWidth || beforeHeight != afterHeight))
+            return null;
+
+        string beforeName = PrepareBaseAsset(
+            beforePath, outputDirectory, pageNumber, true, copyBefore, width, height);
+        string afterName = PrepareBaseAsset(
+            afterPath, outputDirectory, pageNumber, false, copyAfter, width, height);
+        List<ReportBinderDiffRegion> regions = new List<ReportBinderDiffRegion>();
+        if (forcedKind == "added" || forcedKind == "removed")
+        {
+            int inset = Math.Max(6, Math.Min(width, height) / 250);
+            regions.Add(new ReportBinderDiffRegion
+            {
+                regionId = "p" + pageNumber.ToString("0000") + "-r0001",
+                kind = forcedKind,
+                x = (double)inset / width,
+                y = (double)inset / height,
+                width = (double)Math.Max(1, width - (inset * 2)) / width,
+                height = (double)Math.Max(1, height - (inset * 2)) / height,
+                confidence = 1,
+                pixelCount = width * height
+            });
+        }
+        bool unknown = forcedKind == "unknown";
+        return new ReportBinderDiffPage
+        {
+            pageNumber = pageNumber,
+            width = width,
+            height = height,
+            pageSizeChanged = hasBefore && hasAfter &&
+                (beforeWidth != afterWidth || beforeHeight != afterHeight),
+            status = unknown ? "unknown" : "ready",
+            message = unknown ? "信頼できる差分領域を判定できません。" : "",
+            confidence = unknown ? 0 : 1,
+            changedRatio = (forcedKind == "added" || forcedKind == "removed") ? 1 : 0,
+            regionCount = regions.Count,
+            regions = regions.ToArray(),
+            beforeFile = beforeName,
+            afterFile = afterName,
+            beforeMaskFile = "",
+            beforeOverlayFile = "",
+            afterMaskFile = "",
+            afterOverlayFile = ""
+        };
+    }
+
     public static ReportBinderDiffPage ComparePage(
         string beforePath,
         string afterPath,
@@ -619,7 +725,30 @@ public static class ReportBinderDiffEngine
         int minimumRegionPixels,
         int padding)
     {
+        return ComparePage(beforePath, afterPath, outputDirectory, pageNumber, forcedKind,
+            threshold, minimumRegionPixels, padding, true, true);
+    }
+
+    private static ReportBinderDiffPage ComparePage(
+        string beforePath,
+        string afterPath,
+        string outputDirectory,
+        int pageNumber,
+        string forcedKind,
+        int threshold,
+        int minimumRegionPixels,
+        int padding,
+        bool copyBefore,
+        bool copyAfter)
+    {
         Directory.CreateDirectory(outputDirectory);
+        if (forcedKind == "unchanged" || forcedKind == "added" ||
+            forcedKind == "removed" || forcedKind == "unknown")
+        {
+            ReportBinderDiffPage simple = BuildSimplePage(
+                beforePath, afterPath, outputDirectory, pageNumber, forcedKind, copyBefore, copyAfter);
+            if (simple != null) return simple;
+        }
         Bitmap beforeSource = LoadImage(beforePath);
         Bitmap afterSource = LoadImage(afterPath);
         try
@@ -634,10 +763,12 @@ public static class ReportBinderDiffEngine
             using (Bitmap after = Normalize(afterSource, width, height))
             {
                 string stem = pageNumber.ToString("0000");
-                string beforeName = stem + "-b.png";
-                string afterName = stem + "-a.png";
-                SaveBaseImage(beforePath, beforeSource, before, Path.Combine(outputDirectory, beforeName));
-                SaveBaseImage(afterPath, afterSource, after, Path.Combine(outputDirectory, afterName));
+                string beforeName = copyBefore ? stem + "-b.png" : "render.png";
+                string afterName = copyAfter ? stem + "-a.png" : "render.png";
+                if (copyBefore)
+                    SaveBaseImage(beforePath, beforeSource, before, Path.Combine(outputDirectory, beforeName));
+                if (copyAfter)
+                    SaveBaseImage(afterPath, afterSource, after, Path.Combine(outputDirectory, afterName));
 
                 List<PixelRegion> pixelRegions = new List<PixelRegion>();
                 double changedRatio = 0;
@@ -786,7 +917,9 @@ public static class ReportBinderDiffEngine
                     request.kind,
                     threshold,
                     minimumRegionPixels,
-                    padding);
+                    padding,
+                    request.copyBefore,
+                    request.copyAfter);
             }
             catch (Exception ex)
             {

@@ -102,12 +102,12 @@ _baseline=server.split('function Set-ComparisonBaseline',1)[1].split('\n# ---- �
 for needed in ['New-ContentPdfPin','Remove-ContentPdfPin','Get-HistoryRenderVersionAvailability','Get-ContentPdfMaintenanceLockPath']:
     if needed not in _baseline: raise SystemExit(f'automatic comparison baseline protection missing: {needed}')
 
-# Unchanged sheets are lazy, and concurrent lazy requests are retried after the active pair job.
+# Every sheet is lazy, and concurrent selected-sheet requests are retried after the active pair job.
 _skeleton=server.split('function New-DiffDetailSkeleton',1)[1].split('\nfunction Get-DiffDetail',1)[0]
-if "'deferred'" not in _skeleton: raise SystemExit('unchanged sheets must be deferred')
+if "status = 'deferred'" not in _skeleton: raise SystemExit('all comparison sheets must start deferred')
 _worker=server.split('function Invoke-DiffDetailJobCore',1)[1].split('\nfunction ',1)[0]
-if "$sheetKind -ne 'unchanged'" not in _worker or "$sheetStatus -eq 'failed'" not in _worker or 'requestedSheetKey' not in _worker:
-    raise SystemExit('initial diff job must defer unchanged sheets but retry failed lazy sheets')
+for needed in ['requestedSheetKey', '$preferredIndex', '$workIndexes += $preferredIndex']:
+    if needed not in _worker: raise SystemExit(f'one-sheet lazy worker missing: {needed}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 for needed in ['for(let attempt=0;attempt<3;attempt++)', 'joinedExistingDiffJob', "!['deferred','failed'].includes(targetStatus)", "targetStatus==='failed'&&!joinedExisting"]:
     if needed not in _appjs_early: raise SystemExit(f'lazy diff retry missing: {needed}')
@@ -295,9 +295,19 @@ _insert = server.split('function Insert-PageInSheetOrder', 1)[1].split('\nfuncti
 if 'pages=@($ordered)' in _insert or 'pages=$ordered.ToArray()' not in _insert:
     raise SystemExit('generic page list must use ToArray() for Windows PowerShell 5.1')
 
-# Approval is a workspace-level policy; personal config must not gate it.
-for fn in ['function Get-WorkspacePolicy', 'function Test-InputHistoryEnabled', 'function Test-SourceRetentionEnabled']:
+# History/diff is enabled by default; the old workspace policy gate must not return.
+for fn in ['function Test-InputHistoryEnabled', 'function Test-SourceRetentionEnabled']:
     if fn not in server: raise SystemExit('missing: ' + fn)
+if 'function Get-WorkspacePolicy' in server or '$Script:WorkspacePolicyCache' in server:
+    raise SystemExit('legacy policy.json gate/cache must be removed')
+_history_enabled = server.split('function Test-InputHistoryEnabled', 1)[1].split('\nfunction ', 1)[0]
+if 'return $true' not in _history_enabled:
+    raise SystemExit('input history and diff must be enabled without policy.json')
+_source_retention = server.split('function Test-SourceRetentionEnabled', 1)[1].split('\nfunction ', 1)[0]
+if 'StartsWith($sub, [StringComparison]::OrdinalIgnoreCase)' not in _source_retention:
+    raise SystemExit('source retention must remain limited to dataDir under submissionDir')
+if (root/'docs/POLICY_SAMPLE.json').exists():
+    raise SystemExit('obsolete POLICY_SAMPLE.json must not be distributed')
 if 'function Merge-ConfigDefaults' not in server:
     raise SystemExit('Get-AppConfig must merge default-config so existing users receive new keys')
 
@@ -426,13 +436,13 @@ _ensure = server.split('function Ensure-SnapshotMetadata', 1)[1].split('\nfuncti
 if "'manifest.json'" in _ensure: raise SystemExit('Ensure-SnapshotMetadata must write manifest.pending.json')
 if 'function Complete-Snapshot' not in server: raise SystemExit('missing Complete-Snapshot')
 
-# An unapproved workspace must behave exactly like V4.1.
+# Final PDF output always uses the transactional history/archive path.
 _bfp = server.split('function Build-FinalPdf(', 1)[1].split('\nfunction ', 1)[0]
-if 'Build-FinalPdfLegacy' not in _bfp:
-    raise SystemExit('unapproved workspaces must fall back to the V4.1 build path')
-for fn in ['function Write-HistoryEvent', 'function Save-LayoutSnapshot']:
-    blk = server.split(fn, 1)[1].split('\nfunction ', 1)[0]
-    if 'Test-InputHistoryEnabled' not in blk: raise SystemExit(f'{fn} must be gated on approval')
+if 'Invoke-FinalBuildTransaction' not in _bfp or 'Build-FinalPdfLegacy' in _bfp:
+    raise SystemExit('Build-FinalPdf must always use the transactional path')
+_build_all_route = server.split("'/api/final/build-all'", 1)[1].split("'/api/", 1)[0]
+if 'Invoke-FinalBuildAllLegacy' in _build_all_route:
+    raise SystemExit('build-all route must not fall back to the legacy path')
 
 # Archive failures must roll the transaction back, not be swallowed.
 _arch = server.split('function New-FinalArchive', 1)[1].split('\nfunction ', 1)[0]
@@ -506,7 +516,6 @@ if '$Script:ConfigMergeChanged' not in _cfg:
 if '$Script:AppConfigCache' not in _cfg:
     raise SystemExit('Get-AppConfig must cache its result')
 for fn, cache in [('function Get-Paths', '$Script:PathsCache'),
-                  ('function Get-WorkspacePolicy', '$Script:WorkspacePolicyCache'),
                   ('function Get-InputHistorySizeMb', '$Script:HistorySizeCache')]:
     blk = server.split(fn, 1)[1].split('\nfunction ', 1)[0]
     if cache not in blk: raise SystemExit(f'{fn} must be cached ({cache})')
@@ -695,8 +704,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 10' not in server:
-    raise SystemExit('parallel comparison changes must bump DiffDetailAlgorithmVersion to 10')
+if '$Script:DiffDetailAlgorithmVersion = 12' not in server:
+    raise SystemExit('lazy/raster-reuse changes must bump DiffDetailAlgorithmVersion to 12')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -755,7 +764,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 10',
+    '$Script:DiffDetailAlgorithmVersion = 12',
     '$Script:DiffDetailDpi = 120',
     '$Script:DiffDetailThreshold = 24',
     '$Script:DiffDetailMinimumRegionPixels = 24',
@@ -777,7 +786,7 @@ for needed in [
     if needed not in diff_engine:
         raise SystemExit(f'diff-region noise control missing: {needed}')
 analyzer = (root/'app/lib/pdfbox/src/PdfPageAnalyzer.java').read_text(encoding='utf-8-sig')
-for needed in ['ANALYZER_VERSION = 2', 'pagePerceptualHashes', 'perceptualHash']:
+for needed in ['ANALYZER_VERSION = 2', 'pageHashes', 'normalizedPixelHash', 'pagePerceptualHashes', 'perceptualHash']:
     if needed not in analyzer:
         raise SystemExit(f'perceptual visual hash missing: {needed}')
 
@@ -787,12 +796,33 @@ batch_script = (root/'app/tools/diff-image-batch.ps1').read_text(encoding='utf-8
 for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine', 'items = @($results)', 'rasterMs', 'analysisMs']:
     if needed not in batch_script:
         raise SystemExit(f'batched diff rasterization missing: {needed}')
-for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster']:
+for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster', 'beforePersistent', 'afterPersistent']:
     if needed not in batch_script:
         raise SystemExit(f'persistent render-raster reuse missing: {needed}')
 for needed in ['ReportBinderDiffBatchPageRequest', 'ComparePages(', 'analysisThreads', 'analyzedPages']:
     if needed not in batch_script:
         raise SystemExit(f'parallel diff analysis missing: {needed}')
+for needed in ['unchangedPageNumbers', "pageKind = 'unchanged'", 'unchangedPagesSkipped', 'fullyAnalyzedPages']:
+    if needed not in batch_script:
+        raise SystemExit(f'exact-page diff fast path missing from batch script: {needed}')
+for needed in ['BuildSimplePage', 'forcedKind == "unchanged"', 'TryGetImageSize']:
+    if needed not in diff_engine:
+        raise SystemExit(f'non-analysis diff fast path missing from engine: {needed}')
+_diff_skeleton = server.split('function New-DiffDetailSkeleton', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['pageHashes', 'Normalize-FileHash', 'unchangedPageNumbers', "status = 'deferred'"]:
+    if needed not in _diff_skeleton:
+        raise SystemExit(f'exact page hash/lazy propagation missing: {needed}')
+_diff_core = server.split('function Invoke-DiffDetailJobCore', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['$preferredIndex', '$workIndexes += $preferredIndex', '1ジョブにつき1シートだけ処理する']:
+    if needed not in _diff_core:
+        raise SystemExit(f'one-sheet lazy generation missing: {needed}')
+if "$sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed'" in _diff_core:
+    raise SystemExit('diff job must not eagerly queue every changed sheet')
+for needed in ['requestedKey', 'diffPrepareRequestBody(requestedKey)', 'prepareDiffDetail(diffViewState.selectedSheetKey)']:
+    if needed not in appjs:
+        raise SystemExit(f'browser one-sheet lazy generation missing: {needed}')
+if "if(status==='not-generated')await prepareDiffDetail();" in appjs:
+    raise SystemExit('browser must not start an all-sheet diff job')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
 for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
     if needed not in batch_java:
@@ -804,7 +834,17 @@ for needed in ['function Invoke-DiffImageBatchGeneration', '$batchRequest', '$ba
 for needed in ['function Get-RenderRasterSheetDir', 'rasterDirectory', 'beforeRasterDirectory', 'afterRasterDirectory']:
     if needed not in server:
         raise SystemExit(f'render-time raster cache wiring missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v53']:
+for needed in ['copyBefore', 'copyAfter', 'reusedRasterPageAssets']:
+    if needed not in batch_script:
+        raise SystemExit(f'comparison PNG copy avoidance missing from batch script: {needed}')
+for needed in ['public bool copyBefore', 'PrepareBaseAsset', 'return "render.png"', 'if (copyBefore)']:
+    if needed not in diff_engine:
+        raise SystemExit(f'comparison PNG copy avoidance missing from engine: {needed}')
+_serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
+    if needed not in _serve_diff:
+        raise SystemExit(f'direct render-raster serving missing: {needed}')
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v54']:
     if needed not in html:
         raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
