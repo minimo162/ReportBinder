@@ -2398,6 +2398,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
         # ハッシュは「実際に開くファイル」に対して計算しなければならない。
         # 現行Excelのハッシュを使うと、検知版からレンダリングしたのに最新扱いになりCASが壊れる。
         $inputInfo = $null
+        $inputHashVerified = $false
         $ephemeralCaptureId = ''
         if ([string]::IsNullOrWhiteSpace($SourceOverridePath)) {
             try { $inputInfo = Capture-RenderInput $Language $WorkbookId $SourceSnapshotId '' } catch { $inputInfo = $null }
@@ -2405,6 +2406,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 $SourceOverridePath = [string]$inputInfo.path
                 $SourceSnapshotId = [string]$inputInfo.snapshotId
                 $ExpectedSourceHash = [string]$inputInfo.hash
+                $inputHashVerified = [bool](Get-DataProperty $inputInfo 'verified' $false)
                 if ([bool]$inputInfo.ephemeral) { $ephemeralCaptureId = [string]$inputInfo.captureId }
             }
         }
@@ -2415,12 +2417,18 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
         }
         $sourceHash = ''
         $lastReadError = ''
-        for ($readAttempt = 1; $readAttempt -le 3; $readAttempt++) {
-            try {
-                $sourceHash = New-StableHash $sourcePath
-                if (-not [string]::IsNullOrWhiteSpace($sourceHash)) { break }
-            } catch { $lastReadError = $_.Exception.Message }
-            if ($readAttempt -lt 3) { Start-Sleep -Seconds 2 }
+        if ($inputHashVerified -and -not [string]::IsNullOrWhiteSpace($ExpectedSourceHash)) {
+            # Capture-RenderInput already verified this immutable/local captured input.
+            # Re-reading the whole XLSX from a shared snapshot would duplicate the slowest I/O.
+            $sourceHash = Normalize-FileHash $ExpectedSourceHash
+        } else {
+            for ($readAttempt = 1; $readAttempt -le 3; $readAttempt++) {
+                try {
+                    $sourceHash = New-StableHash $sourcePath
+                    if (-not [string]::IsNullOrWhiteSpace($sourceHash)) { break }
+                } catch { $lastReadError = $_.Exception.Message }
+                if ($readAttempt -lt 3) { Start-Sleep -Seconds 2 }
+            }
         }
         # V5-§6.3a: catch 経路が「どの版を試行したか」を知るために記録する。
         # 同一プロセス内のレンダリングは render-engine ロックで直列化されているため安全。
@@ -3175,6 +3183,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
     $status = [pscustomobject][ordered]@{ ok = $true; jobId = $jobId; status = 'running'; total = $total; completed = 0; failed = 0; percent = 3; message = $statusMessage; currentWorkbookId = ''; currentWorkbookName = ''; currentSheet = ''; processId = $processId; stdoutPath = $stdoutPath; stderrPath = $stderrPath; results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = '' }
     Write-RenderJobStatus $statusPath $status
     $excel = $null
+    $renderLoopSucceeded = $false
     try {
         if ($onlyUpdated -and -not $explicitIds) {
             $status.status = 'scanning'
@@ -3273,19 +3282,19 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
                 $status.failed = [int]$status.failed + 1
             }
             $status.currentSheet = ''
-            $status.percent = [int][Math]::Floor((([int]$status.completed + [int]$status.failed) / [Math]::Max(1, $total)) * 100)
+            $status.percent = [int][Math]::Min(95, [Math]::Floor((([int]$status.completed + [int]$status.failed) / [Math]::Max(1, $total)) * 95))
             Write-RenderJobStatus $statusPath $status
         }
-        if ([int]$status.failed -gt 0) {
-            $status.status = 'completed-with-errors'
-            $status.message = "$($status.failed) 件でエラーが発生しました。赤いエラー表示を確認してください。"
-        } else {
-            $status.status = 'completed'
-            $status.message = "$($status.completed) 件のPDF作成が完了しました。"
-        }
-        $status.percent = 100
-        Set-NoteProperty $status 'stateSavedAt' (New-NowIso)
+        # 比較画面が開ける「completed」は、比較情報まで保存し終えてから通知する。
+        # 先に100%を返すと、ブラウザーが作成途中の共有ファイルを読み始めて停止して見える。
+        $status.status = 'analyzing'
+        $status.currentWorkbookId = ''
+        $status.currentWorkbookName = ''
+        $status.currentSheet = ''
+        $status.percent = 96
+        $status.message = '比較情報を準備しています。'
         Write-RenderJobStatus $statusPath $status
+        $renderLoopSucceeded = $true
     } catch {
         $status.status = 'failed'
         $status.message = $_.Exception.Message
@@ -3297,10 +3306,30 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
         [GC]::Collect(); [GC]::WaitForPendingFinalizers()
         # V5-P1: Excel を閉じ、レンダリングロックも解放してから解析する。
         # 比較用の再レンダリングが必要になっても、改めて共通ロックを取り直せる。
-        foreach ($pending in @($deferredAnalyses | Where-Object { $null -ne $_ })) {
+        $analysisItems = @($deferredAnalyses | Where-Object { $null -ne $_ })
+        $analysisIndex = 0
+        foreach ($pending in $analysisItems) {
+            $analysisIndex++
+            if ($renderLoopSucceeded) {
+                $status.message = "比較情報を準備しています: $analysisIndex / $($analysisItems.Count) 件"
+                $status.percent = [int][Math]::Min(99, 96 + [Math]::Floor(($analysisIndex / [Math]::Max(1, $analysisItems.Count)) * 3))
+                Write-RenderJobStatus $statusPath $status
+            }
             try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
             catch { Write-Warning ('画像ハッシュの解析に失敗しました: ' + $_.Exception.Message) }
         }
+    }
+    if ($renderLoopSucceeded) {
+        if ([int]$status.failed -gt 0) {
+            $status.status = 'completed-with-errors'
+            $status.message = "$($status.failed) 件でエラーが発生しました。赤いエラー表示を確認してください。"
+        } else {
+            $status.status = 'completed'
+            $status.message = "$($status.completed) 件のPDF作成が完了しました。"
+        }
+        $status.percent = 100
+        Set-NoteProperty $status 'stateSavedAt' (New-NowIso)
+        Write-RenderJobStatus $statusPath $status
     }
 }
 
@@ -4977,14 +5006,14 @@ function Capture-RenderInput([string]$Language, [string]$WorkbookId, [string]$Sn
     if (Test-SourceRetentionEnabled) {
         $state = Get-SnapshotSourceState $Language $WorkbookId $snap
         if ([bool]$state.sourceRetained) {
-            return [ordered]@{ path = [string]$state.sourcePath; snapshotId = $snap; ephemeral = $false; hash = $hash }
+            return [ordered]@{ path = [string]$state.sourcePath; snapshotId = $snap; ephemeral = $false; hash = $hash; verified = $true }
         }
         # 現物が消えている: 提出フォルダの現物が同じハッシュなら復元する。
         if (Test-Path -LiteralPath $livePath) {
             $liveHash = Normalize-FileHash (New-Sha256 $livePath)
             if ($liveHash -eq $hash) {
                 $r = Save-SnapshotSourceFile $Language $WorkbookId $snap $livePath $hash
-                if ([bool]$r.ok) { return [ordered]@{ path = [string]$r.path; snapshotId = $snap; ephemeral = $false; hash = $hash } }
+                if ([bool]$r.ok) { return [ordered]@{ path = [string]$r.path; snapshotId = $snap; ephemeral = $false; hash = $hash; verified = $true } }
             }
         }
     }
@@ -5006,7 +5035,7 @@ function Capture-RenderInput([string]$Language, [string]$WorkbookId, [string]$Sn
         Remove-EphemeralCopy $Language $captureId
         return [ordered]@{ path = ''; snapshotId = ''; ephemeral = $false; hash = '' }
     }
-    return [ordered]@{ path = $tmp; snapshotId = $snap; ephemeral = $true; hash = $tmpHash; captureId = $captureId }
+    return [ordered]@{ path = $tmp; snapshotId = $snap; ephemeral = $true; hash = $tmpHash; captureId = $captureId; verified = $true }
 }
 
 function Remove-EphemeralCopy([string]$Language, [string]$CaptureId) {
@@ -6197,7 +6226,9 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
         foreach ($r in @(Get-Array $Rendered)) {
             $pdf = [string](Get-DataProperty $r 'pdf' '')
             $name = [string](Get-DataProperty $r 'sheetName' '')
-            if ($pdf -and $name -and (Test-Path -LiteralPath $pdf)) {
+            # Render-Workbook already validated every output PDF before queuing this analysis.
+            # Avoid one extra SMB stat per sheet on the comparison preparation path.
+            if ($pdf -and $name) {
                 $sheets += @{
                     sheetName = $name
                     pdf = $pdf
@@ -6580,12 +6611,46 @@ function Get-JournalTarget($Journal, [string]$Volume) {
     return $null
 }
 
+function Assert-FinalBuildSourcesUnchanged($Snapshots, [string[]]$Volumes) {
+    # 最終PDFの対象になったExcelだけを、共有フォルダー上のサイズ・更新時刻で確認する。
+    # Scan-Updates は全登録Excelを走査して structure.json もブックごとに更新するため、
+    # 最終出力のたびに呼ぶ必要はない。
+    $paths = Get-Paths
+    $seen = @{}
+    foreach ($v in $Volumes) {
+        $snap = Get-DataProperty $Snapshots $v $null
+        foreach ($w in @(Get-Array (Get-DataProperty $snap 'sourceWorkbooks' @()))) {
+            $id = [string](Get-DataProperty $w 'workbookId' '')
+            if ([string]::IsNullOrWhiteSpace($id) -or $seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+            $relativePath = [string](Get-DataProperty $w 'relativePath' '')
+            $name = [string](Get-DataProperty $w 'fileName' $relativePath)
+            $full = Join-Safe ([string]$paths.submissionDir) $relativePath
+            try { $item = Get-Item -LiteralPath $full -ErrorAction Stop }
+            catch { throw [InvalidOperationException]::new("$name が提出フォルダーに見つかりません。先にPDF作成状態を確認してください。") }
+            $knownTicks = [string](Get-DataProperty $w 'currentExcelLastWriteUtcTicks' '')
+            $knownSize = [int64](Get-DataProperty $w 'currentExcelSize' -1)
+            if (-not [string]::IsNullOrWhiteSpace($knownTicks) -and $knownSize -ge 0) {
+                if ([string]$item.LastWriteTimeUtc.Ticks -ne $knownTicks -or [int64]$item.Length -ne $knownSize) {
+                    throw [InvalidOperationException]::new("$name の元Excelが更新されています。先にPDF作成してください。")
+                }
+                continue
+            }
+            # 旧データでメタデータがない場合だけ、対象ファイル1件のハッシュ確認へ縮退する。
+            $knownHash = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
+            $liveHash = Normalize-FileHash (New-StableHash $full)
+            if ([string]::IsNullOrWhiteSpace($knownHash) -or $liveHash -ne $knownHash) {
+                throw [InvalidOperationException]::new("$name の元Excelが更新されています。先にPDF作成してください。")
+            }
+        }
+    }
+}
+
 function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [string[]]$Volumes) {
     # 単体出力もまとめて出力も、必ずこの1本を通る(単体だけ障害復旧が無い状態を作らない)。
     $cat = Require-WorkbookCategory $Category
     $paths = Get-Paths
     $workspace = Get-WorkspacePath $Language
-    try { [void](Scan-Updates $Language $null $false) } catch { }
 
     $allowed = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
     $requested = @($Volumes | Where-Object { $allowed -contains $_ })
@@ -6599,10 +6664,12 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
         $snapshots = @{}
         $targets = @()
         $skipped = @()
-        foreach ($v in $requested) {
-            $snap = Update-StructureLocked $Language {
-                param($st)
-                Apply-DefaultNumberingPerVolume $Language $st $cat
+        # 既定番号の適用と全volumeの入力固定を、structure.json 1回の更新で済ませる。
+        $initialSnapshots = Update-StructureLocked $Language {
+            param($st)
+            Apply-DefaultNumberingPerVolume $Language $st $cat
+            $all = [ordered]@{}
+            foreach ($v in $requested) {
                 $sn = Get-FinalBuildInputSnapshot $st $Language $v $cat
                 # V5-P0: アーカイブ用の情報はこの時点で固定する(後で structure を読み直さない)。
                 $seen = @{}
@@ -6616,6 +6683,10 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     $sw += [ordered]@{
                         workbookId = $wid
                         fileName = [string]$w[0].fileName
+                        relativePath = [string]$w[0].relativePath
+                        currentExcelLastWriteUtcTicks = [string](Get-DataProperty $w[0] 'currentExcelLastWriteUtcTicks' '')
+                        currentExcelSize = [int64](Get-DataProperty $w[0] 'currentExcelSize' -1)
+                        currentExcelHash = Normalize-FileHash ([string](Get-DataProperty $w[0] 'currentExcelHash' ''))
                         snapshotId = [string](Get-DataProperty $w[0] 'lastRenderedSnapshotId' '')
                         versionId = [string](Get-DataProperty $w[0] 'lastRenderedVersionId' '')
                         sourceHash = Normalize-FileHash ([string](Get-DataProperty $w[0] 'lastRenderedExcelHash' ''))
@@ -6624,15 +6695,20 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     }
                 }
                 Set-NoteProperty $sn 'sourceWorkbooks' @($sw)
-                return $sn
+                $all[$v] = $sn
             }
-            if ([int]$snap.pageCount -le 0) { $skipped += $v; continue }
+            return $all
+        }
+        foreach ($v in $requested) {
+            $snap = Get-DataProperty $initialSnapshots $v $null
+            if ($null -eq $snap -or [int]$snap.pageCount -le 0) { $skipped += $v; continue }
             $blockers = @(Get-Array $snap.blockers | Where-Object { [string]$_.code -ne 'no-pages' })
             if ($blockers.Count -gt 0) { throw [InvalidOperationException]::new(("{0}：{1}" -f (Get-VolumeLabelForMessage $v), [string]$blockers[0].message)) }
             $snapshots[$v] = $snap
             $targets += $v
         }
         if ($targets.Count -eq 0) { return [ordered]@{ built = @(); skipped = @($skipped); message = '出力対象がありません。' } }
+        Assert-FinalBuildSourcesUnchanged $snapshots $targets
 
         $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
         $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
@@ -6677,22 +6753,27 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 Set-NoteProperty $t 'tempPath' $tmp
                 $snap = $snapshots[$v]
                 $manifest = [ordered]@{ schemaVersion=2; language=$Language; category=$cat; volume=$v; projectId=[string]$snap.projectId; inputFingerprint=[string]$snap.fingerprint; outputPdf=$tmp; createdAt=New-NowIso; pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true}; pages=$snap.manifestPages }
-                $manifestPath = Join-Path $workspace ("exports\manifest_{0}_{1}.json" -f $v, $cat)
-                Write-JsonFile $manifestPath $manifest
-                $java = Resolve-JavaExe
-                $run = Invoke-NativeCapture $java @('-cp', "$composerJar;$pdfboxJar", 'ReportPdfComposer', '--manifest', $manifestPath)
-                $exit = [int]$run.exitCode
-                $text = [string]$run.text
-                if ($exit -ne 0) { throw "PDFBox組版に失敗しました。exit=$exit`n$text" }
+                $manifestPath = Join-Path ([IO.Path]::GetTempPath()) ("ReportBinder_final_{0}_{1}_{2}.json" -f $v, $cat, $txId)
+                try {
+                    Write-JsonFile $manifestPath $manifest
+                    $java = Resolve-JavaExe
+                    $run = Invoke-NativeCapture $java @('-cp', "$composerJar;$pdfboxJar", 'ReportPdfComposer', '--manifest', $manifestPath)
+                    $exit = [int]$run.exitCode
+                    $text = [string]$run.text
+                    if ($exit -ne 0) { throw "PDFBox組版に失敗しました。exit=$exit`n$text" }
+                } finally {
+                    if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }
+                }
                 if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -le 0) { throw '最終PDFを作成できませんでした。' }
                 Set-NoteProperty $t 'newPdfHash' (Normalize-FileHash (New-Sha256 $tmp))
                 Set-NoteProperty $t 'manifest' $manifest
             }
             Write-FinalJournal $Language $journal
 
-            # 9. fingerprint 再確認
+            # 9. fingerprint 再確認。読取だけなので structure.json をvolumeごとに再保存しない。
+            $afterStructure = Get-Structure $Language
             foreach ($v in $targets) {
-                $after = Update-StructureLocked $Language { param($st) return Get-FinalBuildInputSnapshot $st $Language $v $cat }
+                $after = Get-FinalBuildInputSnapshot $afterStructure $Language $v $cat
                 if ([string]$after.fingerprint -ne [string]$journal.beforeFingerprints[$v]) {
                     throw 'PDF作成中にページ構成またはPDF入力が変更されました。最新の状態で再度出力してください。'
                 }
@@ -6757,11 +6838,8 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     Set-NoteProperty $vs 'lastBuiltAt' ([string]$n.lastBuiltAt)
                     Set-NoteProperty $vs 'outputPdf' ([string]$n.outputPdf)
                     Set-NoteProperty $vs 'staleReasons' @()
-                    $ready = Get-FinalBuildReadiness $st $Language $v $cat
-                    if ($ready.blockers.Count -gt 0) {
-                        Set-NoteProperty $vs 'status' 'needs-rebuild'
-                        Add-StaleReason $vs 'excel-updated' '元Excelが更新されたため、PDFを再作成後に最終PDFを再出力してください'
-                    } else { Set-NoteProperty $vs 'status' 'built' }
+                    # 同じstructureロック内でfingerprintを確認済み。再度全ページを走査しない。
+                    Set-NoteProperty $vs 'status' 'built'
                 }
                 return [ordered]@{ changed = $false }
             }
