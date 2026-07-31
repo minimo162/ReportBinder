@@ -85,6 +85,9 @@ if 'Resolve-ContentPdfSheetPathExact' not in _resolve_diff:
     raise SystemExit('diff content PDF lookup must use exact render-version resolution')
 for forbidden in ['contentPdfRetained','candidateVersion','foreach ($ver in $versions)']:
     if forbidden in _resolve_diff: raise SystemExit(f'diff content PDF lookup must not fall back: {forbidden}')
+_pdf_index=server.split('function Get-ContentPdfSheetIndex',1)[1].split('\nfunction ',1)[0]
+if '[void]$Script:ContentPdfSheetIndexCache.Remove($oldestKey)' not in _pdf_index:
+    raise SystemExit('PDF index cache eviction must not leak a Boolean into the function pipeline')
 _availability=server.split('function Get-HistoryRenderVersionAvailability',1)[1].split('\nfunction ',1)[0]
 for needed in ['visualHashAvailable','contentPdfAvailable','missingSheets','Get-ContentPdfSheetIndex','Resolve-ContentPdfSheetPathFromIndex']:
     if needed not in _availability: raise SystemExit(f'history visual-compare readiness missing: {needed}')
