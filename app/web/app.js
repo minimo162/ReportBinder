@@ -63,6 +63,7 @@ const DIFF_RENDER_SCALE = 120 / 72;
 const DIFF_PAGE_CACHE_LIMIT = 6;
 const DIFF_PDF_CACHE_LIMIT = 16;
 const DIFF_DETAIL_CACHE_LIMIT = 12;
+const DIFF_DETAIL_TIMEOUT_MS = 15000;
 const diffViewState = {
   workbookId: '',
   fromSnapshotId: '',
@@ -441,6 +442,7 @@ async function api(path, options = {}) {
     headers,
     body: hasBody ? (isBinaryBody ? rawBody : JSON.stringify(rawBody ?? {})) : undefined,
     keepalive: !!options.keepalive,
+    signal: options.signal,
     cache: 'no-store'
   });
   const text = await res.text();
@@ -1611,7 +1613,27 @@ async function fetchDiffDetailResponse(path,workbookId){
     diffDetailResponseCache.delete(key);diffDetailResponseCache.set(key,cached);
     return cached;
   }
-  const promise=api(path);
+  const promise=(async()=>{
+    let lastError=null;
+    for(let attempt=0;attempt<2;attempt++){
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),DIFF_DETAIL_TIMEOUT_MS);
+      try{return await api(path,{signal:controller.signal});}
+      catch(error){
+        lastError=error;
+        if(error?.name!=='AbortError')throw error;
+        if(attempt===0){
+          if(isDiffModalOpen()&&diffViewState.workbookId===String(workbookId||'')&&$('diff-subtitle')){
+            $('diff-subtitle').textContent='共有フォルダーの応答を再確認しています。';
+          }
+          await sleep(250);
+          continue;
+        }
+      }finally{clearTimeout(timer);}
+    }
+    const error=new Error('共有フォルダーから比較情報を取得できませんでした。比較画面を閉じて、もう一度開いてください。');
+    error.cause=lastError;throw error;
+  })();
   diffDetailResponseCache.set(key,promise);
   while(diffDetailResponseCache.size>DIFF_DETAIL_CACHE_LIMIT)diffDetailResponseCache.delete(diffDetailResponseCache.keys().next().value);
   try{return await promise;}catch(error){diffDetailResponseCache.delete(key);throw error;}
