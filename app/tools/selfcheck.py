@@ -573,6 +573,17 @@ _transaction = server.split('function Invoke-FinalBuildTransaction', 1)[1].split
 if 'New-FinalArchive $Language $cat $v' in _transaction or "Save-LayoutSnapshot $Language $cat 'final-build'" in _transaction:
     raise SystemExit('final build must not create removed archive/layout-history artifacts')
 
+# Existing automatic comparisons use their deterministic analysis file and skip redundant SMB validation.
+_glc = server.split('function Get-LatestComparison([string]', 1)[1].split('\nfunction ', 1)[0]
+if "Join-Path $recordDir 'comparison-analysis.json'" not in _glc or _glc.index('comparison-analysis.json') > _glc.index("Join-Path $recordDir 'comparisons'"):
+    raise SystemExit('existing automatic comparison must use the direct analysis file before directory enumeration')
+_diff_context = server.split('function Get-DiffDetailContext', 1)[1].split('\nfunction ', 1)[0]
+_auto_context = _diff_context.split("$status = [string]", 1)[1]
+for forbidden in ['currentPdfDir', 'baselinePdfDir', 'Get-DiffSnapshotDate $Language $safeWorkbookId $currentSnapshotId',
+                  'Get-DiffSnapshotDate $Language $safeWorkbookId $baselineSnapshotId']:
+    if forbidden in _auto_context:
+        raise SystemExit(f'automatic comparison open still performs redundant SMB validation: {forbidden}')
+
 # Shared-folder hot paths use local immutable caches and mutation responses.
 for needed in ['$Script:SnapshotManifestCache', '$Script:VisualHashCache', '$Script:SnapshotSummaryCache',
                '$Script:LocalRuntimeCacheRoot', 'function Get-LocalSnapshotSummaryCachePath',
