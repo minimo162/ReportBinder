@@ -6248,7 +6248,24 @@ function Get-LatestComparison([string]$Language, [string]$WorkbookId, $Workbook 
         if ($Script:LatestComparisonCache.ContainsKey($cacheKey)) {
             return $Script:LatestComparisonCache[$cacheKey]
         }
-        $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $snap $ver) 'comparisons'
+        # 既存データも比較フォルダーを列挙せず、レンダリング時の確定ファイルを直接読む。
+        $recordDir = Get-RenderRecordDir $Language $WorkbookId $snap $ver
+        $analysisPath = Join-Path $recordDir 'comparison-analysis.json'
+        if (Test-Path -LiteralPath $analysisPath) {
+            try {
+                $candidate = Read-JsonFile $analysisPath $null
+                $scope = [string](Get-DataProperty $candidate 'scope' '')
+                $candidateSnapshot = [string](Get-DataProperty $candidate 'currentSnapshotId' '')
+                $candidateVersion = [string](Get-DataProperty $candidate 'currentVersionId' '')
+                if ($null -ne $candidate -and ([string]::IsNullOrWhiteSpace($scope) -or $scope -eq 'automatic') -and
+                    ([string]::IsNullOrWhiteSpace($candidateSnapshot) -or $candidateSnapshot -eq $snap) -and
+                    ([string]::IsNullOrWhiteSpace($candidateVersion) -or $candidateVersion -eq $ver)) {
+                    $Script:LatestComparisonCache[$cacheKey] = $candidate
+                    return $candidate
+                }
+            } catch { }
+        }
+        $dir = Join-Path $recordDir 'comparisons'
         if (-not (Test-Path -LiteralPath $dir)) { return $null }
         foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
             try {
@@ -7400,13 +7417,8 @@ function Get-DiffDetailContext(
     # 個別PDFは表示要求時に Serve-HistoryContentPdf が厳密に検証する。
     $currentHashes = Get-VisualHashes $Language $safeWorkbookId $currentSnapshotId $currentVersionId
     $baselineHashes = Get-VisualHashes $Language $safeWorkbookId $baselineSnapshotId $baselineVersionId
-    $workspace = Get-WorkspacePath $Language
-    $currentPdfDir = Get-ContentPdfVersionDir $workspace $safeWorkbookId $currentVersionId
-    $baselinePdfDir = Get-ContentPdfVersionDir $workspace $safeWorkbookId $baselineVersionId
-    if ($null -eq $currentHashes -or $null -eq $baselineHashes -or
-        -not (Test-Path -LiteralPath $currentPdfDir -PathType Container) -or
-        -not (Test-Path -LiteralPath $baselinePdfDir -PathType Container)) {
-        $baseResult.message = '自動比較に使った画像ハッシュまたはcontent PDF世代が保持されていません。PDFを再作成してください。'
+    if ($null -eq $currentHashes -or $null -eq $baselineHashes) {
+        $baseResult.message = '自動比較に使った画像ハッシュが保持されていません。PDFを再作成してください。'
         return [pscustomobject]$baseResult
     }
     $baseResult.currentVisualHashes = $currentHashes
@@ -7414,8 +7426,8 @@ function Get-DiffDetailContext(
     $baseResult.available = $true; $baseResult.status = 'available'; $baseResult.comparison = $comparison; $baseResult.comparisonPersisted = $true
     $baseResult.currentSnapshotId = $currentSnapshotId; $baseResult.currentVersionId = $currentVersionId
     $baseResult.baselineSnapshotId = $baselineSnapshotId; $baseResult.baselineVersionId = $baselineVersionId
-    $baseResult.currentAt = Get-DiffSnapshotDate $Language $safeWorkbookId $currentSnapshotId ([string](Get-DataProperty $workbook 'lastRenderedAt' ''))
-    $baseResult.baselineAt = Get-DiffSnapshotDate $Language $safeWorkbookId $baselineSnapshotId ''
+    $baseResult.currentAt = [string](Get-DataProperty $workbook 'lastRenderedAt' ([string](Get-DataProperty $comparison 'comparedAt' '')))
+    $baseResult.baselineAt = [string](Get-DataProperty $comparison 'baselineAt' '')
     $baseResult.method = [string](Get-DataProperty $comparison 'method' '')
     return [pscustomobject]$baseResult
 }
