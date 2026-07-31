@@ -1771,11 +1771,13 @@ async function pollDiffJob(jobId,tokenId){
 }
 async function prepareDiffDetail(sheetKey=''){
   if(!diffViewState.workbookId)return;
+  // 比較画面を開いただけで全変更シートを作らない。現在選択中の1シートだけを要求する。
+  const requestedKey=String(sheetKey||diffViewState.selectedSheetKey||'');
+  if(!requestedKey)return;
   try{
-    // Another lazy sheet or the initial job may already own the pair lock. In that case
-    // wait for it, then retry this requested sheet instead of leaving it deferred.
+    // 別シートの遅延生成がpair lockを所有していれば完了を待ち、このシートを再要求する。
     for(let attempt=0;attempt<3;attempt++){
-      const started=await api('/api/history/diff/prepare',{method:'POST',body:diffPrepareRequestBody(sheetKey)});
+      const started=await api('/api/history/diff/prepare',{method:'POST',body:diffPrepareRequestBody(requestedKey)});
       const job=started.job||{};
       const joinedExisting=!!job.joinedExistingDiffJob;
       let detail=null;
@@ -1788,12 +1790,9 @@ async function prepareDiffDetail(sheetKey=''){
         detail=loaded.detail||null;
         renderDiffDetail(detail);
       }
-      if(!sheetKey)return;
-      const target=asArray(detail?.sheets).find(s=>String(s.sheetKey||'')===String(sheetKey));
+      const target=asArray(detail?.sheets).find(s=>String(s.sheetKey||'')===requestedKey);
       const targetStatus=String(target?.status||'');
       if(!target||!['deferred','failed'].includes(targetStatus))return;
-      // A failure from the job we started is final for this click. Retry only when
-      // we merely joined another in-flight job that did not complete this sheet.
       if(targetStatus==='failed'&&!joinedExisting)return;
       if(attempt<2)await sleep(150);
     }
@@ -1802,6 +1801,7 @@ async function prepareDiffDetail(sheetKey=''){
     renderDiffDetail(Object.assign({},diffViewState.detail||{},{status:'failed',message:userFriendlyError(e.message),generation:{status:'failed'}}));
   }
 }
+
 async function openDiffDetail(workbookId,opener,historyRange=null){
   const id=String(workbookId||'');if(!id)return;
   diffReturnFocus=opener||document.activeElement;
@@ -1822,8 +1822,10 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
     if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;
     renderDiffDetail(loaded.detail);
     const status=String(loaded.detail?.status||'');
-    if(status==='not-generated')await prepareDiffDetail();
-    else if(status==='generating'&&loaded.detail?.generation?.jobId){
+    const selected=asArray(loaded.detail?.sheets).find(sheet=>String(sheet.sheetKey||'')===String(diffViewState.selectedSheetKey||''));
+    if(status==='not-generated'||['deferred','failed'].includes(String(selected?.status||''))){
+      await prepareDiffDetail(diffViewState.selectedSheetKey);
+    }else if(status==='generating'&&loaded.detail?.generation?.jobId){
       const tokenId=++diffPollToken;
       await pollDiffJob(loaded.detail.generation.jobId,tokenId);
     }
