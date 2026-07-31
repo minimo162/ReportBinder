@@ -609,6 +609,58 @@ public static class ReportBinderDiffEngine
         normalized.Save(destination, ImageFormat.Png);
     }
 
+    private static ReportBinderDiffPage CopyUnchangedPage(
+        string beforePath,
+        string afterPath,
+        string outputDirectory,
+        int pageNumber)
+    {
+        if (String.IsNullOrWhiteSpace(beforePath) || String.IsNullOrWhiteSpace(afterPath) ||
+            !File.Exists(beforePath) || !File.Exists(afterPath))
+            return null;
+
+        int beforeWidth;
+        int beforeHeight;
+        int afterWidth;
+        int afterHeight;
+        using (Image before = Image.FromFile(beforePath))
+        {
+            beforeWidth = before.Width;
+            beforeHeight = before.Height;
+        }
+        using (Image after = Image.FromFile(afterPath))
+        {
+            afterWidth = after.Width;
+            afterHeight = after.Height;
+        }
+        if (beforeWidth != afterWidth || beforeHeight != afterHeight) return null;
+
+        string stem = pageNumber.ToString("0000");
+        string beforeName = stem + "-b.png";
+        string afterName = stem + "-a.png";
+        File.Copy(beforePath, Path.Combine(outputDirectory, beforeName), true);
+        File.Copy(afterPath, Path.Combine(outputDirectory, afterName), true);
+        return new ReportBinderDiffPage
+        {
+            pageNumber = pageNumber,
+            width = beforeWidth,
+            height = beforeHeight,
+            pageSizeChanged = false,
+            status = "ready",
+            message = "",
+            confidence = 1,
+            changedRatio = 0,
+            regionCount = 0,
+            regions = new ReportBinderDiffRegion[0],
+            beforeFile = beforeName,
+            afterFile = afterName,
+            beforeMaskFile = "",
+            beforeOverlayFile = "",
+            afterMaskFile = "",
+            afterOverlayFile = ""
+        };
+    }
+
     public static ReportBinderDiffPage ComparePage(
         string beforePath,
         string afterPath,
@@ -620,6 +672,11 @@ public static class ReportBinderDiffEngine
         int padding)
     {
         Directory.CreateDirectory(outputDirectory);
+        if (String.Equals(forcedKind, "unchanged", StringComparison.Ordinal))
+        {
+            ReportBinderDiffPage unchanged = CopyUnchangedPage(beforePath, afterPath, outputDirectory, pageNumber);
+            if (unchanged != null) return unchanged;
+        }
         Bitmap beforeSource = LoadImage(beforePath);
         Bitmap afterSource = LoadImage(afterPath);
         try
