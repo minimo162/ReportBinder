@@ -704,8 +704,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 11' not in server:
-    raise SystemExit('exact-page fast path must bump DiffDetailAlgorithmVersion to 11')
+if '$Script:DiffDetailAlgorithmVersion = 12' not in server:
+    raise SystemExit('lazy/raster-reuse changes must bump DiffDetailAlgorithmVersion to 12')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -764,7 +764,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 11',
+    '$Script:DiffDetailAlgorithmVersion = 12',
     '$Script:DiffDetailDpi = 120',
     '$Script:DiffDetailThreshold = 24',
     '$Script:DiffDetailMinimumRegionPixels = 24',
@@ -796,7 +796,7 @@ batch_script = (root/'app/tools/diff-image-batch.ps1').read_text(encoding='utf-8
 for needed in ['PdfBatchRasterizer', 'ProcessorCount', 'ReportBinderDiffEngine', 'items = @($results)', 'rasterMs', 'analysisMs']:
     if needed not in batch_script:
         raise SystemExit(f'batched diff rasterization missing: {needed}')
-for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster']:
+for needed in ['Get-CachedRasterPages', 'cacheHitSides', '$needsRaster', 'beforePersistent', 'afterPersistent']:
     if needed not in batch_script:
         raise SystemExit(f'persistent render-raster reuse missing: {needed}')
 for needed in ['ReportBinderDiffBatchPageRequest', 'ComparePages(', 'analysisThreads', 'analyzedPages']:
@@ -805,13 +805,24 @@ for needed in ['ReportBinderDiffBatchPageRequest', 'ComparePages(', 'analysisThr
 for needed in ['unchangedPageNumbers', "pageKind = 'unchanged'", 'unchangedPagesSkipped', 'fullyAnalyzedPages']:
     if needed not in batch_script:
         raise SystemExit(f'exact-page diff fast path missing from batch script: {needed}')
-for needed in ['CopyUnchangedPage', 'String.Equals(forcedKind, "unchanged"', 'File.Copy(beforePath']:
+for needed in ['BuildSimplePage', 'forcedKind == "unchanged"', 'TryGetImageSize']:
     if needed not in diff_engine:
-        raise SystemExit(f'exact-page diff fast path missing from engine: {needed}')
+        raise SystemExit(f'non-analysis diff fast path missing from engine: {needed}')
 _diff_skeleton = server.split('function New-DiffDetailSkeleton', 1)[1].split('\nfunction ', 1)[0]
-for needed in ['pageHashes', 'Normalize-FileHash', 'unchangedPageNumbers']:
+for needed in ['pageHashes', 'Normalize-FileHash', 'unchangedPageNumbers', "status = 'deferred'"]:
     if needed not in _diff_skeleton:
-        raise SystemExit(f'exact page hash propagation missing: {needed}')
+        raise SystemExit(f'exact page hash/lazy propagation missing: {needed}')
+_diff_core = server.split('function Invoke-DiffDetailJobCore', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['$preferredIndex', '$workIndexes += $preferredIndex', '1ジョブにつき1シートだけ処理する']:
+    if needed not in _diff_core:
+        raise SystemExit(f'one-sheet lazy generation missing: {needed}')
+if "$sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed'" in _diff_core:
+    raise SystemExit('diff job must not eagerly queue every changed sheet')
+for needed in ['requestedKey', 'diffPrepareRequestBody(requestedKey)', 'prepareDiffDetail(diffViewState.selectedSheetKey)']:
+    if needed not in appjs:
+        raise SystemExit(f'browser one-sheet lazy generation missing: {needed}')
+if "if(status==='not-generated')await prepareDiffDetail();" in appjs:
+    raise SystemExit('browser must not start an all-sheet diff job')
 batch_java = (root/'app/lib/pdfbox/src/PdfBatchRasterizer.java').read_text(encoding='utf-8-sig')
 for needed in ['newFixedThreadPool', 'Math.min(4', 'renderSafely', 'ImageIO.write']:
     if needed not in batch_java:
@@ -823,7 +834,17 @@ for needed in ['function Invoke-DiffImageBatchGeneration', '$batchRequest', '$ba
 for needed in ['function Get-RenderRasterSheetDir', 'rasterDirectory', 'beforeRasterDirectory', 'afterRasterDirectory']:
     if needed not in server:
         raise SystemExit(f'render-time raster cache wiring missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v53']:
+for needed in ['copyBefore', 'copyAfter', 'reusedRasterPageAssets']:
+    if needed not in batch_script:
+        raise SystemExit(f'comparison PNG copy avoidance missing from batch script: {needed}')
+for needed in ['public bool copyBefore', 'PrepareBaseAsset', 'return "render.png"', 'if (copyBefore)']:
+    if needed not in diff_engine:
+        raise SystemExit(f'comparison PNG copy avoidance missing from engine: {needed}')
+_serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
+    if needed not in _serve_diff:
+        raise SystemExit(f'direct render-raster serving missing: {needed}')
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'app.js?v=20260731_v54']:
     if needed not in html:
         raise SystemExit(f'browser diff layer markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
