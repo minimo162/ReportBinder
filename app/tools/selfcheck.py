@@ -942,7 +942,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v60', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v61', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -989,7 +989,33 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260731_v60' not in html:
+if 'app.js?v=20260731_v61' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
+
+# 2026-07-31 history selection rendering fixes -------------------------------
+_history_loader = appjs.split('async function loadSnapshotHistory', 1)[1].split('\nasync function ', 1)[0]
+for needed in ['snapshotHistoryLoadSerial', 'fetchSnapshotHistoryList', 'requestSerial!==snapshotHistoryLoadSerial']:
+    if needed not in _history_loader:
+        raise SystemExit(f'history response race guard is missing: {needed}')
+_fetch_snapshots = appjs.split('async function fetchSnapshotHistoryList', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['snapshotHistoryResponseCache', 'snapshotHistoryRequestCache', 'if(!promise)']:
+    if needed not in _fetch_snapshots:
+        raise SystemExit(f'history request cache/deduplication is missing: {needed}')
+if 'if(!promise||force)' in _fetch_snapshots:
+    raise SystemExit('forced history refresh must join an identical in-flight request')
+_set_view = appjs.split('function setActiveView', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['viewChanged', '!historyPanelsInitialized', 'options.reloadPanels']:
+    if needed not in _set_view:
+        raise SystemExit(f'history tab side-effect guard is missing: {needed}')
+_swap_part = _history_loader.split("const swap=$('snap-swap-btn')", 1)[1].split("const db=$('snap-diff-btn')", 1)[0]
+if 'loadSnapshotHistory' in _swap_part or 'syncSnapshotHistorySelectionInputs' not in _swap_part:
+    raise SystemExit('snapshot swap must update controls without refetching or rebuilding the table')
+if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-SnapshotSummaryEntry' not in server:
+    raise SystemExit('incremental snapshot summary cache update is missing')
+_publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
+if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
+    raise SystemExit('render completion must keep the snapshot summary cache warm')
+if 'app.js?v=20260731_v61' not in html:
+    raise SystemExit('history rendering fix must bump the app cache version')
 
 print('selfcheck ok')
