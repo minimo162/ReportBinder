@@ -1407,6 +1407,34 @@ function diffHistoryPdfParams(side,sheet){
   const before=side==='before';
   return {workbookId:diffViewState.workbookId,snapshotId:String(before?cmp.baselineSnapshotId||'':cmp.currentSnapshotId||''),versionId:String(before?cmp.baselineVersionId||'':cmp.currentVersionId||''),sheetName:String(sheet?.sheetName||'')};
 }
+async function renderDiffRasterPage(side,sheet,pageNumber,serial){
+  const params={...diffHistoryPdfParams(side,sheet),pageNumber};
+  const res=await fetch(apiUrl('/api/history/render-page',params),{
+    cache:'force-cache',
+    headers:{'X-ReportBinder-Token':token,'Accept':'image/png,application/json'}
+  });
+  const contentType=String(res.headers.get('content-type')||'').toLowerCase();
+  if(!res.ok||!contentType.includes('image/png'))throw new Error('saved-raster-unavailable');
+  const blob=await res.blob();
+  if(!blob.size)throw new Error('saved-raster-empty');
+  const bitmap=await createImageBitmap(blob);
+  try{
+    if(serial!==diffBrowserRenderSerial)return null;
+    const canvas=createWhiteDiffCanvas(bitmap.width,bitmap.height);
+    canvas.getContext('2d',{alpha:false}).drawImage(bitmap,0,0);
+    return canvas;
+  }finally{bitmap.close?.();}
+}
+async function renderDiffSourcePage(side,sheet,pageNumber,serial){
+  try{return await renderDiffRasterPage(side,sheet,pageNumber,serial);}
+  catch(error){
+    if(serial!==diffBrowserRenderSerial)return null;
+    // 古い履歴やラスタ欠落時だけPDF.jsへフォールバックする。
+    setDiffBrowserProgress(true,'保存済みページがないためPDFを描画しています。',35);
+    return renderDiffPdfPage(side,sheet,pageNumber,serial);
+  }
+}
+
 async function fetchDiffPdfDocument(side,sheet){
   const key=diffPdfDocumentKey(side,sheet);
   if(diffPdfDocumentCache.has(key)){
@@ -1535,8 +1563,8 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   const pageNumber=pageIndex+1,kind=String(sheet?.kind||'modified');
   const needBefore=kind!=='added'&&pageNumber<=Math.max(Number(sheet?.beforePages||0),1);
   const needAfter=kind!=='removed'&&pageNumber<=Math.max(Number(sheet?.afterPages||0),1);
-  setDiffBrowserProgress(true,'PDFを表示用に描画しています。',25);
-  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
+  setDiffBrowserProgress(true,'保存済みの比較ページを読み込んでいます。',20);
+  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffSourcePage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffSourcePage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
   if(serial!==diffBrowserRenderSerial)return null;
   const width=Math.max(beforeRaw?.width||0,afterRaw?.width||0),height=Math.max(beforeRaw?.height||0,afterRaw?.height||0);
   if(!width||!height)throw new Error('表示できるPDFページがありません。');
@@ -1581,6 +1609,11 @@ function diffDetailRequestPath(){
     params.set('toSnapshotId',diffViewState.toSnapshotId);
   }
   return `/api/history/diff-detail?${params.toString()}`;
+}
+function prefetchAutomaticDiffDetail(workbookId){
+  const id=String(workbookId||'');if(!id)return;
+  const path='/api/history/diff-detail?'+new URLSearchParams({workbookId:id}).toString();
+  void fetchDiffDetailResponse(path,id).catch(()=>{});
 }
 
 async function fetchDiffDetailResponse(path,workbookId){
@@ -1769,8 +1802,8 @@ function renderDiffPage(){
     diffBrowserPageCache.delete(key);diffBrowserPageCache.set(key,cached);
     setDiffBrowserProgress(false);paintDiffBrowserPage(cached);renderDiffSheetList();return;
   }
-  setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:'PDFを読み込んでいます…');
-  setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:'PDFを読み込んでいます…');
+  setDiffPaneEmpty('before',sheet.kind==='added'?`${beforeLabel}には存在しません`:'比較ページを読み込んでいます…');
+  setDiffPaneEmpty('after',sheet.kind==='removed'?`${afterLabel}では削除されています`:'比較ページを読み込んでいます…');
   void buildDiffBrowserPage(sheet,diffViewState.pageIndex,serial).then(result=>{
     if(!result||serial!==diffBrowserRenderSerial||!isDiffModalOpen())return;
     cacheDiffBrowserPage(key,result);setDiffBrowserProgress(false);paintDiffBrowserPage(result);renderDiffSheetList();
@@ -1859,7 +1892,8 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   // メタデータ取得とPDF.js/Worker初期化を並行し、比較情報の取得後に
   // ライブラリ読込が直列で追加されないようにする。
   const detailRequest=fetchDiffDetailResponse(requestPath,id);
-  void ensureDiffPdfJs().catch(()=>{});
+  // 保存済み120 DPIラスタが使える通常経路ではPDF.jsを読み込まない。
+  // ラスタ欠落時だけ renderDiffSourcePage から遅延初期化する。
   try{getDiffAnalysisWorker();}catch{}
   try{const loaded=await detailRequest;if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail(loaded.detail);}
   catch(error){renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
@@ -1888,7 +1922,11 @@ function renderWorkbooks() {
   selectedWorkbooks=new Set([...selectedWorkbooks].filter(id=>list.some(w=>String(w.workbookId)===String(id))));const allSelected=list.every(w=>selectedWorkbooks.has(String(w.workbookId||''))),someSelected=list.some(w=>selectedWorkbooks.has(String(w.workbookId||'')));
   box.className='table-shell';box.innerHTML=`<table class="data-table workbook-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-workbooks ${allSelected?'checked':''}></th><th>ファイル名</th><th class="pdf-status-col">PDF状況</th></tr></thead><tbody>${list.map(w=>{const id=String(w.workbookId||''),checked=selectedWorkbooks.has(id),renderedAt=formatDateTime(w.lastRenderedAt||'');return `<tr data-workbook-row class="${checked?'selected-row':''} ${w.status==='render-error'?'error-row':''}"><td class="check-col"><input type="checkbox" data-workbook-check value="${escapeAttr(id)}" ${checked?'checked':''}></td><td><div class="file-name-cell"><span class="file-icon excel">${iconUse('i-file-excel')}</span><div><strong title="${escapeAttr(workbookDisplayName(w))}">${escapeHtml(workbookDisplayName(w))}</strong><div class="file-meta" title="最後にページPDFを作成した日時">PDF作成日時：${escapeHtml(renderedAt)}</div></div></div></td><td class="pdf-status-col">${workbookPdfStatusCell(w)}</td></tr>`;}).join('')}</tbody></table>`;
   if(summary)summary.textContent=`${list.length}件中 ${selectedWorkbooks.size}件を選択`;const selectAll=box.querySelector('[data-select-all-workbooks]');if(selectAll){selectAll.indeterminate=someSelected&&!allSelected;selectAll.addEventListener('change',e=>{selectedWorkbooks=e.target.checked?new Set(list.map(w=>String(w.workbookId||'')).filter(Boolean)):new Set();lastWorkbookRangeAnchor='';syncWorkbookSelectionUi();renderWorkbooks();});}
-  box.querySelectorAll('[data-workbook-check]').forEach(ch=>ch.addEventListener('click',e=>{e.stopPropagation();handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));box.querySelectorAll('[data-open-diff]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();openDiffDetail(btn.dataset.openDiff||'',btn);}));box.querySelectorAll('[data-workbook-row]').forEach(row=>row.addEventListener('click',e=>{if(e.target.closest('input,button,a,select,textarea'))return;const ch=row.querySelector('[data-workbook-check]');if(!ch)return;ch.checked=!ch.checked;handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));updateRenderTargetUi();
+  box.querySelectorAll('[data-workbook-check]').forEach(ch=>ch.addEventListener('click',e=>{e.stopPropagation();handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));box.querySelectorAll('[data-open-diff]').forEach(btn=>{
+    const warm=()=>prefetchAutomaticDiffDetail(btn.dataset.openDiff||'');
+    btn.addEventListener('pointerenter',warm,{once:true});btn.addEventListener('focus',warm,{once:true});
+    btn.addEventListener('click',e=>{e.stopPropagation();openDiffDetail(btn.dataset.openDiff||'',btn);});
+  });box.querySelectorAll('[data-workbook-row]').forEach(row=>row.addEventListener('click',e=>{if(e.target.closest('input,button,a,select,textarea'))return;const ch=row.querySelector('[data-workbook-check]');if(!ch)return;ch.checked=!ch.checked;handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));updateRenderTargetUi();
 }
 
 function summarizeRenderResults(results) {
