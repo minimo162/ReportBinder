@@ -6258,6 +6258,10 @@ function Get-LatestComparison([string]$Language, [string]$WorkbookId, $Workbook 
     } catch { return $null }
 }
 
+# =====================================================================
+# V5 Stage 5 — Phase 1B / 2C: アーカイブ・レイアウト履歴・出力トランザクション
+# =====================================================================
+
 function Get-ArchiveRoot([string]$Language) { return (Join-Path (Get-WorkspacePath $Language) 'exports\archive') }
 function Get-LayoutHistoryDir([string]$Language, [string]$Category) { return (Join-Path (Get-WorkspacePath $Language) (Join-Path 'layout-history' $Category)) }
 function Get-FinalTransactionDir([string]$Language) { return (Join-Path (Get-WorkspacePath $Language) 'state\final-transactions') }
@@ -7076,7 +7080,7 @@ function Serve-HistoryRasterPage(
     [int]$PageNumber
 ) {
     if ([string]::IsNullOrWhiteSpace($WorkbookId) -or [string]::IsNullOrWhiteSpace($SnapshotId) -or
-        [string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName) -or $PageNumber -lt 1) {
+        [string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName) -or $PageNumber -lt 1 -or $PageNumber -gt 10000) {
         throw [System.ArgumentException]::new('workbookId / snapshotId / versionId / sheetName / pageNumber が必要です。')
     }
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
