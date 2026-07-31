@@ -102,12 +102,12 @@ _baseline=server.split('function Set-ComparisonBaseline',1)[1].split('\n# ---- æ
 for needed in ['New-ContentPdfPin','Remove-ContentPdfPin','Get-HistoryRenderVersionAvailability','Get-ContentPdfMaintenanceLockPath']:
     if needed not in _baseline: raise SystemExit(f'automatic comparison baseline protection missing: {needed}')
 
-# Unchanged sheets are lazy, and concurrent lazy requests are retried after the active pair job.
+# Every sheet is lazy, and concurrent selected-sheet requests are retried after the active pair job.
 _skeleton=server.split('function New-DiffDetailSkeleton',1)[1].split('\nfunction Get-DiffDetail',1)[0]
-if "'deferred'" not in _skeleton: raise SystemExit('unchanged sheets must be deferred')
+if "status = 'deferred'" not in _skeleton: raise SystemExit('all comparison sheets must start deferred')
 _worker=server.split('function Invoke-DiffDetailJobCore',1)[1].split('\nfunction ',1)[0]
-if "$sheetKind -ne 'unchanged'" not in _worker or "$sheetStatus -eq 'failed'" not in _worker or 'requestedSheetKey' not in _worker:
-    raise SystemExit('initial diff job must defer unchanged sheets but retry failed lazy sheets')
+for needed in ['requestedSheetKey', '$preferredIndex', '$workIndexes += $preferredIndex']:
+    if needed not in _worker: raise SystemExit(f'one-sheet lazy worker missing: {needed}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 for needed in ['for(let attempt=0;attempt<3;attempt++)', 'joinedExistingDiffJob', "!['deferred','failed'].includes(targetStatus)", "targetStatus==='failed'&&!joinedExisting"]:
     if needed not in _appjs_early: raise SystemExit(f'lazy diff retry missing: {needed}')
