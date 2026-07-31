@@ -3641,6 +3641,46 @@ function Write-BytesResponse($Context, [int]$Status, [byte[]]$Bytes, [string]$Co
     $Context.Response.OutputStream.Close()
 }
 
+
+function Write-FileResponse($Context, [int]$Status, [string]$FullPath, [string]$ContentType, [bool]$AllowCors = $false, [string]$CacheControl = 'no-store') {
+    Touch-ResponseActivity
+    if ([string]::IsNullOrWhiteSpace($CacheControl)) { $CacheControl = 'no-store' }
+    $CacheControl = $CacheControl -replace "[\r\n]", ''
+    $ContentType = ([string]$ContentType) -replace "[\r\n]", ''
+    $fileInfo = [IO.FileInfo]::new($FullPath)
+    if (-not $fileInfo.Exists) { throw '配信するファイルが見つかりません。' }
+    $source = [IO.File]::Open($fileInfo.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    if (Test-TcpContext $Context) {
+        try {
+            $statusText = Get-HttpStatusText $Status
+            $corsHeader = ''
+            if ($AllowCors) { $corsHeader = "Access-Control-Allow-Origin: *`r`n" }
+            $header = "HTTP/1.1 $Status $statusText`r`nContent-Type: $ContentType`r`nContent-Length: $($fileInfo.Length)`r`nCache-Control: $CacheControl`r`n${corsHeader}Connection: close`r`n`r`n"
+            $headerBytes = [Text.Encoding]::ASCII.GetBytes($header)
+            $target = $Context.TcpStream
+            $target.Write($headerBytes, 0, $headerBytes.Length)
+            $source.CopyTo($target, 65536)
+            $target.Flush()
+        } finally {
+            $source.Dispose()
+            try { if ($Context.TcpStream) { $Context.TcpStream.Close() } } catch {}
+            try { if ($Context.TcpClient) { $Context.TcpClient.Close() } } catch {}
+        }
+        return
+    }
+    try {
+        $Context.Response.StatusCode = $Status
+        $Context.Response.ContentType = $ContentType
+        $Context.Response.Headers['Cache-Control'] = $CacheControl
+        if ($AllowCors) { $Context.Response.Headers['Access-Control-Allow-Origin'] = '*' }
+        $Context.Response.ContentLength64 = $fileInfo.Length
+        $source.CopyTo($Context.Response.OutputStream, 65536)
+    } finally {
+        $source.Dispose()
+        $Context.Response.OutputStream.Close()
+    }
+}
+
 function Get-Mime([string]$Path) {
     switch ([IO.Path]::GetExtension($Path).ToLowerInvariant()) {
         '.html' { return 'text/html; charset=utf-8' }
@@ -6806,22 +6846,48 @@ function Get-HistoryTimeline([string]$Language, [int]$Limit) {
 }
 
 
-function Resolve-ContentPdfSheetPathExact([string]$Language, [string]$WorkbookId, [string]$VersionId, [string]$SheetName) {
-    if ([string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
+function Get-ContentPdfSheetIndex([string]$Language, [string]$WorkbookId, [string]$VersionId) {
     $workspace = Get-WorkspacePath $Language
-    $dir = Get-ContentPdfVersionDir $workspace $WorkbookId (Assert-SafeStorageSegment $VersionId 'versionId')
-    if (-not (Test-Path -LiteralPath $dir)) { return '' }
-    $safeName = [regex]::Replace($SheetName, '[^0-9A-Za-z]+', '-')
+    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
+    $dir = Get-ContentPdfVersionDir $workspace $WorkbookId $safeVersionId
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @{} }
+    $stamp = [IO.Directory]::GetLastWriteTimeUtc($dir).Ticks
+    $cacheKey = ([IO.Path]::GetFullPath($dir)).ToLowerInvariant()
+    $cached = $Script:ContentPdfSheetIndexCache[$cacheKey]
+    if ($null -ne $cached -and [Int64](Get-DataProperty $cached 'stamp' -1) -eq $stamp) {
+        return (Get-DataProperty $cached 'index' @{})
+    }
+    $root = [IO.Path]::GetFullPath($workspace)
+    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+    $index = @{}
     foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.pdf' -ErrorAction SilentlyContinue)) {
-        if ([string]::Equals([string]$file.BaseName, $SheetName, [StringComparison]::OrdinalIgnoreCase) -or
-            [string]::Equals([string]$file.BaseName, $safeName, [StringComparison]::OrdinalIgnoreCase)) {
-            $full = [IO.Path]::GetFullPath($file.FullName)
-            $root = [IO.Path]::GetFullPath($workspace)
-            if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
-            if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { return $full }
-        }
+        $full = [IO.Path]::GetFullPath($file.FullName)
+        if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $key = ([string]$file.BaseName).ToLowerInvariant()
+        if (-not $index.ContainsKey($key)) { $index[$key] = $full }
+    }
+    if (-not $Script:ContentPdfSheetIndexCache.ContainsKey($cacheKey) -and
+        $Script:ContentPdfSheetIndexCache.Count -ge $Script:ContentPdfSheetIndexCacheLimit) {
+        $oldestKey = @($Script:ContentPdfSheetIndexCache.Keys)[0]
+        if ($null -ne $oldestKey) { $Script:ContentPdfSheetIndexCache.Remove($oldestKey) }
+    }
+    $Script:ContentPdfSheetIndexCache[$cacheKey] = [pscustomobject][ordered]@{ stamp = $stamp; index = $index }
+    return $index
+}
+
+function Resolve-ContentPdfSheetPathFromIndex($Index, [string]$SheetName) {
+    if ($null -eq $Index -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
+    foreach ($candidate in @($SheetName, ([regex]::Replace($SheetName, '[^0-9A-Za-z]+', '-')))) {
+        $key = ([string]$candidate).ToLowerInvariant()
+        if ($Index.ContainsKey($key)) { return [string]$Index[$key] }
     }
     return ''
+}
+
+function Resolve-ContentPdfSheetPathExact([string]$Language, [string]$WorkbookId, [string]$VersionId, [string]$SheetName) {
+    if ([string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
+    $index = Get-ContentPdfSheetIndex $Language $WorkbookId $VersionId
+    return (Resolve-ContentPdfSheetPathFromIndex $index $SheetName)
 }
 
 function Get-HistoryRenderVersionAvailability([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
@@ -6844,6 +6910,8 @@ function Get-HistoryRenderVersionAvailability([string]$Language, [string]$Workbo
         $result.reason = '比較対象シートの画像ハッシュがありません。'
         return [pscustomobject]$result
     }
+    # 版ディレクトリの列挙と更新時刻確認は1回だけ行い、全シートをローカル索引で照合する。
+    $pdfIndex = Get-ContentPdfSheetIndex $Language $WorkbookId $VersionId
     $missing = @()
     foreach ($sheet in $sheets) {
         $name = [string](Get-DataProperty $sheet 'sheetName' '')
@@ -6851,7 +6919,7 @@ function Get-HistoryRenderVersionAvailability([string]$Language, [string]$Workbo
             $missing += '[sheetName missing]'
             continue
         }
-        if ([string]::IsNullOrWhiteSpace((Resolve-ContentPdfSheetPathExact $Language $WorkbookId $VersionId $name))) { $missing += $name }
+        if ([string]::IsNullOrWhiteSpace((Resolve-ContentPdfSheetPathFromIndex $pdfIndex $name))) { $missing += $name }
     }
     $result.missingSheets = @($missing)
     $result.contentPdfAvailable = ($missing.Count -eq 0)
@@ -6950,13 +7018,18 @@ function Serve-HistoryContentPdf($Context, [string]$Language, [string]$WorkbookI
         if ([string]::IsNullOrWhiteSpace($VersionId)) { throw '指定した検知版のPDFは保持されていません。' }
     }
     $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
-    if (-not [string]::IsNullOrWhiteSpace($safeSnapshotId) -and
-        @(Get-RenderVersionIds $Language $safeWorkbookId $safeSnapshotId) -notcontains $safeVersionId) {
-        throw '指定したPDF世代は、この履歴版に属していません。'
+    if (-not [string]::IsNullOrWhiteSpace($safeSnapshotId)) {
+        # renders配下を毎回列挙せず、指定された版ディレクトリを直接確認する。
+        $renderRecordDir = Get-RenderRecordDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId
+        if (-not (Test-Path -LiteralPath $renderRecordDir -PathType Container)) {
+            throw '指定したPDF世代は、この履歴版に属していません。'
+        }
     }
     $full = Resolve-ContentPdfSheetPathExact $Language $safeWorkbookId $safeVersionId $SheetName
     if ([string]::IsNullOrWhiteSpace($full)) { throw '指定した世代のPDFが見つかりません。' }
-    Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
+    # URLはsnapshot/version/sheetで不変。全バイトを先にメモリへ読むのをやめ、
+    # PDF.jsが受信済みデータから解析を始められるようストリーミングする。
+    Write-FileResponse $Context 200 $full 'application/pdf' $false 'private, max-age=31536000, immutable'
 }
 
 function Get-AutoStateSummary([string]$Language) {
@@ -7010,11 +7083,15 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 13
+$Script:DiffDetailAlgorithmVersion = 14
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
 $Script:DiffDetailPadding = 5
+# content PDFの版ディレクトリは生成完了後は不変。シート名索引を共有し、
+# 同じネットワークフォルダーをシート数分だけ再列挙しない。
+$Script:ContentPdfSheetIndexCache = @{}
+$Script:ContentPdfSheetIndexCacheLimit = 64
 
 function Get-DiffSnapshotDate([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$Fallback = '') {
     try {
@@ -7157,6 +7234,7 @@ function Get-DiffDetailContext(
         workbookId = $safeWorkbookId; workbookName = $displayName; workbook = $workbook
         comparison = $null; comparisonPersisted = $false
         currentSnapshotId = ''; currentVersionId = ''; baselineSnapshotId = ''; baselineVersionId = ''
+        currentVisualHashes = $null; baselineVisualHashes = $null
         currentAt = ''; baselineAt = ''; method = ''; scope = 'automatic'
     }
     if (-not (Test-InputHistoryEnabled)) {
@@ -7222,12 +7300,22 @@ function Get-DiffDetailContext(
     }
     $baselineSnapshotId = Assert-SafeStorageSegment $baselineSnapshotId 'baselineSnapshotId'
     $baselineVersionId = Assert-SafeStorageSegment $baselineVersionId 'baselineVersionId'
-    $currentAvailability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $currentSnapshotId $currentVersionId
-    $baselineAvailability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $baselineSnapshotId $baselineVersionId
-    if (-not [bool]$currentAvailability.ready -or -not [bool]$baselineAvailability.ready) {
-        $baseResult.message = '自動比較に使った画像ハッシュと同一世代のcontent PDFが保持されていません。PDFを再作成してください。'
+    # 自動比較の版は作成時に全PDFを検証・固定済み。詳細を開くたびに全シートを
+    # 再列挙せず、軽量な版ディレクトリとハッシュだけを確認する。
+    # 個別PDFは表示要求時に Serve-HistoryContentPdf が厳密に検証する。
+    $currentHashes = Get-VisualHashes $Language $safeWorkbookId $currentSnapshotId $currentVersionId
+    $baselineHashes = Get-VisualHashes $Language $safeWorkbookId $baselineSnapshotId $baselineVersionId
+    $workspace = Get-WorkspacePath $Language
+    $currentPdfDir = Get-ContentPdfVersionDir $workspace $safeWorkbookId $currentVersionId
+    $baselinePdfDir = Get-ContentPdfVersionDir $workspace $safeWorkbookId $baselineVersionId
+    if ($null -eq $currentHashes -or $null -eq $baselineHashes -or
+        -not (Test-Path -LiteralPath $currentPdfDir -PathType Container) -or
+        -not (Test-Path -LiteralPath $baselinePdfDir -PathType Container)) {
+        $baseResult.message = '自動比較に使った画像ハッシュまたはcontent PDF世代が保持されていません。PDFを再作成してください。'
         return [pscustomobject]$baseResult
     }
+    $baseResult.currentVisualHashes = $currentHashes
+    $baseResult.baselineVisualHashes = $baselineHashes
     $baseResult.available = $true; $baseResult.status = 'available'; $baseResult.comparison = $comparison; $baseResult.comparisonPersisted = $true
     $baseResult.currentSnapshotId = $currentSnapshotId; $baseResult.currentVersionId = $currentVersionId
     $baseResult.baselineSnapshotId = $baselineSnapshotId; $baseResult.baselineVersionId = $baselineVersionId
@@ -7332,13 +7420,17 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
             }
         }
     }
-    $currentHashes = $null
-    $baselineHashes = $null
-    # 比較結果がまだ無い初回PDF作成直後は、Contextの版IDが空のまま
-    # unavailableを返す。空IDを履歴パス関数へ渡して400にしない。
+    $currentHashes = Get-DataProperty $Context 'currentVisualHashes' $null
+    $baselineHashes = Get-DataProperty $Context 'baselineVisualHashes' $null
+    # 自動比較ではContextで読んだハッシュを再利用する。履歴比較など未設定の経路だけ
+    # ここで1回読み、同じ共有JSONへの重複アクセスを避ける。
     if ([bool]$Context.available) {
-        $currentHashes = Get-VisualHashes $Language ([string]$Context.workbookId) ([string]$Context.currentSnapshotId) ([string]$Context.currentVersionId)
-        $baselineHashes = Get-VisualHashes $Language ([string]$Context.workbookId) ([string]$Context.baselineSnapshotId) ([string]$Context.baselineVersionId)
+        if ($null -eq $currentHashes) {
+            $currentHashes = Get-VisualHashes $Language ([string]$Context.workbookId) ([string]$Context.currentSnapshotId) ([string]$Context.currentVersionId)
+        }
+        if ($null -eq $baselineHashes) {
+            $baselineHashes = Get-VisualHashes $Language ([string]$Context.workbookId) ([string]$Context.baselineSnapshotId) ([string]$Context.baselineVersionId)
+        }
     }
     $currentMap = Get-DiffHashSheetMap $currentHashes
     $baselineMap = Get-DiffHashSheetMap $baselineHashes
@@ -7415,8 +7507,17 @@ function Get-DiffDetail(
 ) {
     # 比較PNGと差分JSONは事前生成しない。対象版・シート・ページ数だけを返し、
     # 表示中の1ページをPDF.jsとWeb Workerでブラウザ内比較する。
+    $totalTimer = [Diagnostics.Stopwatch]::StartNew()
     $context = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
-    return (New-DiffDetailSkeleton $Language $context)
+    $contextMs = $totalTimer.ElapsedMilliseconds
+    $detail = New-DiffDetailSkeleton $Language $context
+    $totalTimer.Stop()
+    Set-NoteProperty $detail 'performance' ([ordered]@{
+        contextMs = $contextMs
+        skeletonMs = [Math]::Max(0, $totalTimer.ElapsedMilliseconds - $contextMs)
+        totalMs = $totalTimer.ElapsedMilliseconds
+    })
+    return $detail
 }
 
 function Resolve-DiffContentPdfPath([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$SheetName) {
