@@ -41,6 +41,12 @@ $Script:LastHeartbeatUtc = [DateTime]::UtcNow
 $Script:ClientCloseNotifiedUtc = [DateTime]::MinValue
 $Script:ShutdownRequested = $false
 $Script:CachedJavaExe = ''
+# /api/state が読んだ共有フォルダー上のメタデータを、直後の比較画面でも再利用する。
+# ファイル更新時刻・サイズまたは版IDが変われば別キー/再読込になる。
+$Script:StructureReadCache = @{}
+$Script:StructureReadCacheLimit = 4
+$Script:LatestComparisonCache = @{}
+$Script:LatestComparisonCacheLimit = 256
 # 最小化コンソールで起動されたとき、何のウィンドウか分かるようにタイトルを付ける。
 try { $host.UI.RawUI.WindowTitle = "ReportBinder サーバー ($Mode) - このウィンドウを閉じると終了します" } catch { }
 $Script:AutoRenderInProgress = $false
@@ -1055,7 +1061,23 @@ function Write-StructureUnlocked([string]$Language, $Structure, [string]$DataDir
 
 function Get-Structure([string]$Language) {
     # Read-only API path. Repair and schema migration are performed only by Initialize-Or-MigrateStructure.
-    return Read-StructureUnlocked $Language
+    # state取得直後の比較画面で同じ共有JSONを再読込しない。外部PCの更新は
+    # LastWriteTimeUtc/Lengthの変化で検出し、書込経路では明示的に破棄する。
+    $workspace = Get-WorkspacePath $Language
+    $path = Join-Path $workspace 'structure.json'
+    try { $file = Get-Item -LiteralPath $path -ErrorAction Stop } catch { return (Read-StructureUnlocked $Language) }
+    $cacheKey = (([IO.Path]::GetFullPath($path)) + '|' + $Language).ToLowerInvariant()
+    $stamp = ([string]$file.Length) + '|' + ([string]$file.LastWriteTimeUtc.Ticks)
+    $cached = $Script:StructureReadCache[$cacheKey]
+    if ($null -ne $cached -and [string]$cached.stamp -eq $stamp) { return $cached.structure }
+    $structure = Read-StructureUnlocked $Language
+    if (-not $Script:StructureReadCache.ContainsKey($cacheKey) -and
+        $Script:StructureReadCache.Count -ge $Script:StructureReadCacheLimit) {
+        $oldestKey = @($Script:StructureReadCache.Keys)[0]
+        if ($null -ne $oldestKey) { [void]$Script:StructureReadCache.Remove($oldestKey) }
+    }
+    $Script:StructureReadCache[$cacheKey] = [pscustomobject][ordered]@{ stamp = $stamp; structure = $structure }
+    return $structure
 }
 
 function Update-StructureLocked([string]$Language, [scriptblock]$Mutation) {
@@ -1065,6 +1087,8 @@ function Update-StructureLocked([string]$Language, [scriptblock]$Mutation) {
         $structure = Read-StructureUnlocked $Language
         $result = & $Mutation $structure
         Write-StructureUnlocked $Language $structure
+        # 同一ファイルシステム時刻内の連続更新でも古い読取結果を返さない。
+        $Script:StructureReadCache.Clear()
         return $result
     }
 }
@@ -4115,6 +4139,9 @@ function Handle-Api($Context) {
                 ([string]$Context.Request.QueryString['scope'])
             return
         }
+        if ($method -eq 'GET' -and $path -eq '/api/history/render-page') {
+            Serve-HistoryRasterPage $Context $language ([string]$Context.Request.QueryString['workbookId']) ([string]$Context.Request.QueryString['snapshotId']) ([string]$Context.Request.QueryString['versionId']) ([string]$Context.Request.QueryString['sheetName']) ([int]$Context.Request.QueryString['pageNumber']); return
+        }
         if ($method -eq 'GET' -and $path -eq '/api/history/content-pdf') {
             Serve-HistoryContentPdf $Context $language ([string]$Context.Request.QueryString['workbookId']) ([string]$Context.Request.QueryString['versionId']) ([string]$Context.Request.QueryString['sheetName']) ([string]$Context.Request.QueryString['snapshotId']); return
         }
@@ -6197,6 +6224,10 @@ function Get-LatestComparison([string]$Language, [string]$WorkbookId, $Workbook 
         $snap = [string](Get-DataProperty $target 'lastRenderedSnapshotId' '')
         $ver = [string](Get-DataProperty $target 'lastRenderedVersionId' '')
         if ([string]::IsNullOrWhiteSpace($snap) -or [string]::IsNullOrWhiteSpace($ver)) { return $null }
+        $cacheKey = ($Language + '|' + $WorkbookId + '|' + $snap + '|' + $ver).ToLowerInvariant()
+        if ($Script:LatestComparisonCache.ContainsKey($cacheKey)) {
+            return $Script:LatestComparisonCache[$cacheKey]
+        }
         $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $snap $ver) 'comparisons'
         if (-not (Test-Path -LiteralPath $dir)) { return $null }
         foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
@@ -6213,13 +6244,19 @@ function Get-LatestComparison([string]$Language, [string]$WorkbookId, $Workbook 
                 $candidateVersion = [string](Get-DataProperty $candidate 'currentVersionId' '')
                 if (-not [string]::IsNullOrWhiteSpace($candidateSnapshot) -and $candidateSnapshot -ne $snap) { continue }
                 if (-not [string]::IsNullOrWhiteSpace($candidateVersion) -and $candidateVersion -ne $ver) { continue }
+                if (-not $Script:LatestComparisonCache.ContainsKey($cacheKey) -and
+                    $Script:LatestComparisonCache.Count -ge $Script:LatestComparisonCacheLimit) {
+                    $oldestKey = @($Script:LatestComparisonCache.Keys)[0]
+                    if ($null -ne $oldestKey) { [void]$Script:LatestComparisonCache.Remove($oldestKey) }
+                }
+                # snapshot/version付きの自動比較は不変なので、stateで読んだ結果を詳細表示へ引き継ぐ。
+                $Script:LatestComparisonCache[$cacheKey] = $candidate
                 return $candidate
             } catch { }
         }
         return $null
     } catch { return $null }
 }
-
 
 # =====================================================================
 # V5 Stage 5 — Phase 1B / 2C: アーカイブ・レイアウト履歴・出力トランザクション
@@ -7032,6 +7069,40 @@ function Serve-HistoryContentPdf($Context, [string]$Language, [string]$WorkbookI
     Write-FileResponse $Context 200 $full 'application/pdf' $false 'private, max-age=31536000, immutable'
 }
 
+
+function Serve-HistoryRasterPage(
+    $Context,
+    [string]$Language,
+    [string]$WorkbookId,
+    [string]$SnapshotId,
+    [string]$VersionId,
+    [string]$SheetName,
+    [int]$PageNumber
+) {
+    if ([string]::IsNullOrWhiteSpace($WorkbookId) -or [string]::IsNullOrWhiteSpace($SnapshotId) -or
+        [string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName) -or $PageNumber -lt 1 -or $PageNumber -gt 10000) {
+        throw [System.ArgumentException]::new('workbookId / snapshotId / versionId / sheetName / pageNumber が必要です。')
+    }
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
+    # snapshotとversionの組み合わせを直接検証し、別世代のラスタを混在させない。
+    $renderRecordDir = Get-RenderRecordDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId
+    if (-not (Test-Path -LiteralPath $renderRecordDir -PathType Container)) {
+        throw [System.ArgumentException]::new('指定したレンダリング世代が見つかりません。')
+    }
+    $rasterDir = Get-RenderRasterSheetDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId $SheetName
+    $root = [IO.Path]::GetFullPath($rasterDir)
+    $full = [IO.Path]::GetFullPath((Join-Path $root ('page-{0:0000}.png' -f $PageNumber)))
+    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        Write-JsonResponse $Context 404 ([ordered]@{ ok = $false; error = 'render-raster-not-found' })
+        return
+    }
+    # 比較時に再画像化は行わず、PDF作成後のハッシュ解析で保存済みの120 DPI PNGをそのまま返す。
+    Write-FileResponse $Context 200 $full 'image/png' $false 'private, max-age=31536000, immutable'
+}
+
 function Get-AutoStateSummary([string]$Language) {
     $settings = Get-AutoRenderSettings
     $items = @()
@@ -7083,7 +7154,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 14
+$Script:DiffDetailAlgorithmVersion = 15
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24

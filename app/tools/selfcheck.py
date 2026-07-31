@@ -137,7 +137,7 @@ try_pos=write_json_block.find('try {')
 tmp_write_pos=write_json_block.find('Write-Utf8NoBomFile $tmp $json')
 if try_pos < 0 or tmp_write_pos < try_pos:
     raise SystemExit('atomic JSON temp write must be inside fallback try block')
-for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
+for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page','/api/history/render-page']:
     if route not in server: raise SystemExit(f'route not found: {route}')
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
@@ -162,6 +162,11 @@ for signature in [
 # Migration must be isolated from read-only Get-Structure.
 get_block=server.split('function Get-Structure',1)[1].split('function Update-StructureLocked',1)[0]
 if 'Write-StructureUnlocked' in get_block or re.search(r'(?m)^\s*Initialize-Or-MigrateStructure\b', get_block): raise SystemExit('Get-Structure must stay read-only')
+for needed in ['$Script:StructureReadCache', 'LastWriteTimeUtc.Ticks', '$file.Length']:
+    if needed not in get_block: raise SystemExit(f'Get-Structure cold-read cache missing: {needed}')
+_update_structure = server.split('function Update-StructureLocked',1)[1].split('\nfunction ',1)[0]
+if '$Script:StructureReadCache.Clear()' not in _update_structure:
+    raise SystemExit('structure writes must invalidate the read cache')
 # Fingerprint must represent rendered inputs, not the source Excel hash.
 fp_block=server.split('function Get-FinalBuildInputSnapshot',1)[1].split('function Get-FinalBuildFingerprint',1)[0]
 if 'currentExcelHash' in fp_block: raise SystemExit('currentExcelHash must not be in final build fingerprint')
@@ -484,9 +489,11 @@ for needed in ['function addedSheetSet', '追加 ${added}', "badge('追加','att
 
 # Detailed visual diff is rendered from the source PDFs in the browser.
 for needed in ['function Get-DiffDetailContext', 'function Serve-HistoryContentPdf',
-               '$Script:VisualHashDpi = 120', 'Resolve-ContentPdfSheetPathExact',
-               'function Get-ContentPdfSheetIndex', 'function Write-FileResponse',
-               "Write-FileResponse $Context 200 $full 'application/pdf' $false 'private, max-age=31536000, immutable'"]:
+               'function Serve-HistoryRasterPage', '$Script:VisualHashDpi = 120',
+               'Resolve-ContentPdfSheetPathExact', 'function Get-ContentPdfSheetIndex',
+               'function Write-FileResponse',
+               "Write-FileResponse $Context 200 $full 'application/pdf' $false 'private, max-age=31536000, immutable'",
+               "Write-FileResponse $Context 200 $full 'image/png' $false 'private, max-age=31536000, immutable'"]:
     if needed not in server:
         raise SystemExit(f'browser PDF comparison server support missing: {needed}')
 for needed in ['diffDetailRequestPath', 'diffHistoryPdfParams', 'fetchDiffPdfDocument',
@@ -537,6 +544,9 @@ for fn in ['function Save-AppConfig', 'function Ensure-Package']:
 _glc = server.split('function Get-LatestComparison([string]', 1)[1].split('\nfunction ', 1)[0]
 if '$Workbook = $null' not in _glc:
     raise SystemExit('Get-LatestComparison must accept an already-loaded workbook')
+for needed in ['$Script:LatestComparisonCache', '$cacheKey', '$snap', '$ver']:
+    if needed not in _glc:
+        raise SystemExit(f'latest automatic comparison cache missing: {needed}')
 if 'Get-WorkbookChangeSummary $Language ([string]$w.workbookId) $w' not in server:
     raise SystemExit('Get-StatePayload must pass the loaded workbook into the change summary')
 
@@ -712,8 +722,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 14' not in server:
-    raise SystemExit('browser PDF comparison changes must bump DiffDetailAlgorithmVersion to 13')
+if '$Script:DiffDetailAlgorithmVersion = 15' not in server:
+    raise SystemExit('saved-raster comparison changes must bump DiffDetailAlgorithmVersion to 15')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -732,7 +742,7 @@ if 'Write-TcpResponse $Context $Status $Bytes $ContentType $AllowCors $CacheCont
     raise SystemExit('diff asset cache policy must reach the TcpListener response path')
 appjs = (root/'app/web/app.js').read_text(encoding='utf-8-sig')
 diff_worker = (root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ["canvas.style.visibility='hidden'", 'beginDiffBrowserRender', 'task.cancel()', 'DIFF_PAGE_CACHE_LIMIT = 6', 'setDiffBrowserProgress', 'PDFを読み込んでいます…']:
+for needed in ["canvas.style.visibility='hidden'", 'beginDiffBrowserRender', 'task.cancel()', 'DIFF_PAGE_CACHE_LIMIT = 6', 'setDiffBrowserProgress', '比較ページを読み込んでいます…']:
     if needed not in appjs:
         raise SystemExit(f'browser page-switch responsiveness missing: {needed}')
 for needed in ['getImageData(0,0,width,height)', 'postMessage({id,width,height', 'diffAnalysisPending']:
@@ -771,7 +781,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 2',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 14',
+    '$Script:DiffDetailAlgorithmVersion = 15',
 ]:
     if needed not in server:
         raise SystemExit(f'comparison tolerance/browser setting missing: {needed}')
@@ -822,11 +832,19 @@ for needed in ['$preferredIndex', '$workIndexes += $preferredIndex', '1ジョブ
         raise SystemExit(f'one-sheet lazy generation missing: {needed}')
 if "$sheetKind -ne 'unchanged' -or $sheetStatus -eq 'failed'" in _diff_core:
     raise SystemExit('diff job must not eagerly queue every changed sheet')
-for needed in ['ensureDiffPdfJs', 'renderDiffPdfPage', 'analyzeDiffCanvases', 'buildDiffBrowserPage',
-               'clearDiffBrowserResources', 'fetchDiffDetailResponse', 'disableRange:false',
-               'disableStream:false', 'clearDiffBrowserResources(true)']:
+for needed in ['ensureDiffPdfJs', 'renderDiffPdfPage', 'renderDiffRasterPage', 'renderDiffSourcePage',
+               'analyzeDiffCanvases', 'buildDiffBrowserPage', 'clearDiffBrowserResources',
+               'fetchDiffDetailResponse', 'prefetchAutomaticDiffDetail', "cache:'force-cache'",
+               'disableRange:false', 'disableStream:false', 'clearDiffBrowserResources(true)']:
     if needed not in appjs:
         raise SystemExit(f'browser on-demand PDF comparison missing: {needed}')
+_open_diff = appjs.split('async function openDiffDetail', 1)[1].split('\nfunction ', 1)[0]
+if 'ensureDiffPdfJs' in _open_diff:
+    raise SystemExit('initial comparison open must not eagerly load PDF.js when saved rasters are available')
+_fetch_raster = appjs.split('async function renderDiffRasterPage', 1)[1].split('\nasync function ', 1)[0]
+for needed in ["'/api/history/render-page'", "cache:'force-cache'", 'createImageBitmap']:
+    if needed not in _fetch_raster:
+        raise SystemExit(f'saved raster fast path missing: {needed}')
 _fetch_pdf = appjs.split('async function fetchDiffPdfDocument', 1)[1].split('\nfunction ', 1)[0]
 for forbidden in ["cache:'no-store'", 'arrayBuffer()']:
     if forbidden in _fetch_pdf:
@@ -855,7 +873,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v56', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v57', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
