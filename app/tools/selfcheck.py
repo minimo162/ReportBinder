@@ -320,8 +320,8 @@ _history_enabled = server.split('function Test-InputHistoryEnabled', 1)[1].split
 if 'return $true' not in _history_enabled:
     raise SystemExit('input history and diff must be enabled without policy.json')
 _source_retention = server.split('function Test-SourceRetentionEnabled', 1)[1].split('\nfunction ', 1)[0]
-if 'StartsWith($sub, [StringComparison]::OrdinalIgnoreCase)' not in _source_retention:
-    raise SystemExit('source retention must remain limited to dataDir under submissionDir')
+if '$Script:LocalProjectsRoot' not in _source_retention or 'StartsWith($localRoot, [StringComparison]::OrdinalIgnoreCase)' not in _source_retention:
+    raise SystemExit('source retention must remain limited to the per-user local project root')
 if (root/'docs/POLICY_SAMPLE.json').exists():
     raise SystemExit('obsolete POLICY_SAMPLE.json must not be distributed')
 if 'function Merge-ConfigDefaults' not in server:
