@@ -4119,32 +4119,46 @@ function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$C
         throw '共有発行元が利用者ローカルの出力フォルダー外です。最終PDFを再出力してください。'
     }
 
-    $publishDir = Join-Path ([string]$paths.submissionDir) '共有発行'
-    if (-not (Test-Path -LiteralPath $publishDir)) { New-Item -ItemType Directory -Path $publishDir -Force | Out-Null }
+    $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
     $userName = Get-SafePublishUserName
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $baseName = [IO.Path]::GetFileNameWithoutExtension($sourceFull)
-    $fileName = "{0}_{1}_{2}.pdf" -f $baseName, $userName, $stamp
-    $destination = Join-Path $publishDir $fileName
+    $stamp = Get-Date -Format 'MMdd_HHmmss'
+    $languageMarker = $(if ($Language -eq 'ja') { 'J' } else { 'E' })
+    $baseFolderName = "{0}_{1}_{2}" -f $stamp, $languageMarker, $userName
+    $folderName = $baseFolderName
+    $publishDir = Join-Path $submissionDir $folderName
     $suffix = 2
-    while (Test-Path -LiteralPath $destination) {
-        $fileName = "{0}_{1}_{2}_{3}.pdf" -f $baseName, $userName, $stamp, $suffix
-        $destination = Join-Path $publishDir $fileName
+    while (Test-Path -LiteralPath $publishDir) {
+        $folderName = "{0}_{1}" -f $baseFolderName, $suffix
+        $publishDir = Join-Path $submissionDir $folderName
         $suffix++
     }
 
-    $uploading = Join-Path $publishDir ('.uploading-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    # PDFが半端な状態で共有側に見えないよう、同じ共有ルートの隠し一時フォルダーで
+    # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。
+    $stagingDir = Join-Path $submissionDir ('.publishing-' + [Guid]::NewGuid().ToString('N'))
+    $fileName = [IO.Path]::GetFileName($sourceFull)
+    $stagedPdf = Join-Path $stagingDir $fileName
     try {
-        Copy-Item -LiteralPath $sourceFull -Destination $uploading -Force
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        Copy-Item -LiteralPath $sourceFull -Destination $stagedPdf -Force
         $sourceLength = (Get-Item -LiteralPath $sourceFull -ErrorAction Stop).Length
-        $uploadedLength = (Get-Item -LiteralPath $uploading -ErrorAction Stop).Length
+        $uploadedLength = (Get-Item -LiteralPath $stagedPdf -ErrorAction Stop).Length
         if ($sourceLength -le 0 -or $uploadedLength -ne $sourceLength) {
             throw '共有フォルダーへのコピーサイズが一致しません。'
         }
-        Move-Item -LiteralPath $uploading -Destination $destination
+        while (Test-Path -LiteralPath $publishDir) {
+            $folderName = "{0}_{1}" -f $baseFolderName, $suffix
+            $publishDir = Join-Path $submissionDir $folderName
+            $suffix++
+        }
+        Move-Item -LiteralPath $stagingDir -Destination $publishDir
+        $stagingDir = ''
     } finally {
-        if (Test-Path -LiteralPath $uploading) { Remove-Item -LiteralPath $uploading -Force -ErrorAction SilentlyContinue }
+        if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
+            Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
+    $destination = Join-Path $publishDir $fileName
 
     $publishedAt = New-NowIso
     Write-HistoryEvent $Language 'final.published' ([ordered]@{
@@ -4152,8 +4166,11 @@ function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$C
         volume = $Volume
         source = $sourceFull
         destination = $destination
+        sharedFolder = $publishDir
+        folderName = $folderName
         fileName = $fileName
         userName = $userName
+        languageMarker = $languageMarker
         publishedAt = $publishedAt
     })
     return [ordered]@{
@@ -4161,8 +4178,11 @@ function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$C
         category = $cat
         sourcePdf = $sourceFull
         sharedPath = $destination
+        sharedFolder = $publishDir
+        folderName = $folderName
         fileName = $fileName
         publishedBy = $userName
+        languageMarker = $languageMarker
         publishedAt = $publishedAt
     }
 }

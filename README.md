@@ -82,7 +82,8 @@ app\tools\install-thirdparty.cmd
 ```text
 管理データ: %LOCALAPPDATA%\ReportBinder\projects\<提出フォルダ識別子>\data
 通常出力:   %LOCALAPPDATA%\ReportBinder\projects\<提出フォルダ識別子>\output
-共有発行:   提出フォルダ\共有発行（「共有発行」を押したときだけ作成）
+共有発行（日本語）: 提出フォルダ\MMdd_HHmmss_J_Windowsユーザー名
+共有発行（英語）:   提出フォルダ\MMdd_HHmmss_E_Windowsユーザー名
 ```
 
 既存の `提出フォルダ\_reportbinder` と `提出フォルダ\出力` は、各利用者の初回起動時に
@@ -144,9 +145,10 @@ ECM / BOD / DMM
 | fingerprint一致・ファイル実在 | 最終PDFは最新です |
 
 前回PDFが実在する場合、再出力が必要な状態でも`前回出力を開く`を利用できます。
-通常の最終PDFはローカルへ作成します。`共有発行`を押すと、提出フォルダの
-`共有発行`へ `元ファイル名_利用者名_yyyyMMdd_HHmmss.pdf` の別ファイルとして保存します。
-既存ファイルは上書きしません。
+通常の最終PDFはローカルへ作成します。`共有発行`を押すと、提出フォルダ直下へ
+日本語は `MMdd_HHmmss_J_Windowsユーザー名`、英語は
+`MMdd_HHmmss_E_Windowsユーザー名` の発行フォルダを作ります。PDFのファイル名は
+ローカル最終PDFと同じままです。同じ秒に同じ利用者が発行した場合は、フォルダ名へ連番を付けて既存フォルダを上書きしません。
 
 ## 鮮度判定
 

@@ -942,7 +942,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260801_v62', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260802_v63', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -989,7 +989,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260801_v62' not in html:
+if 'app.js?v=20260802_v63' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1015,7 +1015,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260801_v62' not in html:
+if 'app.js?v=20260802_v63' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1039,10 +1039,19 @@ for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出
     if forbidden in _default_paths:
         raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
 _publish = server.split('function Publish-FinalPdfToShared',1)[1].split('\nfunction ',1)[0]
-for needed in ["Join-Path ([string]$paths.submissionDir) '共有発行'", 'Get-SafePublishUserName',
-               "Get-Date -Format 'yyyyMMdd_HHmmss'", "'.uploading-'", "$ready.displayState -ne 'built'"]:
+for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
+               "if ($Language -eq 'ja') { 'J' } else { 'E' }",
+               '"{0}_{1}_{2}" -f $stamp, $languageMarker, $userName',
+               '$fileName = [IO.Path]::GetFileName($sourceFull)', "'.publishing-'",
+               'Move-Item -LiteralPath $stagingDir -Destination $publishDir',
+               "$ready.displayState -ne 'built'"]:
     if needed not in _publish:
         raise SystemExit(f'safe shared publishing is missing: {needed}')
+for forbidden in ["Join-Path ([string]$paths.submissionDir) '共有発行'",
+                  "Get-Date -Format 'yyyyMMdd_HHmmss'",
+                  '$fileName = "{0}_{1}_{2}.pdf"']:
+    if forbidden in _publish:
+        raise SystemExit(f'obsolete shared publish layout remains: {forbidden}')
 for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-appendix-btn\"",
                "api('/api/final/publish'", "publishable=available&&String(r.displayState||'')==='built'"]:
     if needed not in (server + html + appjs):

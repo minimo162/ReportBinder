@@ -75,7 +75,7 @@
           <div class="page-head"><div><h2>提出フォルダ</h2><p>提出Excelだけを共有し、管理データと通常出力は利用者ごとのローカルへ保存します。</p></div><button id="scan-folder-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button></div>
           <section class="card path-card">
             <div class="path-row"><div><label for="submissionDir">提出フォルダ</label><p>提出Excelを置くフォルダです。</p></div><input id="submissionDir" readonly><button id="choose-submission-btn" class="btn primary" type="button">フォルダを選ぶ</button></div>
-            <div class="path-row static"><div><span class="field-label">ローカル出力先</span><p>利用者専用フォルダーへ自動設定されます。共有側へは最終PDF画面の「共有発行」で明示的にコピーします。</p></div><span id="outputDir" class="path-value"></span></div>
+            <div class="path-row static"><div><span class="field-label">ローカル出力先</span><p>利用者専用フォルダーへ自動設定されます。「共有発行」時だけ、提出フォルダー直下へ日時・言語・利用者名付きフォルダーを作成します。</p></div><span id="outputDir" class="path-value"></span></div>
             <div class="path-row static"><div><span class="field-label">ローカル管理データ</span><p>ページ構成・履歴・比較PDFは利用者ごとに独立して保存されます。</p></div><span id="dataDir" class="path-value"></span></div>
           </section>
           <section class="card"><div class="card-head"><h3>フォルダの状況</h3></div><div class="folder-status-grid"><div><span>検出Excel</span><strong id="folder-file-count">0 件</strong></div><div><span>最終確認</span><strong id="folder-scan-time">—</strong></div><div><span>状態</span><span id="folder-scan-result" class="badge neutral">未設定</span></div></div></section>
@@ -166,6 +166,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260801_v62"></script>
+  <script src="app.js?v=20260802_v63"></script>
 </body>
 </html>

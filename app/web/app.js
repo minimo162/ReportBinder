@@ -2550,7 +2550,7 @@ async function publishFinalVolume(volume,btn) {
     const response=await api('/api/final/publish',{method:'POST',body:{volume,category:activePreset}});
     const result=response.result||{};
     showMessage('ok',`${volumeLabel(volume)}PDFを共有発行しました`,
-      `${result.fileName||'PDF'} を提出フォルダーの「共有発行」へ保存しました。`,
+      `${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
       result,[],0);
   });
 }
