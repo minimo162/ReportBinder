@@ -1,13 +1,99 @@
 ﻿param(
     [ValidateSet('ja','en')]
     [string]$Mode = 'ja',
-    [switch]$Diagnostics
+    [switch]$Diagnostics,
+    [switch]$LocalRuntime,
+    [string]$SharedAppRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $script:AppRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($SharedAppRoot)) { $SharedAppRoot = $script:AppRoot }
+$script:SharedAppRoot = [IO.Path]::GetFullPath($SharedAppRoot)
+$script:BootstrapWarning = ''
+$runtimeInfoPath = Join-Path $script:AppRoot 'runtime-version.json'
+$script:RuntimeVersion = 'legacy'
+try {
+    if (Test-Path -LiteralPath $runtimeInfoPath) {
+        $runtimeInfo = Get-Content -LiteralPath $runtimeInfoPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $candidateVersion = ([string]$runtimeInfo.version).Trim()
+        if ($candidateVersion -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { $script:RuntimeVersion = $candidateVersion }
+    }
+} catch { }
+
+# The shared launcher is intentionally thin. It reads one small version file, installs
+# that immutable app version under LocalAppData when necessary, then restarts this
+# launcher from the local copy. Heavy PowerShell, web, Java and PDFBox files are never
+# loaded from SMB during normal startup.
+if (-not $LocalRuntime -and $script:RuntimeVersion -ne 'legacy') {
+    $installMutex = $null
+    $installOwned = $false
+    $stageRoot = ''
+    try {
+        $runtimeBase = Join-Path (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder\runtime\versions') $script:RuntimeVersion
+        $localAppRoot = Join-Path $runtimeBase 'app'
+        $installedMarker = Join-Path $runtimeBase 'installed.json'
+        $ready = (Test-Path -LiteralPath $installedMarker -PathType Leaf) -and
+                 (Test-Path -LiteralPath (Join-Path $localAppRoot 'server.ps1') -PathType Leaf) -and
+                 (Test-Path -LiteralPath (Join-Path $localAppRoot 'web\app.js') -PathType Leaf)
+        if (-not $ready) {
+            $mutexName = 'Local\ReportBinder.RuntimeInstall.' + $script:RuntimeVersion
+            $created = $false
+            $installMutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
+            try { $installOwned = $installMutex.WaitOne(120000, $false) }
+            catch [System.Threading.AbandonedMutexException] { $installOwned = $true }
+            if (-not $installOwned) { throw 'ローカル版アプリの更新待ちがタイムアウトしました。' }
+
+            $ready = (Test-Path -LiteralPath $installedMarker -PathType Leaf) -and
+                     (Test-Path -LiteralPath (Join-Path $localAppRoot 'server.ps1') -PathType Leaf)
+            if (-not $ready) {
+                $runtimeParent = Split-Path -Parent $runtimeBase
+                if (-not (Test-Path -LiteralPath $runtimeParent)) { New-Item -ItemType Directory -Path $runtimeParent -Force | Out-Null }
+                if (Test-Path -LiteralPath $runtimeBase) { Remove-Item -LiteralPath $runtimeBase -Recurse -Force }
+                $stageRoot = $runtimeBase + '.staging-' + ([Guid]::NewGuid().ToString('N'))
+                $stageApp = Join-Path $stageRoot 'app'
+                New-Item -ItemType Directory -Path $stageApp -Force | Out-Null
+                foreach ($entry in @(Get-ChildItem -LiteralPath $script:AppRoot -Force)) {
+                    if ($entry.Name -in @('logs','thirdparty-cache','config.json')) { continue }
+                    Copy-Item -LiteralPath $entry.FullName -Destination $stageApp -Recurse -Force
+                }
+                foreach ($required in @('launch.ps1','server.ps1','runtime-version.json','web\app.js')) {
+                    if (-not (Test-Path -LiteralPath (Join-Path $stageApp $required) -PathType Leaf)) {
+                        throw "ローカル版アプリのコピーが不完全です: $required"
+                    }
+                }
+                [ordered]@{
+                    version = $script:RuntimeVersion
+                    source = $script:SharedAppRoot
+                    installedAt = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+                } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stageRoot 'installed.json') -Encoding UTF8
+                Move-Item -LiteralPath $stageRoot -Destination $runtimeBase
+                $stageRoot = ''
+            }
+        }
+
+        $psExeBootstrap = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $psExeBootstrap)) { $psExeBootstrap = 'powershell.exe' }
+        $localLauncher = Join-Path $localAppRoot 'launch.ps1'
+        $qLauncher = '"' + ($localLauncher -replace '"','\"') + '"'
+        $qShared = '"' + ($script:SharedAppRoot -replace '"','\"') + '"'
+        $bootstrapArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $qLauncher -Mode $Mode -LocalRuntime -SharedAppRoot $qShared"
+        if ($Diagnostics) { $bootstrapArgs += ' -Diagnostics' }
+        Start-Process -FilePath $psExeBootstrap -ArgumentList $bootstrapArgs -WindowStyle Hidden | Out-Null
+        exit 0
+    } catch {
+        $script:BootstrapWarning = $_.Exception.Message
+        # Availability wins over speed if the local install cannot be prepared.
+        # Continue from the shared copy for this launch and leave a diagnostic locally.
+    } finally {
+        if ($stageRoot -and (Test-Path -LiteralPath $stageRoot)) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($installOwned -and $null -ne $installMutex) { try { $installMutex.ReleaseMutex() } catch { } }
+        if ($null -ne $installMutex) { try { $installMutex.Dispose() } catch { } }
+    }
+}
+
 $script:RootDir = Split-Path -Parent $script:AppRoot
-$logDir = Join-Path $script:AppRoot 'logs'
+$logDir = Join-Path (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder') 'logs'
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 # 30日より古いログ・ジョブファイルを削除する(*-latest.* は対象外)。
 try {
@@ -26,7 +112,7 @@ $appRootKey = 'default'
 try {
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
-        $hashBytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($script:AppRoot.ToLowerInvariant()))
+        $hashBytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($script:SharedAppRoot.ToLowerInvariant()))
         $appRootKey = -join ($hashBytes[0..7] | ForEach-Object { $_.ToString('x2') })
     } finally { try { $sha.Dispose() } catch {} }
 } catch {
@@ -254,10 +340,12 @@ function Test-ReportBinderTcpHttpUrl([string]$Url, [string]$ApiPath, [int]$Timeo
             $ms.Write($buffer, 0, $read)
             if ($ms.Length -gt 8192) { break }
             $partial = [Text.Encoding]::UTF8.GetString($ms.ToArray())
-            if ($partial -match '^HTTP/1\.[01]\s+200\s' -and $partial -match '"ok"\s*:\s*true') { return $true }
+            $versionOk = ($script:RuntimeVersion -eq 'legacy') -or ($partial -match ('"runtimeVersion"\s*:\s*"' + [regex]::Escape($script:RuntimeVersion) + '"'))
+            if ($partial -match '^HTTP/1\.[01]\s+200\s' -and $partial -match '"ok"\s*:\s*true' -and $versionOk) { return $true }
         }
         $text = [Text.Encoding]::UTF8.GetString($ms.ToArray())
-        return ($text -match '^HTTP/1\.[01]\s+200\s' -and $text -match '"ok"\s*:\s*true')
+        $versionOk = ($script:RuntimeVersion -eq 'legacy') -or ($text -match ('"runtimeVersion"\s*:\s*"' + [regex]::Escape($script:RuntimeVersion) + '"'))
+        return ($text -match '^HTTP/1\.[01]\s+200\s' -and $text -match '"ok"\s*:\s*true' -and $versionOk)
     } catch {
         return $false
     } finally {
@@ -478,7 +566,8 @@ function Stop-StaleUiServerProcesses([string]$ServerPath, [string]$TargetMode) {
         $stale = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $cmd = Get-ProcessCommandLineText $_
             $cmdLower = $cmd.ToLowerInvariant()
-            (CommandLine-ContainsPath $cmd $ServerPath) -and
+            ((CommandLine-ContainsPath $cmd $ServerPath) -or
+             ($cmdLower -match '[\\/]reportbinder[\\/]runtime[\\/]versions[\\/][^\\/]+[\\/]app[\\/]server\.ps1')) -and
             ($cmdLower -notmatch '\s-renderjobpath\b') -and
             ($cmdLower -notmatch '\s-diffjobpath\b') -and
             ($cmdLower -notmatch '\s-autoschedulerpath\b') -and
@@ -547,6 +636,11 @@ try {
     Set-Content -LiteralPath $launchPidFile -Value ([string]$PID) -Encoding ASCII
     Add-LaunchLog "ReportBinder launcher start. Mode=$Mode"
     Add-LaunchLog "AppRoot=$script:AppRoot"
+    Add-LaunchLog "SharedAppRoot=$script:SharedAppRoot"
+    Add-LaunchLog "RuntimeVersion=$script:RuntimeVersion LocalRuntime=$LocalRuntime"
+    if (-not [string]::IsNullOrWhiteSpace($script:BootstrapWarning)) {
+        Add-LaunchLog ("Local runtime install failed; using shared copy for this launch: " + $script:BootstrapWarning)
+    }
     Add-LaunchLog "PowerShell=$($PSVersionTable.PSVersion)"
 
     $server = Join-Path $script:AppRoot 'server.ps1'

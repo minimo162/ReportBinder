@@ -902,10 +902,14 @@ function updateBulkSelectionLabel() {
 }
 
 function renderVolumeLinks() {
-  for (const [volume,id] of [[mainVolume(),'open-main-link'],[appendixVolume(),'open-appendix-link']]) {
-    const a=$(id);if(!a)continue;const r=volumeReadiness(volume);
-    if(r.outputPdf && r.outputPdfExists){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;a.textContent=r.displayState==='built'?'PDFを開く':'前回出力を開く';a.classList.remove('hidden');}
-    else{a.removeAttribute('href');a.classList.add('hidden');}
+  for (const [volume,id,publishId] of [[mainVolume(),'open-main-link','publish-main-btn'],[appendixVolume(),'open-appendix-link','publish-appendix-btn']]) {
+    const a=$(id),publish=$(publishId);const r=volumeReadiness(volume);
+    const available=!!(r.outputPdf && r.outputPdfExists);
+    if(a){
+      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;a.textContent=r.displayState==='built'?'PDFを開く':'前回出力を開く';a.classList.remove('hidden');}
+      else{a.removeAttribute('href');a.classList.add('hidden');}
+    }
+    if(publish){publish.classList.toggle('hidden',!available);publish.disabled=!available;}
   }
 }
 
@@ -2472,15 +2476,16 @@ function pathElementValue(id) {
 function setPathElementValue(id,value) {
   const el=$(id);if(!el)return;if('value' in el)el.value=value||'';else el.textContent=value||'—';
 }
-function applyDefaultChildPaths(force=false) {
+async function applyDefaultChildPaths(force=false) {
   const sub = pathElementValue('submissionDir');
   if (!sub) return;
-  const nextData = pathJoin(sub, '_reportbinder');
-  const nextOut = pathJoin(sub, '出力');
-  const currentData=pathElementValue('dataDir'),currentOut=pathElementValue('outputDir');
-  if (force || !currentData || currentData === pathJoin(lastSubmissionDefaultBase, '_reportbinder')) setPathElementValue('dataDir',nextData);
-  if (force || !currentOut || currentOut === pathJoin(lastSubmissionDefaultBase, '出力')) setPathElementValue('outputDir',nextOut);
-  lastSubmissionDefaultBase = sub;
+  try {
+    const result=await api('/api/paths/defaults',{method:'POST',body:{submissionDir:sub}});
+    const next=result?.paths||{};
+    if(force||!pathElementValue('dataDir'))setPathElementValue('dataDir',next.dataDir||'');
+    if(force||!pathElementValue('outputDir'))setPathElementValue('outputDir',next.outputDir||'');
+    lastSubmissionDefaultBase=sub;
+  } catch {}
 }
 async function chooseSubmissionFolder(btn) {
   if (folderPickerBusy) return;
@@ -2539,6 +2544,16 @@ async function buildVolume(volume, btn) {
   await runBusy(btn,async()=>{const result=await api('/api/final/build',{method:'POST',body:{volume,category:activePreset}});await refresh();showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,result.result?.outputPdf||'出力フォルダを確認してください。',result.result,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);showPostBuildWarning(volume);});
 }
 
+async function publishFinalVolume(volume,btn) {
+  await runBusy(btn,async()=>{
+    const response=await api('/api/final/publish',{method:'POST',body:{volume,category:activePreset}});
+    const result=response.result||{};
+    showMessage('ok',`${volumeLabel(volume)}PDFを共有発行しました`,
+      `${result.fileName||'PDF'} を提出フォルダーの「共有発行」へ保存しました。`,
+      result,[],0);
+  });
+}
+
 async function buildAllVolumes(btn) {
   // V5: 本体だけ成功する状態を作らないよう、サーバー側の準トランザクションAPIを1回だけ呼ぶ。
   await runBusy(btn, async () => {
@@ -2594,6 +2609,7 @@ bind('select-visible-files-btn','click',selectVisibleFiles);bind('clear-selected
 bind('bulk-main-btn','click',()=>moveSelectedPagesToVolume(mainVolume(),$('bulk-main-btn')));bind('bulk-appendix-btn','click',()=>moveSelectedPagesToVolume(appendixVolume(),$('bulk-appendix-btn')));bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
 bind('register-selected-btn','click',()=>registerSelected($('register-selected-btn')));bind('unregister-selected-btn','click',()=>unregisterSelected($('unregister-selected-btn')));bind('render-selected-btn','click',()=>renderSelectedWorkbooks($('render-selected-btn')));bind('render-all-btn','click',()=>renderAllWorkbooks($('render-all-btn')));bind('sort-by-sheet-btn','click',()=>sortPagesBySheet($('sort-by-sheet-btn')));
 bind('build-main-btn','click',()=>buildVolume(mainVolume(),$('build-main-btn')));bind('build-appendix-btn','click',()=>buildVolume(appendixVolume(),$('build-appendix-btn')));bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
+bind('publish-main-btn','click',()=>publishFinalVolume(mainVolume(),$('publish-main-btn')));bind('publish-appendix-btn','click',()=>publishFinalVolume(appendixVolume(),$('publish-appendix-btn')));
 const changedOnlyToggle=$('changed-only-toggle');
 if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;renderPages();});
 bind('history-refresh-btn','click',()=>loadHistoryPanels({force:true}));
@@ -2694,7 +2710,7 @@ async function loadHistoryTimeline(){
     const r=await api('/api/history/timeline?limit=50');
     const events=asArray(r.events);
     if(!events.length){box.innerHTML='<div class="caption">履歴はまだありません。</div>';return;}
-    const label={'input.snapshot.created':'提出Excelの変更を検知','input.snapshot.deduplicated':'同じ内容を再検知','input.source.removed':'保存期限により現物を削除','render.started':'PDF作成を開始','render.completed':'PDF作成が完了','render.failed':'PDF作成に失敗','compare.completed':'変更を判定','layout.changed':'ページ構成を変更','layout.restored':'ページ構成を復元','final.built':'最終PDFを出力','final.build.failed':'最終PDFの出力に失敗','final.archive.created':'最終PDFを保存','auto.detected':'自動処理が変更を検知','auto.deferred':'自動処理を保留','history.cleanup':'履歴を整理'};
+    const label={'input.snapshot.created':'提出Excelの変更を検知','input.snapshot.deduplicated':'同じ内容を再検知','input.source.removed':'保存期限により現物を削除','render.started':'PDF作成を開始','render.completed':'PDF作成が完了','render.failed':'PDF作成に失敗','compare.completed':'変更を判定','layout.changed':'ページ構成を変更','layout.restored':'ページ構成を復元','final.built':'最終PDFを出力','final.build.failed':'最終PDFの出力に失敗','final.archive.created':'最終PDFを保存','final.published':'最終PDFを共有発行','auto.detected':'自動処理が変更を検知','auto.deferred':'自動処理を保留','history.cleanup':'履歴を整理'};
     box.innerHTML=events.map(e=>{
       const t=String(e.eventType||'');
       return `<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(e.at))}</span><span>${escapeHtml(label[t]||t)}</span><span class="subtext">${escapeHtml(String(e.data?.workbookId||e.data?.category||''))}</span></div>`;

@@ -3,7 +3,7 @@ import json, os, re, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
-    '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/launch.ps1',
+    '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/runtime-version.json','app/launch.ps1',
     'app/web/index.html','app/web/style.css','app/web/app.js','app/web/diff-worker.js','app/lib/pdfbox/ReportPdfComposer.jar',
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
@@ -137,7 +137,7 @@ try_pos=write_json_block.find('try {')
 tmp_write_pos=write_json_block.find('Write-Utf8NoBomFile $tmp $json')
 if try_pos < 0 or tmp_write_pos < try_pos:
     raise SystemExit('atomic JSON temp write must be inside fallback try block')
-for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
+for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
     if route not in server: raise SystemExit(f'route not found: {route}')
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
@@ -942,7 +942,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v61', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260801_v62', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -989,7 +989,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260731_v61' not in html:
+if 'app.js?v=20260801_v62' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1015,7 +1015,37 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260731_v61' not in html:
+if 'app.js?v=20260801_v62' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
+
+# 2026-08-01 per-user local runtime/project architecture ----------------------
+runtime_info=json.loads((root/'app/runtime-version.json').read_text(encoding='utf-8'))
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', str(runtime_info.get('version',''))):
+    raise SystemExit('runtime version must be a safe immutable directory name')
+launch=(root/'app/launch.ps1').read_text(encoding='utf-8-sig')
+for needed in ['[switch]$LocalRuntime', "'ReportBinder\\runtime\\versions'", 'installed.json',
+               '$script:SharedAppRoot', 'runtimeVersion']:
+    if needed not in launch:
+        raise SystemExit(f'local runtime bootstrap is missing: {needed}')
+for needed in ['function Get-LocalProjectKey', '$Script:LocalProjectsRoot',
+               "dataDir = (Join-Path $projectRoot 'data')",
+               "outputDir = (Join-Path $projectRoot 'output')",
+               'function Initialize-LocalProjectConfig',
+               'function Invoke-LegacyProjectMigration']:
+    if needed not in server:
+        raise SystemExit(f'per-user local project storage is missing: {needed}')
+_default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfunction ',1)[0]
+for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
+    if forbidden in _default_paths:
+        raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
+_publish = server.split('function Publish-FinalPdfToShared',1)[1].split('\nfunction ',1)[0]
+for needed in ["Join-Path ([string]$paths.submissionDir) '共有発行'", 'Get-SafePublishUserName',
+               "Get-Date -Format 'yyyyMMdd_HHmmss'", "'.uploading-'"]:
+    if needed not in _publish:
+        raise SystemExit(f'safe shared publishing is missing: {needed}')
+for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-appendix-btn\"",
+               "api('/api/final/publish'"]:
+    if needed not in (server + html + appjs):
+        raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 print('selfcheck ok')
