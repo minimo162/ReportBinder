@@ -4104,6 +4104,9 @@ function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$C
     $paths = Get-Paths
     $structure = Get-Structure $Language
     $ready = Get-FinalBuildReadiness $structure $Language $Volume $cat
+    if ([string]$ready.displayState -ne 'built') {
+        throw '最終PDFが最新ではありません。最新状態で再出力してから共有発行してください。'
+    }
     $source = [string]$ready.outputPdf
     if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
         throw '共有発行できる最終PDFがありません。先に最終PDFを出力してください。'

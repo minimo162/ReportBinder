@@ -1040,11 +1040,11 @@ for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出
         raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
 _publish = server.split('function Publish-FinalPdfToShared',1)[1].split('\nfunction ',1)[0]
 for needed in ["Join-Path ([string]$paths.submissionDir) '共有発行'", 'Get-SafePublishUserName',
-               "Get-Date -Format 'yyyyMMdd_HHmmss'", "'.uploading-'"]:
+               "Get-Date -Format 'yyyyMMdd_HHmmss'", "'.uploading-'", "$ready.displayState -ne 'built'"]:
     if needed not in _publish:
         raise SystemExit(f'safe shared publishing is missing: {needed}')
 for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-appendix-btn\"",
-               "api('/api/final/publish'"]:
+               "api('/api/final/publish'", "publishable=available&&String(r.displayState||'')==='built'"]:
     if needed not in (server + html + appjs):
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 

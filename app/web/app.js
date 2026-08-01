@@ -905,11 +905,12 @@ function renderVolumeLinks() {
   for (const [volume,id,publishId] of [[mainVolume(),'open-main-link','publish-main-btn'],[appendixVolume(),'open-appendix-link','publish-appendix-btn']]) {
     const a=$(id),publish=$(publishId);const r=volumeReadiness(volume);
     const available=!!(r.outputPdf && r.outputPdfExists);
+    const publishable=available&&String(r.displayState||'')==='built';
     if(a){
       if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;a.textContent=r.displayState==='built'?'PDFを開く':'前回出力を開く';a.classList.remove('hidden');}
       else{a.removeAttribute('href');a.classList.add('hidden');}
     }
-    if(publish){publish.classList.toggle('hidden',!available);publish.disabled=!available;}
+    if(publish){publish.classList.toggle('hidden',!publishable);publish.disabled=!publishable;}
   }
 }
 
