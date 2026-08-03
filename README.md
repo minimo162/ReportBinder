@@ -7,11 +7,32 @@ V4では、最終PDFの鮮度判定、ECM/BOD/DMMの分離、ページ順の復�
 ## 起動入口
 
 ```text
-日本語管理.vbs
-英語管理.vbs
+日本語管理.cmd
+英語管理.cmd
 ```
 
 日本語と英語は別ワークスペースです。画面右上の言語表示は案内用で、自動的に別プロセスへ切り替えません。
+VBScriptはWindowsで段階的に廃止されるため、通常の起動入口をCMDへ移行しました。既存ショートカットの移行猶予としてソースと従来ZIPにはVBSも残しますが、新しい共有フォルダー用配布物には含めません。
+
+## 共有フォルダー用の完成フォルダー
+
+リポジトリ直下の次のファイルを実行します。
+
+```text
+共有フォルダー用フォルダー作成.cmd
+```
+
+selfcheckと第三者依存物の検証後、デスクトップの
+`ReportBinderRelease\ReportBinder_共有フォルダー用_yyyyMMdd_HHmmss`
+へ、共有フォルダーへそのままコピーできるオフライン完結版を作成し、作成先をエクスプローラーで開きます。
+
+作成物にはポータブルJRE、PDFBox、PDF.jsを含みます。一方、個人設定、ログ、キャッシュ、管理データ、出力PDF、GitHub設定、テストfixture、Javaビルドソース、パッケージ作成ファイル、移行用VBSは含めません。作成されたフォルダー全体を共有フォルダーへコピーしてください。
+
+PowerShellから作成先を指定する場合は次を実行します。作成先にReportBinderの元フォルダー配下は指定できません。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\package-release.ps1 -SharedFolderOnly -OutputDir "D:\配布作業"
+```
 
 ## V3以前から更新する場合
 
