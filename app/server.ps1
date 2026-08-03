@@ -778,123 +778,90 @@ function Get-DefaultChildPaths([string]$SubmissionDir) {
     }
 }
 
-function Copy-DirectoryContents([string]$Source, [string]$Destination) {
-    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return }
-    if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
-    foreach ($entry in @(Get-ChildItem -LiteralPath $Source -Force -ErrorAction Stop)) {
-        Copy-Item -LiteralPath $entry.FullName -Destination $Destination -Recurse -Force
+function Move-IncompleteLocalProjectPath([string]$Path, [string]$ProjectRoot, [string]$Kind) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return '' }
+    $hasEntries = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Select-Object -First 1).Count -gt 0
+    if (-not $hasEntries) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return ''
     }
+
+    # 移行完了マーカーがないローカルデータは、旧共有コピーの失敗途中か
+    # 旧実装の残骸である。削除せず短い名前で退避し、新しい管理領域は空で始める。
+    $suffix = (Get-Date -Format 'yyyyMMddHHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,8)
+    $backup = Join-Path $ProjectRoot ('.preclean-' + $Kind + '-' + $suffix)
+    Move-Item -LiteralPath $Path -Destination $backup -ErrorAction Stop
+    return $backup
 }
 
-function New-LegacyMigrationStagePath {
-    # projectRoot配下へstageを置くと、content-pdfの深い階層がMAX_PATHを超える。
-    # %TEMP%直下の短い名前で完成させ、移行完了後にローカルprojectへ移動する。
-    $tempRoot = [IO.Path]::GetTempPath()
-    for ($attempt = 0; $attempt -lt 10; $attempt++) {
-        $name = 'rbm-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
-        $candidate = Join-Path $tempRoot $name
-        try {
-            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
-            return $candidate
-        } catch {
-            if (-not (Test-Path -LiteralPath $candidate)) { throw }
-        }
-    }
-    throw '既存管理データ移行用の一時フォルダーを作成できませんでした。'
-}
-
-function Update-MigratedOutputPaths([string]$DataDir, [string]$OutputDir) {
-    foreach ($language in @('ja','en')) {
-        $structurePath = Join-Path $DataDir (Join-Path $language 'structure.json')
-        if (-not (Test-Path -LiteralPath $structurePath -PathType Leaf)) { continue }
-        try {
-            $structure = Read-JsonFile $structurePath $null
-            if ($null -eq $structure -or $null -eq $structure.volumes) { continue }
-            $changed = $false
-            foreach ($prop in @($structure.volumes.PSObject.Properties)) {
-                $volumeState = $prop.Value
-                $oldOutput = [string](Get-DataProperty $volumeState 'outputPdf' '')
-                if ([string]::IsNullOrWhiteSpace($oldOutput)) { continue }
-                $candidate = Join-Path $OutputDir ([IO.Path]::GetFileName($oldOutput))
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                    Set-NoteProperty $volumeState 'outputPdf' $candidate
-                    $changed = $true
-                }
-            }
-            if ($changed) { Write-JsonFile $structurePath $structure }
-        } catch { }
-    }
-}
-
-function Invoke-LegacyProjectMigration($LocalPaths) {
+function Initialize-CleanLocalProject($LocalPaths) {
     $submissionDir = [string]$LocalPaths.submissionDir
     $targetData = [string]$LocalPaths.dataDir
     $targetOutput = [string]$LocalPaths.outputDir
     $projectRoot = [string]$LocalPaths.projectRoot
     if ([string]::IsNullOrWhiteSpace($submissionDir) -or [string]::IsNullOrWhiteSpace($projectRoot)) {
-        return [ordered]@{ migrated = $false; reason = 'not-configured' }
+        return [ordered]@{ initialized = $false; reason = 'not-configured' }
     }
+
     $marker = Join-Path $projectRoot 'local-project.json'
     if (Test-Path -LiteralPath $marker -PathType Leaf) {
-        return [ordered]@{ migrated = $false; reason = 'already-local'; marker = $marker }
+        return [ordered]@{ initialized = $false; reason = 'already-local'; marker = $marker }
     }
 
-    if (-not (Test-Path -LiteralPath $projectRoot)) { New-Item -ItemType Directory -Path $projectRoot -Force | Out-Null }
-    $migrationMutex = $null
-    $migrationOwned = $false
+    if (-not (Test-Path -LiteralPath $projectRoot)) {
+        New-Item -ItemType Directory -Path $projectRoot -Force | Out-Null
+    }
+
+    # 古い版との同時起動でも旧共有コピーと新しいクリーン初期化が競合しないよう、
+    # mutex名は既存版と同じまま維持する。
+    $projectMutex = $null
+    $projectMutexOwned = $false
     try {
         $created = $false
-        $migrationMutex = New-Object System.Threading.Mutex($false, ('Local\ReportBinder.ProjectMigration.' + [string]$LocalPaths.projectKey), [ref]$created)
-        try { $migrationOwned = $migrationMutex.WaitOne(1800000, $false) }
-        catch [System.Threading.AbandonedMutexException] { $migrationOwned = $true }
-        if (-not $migrationOwned) { throw '既存管理データのローカル移行待ちがタイムアウトしました。' }
+        $projectMutex = New-Object System.Threading.Mutex($false, ('Local\ReportBinder.ProjectMigration.' + [string]$LocalPaths.projectKey), [ref]$created)
+        try { $projectMutexOwned = $projectMutex.WaitOne(1800000, $false) }
+        catch [System.Threading.AbandonedMutexException] { $projectMutexOwned = $true }
+        if (-not $projectMutexOwned) { throw '利用者ローカル管理領域の初期化待ちがタイムアウトしました。' }
         if (Test-Path -LiteralPath $marker -PathType Leaf) {
-            return [ordered]@{ migrated = $false; reason = 'already-local'; marker = $marker }
+            return [ordered]@{ initialized = $false; reason = 'already-local'; marker = $marker }
         }
 
-        $legacyData = Join-Path $submissionDir '_reportbinder'
-        $legacyOutput = Join-Path $submissionDir '出力'
-        $hasLegacy = (Test-Path -LiteralPath $legacyData -PathType Container) -or (Test-Path -LiteralPath $legacyOutput -PathType Container)
-        if ($hasLegacy) {
-            $stage = New-LegacyMigrationStagePath
-            try {
-                $stageData = Join-Path $stage 'data'
-                $stageOutput = Join-Path $stage 'output'
-                if (Test-Path -LiteralPath $legacyData -PathType Container) { Copy-DirectoryContents $legacyData $stageData }
-                if (Test-Path -LiteralPath $legacyOutput -PathType Container) { Copy-DirectoryContents $legacyOutput $stageOutput }
-                foreach ($transient in @(
-                    (Join-Path $stageData 'common\tmp'),
-                    (Join-Path $stageData 'common\locks')
-                )) {
-                    if (Test-Path -LiteralPath $transient) { Remove-Item -LiteralPath $transient -Recurse -Force -ErrorAction SilentlyContinue }
-                }
-                if (-not (Test-Path -LiteralPath $targetData) -and (Test-Path -LiteralPath $stageData)) {
-                    Move-Item -LiteralPath $stageData -Destination $targetData
-                }
-                if (-not (Test-Path -LiteralPath $targetOutput) -and (Test-Path -LiteralPath $stageOutput)) {
-                    Move-Item -LiteralPath $stageOutput -Destination $targetOutput
-                }
-            } finally {
-                if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-            }
+        # 共有側の _reportbinder / 出力 は存在確認もコピーも行わない。
+        # 提出フォルダーはExcelの読込元としてだけ使用する。
+        $quarantined = @()
+        $oldData = Move-IncompleteLocalProjectPath $targetData $projectRoot 'data'
+        if (-not [string]::IsNullOrWhiteSpace($oldData)) {
+            $quarantined += [ordered]@{ kind = 'data'; path = $oldData }
+        }
+        $oldOutput = Move-IncompleteLocalProjectPath $targetOutput $projectRoot 'output'
+        if (-not [string]::IsNullOrWhiteSpace($oldOutput)) {
+            $quarantined += [ordered]@{ kind = 'output'; path = $oldOutput }
         }
 
-        if (-not (Test-Path -LiteralPath $targetData)) { New-Item -ItemType Directory -Path $targetData -Force | Out-Null }
-        if (-not (Test-Path -LiteralPath $targetOutput)) { New-Item -ItemType Directory -Path $targetOutput -Force | Out-Null }
-        Update-MigratedOutputPaths $targetData $targetOutput
+        New-Item -ItemType Directory -Path $targetData -Force | Out-Null
+        New-Item -ItemType Directory -Path $targetOutput -Force | Out-Null
         Write-JsonFile $marker ([ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             projectKey = [string]$LocalPaths.projectKey
             submissionDir = $submissionDir
             dataDir = $targetData
             outputDir = $targetOutput
-            migratedFrom = $(if ($hasLegacy) { $legacyData } else { '' })
-            migratedAt = New-NowIso
+            initializationMode = 'clean'
+            legacySharedImport = $false
+            initializedAt = New-NowIso
+            quarantinedLocalPaths = @($quarantined)
         })
-        return [ordered]@{ migrated = [bool]$hasLegacy; marker = $marker; dataDir = $targetData; outputDir = $targetOutput }
+        return [ordered]@{
+            initialized = $true
+            reason = 'clean-start'
+            marker = $marker
+            dataDir = $targetData
+            outputDir = $targetOutput
+            quarantinedLocalPaths = @($quarantined)
+        }
     } finally {
-        if ($migrationOwned -and $null -ne $migrationMutex) { try { $migrationMutex.ReleaseMutex() } catch { } }
-        if ($null -ne $migrationMutex) { try { $migrationMutex.Dispose() } catch { } }
+        if ($projectMutexOwned -and $null -ne $projectMutex) { try { $projectMutex.ReleaseMutex() } catch { } }
+        if ($null -ne $projectMutex) { try { $projectMutex.Dispose() } catch { } }
     }
 }
 
@@ -909,11 +876,11 @@ function Initialize-LocalProjectConfig($Config) {
     try { $sameData = ([IO.Path]::GetFullPath($currentData) -eq [IO.Path]::GetFullPath([string]$localPaths.dataDir)) } catch { }
     try { $sameOutput = ([IO.Path]::GetFullPath($currentOutput) -eq [IO.Path]::GetFullPath([string]$localPaths.outputDir)) } catch { }
     if ($sameData -and $sameOutput) {
-        [void](Invoke-LegacyProjectMigration $localPaths)
+        [void](Initialize-CleanLocalProject $localPaths)
         return $Config
     }
 
-    [void](Invoke-LegacyProjectMigration $localPaths)
+    [void](Initialize-CleanLocalProject $localPaths)
     Set-NoteProperty $Config 'lastSubmissionDir' ([string]$localPaths.submissionDir)
     Set-NoteProperty $Config 'lastDataDir' ([string]$localPaths.dataDir)
     Set-NoteProperty $Config 'lastOutputDir' ([string]$localPaths.outputDir)
@@ -4263,7 +4230,7 @@ function Handle-Api($Context) {
                 Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; cancelled = $true; state = (Get-StatePayload $language) }); return
             }
             $newPaths = Get-DefaultChildPaths $selected
-            $migration = Invoke-LegacyProjectMigration $newPaths
+            $migration = Initialize-CleanLocalProject $newPaths
             Ensure-Package $newPaths
             $config = Get-AppConfig
             $config.lastSubmissionDir = [string]$newPaths.submissionDir
@@ -4301,7 +4268,7 @@ function Handle-Api($Context) {
             # 管理データと通常出力は常に利用者ローカル。APIから共有側の任意パスを
             # 指定して、複数利用者の状態が再び混ざる経路を残さない。
             $newPaths = Get-DefaultChildPaths ([string]$body.submissionDir)
-            $migration = Invoke-LegacyProjectMigration $newPaths
+            $migration = Initialize-CleanLocalProject $newPaths
             Ensure-Package $newPaths
             $config = Get-AppConfig
             $config.lastSubmissionDir = [string]$newPaths.submissionDir
