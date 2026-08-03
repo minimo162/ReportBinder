@@ -3,7 +3,7 @@ import json, os, re, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
-    '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/launch.ps1',
+    '日本語管理.cmd','英語管理.cmd','日本語管理.vbs','英語管理.vbs','共有フォルダー用フォルダー作成.cmd','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/runtime-version.json','app/launch.ps1',
     'app/web/index.html','app/web/style.css','app/web/app.js','app/web/diff-worker.js','app/lib/pdfbox/ReportPdfComposer.jar',
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
@@ -16,6 +16,16 @@ if (root/'app/config.json').exists(): raise SystemExit('runtime app/config.json 
 json.loads((root/'app/default-config.json').read_text(encoding='utf-8'))
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
+
+for rel, mode in [('日本語管理.cmd', 'ja'), ('英語管理.cmd', 'en')]:
+    launcher_cmd=(root/rel).read_text(encoding='utf-8-sig')
+    for needed in ['app\\launch.ps1', 'start "" /b', 'powershell.exe', f'-Mode {mode}']:
+        if needed not in launcher_cmd:
+            raise SystemExit(f'CMD launcher regression ({rel}): {needed}')
+shared_folder_cmd=(root/'共有フォルダー用フォルダー作成.cmd').read_text(encoding='utf-8-sig')
+for needed in ['app\\tools\\package-release.ps1', '-SharedFolderOnly', 'pause']:
+    if needed not in shared_folder_cmd:
+        raise SystemExit(f'shared-folder CMD regression: {needed}')
 
 server=(root/'app/server.ps1').read_text(encoding='utf-8-sig')
 
@@ -137,7 +147,7 @@ try_pos=write_json_block.find('try {')
 tmp_write_pos=write_json_block.find('Write-Utf8NoBomFile $tmp $json')
 if try_pos < 0 or tmp_write_pos < try_pos:
     raise SystemExit('atomic JSON temp write must be inside fallback try block')
-for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
+for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
     if route not in server: raise SystemExit(f'route not found: {route}')
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
@@ -252,7 +262,7 @@ with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
         if cls not in set(zf.namelist()): raise SystemExit(f'jar class missing: {cls}')
 
 root_files={x.name for x in root.iterdir() if x.is_file()}
-extra=sorted(root_files-{'日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md','.gitignore'})
+extra=sorted(root_files-{'日本語管理.cmd','英語管理.cmd','日本語管理.vbs','英語管理.vbs','共有フォルダー用フォルダー作成.cmd','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md','.gitignore'})
 if extra: raise SystemExit('unexpected top files: '+', '.join(extra))
 
 # PowerShell automatic variable $PID is read-only and variable names are case-insensitive.
@@ -320,8 +330,8 @@ _history_enabled = server.split('function Test-InputHistoryEnabled', 1)[1].split
 if 'return $true' not in _history_enabled:
     raise SystemExit('input history and diff must be enabled without policy.json')
 _source_retention = server.split('function Test-SourceRetentionEnabled', 1)[1].split('\nfunction ', 1)[0]
-if 'StartsWith($sub, [StringComparison]::OrdinalIgnoreCase)' not in _source_retention:
-    raise SystemExit('source retention must remain limited to dataDir under submissionDir')
+if '$Script:LocalProjectsRoot' not in _source_retention or 'StartsWith($localRoot, [StringComparison]::OrdinalIgnoreCase)' not in _source_retention:
+    raise SystemExit('source retention must remain limited to the per-user local project root')
 if (root/'docs/POLICY_SAMPLE.json').exists():
     raise SystemExit('obsolete POLICY_SAMPLE.json must not be distributed')
 if 'function Merge-ConfigDefaults' not in server:
@@ -612,7 +622,7 @@ for needed in ['function applyPageMutationResult', 'applyPageMutationResult(resp
     if needed not in appjs:
         raise SystemExit(f'client-side fast mutation/preview path missing: {needed}')
 _history_loader = appjs.split('function loadHistoryPanels', 1)[1].split('\n}', 1)[0]
-if 'loadSnapshotHistory()' not in _history_loader or any(x in _history_loader for x in ['loadHistoryTimeline', 'loadLayoutSnapshots', 'loadFinalArchives']):
+if 'loadSnapshotHistory(' not in _history_loader or any(x in _history_loader for x in ['loadHistoryTimeline', 'loadLayoutSnapshots', 'loadFinalArchives']):
     raise SystemExit('history view must load only the selected workbook versions')
 for obsolete in ['id="history-timeline"', 'id="layout-history"', 'id="final-archives"']:
     if obsolete in html:
@@ -752,6 +762,7 @@ if os.name == 'nt':
     ps_paths = [
         root/'app/server.ps1',
         root/'app/launch.ps1',
+        root/'app/tools/package-release.ps1',
         root/'app/tools/diff-image-batch.ps1',
     ]
     quoted_paths = ','.join("'" + str(path).replace("'", "''") + "'" for path in ps_paths)
@@ -827,6 +838,18 @@ for needed in ['RequirePortableJava', 'SHA-512 verified', 'verified npm package 
 package_release = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
 for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAVA_VERSION.txt']:
     if needed not in package_release: raise SystemExit(f'release dependency gate missing: {needed}')
+for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelopmentFiles', 'function Assert-SharedFolderLayout',
+               'ReportBinder_共有フォルダー用_', "'日本語管理.vbs'", "'英語管理.vbs'", 'Start-Process']:
+    if needed not in package_release: raise SystemExit(f'shared-folder release feature missing: {needed}')
+_shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
+               "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'"]:
+    if needed not in _shared_cleanup:
+        raise SystemExit(f'shared-folder cleanup omission: {needed}')
+if "-IncludeJava $true" not in package_release:
+    raise SystemExit('shared-folder release must always include portable Java')
+if 'Invoke-SelfCheck $false' not in package_release or 'Invoke-SelfCheck $true' not in package_release:
+    raise SystemExit('shared-folder creation must work without Python while ZIP releases stay fail-closed')
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 
@@ -942,7 +965,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260731_v60', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260802_v63', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -989,7 +1012,72 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260731_v60' not in html:
+if 'app.js?v=20260802_v63' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
+
+# 2026-07-31 history selection rendering fixes -------------------------------
+_history_loader = appjs.split('async function loadSnapshotHistory', 1)[1].split('\nasync function ', 1)[0]
+for needed in ['snapshotHistoryLoadSerial', 'fetchSnapshotHistoryList', 'requestSerial!==snapshotHistoryLoadSerial']:
+    if needed not in _history_loader:
+        raise SystemExit(f'history response race guard is missing: {needed}')
+_fetch_snapshots = appjs.split('async function fetchSnapshotHistoryList', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['snapshotHistoryResponseCache', 'snapshotHistoryRequestCache', 'if(!promise)']:
+    if needed not in _fetch_snapshots:
+        raise SystemExit(f'history request cache/deduplication is missing: {needed}')
+if 'if(!promise||force)' in _fetch_snapshots:
+    raise SystemExit('forced history refresh must join an identical in-flight request')
+_set_view = appjs.split('function setActiveView', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['viewChanged', '!historyPanelsInitialized', 'options.reloadPanels']:
+    if needed not in _set_view:
+        raise SystemExit(f'history tab side-effect guard is missing: {needed}')
+_swap_part = _history_loader.split("const swap=$('snap-swap-btn')", 1)[1].split("const db=$('snap-diff-btn')", 1)[0]
+if 'loadSnapshotHistory' in _swap_part or 'syncSnapshotHistorySelectionInputs' not in _swap_part:
+    raise SystemExit('snapshot swap must update controls without refetching or rebuilding the table')
+if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-SnapshotSummaryEntry' not in server:
+    raise SystemExit('incremental snapshot summary cache update is missing')
+_publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
+if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
+    raise SystemExit('render completion must keep the snapshot summary cache warm')
+if 'app.js?v=20260802_v63' not in html:
+    raise SystemExit('history rendering fix must bump the app cache version')
+
+# 2026-08-01 per-user local runtime/project architecture ----------------------
+runtime_info=json.loads((root/'app/runtime-version.json').read_text(encoding='utf-8'))
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', str(runtime_info.get('version',''))):
+    raise SystemExit('runtime version must be a safe immutable directory name')
+launch=(root/'app/launch.ps1').read_text(encoding='utf-8-sig')
+for needed in ['[switch]$LocalRuntime', "'ReportBinder\\runtime\\versions'", 'installed.json',
+               '$script:SharedAppRoot', 'runtimeVersion']:
+    if needed not in launch:
+        raise SystemExit(f'local runtime bootstrap is missing: {needed}')
+for needed in ['function Get-LocalProjectKey', '$Script:LocalProjectsRoot',
+               "dataDir = (Join-Path $projectRoot 'data')",
+               "outputDir = (Join-Path $projectRoot 'output')",
+               'function Initialize-LocalProjectConfig',
+               'function Invoke-LegacyProjectMigration']:
+    if needed not in server:
+        raise SystemExit(f'per-user local project storage is missing: {needed}')
+_default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfunction ',1)[0]
+for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
+    if forbidden in _default_paths:
+        raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
+_publish = server.split('function Publish-FinalPdfToShared',1)[1].split('\nfunction ',1)[0]
+for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
+               "if ($Language -eq 'ja') { 'J' } else { 'E' }",
+               '"{0}_{1}_{2}" -f $stamp, $languageMarker, $userName',
+               '$fileName = [IO.Path]::GetFileName($sourceFull)', "'.publishing-'",
+               'Move-Item -LiteralPath $stagingDir -Destination $publishDir',
+               "$ready.displayState -ne 'built'"]:
+    if needed not in _publish:
+        raise SystemExit(f'safe shared publishing is missing: {needed}')
+for forbidden in ["Join-Path ([string]$paths.submissionDir) '共有発行'",
+                  "Get-Date -Format 'yyyyMMdd_HHmmss'",
+                  '$fileName = "{0}_{1}_{2}.pdf"']:
+    if forbidden in _publish:
+        raise SystemExit(f'obsolete shared publish layout remains: {forbidden}')
+for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-appendix-btn\"",
+               "api('/api/final/publish'", "publishable=available&&String(r.displayState||'')==='built'"]:
+    if needed not in (server + html + appjs):
+        raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 print('selfcheck ok')

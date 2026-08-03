@@ -72,11 +72,11 @@
         </section>
 
         <section data-view-panel="folders" class="view-panel">
-          <div class="page-head"><div><h2>提出フォルダ</h2><p>提出Excelの場所を設定します。出力先と管理データは自動で決まります。</p></div><button id="scan-folder-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button></div>
+          <div class="page-head"><div><h2>提出フォルダ</h2><p>提出Excelだけを共有し、管理データと通常出力は利用者ごとのローカルへ保存します。</p></div><button id="scan-folder-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button></div>
           <section class="card path-card">
             <div class="path-row"><div><label for="submissionDir">提出フォルダ</label><p>提出Excelを置くフォルダです。</p></div><input id="submissionDir" readonly><button id="choose-submission-btn" class="btn primary" type="button">フォルダを選ぶ</button></div>
-            <div class="path-row static"><div><span class="field-label">出力先</span><p>提出フォルダ内の「出力」に自動設定されます。</p></div><span id="outputDir" class="path-value"></span></div>
-            <div class="path-row static"><div><span class="field-label">管理データ</span><p>提出フォルダ内の「_reportbinder」に自動設定されます。</p></div><span id="dataDir" class="path-value"></span></div>
+            <div class="path-row static"><div><span class="field-label">ローカル出力先</span><p>利用者専用フォルダーへ自動設定されます。「共有発行」時だけ、提出フォルダー直下へ日時・言語・利用者名付きフォルダーを作成します。</p></div><span id="outputDir" class="path-value"></span></div>
+            <div class="path-row static"><div><span class="field-label">ローカル管理データ</span><p>ページ構成・履歴・比較PDFは利用者ごとに独立して保存されます。</p></div><span id="dataDir" class="path-value"></span></div>
           </section>
           <section class="card"><div class="card-head"><h3>フォルダの状況</h3></div><div class="folder-status-grid"><div><span>検出Excel</span><strong id="folder-file-count">0 件</strong></div><div><span>最終確認</span><strong id="folder-scan-time">—</strong></div><div><span>状態</span><span id="folder-scan-result" class="badge neutral">未設定</span></div></div></section>
         </section>
@@ -104,8 +104,8 @@
         <section data-view-panel="final" class="view-panel">
           <div class="page-head"><div><h2>最終PDF</h2><p>最新状態を確認して、本体・補足PDFを出力します。</p></div><button id="build-all-btn" class="btn secondary" type="button">本体・補足をまとめて出力</button></div>
           <div class="final-grid">
-            <section class="card final-card"><div class="card-head"><div><h3>本体PDF</h3><p><strong id="final-main-pages" class="large-number">0</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div id="final-main-state" class="freshness"></div><div class="card-actions"><button id="build-main-btn" class="btn primary" type="button">本体PDFを出力</button><button id="final-main-fix" class="btn ghost hidden" type="button">Excel登録・PDF作成へ →</button><a id="open-main-link" class="btn ghost hidden" href="#">前回出力を開く</a></div></section>
-            <section class="card final-card"><div class="card-head"><div><h3>補足PDF</h3><p><strong id="final-appendix-pages" class="large-number">0</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div id="final-appendix-state" class="freshness"></div><div class="card-actions"><button id="build-appendix-btn" class="btn primary" type="button">補足PDFを出力</button><button id="final-appendix-fix" class="btn ghost hidden" type="button">Excel登録・PDF作成へ →</button><a id="open-appendix-link" class="btn ghost hidden" href="#">前回出力を開く</a></div></section>
+            <section class="card final-card"><div class="card-head"><div><h3>本体PDF</h3><p><strong id="final-main-pages" class="large-number">0</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div id="final-main-state" class="freshness"></div><div class="card-actions"><button id="build-main-btn" class="btn primary" type="button">本体PDFを出力</button><button id="publish-main-btn" class="btn secondary hidden" type="button">共有発行</button><button id="final-main-fix" class="btn ghost hidden" type="button">Excel登録・PDF作成へ →</button><a id="open-main-link" class="btn ghost hidden" href="#">前回出力を開く</a></div></section>
+            <section class="card final-card"><div class="card-head"><div><h3>補足PDF</h3><p><strong id="final-appendix-pages" class="large-number">0</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div id="final-appendix-state" class="freshness"></div><div class="card-actions"><button id="build-appendix-btn" class="btn primary" type="button">補足PDFを出力</button><button id="publish-appendix-btn" class="btn secondary hidden" type="button">共有発行</button><button id="final-appendix-fix" class="btn ghost hidden" type="button">Excel登録・PDF作成へ →</button><a id="open-appendix-link" class="btn ghost hidden" href="#">前回出力を開く</a></div></section>
           </div>
           <p class="caption final-numbering-caption">ページ番号：- 2 - 形式／先頭ページは番号なし</p>
           <section class="card"><div class="card-head"><h3>出力履歴</h3></div><div id="final-history"></div></section>
@@ -166,6 +166,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260731_v60"></script>
+  <script src="app.js?v=20260802_v63"></script>
 </body>
 </html>

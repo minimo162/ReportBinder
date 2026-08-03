@@ -7,11 +7,32 @@ V4では、最終PDFの鮮度判定、ECM/BOD/DMMの分離、ページ順の復�
 ## 起動入口
 
 ```text
-日本語管理.vbs
-英語管理.vbs
+日本語管理.cmd
+英語管理.cmd
 ```
 
 日本語と英語は別ワークスペースです。画面右上の言語表示は案内用で、自動的に別プロセスへ切り替えません。
+VBScriptはWindowsで段階的に廃止されるため、通常の起動入口をCMDへ移行しました。既存ショートカットの移行猶予としてソースと従来ZIPにはVBSも残しますが、新しい共有フォルダー用配布物には含めません。
+
+## 共有フォルダー用の完成フォルダー
+
+リポジトリ直下の次のファイルを実行します。
+
+```text
+共有フォルダー用フォルダー作成.cmd
+```
+
+Pythonが利用できる場合はselfcheckも実行し、第三者依存物と配布フォルダー構成を必ず検証した後、デスクトップの
+`ReportBinderRelease\ReportBinder_共有フォルダー用_yyyyMMdd_HHmmss`
+へ、共有フォルダーへそのままコピーできるオフライン完結版を作成し、作成先をエクスプローラーで開きます。
+
+作成物にはポータブルJRE、PDFBox、PDF.jsを含みます。一方、個人設定、ログ、キャッシュ、管理データ、出力PDF、GitHub設定、テストfixture、Javaビルドソース、パッケージ作成ファイル、移行用VBSは含めません。作成されたフォルダー全体を共有フォルダーへコピーしてください。
+
+PowerShellから作成先を指定する場合は次を実行します。作成先にReportBinderの元フォルダー配下は指定できません。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\package-release.ps1 -SharedFolderOnly -OutputDir "D:\配布作業"
+```
 
 ## V3以前から更新する場合
 
@@ -32,7 +53,10 @@ V4の初回起動では、各言語の`structure.json`をschemaVersion 2へ移�
 
 `app\lib\java`を含みます。PDFBox、PDF.js、ポータブルJREを配置済みのため、社内ネットワークからの取得なしで利用できます。V5の通常プレビューはブラウザ内蔵PDFビューア、差分詳細はPDF.jsで表示中のページだけをブラウザ内描画・比較します。比較用PNGは作成しません。
 
-H:などの共有ドライブから初めてJavaを起動すると、SMB経由のクラスロードにより数秒余分にかかることがあります。
+共有フォルダの起動入口は小さなバージョン情報だけを確認します。初回または更新時にアプリ一式を
+`%LOCALAPPDATA%\ReportBinder\runtime\versions\<version>` へコピーし、通常はローカル版の
+PowerShell、Web画面、Java、PDFBox、PDF.jsを使用します。更新がない起動では共有側の大量の
+小ファイルを読み直しません。
 
 ### オンライン導入版
 
@@ -47,7 +71,8 @@ app\tools\install-thirdparty.cmd
 ## 入力履歴・差分機能
 
 入力履歴と差分機能は既定で有効です。`_reportbinder\common\policy.json` は不要で、既存ファイルがあっても参照しません。
-提出Excelの現物は、管理データ（`dataDir`）が提出フォルダ配下にある場合だけ保持します。
+提出Excelの履歴、比較用PDF、ページ構成は利用者ごとのローカルプロジェクトに保持します。
+同じ提出フォルダを複数人が選んでも、登録状態・比較基準・ページ構成・出力は互いに影響しません。
 保持世代数、容量上限、自動処理の設定は `docs\INPUT_HISTORY_POLICY.md` を参照してください。
 
 登録済みExcelの「変更 Nシート」「追加 Nシート」「削除 Nシート」「変更なし」
@@ -72,12 +97,18 @@ app\tools\install-thirdparty.cmd
 
 ローカル設定がない初回だけ`default-config.json`をコピーし、以後はローカル設定だけを更新します。共有側の既定値へ現在値を書き戻しません。
 
-提出フォルダを選ぶと、次が自動設定されます。
+提出フォルダを選ぶと、共有側は提出Excelの読込元としてだけ使用し、作業場所は自動的に
+利用者ローカルへ設定されます。
 
 ```text
-管理データ: 提出フォルダ\_reportbinder
-出力先:     提出フォルダ\出力
+管理データ: %LOCALAPPDATA%\ReportBinder\projects\<提出フォルダ識別子>\data
+通常出力:   %LOCALAPPDATA%\ReportBinder\projects\<提出フォルダ識別子>\output
+共有発行（日本語）: 提出フォルダ\MMdd_HHmmss_J_Windowsユーザー名
+共有発行（英語）:   提出フォルダ\MMdd_HHmmss_E_Windowsユーザー名
 ```
+
+既存の `提出フォルダ\_reportbinder` と `提出フォルダ\出力` は、各利用者の初回起動時に
+ローカルプロジェクトへ一度だけコピーします。以後、共有側の旧管理データは更新しません。
 
 ## 基本操作
 
@@ -135,6 +166,10 @@ ECM / BOD / DMM
 | fingerprint一致・ファイル実在 | 最終PDFは最新です |
 
 前回PDFが実在する場合、再出力が必要な状態でも`前回出力を開く`を利用できます。
+通常の最終PDFはローカルへ作成します。`共有発行`を押すと、提出フォルダ直下へ
+日本語は `MMdd_HHmmss_J_Windowsユーザー名`、英語は
+`MMdd_HHmmss_E_Windowsユーザー名` の発行フォルダを作ります。PDFのファイル名は
+ローカル最終PDFと同じままです。同じ秒に同じ利用者が発行した場合は、フォルダ名へ連番を付けて既存フォルダを上書きしません。
 
 ## 鮮度判定
 

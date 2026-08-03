@@ -15,6 +15,15 @@ $ErrorActionPreference = 'Stop'
 $Script:AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:WebRoot = Join-Path $Script:AppRoot 'web'
 $Script:DefaultConfigPath = Join-Path $Script:AppRoot 'default-config.json'
+$Script:RuntimeVersion = 'legacy'
+try {
+    $runtimeInfoPath = Join-Path $Script:AppRoot 'runtime-version.json'
+    if (Test-Path -LiteralPath $runtimeInfoPath) {
+        $runtimeInfo = Get-Content -LiteralPath $runtimeInfoPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $runtimeCandidate = ([string]$runtimeInfo.version).Trim()
+        if ($runtimeCandidate -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { $Script:RuntimeVersion = $runtimeCandidate }
+    }
+} catch { }
 $localConfigOverride = ([string]$env:REPORTBINDER_LOCAL_CONFIG_ROOT).Trim()
 if ([string]::IsNullOrWhiteSpace($localConfigOverride)) {
     $Script:LocalConfigRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder'
@@ -22,7 +31,9 @@ if ([string]::IsNullOrWhiteSpace($localConfigOverride)) {
     $Script:LocalConfigRoot = [IO.Path]::GetFullPath($localConfigOverride)
 }
 $Script:ConfigPath = Join-Path $Script:LocalConfigRoot 'config.json'
+$Script:LocalProjectsRoot = Join-Path $Script:LocalConfigRoot 'projects'
 if (-not (Test-Path -LiteralPath $Script:LocalConfigRoot)) { New-Item -ItemType Directory -Path $Script:LocalConfigRoot -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $Script:LocalProjectsRoot)) { New-Item -ItemType Directory -Path $Script:LocalProjectsRoot -Force | Out-Null }
 if ([string]::IsNullOrWhiteSpace($Token)) {
     $tokenBytes = New-Object byte[] 32
     $tokenRng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -501,16 +512,15 @@ function Test-InputHistoryEnabled {
 }
 
 function Test-SourceRetentionEnabled {
-    # 提出Excelの現物は、管理データが提出フォルダ配下にある場合だけ保持する。
-    # policy.json ではなく実パスを検証し、外部フォルダへの意図しない複製を防ぐ。
+    # 利用者が選択した提出Excelの履歴は、ReportBinder専用のローカルプロジェクト内に保持する。
+    # 共有提出フォルダーへ履歴・中間PDFを書かない。
     try {
         $paths = Get-Paths
-        $sub = [IO.Path]::GetFullPath([string]$paths.submissionDir)
-        if (-not $sub.EndsWith([IO.Path]::DirectorySeparatorChar)) { $sub += [IO.Path]::DirectorySeparatorChar }
         $data = [IO.Path]::GetFullPath([string]$paths.dataDir)
-        if (-not $data.StartsWith($sub, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $localRoot = [IO.Path]::GetFullPath($Script:LocalProjectsRoot)
+        if (-not $localRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $localRoot += [IO.Path]::DirectorySeparatorChar }
+        return $data.StartsWith($localRoot, [StringComparison]::OrdinalIgnoreCase)
     } catch { return $false }
-    return $true
 }
 
 function Get-AutoRenderSettings {
@@ -715,16 +725,184 @@ function Get-Paths {
 }
 
 
+function Get-CanonicalSubmissionPath([string]$SubmissionDir) {
+    if ([string]::IsNullOrWhiteSpace($SubmissionDir)) { return '' }
+    $full = [IO.Path]::GetFullPath($SubmissionDir).TrimEnd([char[]]@([char]92, [char]47))
+    # 同じ共有フォルダーを H:\ と \\server\share の両方で選んでも、同じローカル
+    # プロジェクトになるよう、取得できる場合はマップドライブをUNCへ正規化する。
+    if ($full -match '^([A-Za-z]):[\\/]') {
+        try {
+            $drive = Get-PSDrive -Name $matches[1] -ErrorAction Stop
+            $displayRoot = ''
+            $displayProp = $drive.PSObject.Properties['DisplayRoot']
+            if ($null -ne $displayProp) { $displayRoot = [string]$displayProp.Value }
+            if ([string]::IsNullOrWhiteSpace($displayRoot) -and ([string]$drive.Root -match '^\\\\')) { $displayRoot = [string]$drive.Root }
+            if (-not [string]::IsNullOrWhiteSpace($displayRoot)) {
+                $tail = if ($full.Length -gt 3) { $full.Substring(3) } else { '' }
+                $full = [IO.Path]::GetFullPath((Join-Path $displayRoot $tail)).TrimEnd([char[]]@([char]92, [char]47))
+            }
+        } catch { }
+    }
+    return $full
+}
+
+function Get-LocalProjectKey([string]$SubmissionDir) {
+    $canonical = Get-CanonicalSubmissionPath $SubmissionDir
+    if ([string]::IsNullOrWhiteSpace($canonical)) { return '' }
+    $label = [IO.Path]::GetFileName($canonical)
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = 'project' }
+    $label = [regex]::Replace($label, '[^\p{L}\p{Nd}._-]+', '-').Trim([char[]]@('-','.'))
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = 'project' }
+    if ($label.Length -gt 32) { $label = $label.Substring(0,32) }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical.ToLowerInvariant()))
+        $hash = -join ($bytes[0..7] | ForEach-Object { $_.ToString('x2') })
+    } finally { $sha.Dispose() }
+    return "$label-$hash"
+}
+
 function Get-DefaultChildPaths([string]$SubmissionDir) {
     if ([string]::IsNullOrWhiteSpace($SubmissionDir)) {
-        return [ordered]@{ submissionDir = ''; dataDir = ''; outputDir = '' }
+        return [ordered]@{ submissionDir = ''; dataDir = ''; outputDir = ''; projectRoot = ''; projectKey = '' }
     }
-    $trimmed = $SubmissionDir.TrimEnd([char[]]@([char]92, [char]47))
+    $canonical = Get-CanonicalSubmissionPath $SubmissionDir
+    $projectKey = Get-LocalProjectKey $canonical
+    $projectRoot = Join-Path $Script:LocalProjectsRoot $projectKey
     return [ordered]@{
-        submissionDir = $trimmed
-        dataDir = (Join-Path $trimmed '_reportbinder')
-        outputDir = (Join-Path $trimmed '出力')
+        submissionDir = $canonical
+        dataDir = (Join-Path $projectRoot 'data')
+        outputDir = (Join-Path $projectRoot 'output')
+        projectRoot = $projectRoot
+        projectKey = $projectKey
     }
+}
+
+function Copy-DirectoryContents([string]$Source, [string]$Destination) {
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return }
+    if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Source -Force -ErrorAction Stop)) {
+        Copy-Item -LiteralPath $entry.FullName -Destination $Destination -Recurse -Force
+    }
+}
+
+function Update-MigratedOutputPaths([string]$DataDir, [string]$OutputDir) {
+    foreach ($language in @('ja','en')) {
+        $structurePath = Join-Path $DataDir (Join-Path $language 'structure.json')
+        if (-not (Test-Path -LiteralPath $structurePath -PathType Leaf)) { continue }
+        try {
+            $structure = Read-JsonFile $structurePath $null
+            if ($null -eq $structure -or $null -eq $structure.volumes) { continue }
+            $changed = $false
+            foreach ($prop in @($structure.volumes.PSObject.Properties)) {
+                $volumeState = $prop.Value
+                $oldOutput = [string](Get-DataProperty $volumeState 'outputPdf' '')
+                if ([string]::IsNullOrWhiteSpace($oldOutput)) { continue }
+                $candidate = Join-Path $OutputDir ([IO.Path]::GetFileName($oldOutput))
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    Set-NoteProperty $volumeState 'outputPdf' $candidate
+                    $changed = $true
+                }
+            }
+            if ($changed) { Write-JsonFile $structurePath $structure }
+        } catch { }
+    }
+}
+
+function Invoke-LegacyProjectMigration($LocalPaths) {
+    $submissionDir = [string]$LocalPaths.submissionDir
+    $targetData = [string]$LocalPaths.dataDir
+    $targetOutput = [string]$LocalPaths.outputDir
+    $projectRoot = [string]$LocalPaths.projectRoot
+    if ([string]::IsNullOrWhiteSpace($submissionDir) -or [string]::IsNullOrWhiteSpace($projectRoot)) {
+        return [ordered]@{ migrated = $false; reason = 'not-configured' }
+    }
+    $marker = Join-Path $projectRoot 'local-project.json'
+    if (Test-Path -LiteralPath $marker -PathType Leaf) {
+        return [ordered]@{ migrated = $false; reason = 'already-local'; marker = $marker }
+    }
+
+    if (-not (Test-Path -LiteralPath $projectRoot)) { New-Item -ItemType Directory -Path $projectRoot -Force | Out-Null }
+    $migrationMutex = $null
+    $migrationOwned = $false
+    try {
+        $created = $false
+        $migrationMutex = New-Object System.Threading.Mutex($false, ('Local\ReportBinder.ProjectMigration.' + [string]$LocalPaths.projectKey), [ref]$created)
+        try { $migrationOwned = $migrationMutex.WaitOne(1800000, $false) }
+        catch [System.Threading.AbandonedMutexException] { $migrationOwned = $true }
+        if (-not $migrationOwned) { throw '既存管理データのローカル移行待ちがタイムアウトしました。' }
+        if (Test-Path -LiteralPath $marker -PathType Leaf) {
+            return [ordered]@{ migrated = $false; reason = 'already-local'; marker = $marker }
+        }
+
+        $legacyData = Join-Path $submissionDir '_reportbinder'
+        $legacyOutput = Join-Path $submissionDir '出力'
+        $hasLegacy = (Test-Path -LiteralPath $legacyData -PathType Container) -or (Test-Path -LiteralPath $legacyOutput -PathType Container)
+        if ($hasLegacy) {
+            $stage = Join-Path $projectRoot ('.migration-' + [Guid]::NewGuid().ToString('N'))
+            try {
+                $stageData = Join-Path $stage 'data'
+                $stageOutput = Join-Path $stage 'output'
+                if (Test-Path -LiteralPath $legacyData -PathType Container) { Copy-DirectoryContents $legacyData $stageData }
+                if (Test-Path -LiteralPath $legacyOutput -PathType Container) { Copy-DirectoryContents $legacyOutput $stageOutput }
+                foreach ($transient in @(
+                    (Join-Path $stageData 'common\tmp'),
+                    (Join-Path $stageData 'common\locks')
+                )) {
+                    if (Test-Path -LiteralPath $transient) { Remove-Item -LiteralPath $transient -Recurse -Force -ErrorAction SilentlyContinue }
+                }
+                if (-not (Test-Path -LiteralPath $targetData) -and (Test-Path -LiteralPath $stageData)) {
+                    Move-Item -LiteralPath $stageData -Destination $targetData
+                }
+                if (-not (Test-Path -LiteralPath $targetOutput) -and (Test-Path -LiteralPath $stageOutput)) {
+                    Move-Item -LiteralPath $stageOutput -Destination $targetOutput
+                }
+            } finally {
+                if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+        }
+
+        if (-not (Test-Path -LiteralPath $targetData)) { New-Item -ItemType Directory -Path $targetData -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $targetOutput)) { New-Item -ItemType Directory -Path $targetOutput -Force | Out-Null }
+        Update-MigratedOutputPaths $targetData $targetOutput
+        Write-JsonFile $marker ([ordered]@{
+            schemaVersion = 1
+            projectKey = [string]$LocalPaths.projectKey
+            submissionDir = $submissionDir
+            dataDir = $targetData
+            outputDir = $targetOutput
+            migratedFrom = $(if ($hasLegacy) { $legacyData } else { '' })
+            migratedAt = New-NowIso
+        })
+        return [ordered]@{ migrated = [bool]$hasLegacy; marker = $marker; dataDir = $targetData; outputDir = $targetOutput }
+    } finally {
+        if ($migrationOwned -and $null -ne $migrationMutex) { try { $migrationMutex.ReleaseMutex() } catch { } }
+        if ($null -ne $migrationMutex) { try { $migrationMutex.Dispose() } catch { } }
+    }
+}
+
+function Initialize-LocalProjectConfig($Config) {
+    $submissionDir = [string](Get-DataProperty $Config 'lastSubmissionDir' '')
+    if ([string]::IsNullOrWhiteSpace($submissionDir)) { return $Config }
+    $localPaths = Get-DefaultChildPaths $submissionDir
+    $currentData = [string](Get-DataProperty $Config 'lastDataDir' '')
+    $currentOutput = [string](Get-DataProperty $Config 'lastOutputDir' '')
+    $sameData = $false
+    $sameOutput = $false
+    try { $sameData = ([IO.Path]::GetFullPath($currentData) -eq [IO.Path]::GetFullPath([string]$localPaths.dataDir)) } catch { }
+    try { $sameOutput = ([IO.Path]::GetFullPath($currentOutput) -eq [IO.Path]::GetFullPath([string]$localPaths.outputDir)) } catch { }
+    if ($sameData -and $sameOutput) {
+        [void](Invoke-LegacyProjectMigration $localPaths)
+        return $Config
+    }
+
+    [void](Invoke-LegacyProjectMigration $localPaths)
+    Set-NoteProperty $Config 'lastSubmissionDir' ([string]$localPaths.submissionDir)
+    Set-NoteProperty $Config 'lastDataDir' ([string]$localPaths.dataDir)
+    Set-NoteProperty $Config 'lastOutputDir' ([string]$localPaths.outputDir)
+    Write-JsonFile $Script:ConfigPath $Config
+    Reset-ConfigCaches
+    return $Config
 }
 
 
@@ -3908,6 +4086,107 @@ function Serve-FinalPdf($Context,[string]$Language) {
     Serve-FinalPdfByVolume $Context $Language ([string]$Context.Request.QueryString['volume']) ([string]$Context.Request.QueryString['category'])
 }
 
+function Get-SafePublishUserName {
+    $name = ([string]$env:USERNAME).Trim()
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'user' }
+    $name = [regex]::Replace($name, '[<>:"/\\|?*\x00-\x1F]+', '_')
+    $name = [regex]::Replace($name, '\s+', '_').Trim([char[]]@('_','.'))
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'user' }
+    if ($name.Length -gt 40) { $name = $name.Substring(0,40) }
+    return $name
+}
+
+function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$Category) {
+    $cat = Require-WorkbookCategory $Category
+    if (@(Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) {
+        throw [ArgumentException]::new('共有発行するPDFの種類が不正です。')
+    }
+    $paths = Get-Paths
+    $structure = Get-Structure $Language
+    $ready = Get-FinalBuildReadiness $structure $Language $Volume $cat
+    if ([string]$ready.displayState -ne 'built') {
+        throw '最終PDFが最新ではありません。最新状態で再出力してから共有発行してください。'
+    }
+    $source = [string]$ready.outputPdf
+    if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw '共有発行できる最終PDFがありません。先に最終PDFを出力してください。'
+    }
+
+    $localOutputRoot = [IO.Path]::GetFullPath([string]$paths.outputDir)
+    if (-not $localOutputRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $localOutputRoot += [IO.Path]::DirectorySeparatorChar }
+    $sourceFull = [IO.Path]::GetFullPath($source)
+    if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw '共有発行元が利用者ローカルの出力フォルダー外です。最終PDFを再出力してください。'
+    }
+
+    $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
+    $userName = Get-SafePublishUserName
+    $stamp = Get-Date -Format 'MMdd_HHmmss'
+    $languageMarker = $(if ($Language -eq 'ja') { 'J' } else { 'E' })
+    $baseFolderName = "{0}_{1}_{2}" -f $stamp, $languageMarker, $userName
+    $folderName = $baseFolderName
+    $publishDir = Join-Path $submissionDir $folderName
+    $suffix = 2
+    while (Test-Path -LiteralPath $publishDir) {
+        $folderName = "{0}_{1}" -f $baseFolderName, $suffix
+        $publishDir = Join-Path $submissionDir $folderName
+        $suffix++
+    }
+
+    # PDFが半端な状態で共有側に見えないよう、同じ共有ルートの隠し一時フォルダーで
+    # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。
+    $stagingDir = Join-Path $submissionDir ('.publishing-' + [Guid]::NewGuid().ToString('N'))
+    $fileName = [IO.Path]::GetFileName($sourceFull)
+    $stagedPdf = Join-Path $stagingDir $fileName
+    try {
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        Copy-Item -LiteralPath $sourceFull -Destination $stagedPdf -Force
+        $sourceLength = (Get-Item -LiteralPath $sourceFull -ErrorAction Stop).Length
+        $uploadedLength = (Get-Item -LiteralPath $stagedPdf -ErrorAction Stop).Length
+        if ($sourceLength -le 0 -or $uploadedLength -ne $sourceLength) {
+            throw '共有フォルダーへのコピーサイズが一致しません。'
+        }
+        while (Test-Path -LiteralPath $publishDir) {
+            $folderName = "{0}_{1}" -f $baseFolderName, $suffix
+            $publishDir = Join-Path $submissionDir $folderName
+            $suffix++
+        }
+        Move-Item -LiteralPath $stagingDir -Destination $publishDir
+        $stagingDir = ''
+    } finally {
+        if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
+            Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $destination = Join-Path $publishDir $fileName
+
+    $publishedAt = New-NowIso
+    Write-HistoryEvent $Language 'final.published' ([ordered]@{
+        category = $cat
+        volume = $Volume
+        source = $sourceFull
+        destination = $destination
+        sharedFolder = $publishDir
+        folderName = $folderName
+        fileName = $fileName
+        userName = $userName
+        languageMarker = $languageMarker
+        publishedAt = $publishedAt
+    })
+    return [ordered]@{
+        volume = $Volume
+        category = $cat
+        sourcePdf = $sourceFull
+        sharedPath = $destination
+        sharedFolder = $publishDir
+        folderName = $folderName
+        fileName = $fileName
+        publishedBy = $userName
+        languageMarker = $languageMarker
+        publishedAt = $publishedAt
+    }
+}
+
 function Handle-Api($Context) {
     $language = Get-EffectiveLanguage
     $path = $Context.Request.Url.AbsolutePath
@@ -3923,7 +4202,7 @@ function Handle-Api($Context) {
             Write-BytesResponse $Context 200 $Script:ReadyGifBytes 'image/gif' $true; return
         }
         if ($method -eq 'GET' -and $path -eq '/api/ping') {
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; mode = $Mode; at = New-NowIso }) $true; return
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; mode = $Mode; runtimeVersion = $Script:RuntimeVersion; at = New-NowIso }) $true; return
         }
         if (-not (Test-Token $Context.Request)) { Write-JsonResponse $Context 403 ([ordered]@{ ok = $false; error = 'invalid token' }); return }
         Touch-ClientActivity '' | Out-Null
@@ -3967,6 +4246,7 @@ function Handle-Api($Context) {
                 Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; cancelled = $true; state = (Get-StatePayload $language) }); return
             }
             $newPaths = Get-DefaultChildPaths $selected
+            $migration = Invoke-LegacyProjectMigration $newPaths
             Ensure-Package $newPaths
             $config = Get-AppConfig
             $config.lastSubmissionDir = [string]$newPaths.submissionDir
@@ -3974,7 +4254,7 @@ function Handle-Api($Context) {
             $config.lastOutputDir = [string]$newPaths.outputDir
             $config.lastMode = $Mode
             Save-AppConfig $config
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = (Get-ExcelFilesInSubmission) }); return
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; migration = $migration; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = (Get-ExcelFilesInSubmission) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/dialog/folder') {
             $body = Read-BodyJson $Context.Request
@@ -4001,12 +4281,10 @@ function Handle-Api($Context) {
         }
         if ($method -eq 'POST' -and $path -eq '/api/paths') {
             $body = Read-BodyJson $Context.Request
-            $newPaths = [ordered]@{ submissionDir = [string]$body.submissionDir; dataDir = [string]$body.dataDir; outputDir = [string]$body.outputDir }
-            if ([string]::IsNullOrWhiteSpace([string]$newPaths.dataDir) -or [string]::IsNullOrWhiteSpace([string]$newPaths.outputDir)) {
-                $defaults = Get-DefaultChildPaths ([string]$newPaths.submissionDir)
-                if ([string]::IsNullOrWhiteSpace([string]$newPaths.dataDir)) { $newPaths.dataDir = [string]$defaults.dataDir }
-                if ([string]::IsNullOrWhiteSpace([string]$newPaths.outputDir)) { $newPaths.outputDir = [string]$defaults.outputDir }
-            }
+            # 管理データと通常出力は常に利用者ローカル。APIから共有側の任意パスを
+            # 指定して、複数利用者の状態が再び混ざる経路を残さない。
+            $newPaths = Get-DefaultChildPaths ([string]$body.submissionDir)
+            $migration = Invoke-LegacyProjectMigration $newPaths
             Ensure-Package $newPaths
             $config = Get-AppConfig
             $config.lastSubmissionDir = [string]$newPaths.submissionDir
@@ -4124,6 +4402,11 @@ function Handle-Api($Context) {
             $result = Invoke-FinalBuildTransaction $language $cat $vols
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
         }
+        if ($method -eq 'POST' -and $path -eq '/api/final/publish') {
+            $body = Read-BodyJson $Context.Request
+            $result = Publish-FinalPdfToShared $language ([string]$body.volume) ([string]$body.category)
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
+        }
 
         # ---- V5: 履歴・差分・自動処理 ----
         if ($method -eq 'GET' -and $path -eq '/api/history/timeline') {
@@ -4181,7 +4464,7 @@ function Handle-Api($Context) {
             if (-not (New-SnapshotPin $language $wbId $snapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
                 throw '履歴の保護情報を保存できませんでした。'
             }
-            Clear-SnapshotSummaryCache $language $wbId
+            [void](Update-SnapshotSummaryCacheEntry $language $wbId $snapshotId)
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/history/unpin') {
@@ -4189,7 +4472,7 @@ function Handle-Api($Context) {
             $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
             $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
             Remove-SnapshotPin $language $wbId $snapshotId 'manual'
-            Clear-SnapshotSummaryCache $language $wbId
+            [void](Update-SnapshotSummaryCacheEntry $language $wbId $snapshotId)
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/layout/snapshots') {
@@ -6243,7 +6526,11 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
         Write-RenderRecord $Language $WorkbookId $SnapshotId $VersionId 'normal' $true $parsed
         if ($null -eq $parsed) { return $null }
         $cmp = Compare-SnapshotVisual $Language $WorkbookId $SnapshotId $VersionId
-        Clear-SnapshotSummaryCache $Language $WorkbookId
+        # complete の経路は Publish-LatestComparisonCaches が索引を更新する。
+        # baselineなし等の unavailable 版も、該当1版だけを更新する。
+        if ([string](Get-DataProperty $cmp 'status' '') -ne 'complete') {
+            [void](Update-SnapshotSummaryCacheEntry $Language $WorkbookId $SnapshotId)
+        }
         # complete/unavailableのどちらでも解析結果を版の記録へ残す。
         # 非同期解析の競合や環境差で比較できない場合に、理由を後から確認できる。
         try {
@@ -7097,6 +7384,77 @@ function Clear-SnapshotSummaryCache([string]$Language, [string]$WorkbookId) {
     } catch { }
 }
 
+function Get-SnapshotSummaryEntry([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $m = Get-SnapshotManifest $Language $safeWorkbookId $safeSnapshotId
+    if ($null -eq $m) { return $null }
+    $state = Get-SnapshotSourceState $Language $safeWorkbookId $safeSnapshotId
+    $versions = @(Get-RenderVersionIds $Language $safeWorkbookId $safeSnapshotId)
+    $preferred = ''; $visualAvailable = $false; $contentAvailable = $false
+    $reason = 'PDF作成済みの比較可能な版がありません。'
+    foreach ($versionId in @($versions | Sort-Object -Descending)) {
+        $availability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $safeSnapshotId ([string]$versionId)
+        if ([bool]$availability.visualHashAvailable) { $visualAvailable = $true }
+        if ([bool]$availability.contentPdfAvailable) { $contentAvailable = $true }
+        if ([string]::IsNullOrWhiteSpace($preferred) -and [bool]$availability.ready) {
+            $preferred = [string]$versionId; $reason = ''
+        } elseif ([string]::IsNullOrWhiteSpace($preferred) -and -not [string]::IsNullOrWhiteSpace([string]$availability.reason)) {
+            $reason = [string]$availability.reason
+        }
+    }
+    return [pscustomobject][ordered]@{
+        snapshotId = $safeSnapshotId; detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
+        captureReason = [string](Get-DataProperty $m 'captureReason' '')
+        sourceHash = [string](Get-DataProperty $m 'sourceHash' '')
+        sourceRetained = [bool]$state.sourceRetained
+        pins = @(Get-SnapshotPins $Language $safeWorkbookId $safeSnapshotId)
+        renderVersionIds = @($versions); visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
+        preferredVersionId = $preferred; visualHashAvailable = $visualAvailable
+        contentPdfAvailable = $contentAvailable; unavailableReason = $reason
+    }
+}
+
+function Update-SnapshotSummaryCacheEntry([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
+    # PDF作成やpin変更で影響する通常1版だけを差し替え、履歴画面で40版を再走査しない。
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $historyDir = Get-WorkbookHistoryDir $Language $safeWorkbookId
+    if (-not (Test-Path -LiteralPath $historyDir)) { Clear-SnapshotSummaryCache $Language $safeWorkbookId; return $false }
+    $cacheKey = ($Language + '|' + $safeWorkbookId).ToLowerInvariant()
+    $record = $Script:SnapshotSummaryCache[$cacheKey]
+    $localPath = Get-LocalSnapshotSummaryCachePath $Language $safeWorkbookId
+    if ($null -eq $record) {
+        try { if (Test-Path -LiteralPath $localPath) { $record = Read-JsonFile $localPath $null } } catch { $record = $null }
+    }
+    $entry = Get-SnapshotSummaryEntry $Language $safeWorkbookId $safeSnapshotId
+    if ($null -eq $entry) { Clear-SnapshotSummaryCache $Language $safeWorkbookId; return $false }
+
+    # 新規版追加や期限整理も反映するため、軽量な版ID一覧だけは1回確認する。
+    [void]$Script:SnapshotIdCache.Remove($cacheKey)
+    $recentIds = @((Get-SnapshotIds $Language $safeWorkbookId) | Select-Object -Last 40)
+    $map = @{}
+    foreach ($old in @(Get-Array (Get-DataProperty $record 'summaries' @()))) {
+        $oldId = [string](Get-DataProperty $old 'snapshotId' '')
+        if (-not [string]::IsNullOrWhiteSpace($oldId)) { $map[$oldId] = $old }
+    }
+    $map[$safeSnapshotId] = $entry
+    $summaries = @()
+    foreach ($id in @($recentIds | Sort-Object -Descending)) {
+        $key = [string]$id
+        if (-not $map.ContainsKey($key)) {
+            Clear-SnapshotSummaryCache $Language $safeWorkbookId
+            return $false
+        }
+        $summaries += $map[$key]
+    }
+    $stamp = [IO.Directory]::GetLastWriteTimeUtc($historyDir).Ticks
+    $updated = [pscustomobject][ordered]@{ schemaVersion = 1; stamp = $stamp; summaries = @($summaries); savedAt = New-NowIso }
+    $Script:SnapshotSummaryCache[$cacheKey] = $updated
+    try { Write-JsonFile $localPath $updated } catch { }
+    return $true
+}
+
 function Get-SnapshotSummaries([string]$Language, [string]$WorkbookId) {
     if ([string]::IsNullOrWhiteSpace($WorkbookId)) { return @() }
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
@@ -7120,34 +7478,9 @@ function Get-SnapshotSummaries([string]$Language, [string]$WorkbookId) {
         }
     } catch { }
     $out = @()
-    # 画面では直近40版に絞り、古い履歴の全検査で共有フォルダーを占有しない。
     foreach ($id in @((Get-SnapshotIds $Language $safeWorkbookId) | Select-Object -Last 40)) {
-        $m = Get-SnapshotManifest $Language $safeWorkbookId $id
-        if ($null -eq $m) { continue }
-        $state = Get-SnapshotSourceState $Language $safeWorkbookId $id
-        $versions = @(Get-RenderVersionIds $Language $safeWorkbookId $id)
-        $preferred = ''; $visualAvailable = $false; $contentAvailable = $false
-        $reason = 'PDF作成済みの比較可能な版がありません。'
-        foreach ($versionId in @($versions | Sort-Object -Descending)) {
-            $availability = Get-HistoryRenderVersionAvailability $Language $safeWorkbookId $id ([string]$versionId)
-            if ([bool]$availability.visualHashAvailable) { $visualAvailable = $true }
-            if ([bool]$availability.contentPdfAvailable) { $contentAvailable = $true }
-            if ([string]::IsNullOrWhiteSpace($preferred) -and [bool]$availability.ready) {
-                $preferred = [string]$versionId; $reason = ''
-            } elseif ([string]::IsNullOrWhiteSpace($preferred) -and -not [string]::IsNullOrWhiteSpace([string]$availability.reason)) {
-                $reason = [string]$availability.reason
-            }
-        }
-        $out += [ordered]@{
-            snapshotId = $id; detectedAt = [string](Get-DataProperty $m 'detectedAt' '')
-            captureReason = [string](Get-DataProperty $m 'captureReason' '')
-            sourceHash = [string](Get-DataProperty $m 'sourceHash' '')
-            sourceRetained = [bool]$state.sourceRetained
-            pins = @(Get-SnapshotPins $Language $safeWorkbookId $id)
-            renderVersionIds = @($versions); visualCompareReady = (-not [string]::IsNullOrWhiteSpace($preferred))
-            preferredVersionId = $preferred; visualHashAvailable = $visualAvailable
-            contentPdfAvailable = $contentAvailable; unavailableReason = $reason
-        }
+        $entry = Get-SnapshotSummaryEntry $Language $safeWorkbookId ([string]$id)
+        if ($null -ne $entry) { $out += $entry }
     }
     $summaries = @($out | Sort-Object { [string]$_.snapshotId } -Descending)
     $record = [pscustomobject][ordered]@{ schemaVersion = 1; stamp = $stamp; summaries = $summaries; savedAt = New-NowIso }
@@ -7769,7 +8102,7 @@ function Publish-LatestComparisonCaches([string]$Language, [string]$WorkbookId, 
     Save-LocalDiffDetailCache $Language $detail
     $latestKey = ($Language + '|' + $WorkbookId + '|' + [string]$Comparison.currentSnapshotId + '|' + [string]$Comparison.currentVersionId).ToLowerInvariant()
     $Script:LatestComparisonCache[$latestKey] = $Comparison
-    Clear-SnapshotSummaryCache $Language $WorkbookId
+    [void](Update-SnapshotSummaryCacheEntry $Language $WorkbookId ([string]$Comparison.currentSnapshotId))
 }
 
 function Get-DiffDetail(
@@ -8322,6 +8655,7 @@ if (-not [string]::IsNullOrWhiteSpace($RenderJobPath)) {
 
 if ($Port -le 0) { $Port = Get-FreePort }
 $config0 = Get-AppConfig
+$config0 = Initialize-LocalProjectConfig $config0
 if ([string](Get-DataProperty $config0 'lastMode' '') -ne $Mode) {
     $config0.lastMode = $Mode
     Save-AppConfig $config0
