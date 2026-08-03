@@ -15,6 +15,11 @@ function luminance(data,index){
   return (77*data[index]+150*data[index+1]+29*data[index+2])>>8;
 }
 const ROW_STEP=4,ROW_BINS=48,ROW_ALIGNMENT_BAND=64;
+const COLUMN_STEP=4,COLUMN_BINS=48;
+function clearlyImproves(candidateScore,identityScore,ratio=.76){
+  if(!Number.isFinite(candidateScore)||!Number.isFinite(identityScore))return false;
+  return candidateScore<2.5&&identityScore>3.5||candidateScore<identityScore*ratio;
+}
 function buildRowDescriptors(data,width,height){
   const rowCount=Math.ceil(height/ROW_STEP),values=new Float32Array(rowCount*ROW_BINS),ink=new Float32Array(rowCount);
   for(let row=0;row<rowCount;row++){
@@ -37,6 +42,35 @@ function rowDistance(a,b,ai,bi){
   return total/ROW_BINS+Math.abs(a.ink[ai]-b.ink[bi])*.35;
 }
 function rowGapCost(descriptors,index){return 5+Math.min(24,descriptors.ink[index]*.12);}
+function buildColumnDescriptors(data,width,height){
+  const columnCount=Math.ceil(width/COLUMN_STEP),values=new Float32Array(columnCount*COLUMN_BINS),ink=new Float32Array(columnCount);
+  for(let column=0;column<columnCount;column++){
+    const x0=column*COLUMN_STEP,x1=Math.min(width,x0+COLUMN_STEP);
+    let total=0;
+    for(let bin=0;bin<COLUMN_BINS;bin++){
+      const y0=Math.floor(bin*height/COLUMN_BINS),y1=Math.max(y0+1,Math.floor((bin+1)*height/COLUMN_BINS));
+      let sum=0,count=0;
+      for(let x=x0;x<x1;x++)for(let y=y0;y<y1;y+=2){sum+=255-luminance(data,(y*width+x)*4);count++;}
+      const value=count?sum/count:0;values[column*COLUMN_BINS+bin]=value;total+=value;
+    }
+    ink[column]=total/COLUMN_BINS;
+  }
+  return {columnCount,values,ink};
+}
+function columnDistance(a,b,ai,bi){
+  let total=0;const a0=ai*COLUMN_BINS,b0=bi*COLUMN_BINS;
+  for(let k=0;k<COLUMN_BINS;k++)total+=Math.abs(a.values[a0+k]-b.values[b0+k]);
+  return total/COLUMN_BINS+Math.abs(a.ink[ai]-b.ink[bi])*.35;
+}
+function smoothColumnScore(a,b,scale,offset,split=-1,jump=0){
+  let total=0,count=0;
+  for(let i=0;i<a.columnCount;i+=2){
+    const j=Math.round(i*scale+offset+(split>=0&&i>=split?jump:0));
+    if(j<0||j>=b.columnCount||(a.ink[i]<2&&b.ink[j]<2))continue;
+    total+=Math.min(45,columnDistance(a,b,i,j));count++;
+  }
+  return count?total/count:Number.MAX_VALUE;
+}
 function smoothMappingScore(a,b,scale,offset,split=-1,jump=0){
   let total=0,count=0;
   for(let i=0;i<a.rowCount;i+=3){
@@ -88,7 +122,7 @@ function chooseSmoothRowMapping(a,b){
       const sum=first.sums[split]+second.sums[a.rowCount]-second.sums[split];
       const count=first.counts[split]+second.counts[a.rowCount]-second.counts[split];
       if(!count)continue;
-      const jump=offset2-offset1,score=sum/count,fitness=score+Math.abs(candidateScale-1)*20+Math.abs(jump)*1.5;
+      const jump=offset2-offset1,score=sum/count,fitness=score+Math.abs(candidateScale-1)*20+Math.abs(jump)*.15;
       if(fitness<best.fitness)best={scale:candidateScale,offset:offset1,split,jump,score,fitness};
     }
   }
@@ -111,7 +145,10 @@ function choosePixelRowMapping(before,after,width,height,rowCount){
         for(let x=8;x<width-8;x+=12){
           const bi=(y*width+x)*4,ai=(ay*width+x)*4;
           if(luminance(before,bi)>247&&luminance(after,ai)>247)continue;
-          total+=Math.min(45,pixelDifference(before,after,bi,ai));count++;
+          let difference=pixelDifference(before,after,bi,ai);
+          if(ay>0)difference=Math.min(difference,pixelDifference(before,after,bi,ai-width*4));
+          if(ay+1<height)difference=Math.min(difference,pixelDifference(before,after,bi,ai+width*4));
+          total+=Math.min(45,difference);count++;
         }
         if(count){sums[row+1]+=total/count;counts[row+1]++;}
       }
@@ -134,7 +171,31 @@ function choosePixelRowMapping(before,after,width,height,rowCount){
     const y=row*ROW_STEP;
     mapping[row]=(y*best.scale+best.offset+(best.split>=0&&row>=best.split?best.jump:0))/ROW_STEP;
   }
-  return {...best,mapping};
+  const identityScore=(()=>{
+    let total=0,count=0;
+    for(let row=0;row<rowCount;row++){
+      const y=Math.min(height-1,row*ROW_STEP);
+      let rowTotal=0,rowCounted=0;
+      for(let x=8;x<width-8;x+=12){
+        const index=(y*width+x)*4;
+        if(luminance(before,index)>247&&luminance(after,index)>247)continue;
+        let difference=pixelDifference(before,after,index,index);
+        if(y>0)difference=Math.min(difference,pixelDifference(before,after,index,index-width*4));
+        if(y+1<height)difference=Math.min(difference,pixelDifference(before,after,index,index+width*4));
+        rowTotal+=Math.min(45,difference);rowCounted++;
+      }
+      if(rowCounted){total+=rowTotal/rowCounted;count++;}
+    }
+    return count?total/count:Number.MAX_VALUE;
+  })();
+  return {...best,mapping,identityScore};
+}
+function splitHasLayoutSupport(descriptors,split){
+  if(split<0)return true;
+  let before=0,after=0;
+  for(let i=0;i<descriptors.rowCount;i++)if(descriptors.ink[i]>=2){if(i<split)before++;else after++;}
+  const total=before+after,minimum=Math.max(6,Math.ceil(total*.12));
+  return before>=minimum&&after>=minimum;
 }
 function alignRows(before,after,width,height){
   const a=buildRowDescriptors(before,width,height),b=buildRowDescriptors(after,width,height);
@@ -182,10 +243,10 @@ function alignRows(before,after,width,height){
     else if(next>=0)mapping[row]=mapping[next]-(next-row);
     else mapping[row]=row;
   }
-  let maxLocalShiftJump=0;
-  for(let row=1;row<n;row++)maxLocalShiftJump=Math.max(maxLocalShiftJump,Math.abs((mapping[row]-mapping[row-1])-1)*ROW_STEP);
+  let sequenceMaxLocalShiftJump=0;
+  for(let row=1;row<n;row++)sequenceMaxLocalShiftJump=Math.max(sequenceMaxLocalShiftJump,Math.abs((mapping[row]-mapping[row-1])-1)*ROW_STEP);
   const first=pairs[0]||[0,0],last=pairs[pairs.length-1]||[Math.max(1,n-1),Math.max(1,m-1)];
-  let scaleY=(last[1]-first[1])/Math.max(1,last[0]-first[0]),alignmentMode='sequence';
+  const sequenceScale=(last[1]-first[1])/Math.max(1,last[0]-first[0]);
   const sequenceScore=(()=>{
     let total=0,count=0;
     for(let row=0;row<n;row+=3){
@@ -195,19 +256,35 @@ function alignRows(before,after,width,height){
     }
     return count?total/count:Number.MAX_VALUE;
   })();
+  const identityScore=smoothMappingScore(a,b,1,0);
+  const sequenceMapping=new Float32Array(mapping),sequenceInserted=inserted.slice(),sequenceDeleted=deleted.slice();
+  for(let row=0;row<n;row++)mapping[row]=row;
+  inserted.length=0;deleted.length=0;
+  let scaleY=1,maxLocalShiftJump=0,alignmentMode='identity',adjusted=false,splitRow=-1,jumpPixels=0;
+  let chosenRelative=1;
+  const sequenceGapCount=sequenceInserted.length+sequenceDeleted.length;
+  if(sequenceGapCount<=Math.max(8,Math.ceil(n*.08))&&sequenceMaxLocalShiftJump<=48&&clearlyImproves(sequenceScore,identityScore,.72)){
+    mapping.set(sequenceMapping);inserted.push(...sequenceInserted);deleted.push(...sequenceDeleted);
+    scaleY=sequenceScale;maxLocalShiftJump=sequenceMaxLocalShiftJump;alignmentMode='sequence';adjusted=true;
+    chosenRelative=sequenceScore/Math.max(.1,identityScore);
+  }
   const smooth=chooseSmoothRowMapping(a,b);
-  if(smooth.score<2||smooth.fitness<=sequenceScore*.96){
+  const smoothRelative=smooth.score/Math.max(.1,identityScore);
+  // A one-sided row descriptor can make a newly added object look like a layout shift by
+  // mapping around it. Piecewise shifts therefore require pixel/sequence corroboration.
+  if(smooth.split<0&&clearlyImproves(smooth.score,identityScore,.65)&&smoothRelative<chosenRelative*.98){
     mapping.set(smooth.mapping);scaleY=smooth.scale;alignmentMode=smooth.split>=0?'scale-and-row-shift':'scale';
-    inserted.length=0;deleted.length=0;
-    maxLocalShiftJump=Math.abs(smooth.jump)*ROW_STEP;
+    inserted.length=0;deleted.length=0;maxLocalShiftJump=Math.abs(smooth.jump)*ROW_STEP;adjusted=true;
+    splitRow=smooth.split;jumpPixels=smooth.jump*ROW_STEP;chosenRelative=smoothRelative;
   }
   const pixel=choosePixelRowMapping(before,after,width,height,n);
-  if(pixel.score<12||pixel.fitness<=sequenceScore*.9){
+  const pixelRelative=pixel.score/Math.max(.1,pixel.identityScore);
+  if(splitHasLayoutSupport(a,pixel.split)&&clearlyImproves(pixel.score,pixel.identityScore,.7)&&(pixelRelative<chosenRelative*.98||alignmentMode==='identity')){
     mapping.set(pixel.mapping);scaleY=pixel.scale;alignmentMode=pixel.split>=0?'pixel-scale-and-row-shift':'pixel-scale';
-    inserted.length=0;deleted.length=0;
-    maxLocalShiftJump=Math.abs(pixel.jump);
+    inserted.length=0;deleted.length=0;maxLocalShiftJump=Math.abs(pixel.jump);adjusted=true;
+    splitRow=pixel.split;jumpPixels=pixel.jump;
   }
-  return {a,b,mapping,inserted,deleted,scaleY,maxLocalShiftJump,alignmentMode};
+  return {a,b,mapping,inserted,deleted,scaleY,maxLocalShiftJump,alignmentMode,adjusted,splitRow,jumpPixels};
 }
 function mappedCoarseRowY(alignment,y,height){
   const position=y/ROW_STEP,index=Math.max(0,Math.min(alignment.mapping.length-1,Math.floor(position))),next=Math.min(alignment.mapping.length-1,index+1),fraction=position-index;
@@ -217,33 +294,70 @@ function mappedRowY(alignment,y,height){
   if(alignment.pixelMapping&&y>=0&&y<alignment.pixelMapping.length)return alignment.pixelMapping[y];
   return mappedCoarseRowY(alignment,y,height);
 }
-function chooseHorizontalAlignment(before,after,width,height,rowAlignment){
-  let bestX=0,bestScore=Number.MAX_VALUE;
-  for(let dx=-6;dx<=6;dx++){
-    let total=0,count=0;
-    for(let y=8;y<height-8;y+=12){
-      const ay=mappedRowY(rowAlignment,y,height);
-      for(let x=8;x<width-8;x+=12){
-        const ax=x+dx;if(ax<1||ax>=width-1)continue;
-        const bi=(y*width+x)*4,ai=(ay*width+ax)*4;
-        if(luminance(before,bi)>247&&luminance(after,ai)>247)continue;
-        total+=pixelDifference(before,after,bi,ai);count++;
-      }
+function choosePixelColumnMapping(before,after,width,height,rowAlignment){
+  const a=buildColumnDescriptors(before,width,height),b=buildColumnDescriptors(after,width,height),columnCount=a.columnCount;
+  const identityScore=smoothColumnScore(a,b,1,0);
+  let best={scale:1,offset:0,split:-1,jump:0,score:identityScore,fitness:identityScore};
+  for(let scaleStep=-6;scaleStep<=6;scaleStep++){
+    const scale=1+scaleStep*.01;
+    for(let offset=-24;offset<=24;offset+=2){
+      const score=smoothColumnScore(a,b,scale,offset),fitness=score+Math.abs(scale-1)*20+Math.abs(offset)*.1;
+      if(fitness<best.fitness)best={scale,offset,split:-1,jump:0,score,fitness};
     }
-    const score=count?total/count:Number.MAX_VALUE;
-    if(score<bestScore-.001||(Math.abs(score-bestScore)<=.001&&Math.abs(dx)<Math.abs(bestX))){bestScore=score;bestX=dx;}
   }
-  return bestX;
+  const coarse=best;
+  for(let scaleStep=-4;scaleStep<=4;scaleStep++)for(let offset=coarse.offset-2;offset<=coarse.offset+2;offset++){
+    const scale=coarse.scale+scaleStep*.0025,score=smoothColumnScore(a,b,scale,offset),fitness=score+Math.abs(scale-1)*20+Math.abs(offset)*.1;
+    if(fitness<best.fitness)best={scale,offset,split:-1,jump:0,score,fitness};
+  }
+  const base=best,minSplit=Math.floor(columnCount*.08),maxSplit=Math.ceil(columnCount*.92),offsetValues=[];
+  for(let offset=-24;offset<=24;offset++)offsetValues.push(offset);
+  const scaleCandidates=[base.scale-.01,base.scale,base.scale+.01,1]
+    .map(value=>Math.max(.94,Math.min(1.06,Math.round(value*1000)/1000))).filter((value,index,array)=>array.indexOf(value)===index);
+  for(const scale of scaleCandidates){
+    const stats=new Map();
+    for(const offset of offsetValues){
+      const sums=new Float32Array(columnCount+1),counts=new Uint16Array(columnCount+1);
+      for(let i=0;i<columnCount;i++){
+        sums[i+1]=sums[i];counts[i+1]=counts[i];const j=Math.round(i*scale+offset);
+        if(j<0||j>=b.columnCount||(a.ink[i]<2&&b.ink[j]<2))continue;
+        sums[i+1]+=Math.min(45,columnDistance(a,b,i,j));counts[i+1]++;
+      }
+      stats.set(offset,{sums,counts});
+    }
+    for(let split=minSplit;split<=maxSplit;split+=6)for(const offset1 of offsetValues)for(const offset2 of offsetValues){
+      const first=stats.get(offset1),second=stats.get(offset2),sum=first.sums[split]+second.sums[columnCount]-second.sums[split];
+      const count=first.counts[split]+second.counts[columnCount]-second.counts[split];if(!count)continue;
+      const jump=offset2-offset1,score=sum/count,fitness=score+Math.abs(scale-1)*20+Math.abs(jump)*.04+(Math.abs(offset1)+Math.abs(offset2))*.02;
+      if(fitness<best.fitness)best={scale,offset:offset1,split,jump,score,fitness};
+    }
+  }
+  const adjusted=(Math.abs(best.scale-1)>.003||Math.abs(best.offset*COLUMN_STEP)>1||Math.abs(best.jump*COLUMN_STEP)>1)&&clearlyImproves(best.score,identityScore,.65);
+  const mapping=new Float32Array(columnCount);
+  for(let column=0;column<columnCount;column++){
+    mapping[column]=adjusted?column*best.scale+best.offset+(best.split>=0&&column>=best.split?best.jump:0):column;
+  }
+  if(!adjusted)best={scale:1,offset:0,split:-1,jump:0,score:identityScore,fitness:identityScore};
+  return {...best,offset:best.offset*COLUMN_STEP,jump:best.jump*COLUMN_STEP,mapping,identityScore,adjusted};
 }
-function refinePixelRowMapping(before,after,width,height,rowAlignment,offsetX){
+function mappedCoarseColumnX(alignment,x,width){
+  const position=x/COLUMN_STEP,index=Math.max(0,Math.min(alignment.mapping.length-1,Math.floor(position))),next=Math.min(alignment.mapping.length-1,index+1),fraction=position-index;
+  return Math.max(0,Math.min(width-1,Math.round((alignment.mapping[index]*(1-fraction)+alignment.mapping[next]*fraction)*COLUMN_STEP)));
+}
+function mappedColumnX(alignment,x,width){
+  if(alignment.pixelMapping&&x>=0&&x<alignment.pixelMapping.length)return alignment.pixelMapping[x];
+  return mappedCoarseColumnX(alignment,x,width);
+}
+function refinePixelRowMapping(before,after,width,height,rowAlignment,columnAlignment){
+  if(!rowAlignment.adjusted)return;
   const mapping=new Int32Array(height);
   for(let y=0;y<height;y+=2){
     const expected=mappedCoarseRowY(rowAlignment,y,height);
     let bestY=expected,bestScore=Number.MAX_VALUE,foundInk=false;
-    for(let candidate=Math.max(0,expected-3);candidate<=Math.min(height-1,expected+3);candidate++){
+    for(let candidate=Math.max(0,expected-1);candidate<=Math.min(height-1,expected+1);candidate++){
       let total=0,count=0;
       for(let x=8;x<width-8;x+=8){
-        const ax=x+offsetX;if(ax<0||ax>=width)continue;
+        const ax=mappedColumnX(columnAlignment,x,width);if(ax<0||ax>=width)continue;
         const bi=(y*width+x)*4,ai=(candidate*width+ax)*4;
         if(luminance(before,bi)>247&&luminance(after,ai)>247)continue;
         total+=pixelDifference(before,after,bi,ai);count++;
@@ -258,6 +372,30 @@ function refinePixelRowMapping(before,after,width,height,rowAlignment,offsetX){
   for(let y=1;y<height;y+=2)mapping[y]=Math.round((mapping[y-1]+mapping[Math.min(height-1,y+1)])/2);
   for(let y=1;y<height;y++)mapping[y]=Math.max(mapping[y-1],mapping[y]);
   rowAlignment.pixelMapping=mapping;
+}
+function refinePixelColumnMapping(before,after,width,height,rowAlignment,columnAlignment){
+  if(!columnAlignment.adjusted)return;
+  const mapping=new Int32Array(width);
+  for(let x=0;x<width;x+=2){
+    const expected=mappedCoarseColumnX(columnAlignment,x,width);
+    let bestX=expected,bestScore=Number.MAX_VALUE,foundInk=false;
+    for(let candidate=Math.max(0,expected-1);candidate<=Math.min(width-1,expected+1);candidate++){
+      let total=0,count=0;
+      for(let y=8;y<height-8;y+=8){
+        const ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4,ai=(ay*width+candidate)*4;
+        if(luminance(before,bi)>247&&luminance(after,ai)>247)continue;
+        total+=pixelDifference(before,after,bi,ai);count++;
+      }
+      if(!count)continue;
+      foundInk=true;
+      const score=total/count+Math.abs(candidate-expected)*.8;
+      if(score<bestScore){bestScore=score;bestX=candidate;}
+    }
+    mapping[x]=foundInk?bestX:expected;
+  }
+  for(let x=1;x<width;x+=2)mapping[x]=Math.round((mapping[x-1]+mapping[Math.min(width-1,x+1)])/2);
+  for(let x=1;x<width;x++)mapping[x]=Math.max(mapping[x-1],mapping[x]);
+  columnAlignment.pixelMapping=mapping;
 }
 function tolerantPixelDifference(before,after,width,height,x,y,ax,ay){
   const bi=(y*width+x)*4;
@@ -294,9 +432,9 @@ function mergeNearbyComponents(components,width,height){
 }
 function analyzeBrowserDiff(before,after,width,height){
   const rowAlignment=alignRows(before,after,width,height);
-  let offsetX=chooseHorizontalAlignment(before,after,width,height,rowAlignment);
-  refinePixelRowMapping(before,after,width,height,rowAlignment,offsetX);
-  offsetX=chooseHorizontalAlignment(before,after,width,height,rowAlignment);
+  const columnAlignment=choosePixelColumnMapping(before,after,width,height,rowAlignment);
+  refinePixelRowMapping(before,after,width,height,rowAlignment,columnAlignment);
+  refinePixelColumnMapping(before,after,width,height,rowAlignment,columnAlignment);
   const gridWidth=Math.ceil(width/BLOCK),gridHeight=Math.ceil(height/BLOCK),cellCount=gridWidth*gridHeight;
   const mask=new Uint8Array(cellCount),counts=new Uint32Array(cellCount);
   let totalChanged=0;
@@ -304,7 +442,7 @@ function analyzeBrowserDiff(before,after,width,height){
     let changed=0;
     const x0=gx*BLOCK,y0=gy*BLOCK,x1=Math.min(width,x0+BLOCK),y1=Math.min(height,y0+BLOCK);
     for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-      const ax=x+offsetX,ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4;
+      const ax=mappedColumnX(columnAlignment,x,width),ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4;
       let different=false;
       if(ax<0||ax>=width||ay<0||ay>=height){
         different=before[bi]<248||before[bi+1]<248||before[bi+2]<248;
@@ -331,11 +469,23 @@ function analyzeBrowserDiff(before,after,width,height){
     const centerY=Math.min(height-1,gap.beforeRow*ROW_STEP),half=6;
     let minGX=gridWidth,maxGX=-1;
     for(let y=Math.max(0,centerY-half);y<Math.min(height,centerY+half);y+=4)for(let x=8;x<width-8;x+=8){
-      const bi=(y*width+x)*4,ay=gap.source==='after'?Math.min(height-1,(gap.afterRow||0)*ROW_STEP):mappedRowY(rowAlignment,y,height),ai=(ay*width+Math.max(0,Math.min(width-1,x+offsetX)))*4;
+      const bi=(y*width+x)*4,ay=gap.source==='after'?Math.min(height-1,(gap.afterRow||0)*ROW_STEP):mappedRowY(rowAlignment,y,height),ai=(ay*width+mappedColumnX(columnAlignment,x,width))*4;
       if(luminance(before,bi)<245||luminance(after,ai)<245){minGX=Math.min(minGX,Math.floor(x/BLOCK));maxGX=Math.max(maxGX,Math.floor(x/BLOCK));}
     }
     if(maxGX<minGX){minGX=2;maxGX=gridWidth-3;}
     for(let gy=Math.max(0,Math.floor((centerY-half)/BLOCK));gy<=Math.min(gridHeight-1,Math.floor((centerY+half)/BLOCK));gy++)for(let gx=minGX;gx<=maxGX;gx++){
+      const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
+    }
+  }
+  if(rowAlignment.splitRow>=0&&Math.abs(rowAlignment.jumpPixels)>=3){
+    const centerY=Math.min(height-1,rowAlignment.splitRow*ROW_STEP),half=Math.max(6,Math.ceil(Math.abs(rowAlignment.jumpPixels)/2)+3);
+    for(let gy=Math.max(0,Math.floor((centerY-half)/BLOCK));gy<=Math.min(gridHeight-1,Math.floor((centerY+half)/BLOCK));gy++)for(let gx=1;gx<gridWidth-1;gx++){
+      const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
+    }
+  }
+  if(columnAlignment.split>=0&&Math.abs(columnAlignment.jump)>=3){
+    const centerX=Math.min(width-1,columnAlignment.split*COLUMN_STEP),half=Math.max(6,Math.ceil(Math.abs(columnAlignment.jump)/2)+3);
+    for(let gx=Math.max(0,Math.floor((centerX-half)/BLOCK));gx<=Math.min(gridWidth-1,Math.floor((centerX+half)/BLOCK));gx++)for(let gy=1;gy<gridHeight-1;gy++){
       const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
     }
   }
@@ -375,8 +525,8 @@ function analyzeBrowserDiff(before,after,width,height){
     width:Math.max(1,component.maxX-component.minX+1)/width,height:Math.max(1,component.maxY-component.minY+1)/height,
     confidence:Math.max(.55,Math.min(1,component.pixels/Math.max(MIN_PIXELS,(component.maxX-component.minX+1)*(component.maxY-component.minY+1)))),pixelCount:component.pixels
   }));
-  const alignmentAdjusted=Math.abs(rowAlignment.scaleY-1)>.003||Math.abs(offsetX)>1||gapRows.length>0||rowAlignment.maxLocalShiftJump>=4;
-  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX,offsetY:0,scaleY:rowAlignment.scaleY,maxLocalShiftJump:rowAlignment.maxLocalShiftJump,alignmentMode:rowAlignment.alignmentMode,alignmentAdjusted};
+  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||gapRows.length>0;
+  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump)),alignmentMode:`${rowAlignment.alignmentMode}/${columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity'}`,alignmentAdjusted};
 }
 self.onmessage=function handleDiffWorkerMessage(event){
   const payload=event.data||{},id=payload.id;
