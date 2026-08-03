@@ -72,7 +72,7 @@ $Script:ServerStartedUtc = [DateTime]::UtcNow
 $Script:IdleTimeoutSeconds = 1800
 $Script:NoClientStartupTimeoutSeconds = 600
 $Script:ReadyGifBytes = [Convert]::FromBase64String('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==')
-$Script:ExcelPrintProfileVersion = 2026080302
+$Script:ExcelPrintProfileVersion = 2026072201
 $Script:FinalPdfComposerProfileVersion = 20260604
 $Script:RenderEnvironmentCache = $null
 $Script:RenderEnvironmentCompared = $false
