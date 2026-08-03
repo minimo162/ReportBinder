@@ -848,8 +848,11 @@ for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools
         raise SystemExit(f'shared-folder cleanup omission: {needed}')
 if "-IncludeJava $true" not in package_release:
     raise SystemExit('shared-folder release must always include portable Java')
-if 'Invoke-SelfCheck $false' not in package_release or 'Invoke-SelfCheck $true' not in package_release:
-    raise SystemExit('shared-folder creation must work without Python while ZIP releases stay fail-closed')
+_shared_release_entry = package_release.split('if ($SharedFolderOnly) {', 1)[1].split('\n}\n\nInvoke-SelfCheck', 1)[0]
+if 'Invoke-SelfCheck' in _shared_release_entry:
+    raise SystemExit('shared-folder creation must not run the development-tree selfcheck')
+if '\nInvoke-SelfCheck\n# PDFBox and PDF.js' not in package_release:
+    raise SystemExit('ZIP releases must keep the fail-closed development-tree selfcheck')
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 
