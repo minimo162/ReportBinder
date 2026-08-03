@@ -15,7 +15,7 @@ function luminance(data,index){
   return (77*data[index]+150*data[index+1]+29*data[index+2])>>8;
 }
 const ROW_STEP=4,ROW_BINS=48,ROW_ALIGNMENT_BAND=64;
-const COLUMN_STEP=4,COLUMN_BINS=48;
+const COLUMN_STEP=4,COLUMN_BINS=48,MIN_LAYOUT_SCALE=.82,MAX_LAYOUT_SCALE=1.18;
 function clearlyImproves(candidateScore,identityScore,ratio=.76){
   if(!Number.isFinite(candidateScore)||!Number.isFinite(identityScore))return false;
   return candidateScore<2.5&&identityScore>3.5||candidateScore<identityScore*ratio;
@@ -84,8 +84,8 @@ function smoothMappingScore(a,b,scale,offset,split=-1,jump=0){
 function chooseSmoothRowMapping(a,b){
   let best={scale:1,offset:0,split:-1,jump:0,score:smoothMappingScore(a,b,1,0)};
   best.fitness=best.score;
-  for(let scaleStep=-6;scaleStep<=6;scaleStep++){
-    const scale=1+scaleStep*.01;
+  for(let scaleStep=-8;scaleStep<=8;scaleStep++){
+    const scale=1+scaleStep*.02;
     for(let offset=-6;offset<=6;offset+=2){
       const score=smoothMappingScore(a,b,scale,offset);
       const fitness=score+Math.abs(scale-1)*20;
@@ -103,7 +103,7 @@ function chooseSmoothRowMapping(a,b){
   }
   const base=best,minSplit=Math.floor(a.rowCount*.1),maxSplit=Math.ceil(a.rowCount*.9);
   const scaleCandidates=[base.scale-.02,base.scale-.01,base.scale,base.scale+.01,base.scale+.02,1]
-    .map(value=>Math.max(.94,Math.min(1.06,Math.round(value*1000)/1000)))
+    .map(value=>Math.max(MIN_LAYOUT_SCALE,Math.min(MAX_LAYOUT_SCALE,Math.round(value*1000)/1000)))
     .filter((value,index,array)=>array.indexOf(value)===index);
   for(const candidateScale of scaleCandidates){
     const offsetStats=new Map();
@@ -133,8 +133,8 @@ function chooseSmoothRowMapping(a,b){
 function choosePixelRowMapping(before,after,width,height,rowCount){
   let best={scale:1,offset:0,split:-1,jump:0,score:Number.MAX_VALUE,fitness:Number.MAX_VALUE};
   const offsetValues=[];for(let offset=-32;offset<=32;offset+=4)offsetValues.push(offset);
-  for(let scaleStep=-6;scaleStep<=6;scaleStep++){
-    const scale=1+scaleStep*.01,stats=new Map();
+  for(let scaleStep=-8;scaleStep<=8;scaleStep++){
+    const scale=1+scaleStep*.02,stats=new Map();
     for(const offset of offsetValues){
       const sums=new Float32Array(rowCount+1),counts=new Uint16Array(rowCount+1);
       for(let row=0;row<rowCount;row++){
@@ -298,22 +298,22 @@ function choosePixelColumnMapping(before,after,width,height,rowAlignment){
   const a=buildColumnDescriptors(before,width,height),b=buildColumnDescriptors(after,width,height),columnCount=a.columnCount;
   const identityScore=smoothColumnScore(a,b,1,0);
   let best={scale:1,offset:0,split:-1,jump:0,score:identityScore,fitness:identityScore};
-  for(let scaleStep=-6;scaleStep<=6;scaleStep++){
-    const scale=1+scaleStep*.01;
+  for(let scaleStep=-8;scaleStep<=8;scaleStep++){
+    const scale=1+scaleStep*.02;
     for(let offset=-24;offset<=24;offset+=2){
-      const score=smoothColumnScore(a,b,scale,offset),fitness=score+Math.abs(scale-1)*20+Math.abs(offset)*.1;
+      const score=smoothColumnScore(a,b,scale,offset),fitness=score+Math.abs(scale-1)*4+Math.abs(offset)*.02;
       if(fitness<best.fitness)best={scale,offset,split:-1,jump:0,score,fitness};
     }
   }
   const coarse=best;
   for(let scaleStep=-4;scaleStep<=4;scaleStep++)for(let offset=coarse.offset-2;offset<=coarse.offset+2;offset++){
-    const scale=coarse.scale+scaleStep*.0025,score=smoothColumnScore(a,b,scale,offset),fitness=score+Math.abs(scale-1)*20+Math.abs(offset)*.1;
+    const scale=coarse.scale+scaleStep*.0025,score=smoothColumnScore(a,b,scale,offset),fitness=score+Math.abs(scale-1)*4+Math.abs(offset)*.02;
     if(fitness<best.fitness)best={scale,offset,split:-1,jump:0,score,fitness};
   }
   const base=best,minSplit=Math.floor(columnCount*.08),maxSplit=Math.ceil(columnCount*.92),offsetValues=[];
   for(let offset=-24;offset<=24;offset++)offsetValues.push(offset);
   const scaleCandidates=[base.scale-.01,base.scale,base.scale+.01,1]
-    .map(value=>Math.max(.94,Math.min(1.06,Math.round(value*1000)/1000))).filter((value,index,array)=>array.indexOf(value)===index);
+    .map(value=>Math.max(MIN_LAYOUT_SCALE,Math.min(MAX_LAYOUT_SCALE,Math.round(value*1000)/1000))).filter((value,index,array)=>array.indexOf(value)===index);
   for(const scale of scaleCandidates){
     const stats=new Map();
     for(const offset of offsetValues){
@@ -328,11 +328,13 @@ function choosePixelColumnMapping(before,after,width,height,rowAlignment){
     for(let split=minSplit;split<=maxSplit;split+=6)for(const offset1 of offsetValues)for(const offset2 of offsetValues){
       const first=stats.get(offset1),second=stats.get(offset2),sum=first.sums[split]+second.sums[columnCount]-second.sums[split];
       const count=first.counts[split]+second.counts[columnCount]-second.counts[split];if(!count)continue;
-      const jump=offset2-offset1,score=sum/count,fitness=score+Math.abs(scale-1)*20+Math.abs(jump)*.04+(Math.abs(offset1)+Math.abs(offset2))*.02;
+      const jump=offset2-offset1,score=sum/count,fitness=score+Math.abs(scale-1)*4+Math.abs(jump)*.04+(Math.abs(offset1)+Math.abs(offset2))*.01;
       if(fitness<best.fitness)best={scale,offset:offset1,split,jump,score,fitness};
     }
   }
-  const adjusted=(Math.abs(best.scale-1)>.003||Math.abs(best.offset*COLUMN_STEP)>1||Math.abs(best.jump*COLUMN_STEP)>1)&&clearlyImproves(best.score,identityScore,.65);
+  const scaleChange=Math.abs(best.scale-1);
+  const requiredScoreRatio=scaleChange>.04?.94:.65;
+  const adjusted=(scaleChange>.003||Math.abs(best.offset*COLUMN_STEP)>1||Math.abs(best.jump*COLUMN_STEP)>1)&&clearlyImproves(best.score,identityScore,requiredScoreRatio);
   const mapping=new Float32Array(columnCount);
   for(let column=0;column<columnCount;column++){
     mapping[column]=adjusted?column*best.scale+best.offset+(best.split>=0&&column>=best.split?best.jump:0):column;
@@ -458,6 +460,30 @@ function buildFallbackRegion(counts,gridWidth,gridHeight,width,height){
   const maxX=Math.min(width-1,(maxGX+1)*BLOCK-1+padding),maxY=Math.min(height-1,(maxGY+1)*BLOCK-1+padding);
   return {regionId:'browser-r0001',kind:'modified',x:minX/width,y:minY/height,width:Math.max(1,maxX-minX+1)/width,height:Math.max(1,maxY-minY+1)/height,confidence:.5,pixelCount:pixels};
 }
+function structuralColumnInkBounds(before,after,width,height,columnAlignment,centerX,half){
+  const rows=new Uint8Array(height),left=Math.max(0,centerX-half-4),right=Math.min(width-1,centerX+half+4);
+  for(let y=0;y<height;y++){
+    let ink=0;
+    for(let x=left;x<=right;x+=2){
+      const mapped=mappedColumnX(columnAlignment,x,width),bi=(y*width+x)*4,ai=(y*width+mapped)*4;
+      if(luminance(before,bi)<245||luminance(after,ai)<245){ink++;if(ink>=2){rows[y]=1;break;}}
+    }
+  }
+  let best=null,start=-1,last=-1,inkRows=0;
+  const finish=()=>{
+    if(start<0)return;
+    const candidate={start,last,inkRows,span:last-start+1};
+    if(!best||candidate.span>best.span||(candidate.span===best.span&&candidate.inkRows>best.inkRows))best=candidate;
+    start=-1;last=-1;inkRows=0;
+  };
+  for(let y=0;y<height;y++){
+    if(rows[y]){if(start<0)start=y;last=y;inkRows++;}
+    else if(start>=0&&y-last>8)finish();
+  }
+  finish();
+  if(!best)return {minY:BLOCK,maxY:height-BLOCK-1};
+  return {minY:Math.max(0,best.start-PADDING),maxY:Math.min(height-1,best.last+PADDING)};
+}
 function analyzeBrowserDiff(before,after,width,height){
   const rowAlignment=alignRows(before,after,width,height);
   const columnAlignment=choosePixelColumnMapping(before,after,width,height,rowAlignment);
@@ -483,7 +509,7 @@ function analyzeBrowserDiff(before,after,width,height){
     if(changed>=Math.max(2,Math.floor((x1-x0)*(y1-y0)*.2)))mask[index]=1;
   }
   // Rows that have no counterpart are the human-visible insertion/deletion bands.
-  const gapRows=[];
+  const gapRows=[];let structuralColumnBox=null;
   for(const row of rowAlignment.deleted){if(rowAlignment.a.ink[row]>4)gapRows.push({beforeRow:row,source:'before'});}
   for(const row of rowAlignment.inserted){
     if(rowAlignment.b.ink[row]<=4)continue;
@@ -514,7 +540,11 @@ function analyzeBrowserDiff(before,after,width,height){
   }
   if(columnAlignment.split>=0&&Math.abs(columnAlignment.jump)>=3){
     const centerX=Math.min(width-1,columnAlignment.split*COLUMN_STEP),half=Math.max(6,Math.ceil(Math.abs(columnAlignment.jump)/2)+3);
-    for(let gx=Math.max(0,Math.floor((centerX-half)/BLOCK));gx<=Math.min(gridWidth-1,Math.floor((centerX+half)/BLOCK));gx++)for(let gy=1;gy<gridHeight-1;gy++){
+    const inkBounds=structuralColumnInkBounds(before,after,width,height,columnAlignment,centerX,half);
+    const minGY=Math.max(0,Math.floor(inkBounds.minY/BLOCK)),maxGY=Math.min(gridHeight-1,Math.floor(inkBounds.maxY/BLOCK));
+    const bandMinX=Math.max(0,centerX-half-PADDING),bandMaxX=Math.min(width-1,centerX+half+PADDING);
+    structuralColumnBox={minX:bandMinX,maxX:bandMaxX,minY:inkBounds.minY,maxY:inkBounds.maxY,pixels:(bandMaxX-bandMinX+1)*(inkBounds.maxY-inkBounds.minY+1)};
+    for(let gx=Math.max(0,Math.floor((centerX-half)/BLOCK));gx<=Math.min(gridWidth-1,Math.floor((centerX+half)/BLOCK));gx++)for(let gy=minGY;gy<=maxGY;gy++){
       const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
     }
   }
@@ -547,6 +577,16 @@ function analyzeBrowserDiff(before,after,width,height){
     raw.push({minX:Math.max(0,minX-PADDING),minY:Math.max(0,minY-PADDING),maxX:Math.min(width-1,maxX+PADDING),maxY:Math.min(height-1,maxY+PADDING),pixels});
   }
   let components=mergeNearbyComponents(raw,width,height);
+  if(structuralColumnBox){
+    // Residual antialiasing after an Excel fit-to-page scale can connect every table
+    // gridline into one huge rectangle. The discontinuity itself is the useful human
+    // signal, so replace such broad residuals with the actual inserted/resized band.
+    components=components.filter(component=>{
+      const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
+      return !(componentWidth>width*.65&&componentHeight>height*.18);
+    });
+    components.push(structuralColumnBox);
+  }
   if(components.length>MAX_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_REGIONS);
   components.sort((a,b)=>a.minY-b.minY||a.minX-b.minX);
   let regions=components.map((component,index)=>({
