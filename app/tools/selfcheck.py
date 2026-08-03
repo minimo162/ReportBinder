@@ -3,7 +3,7 @@ import json, os, re, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
-    '日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/runtime-version.json','app/launch.ps1',
+    '日本語管理.cmd','英語管理.cmd','日本語管理.vbs','英語管理.vbs','共有フォルダー用フォルダー作成.cmd','README.md','THIRD_PARTY_NOTICES.md','app/server.ps1','app/default-config.json','app/runtime-version.json','app/launch.ps1',
     'app/web/index.html','app/web/style.css','app/web/app.js','app/web/diff-worker.js','app/lib/pdfbox/ReportPdfComposer.jar',
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
@@ -16,6 +16,16 @@ if (root/'app/config.json').exists(): raise SystemExit('runtime app/config.json 
 json.loads((root/'app/default-config.json').read_text(encoding='utf-8'))
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
+
+for rel, mode in [('日本語管理.cmd', 'ja'), ('英語管理.cmd', 'en')]:
+    launcher_cmd=(root/rel).read_text(encoding='utf-8-sig')
+    for needed in ['app\\launch.ps1', 'start "" /b', 'powershell.exe', f'-Mode {mode}']:
+        if needed not in launcher_cmd:
+            raise SystemExit(f'CMD launcher regression ({rel}): {needed}')
+shared_folder_cmd=(root/'共有フォルダー用フォルダー作成.cmd').read_text(encoding='utf-8-sig')
+for needed in ['app\\tools\\package-release.ps1', '-SharedFolderOnly', 'pause']:
+    if needed not in shared_folder_cmd:
+        raise SystemExit(f'shared-folder CMD regression: {needed}')
 
 server=(root/'app/server.ps1').read_text(encoding='utf-8-sig')
 
@@ -252,7 +262,7 @@ with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
         if cls not in set(zf.namelist()): raise SystemExit(f'jar class missing: {cls}')
 
 root_files={x.name for x in root.iterdir() if x.is_file()}
-extra=sorted(root_files-{'日本語管理.vbs','英語管理.vbs','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md','.gitignore'})
+extra=sorted(root_files-{'日本語管理.cmd','英語管理.cmd','日本語管理.vbs','英語管理.vbs','共有フォルダー用フォルダー作成.cmd','README.md','THIRD_PARTY_NOTICES.md','CHANGELOG_V4.md','CHANGELOG_V5.md','.gitignore'})
 if extra: raise SystemExit('unexpected top files: '+', '.join(extra))
 
 # PowerShell automatic variable $PID is read-only and variable names are case-insensitive.
@@ -827,6 +837,16 @@ for needed in ['RequirePortableJava', 'SHA-512 verified', 'verified npm package 
 package_release = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
 for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAVA_VERSION.txt']:
     if needed not in package_release: raise SystemExit(f'release dependency gate missing: {needed}')
+for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelopmentFiles', 'function Assert-SharedFolderLayout',
+               'ReportBinder_共有フォルダー用_', "'日本語管理.vbs'", "'英語管理.vbs'", 'Start-Process']:
+    if needed not in package_release: raise SystemExit(f'shared-folder release feature missing: {needed}')
+_shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
+               "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'"]:
+    if needed not in _shared_cleanup:
+        raise SystemExit(f'shared-folder cleanup omission: {needed}')
+if "-IncludeJava $true" not in package_release:
+    raise SystemExit('shared-folder release must always include portable Java')
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 
