@@ -762,6 +762,7 @@ if os.name == 'nt':
     ps_paths = [
         root/'app/server.ps1',
         root/'app/launch.ps1',
+        root/'app/tools/package-release.ps1',
         root/'app/tools/diff-image-batch.ps1',
     ]
     quoted_paths = ','.join("'" + str(path).replace("'", "''") + "'" for path in ps_paths)
@@ -847,6 +848,8 @@ for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools
         raise SystemExit(f'shared-folder cleanup omission: {needed}')
 if "-IncludeJava $true" not in package_release:
     raise SystemExit('shared-folder release must always include portable Java')
+if 'Invoke-SelfCheck $false' not in package_release or 'Invoke-SelfCheck $true' not in package_release:
+    raise SystemExit('shared-folder creation must work without Python while ZIP releases stay fail-closed')
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 
