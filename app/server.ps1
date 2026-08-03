@@ -6048,7 +6048,7 @@ function Stop-AutoSchedulerProcess {
 # V5 Stage 4 — Phase 2B: 画像ハッシュと比較
 # =====================================================================
 
-$Script:VisualHashProfileVersion = 2
+$Script:VisualHashProfileVersion = 3
 $Script:VisualHashPageDistanceLimit = 0.075
 $Script:VisualHashAverageDistanceLimit = 0.040
 $Script:VisualHashDpi = 120
@@ -6103,6 +6103,19 @@ function Test-SheetVisualEquivalent($Before, $After) {
 
     $beforePages = @(Get-Array (Get-DataProperty $Before 'pagePerceptualHashes' @()))
     $afterPages = @(Get-Array (Get-DataProperty $After 'pagePerceptualHashes' @()))
+    $beforeExactPages = @(Get-Array (Get-DataProperty $Before 'pageHashes' @()))
+    $afterExactPages = @(Get-Array (Get-DataProperty $After 'pageHashes' @()))
+    # Current analyzer records normalized RGB pixels. When both generations have
+    # those hashes, they are authoritative: the old 32x32 grayscale perceptual hash
+    # can hide a cell fill, pale color, border color, or small drawing resize.
+    if ($beforeExactPages.Count -gt 0 -and $beforeExactPages.Count -eq $afterExactPages.Count) {
+        for ($i = 0; $i -lt $beforeExactPages.Count; $i++) {
+            if ((Normalize-FileHash ([string]$beforeExactPages[$i])) -ne
+                (Normalize-FileHash ([string]$afterExactPages[$i]))) { return $false }
+        }
+        return $true
+    }
+    # Legacy records without normalized page hashes retain the perceptual fallback.
     if ($beforePages.Count -eq 0 -or $beforePages.Count -ne $afterPages.Count) { return $false }
     $total = 0.0
     $pageLimit = $(if ($hasComparableText) { $Script:VisualHashPageDistanceLimit } else { 0.035 })
@@ -7687,7 +7700,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 17
+$Script:DiffDetailAlgorithmVersion = 18
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
