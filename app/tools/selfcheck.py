@@ -1074,6 +1074,18 @@ for needed in ['function Get-LocalProjectKey', '$Script:LocalProjectsRoot',
                'function Invoke-LegacyProjectMigration']:
     if needed not in server:
         raise SystemExit(f'per-user local project storage is missing: {needed}')
+_migration_stage = server.split('function New-LegacyMigrationStagePath',1)[1].split('\nfunction ',1)[0]
+for needed in ['[IO.Path]::GetTempPath()', "name = 'rbm-'", ".Substring(0,12)",
+               'New-Item -ItemType Directory -Path $candidate -ErrorAction Stop']:
+    if needed not in _migration_stage:
+        raise SystemExit(f'short legacy migration stage missing: {needed}')
+if '$projectRoot' in _migration_stage or "'.migration-'" in _migration_stage:
+    raise SystemExit('legacy migration stage must not be nested under the project path')
+_legacy_migration = server.split('function Invoke-LegacyProjectMigration',1)[1].split('\nfunction ',1)[0]
+if '$stage = New-LegacyMigrationStagePath' not in _legacy_migration:
+    raise SystemExit('legacy migration must use the short temporary stage')
+if "Join-Path $projectRoot ('.migration-'" in _legacy_migration:
+    raise SystemExit('project-nested migration stage can exceed MAX_PATH')
 _default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfunction ',1)[0]
 for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
     if forbidden in _default_paths:

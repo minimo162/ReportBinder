@@ -786,6 +786,23 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
     }
 }
 
+function New-LegacyMigrationStagePath {
+    # projectRoot配下へstageを置くと、content-pdfの深い階層がMAX_PATHを超える。
+    # %TEMP%直下の短い名前で完成させ、移行完了後にローカルprojectへ移動する。
+    $tempRoot = [IO.Path]::GetTempPath()
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        $name = 'rbm-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
+        $candidate = Join-Path $tempRoot $name
+        try {
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+            return $candidate
+        } catch {
+            if (-not (Test-Path -LiteralPath $candidate)) { throw }
+        }
+    }
+    throw '既存管理データ移行用の一時フォルダーを作成できませんでした。'
+}
+
 function Update-MigratedOutputPaths([string]$DataDir, [string]$OutputDir) {
     foreach ($language in @('ja','en')) {
         $structurePath = Join-Path $DataDir (Join-Path $language 'structure.json')
@@ -839,7 +856,7 @@ function Invoke-LegacyProjectMigration($LocalPaths) {
         $legacyOutput = Join-Path $submissionDir '出力'
         $hasLegacy = (Test-Path -LiteralPath $legacyData -PathType Container) -or (Test-Path -LiteralPath $legacyOutput -PathType Container)
         if ($hasLegacy) {
-            $stage = Join-Path $projectRoot ('.migration-' + [Guid]::NewGuid().ToString('N'))
+            $stage = New-LegacyMigrationStagePath
             try {
                 $stageData = Join-Path $stage 'data'
                 $stageOutput = Join-Path $stage 'output'
