@@ -22,7 +22,7 @@ VBScriptはWindowsで段階的に廃止されるため、通常の起動入口�
 共有フォルダー用フォルダー作成.cmd
 ```
 
-selfcheckと第三者依存物の検証後、デスクトップの
+Pythonが利用できる場合はselfcheckも実行し、第三者依存物と配布フォルダー構成を必ず検証した後、デスクトップの
 `ReportBinderRelease\ReportBinder_共有フォルダー用_yyyyMMdd_HHmmss`
 へ、共有フォルダーへそのままコピーできるオフライン完結版を作成し、作成先をエクスプローラーで開きます。
 
