@@ -853,6 +853,20 @@ if 'Invoke-SelfCheck' in _shared_release_entry:
     raise SystemExit('shared-folder creation must not run the development-tree selfcheck')
 if '\nInvoke-SelfCheck\n# PDFBox and PDF.js' not in package_release:
     raise SystemExit('ZIP releases must keep the fail-closed development-tree selfcheck')
+for needed in ["GetFolderPath('LocalApplicationData')", "'ReportBinder\\release'",
+               'function Copy-DirectoryContents', 'function Publish-SharedFolderStage',
+               "'_作成中.txt'", 'ReportBinderShared_', 'Publish-SharedFolderStage -StageRoot $stage']:
+    if needed not in package_release:
+        raise SystemExit(f'OneDrive-safe shared release feature missing: {needed}')
+_publish_shared = package_release.split('function Publish-SharedFolderStage', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['Move-Item -LiteralPath $StageRoot', 'catch {', 'Copy-DirectoryContents',
+               'Assert-StagedDependencies -StageRoot $TargetRoot', 'Assert-SharedFolderLayout $TargetRoot',
+               'Remove-Item -LiteralPath $TargetRoot -Recurse -Force']:
+    if needed not in _publish_shared:
+        raise SystemExit(f'shared release publish fallback missing: {needed}')
+_new_shared = package_release.split('function New-SharedFolderRelease', 1)[1].split('\nfunction ', 1)[0]
+if 'Move-Item -LiteralPath $stage' in _new_shared:
+    raise SystemExit('shared release must publish through the OneDrive-safe fallback helper')
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 
