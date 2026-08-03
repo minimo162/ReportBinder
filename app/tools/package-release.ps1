@@ -20,13 +20,16 @@ if ($OutputDir -eq $root -or $OutputDir.StartsWith($rootPrefix, [StringCompariso
 }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-function Invoke-SelfCheck {
+function Invoke-SelfCheck([bool]$Required) {
     $script = Join-Path $root 'app\tools\selfcheck.py'
     $python = Get-Command py -ErrorAction SilentlyContinue
     if ($python) { & $python.Source -3 $script; if ($LASTEXITCODE -ne 0) { throw 'selfcheckに失敗しました。' }; return }
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) { & $python.Source $script; if ($LASTEXITCODE -ne 0) { throw 'selfcheckに失敗しました。' }; return }
-    throw 'Pythonが見つかりません。先に app\tools\selfcheck.py を実行してください。'
+    if ($Required) {
+        throw 'Pythonが見つかりません。先に app\tools\selfcheck.py を実行してください。'
+    }
+    Write-Warning 'Pythonがないためselfcheckを省略します。依存物と配布フォルダー構成の検証は継続します。'
 }
 
 function Invoke-ThirdPartyCheck([bool]$RequirePortableJava) {
@@ -248,8 +251,9 @@ function New-Utf8Zip([string]$SourceDir, [string]$ZipPath) {
     }
 }
 
-Invoke-SelfCheck
 if ($SharedFolderOnly) {
+    # 標準Windowsだけでも作成できるよう、Pythonがない場合はselfcheckだけを省略する。
+    Invoke-SelfCheck $false
     # 共有フォルダー版は、ネットワーク接続なしで各PCへローカル展開できる完成版に限定する。
     Invoke-ThirdPartyCheck $true
     $sharedFolder = New-SharedFolderRelease
@@ -264,6 +268,7 @@ if ($SharedFolderOnly) {
     exit 0
 }
 
+Invoke-SelfCheck $true
 # PDFBox and PDF.js are included in both ZIP release variants.
 Invoke-ThirdPartyCheck $false
 # The offline-complete release must contain its own verified portable JRE even if system Java exists.
