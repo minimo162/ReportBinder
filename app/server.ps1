@@ -72,7 +72,7 @@ $Script:ServerStartedUtc = [DateTime]::UtcNow
 $Script:IdleTimeoutSeconds = 1800
 $Script:NoClientStartupTimeoutSeconds = 600
 $Script:ReadyGifBytes = [Convert]::FromBase64String('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==')
-$Script:ExcelPrintProfileVersion = 2026072201
+$Script:ExcelPrintProfileVersion = 2026080302
 $Script:FinalPdfComposerProfileVersion = 20260604
 $Script:RenderEnvironmentCache = $null
 $Script:RenderEnvironmentCompared = $false
@@ -1844,14 +1844,56 @@ function Clear-ExcelHeaderFooterPictures($PageSetup) {
     }
 }
 
-function Remove-XlsxHeaderFooterXml([string]$XlsxPath) {
-    # Remove Excel header/footer definitions from the temporary XLSX package before Excel opens it.
-    # This avoids relying on slow/fragile COM FirstPage/EvenPage PageSetup calls and prevents
-    # footer page numbers such as &P from being exported into the content PDF.
-    if ([string]::IsNullOrWhiteSpace($XlsxPath)) { return [ordered]@{ ok = $true; changed = 0; skipped = $true } }
+function Set-OpenXmlAttributeValue($Node, [string]$Name, [string]$Value) {
+    if ($null -eq $Node) { return }
+    $attribute = $Node.Attributes.GetNamedItem($Name)
+    if ($null -eq $attribute) {
+        $attribute = $Node.OwnerDocument.CreateAttribute($Name)
+        [void]$Node.Attributes.Append($attribute)
+    }
+    $attribute.Value = $Value
+}
+
+function Add-WorksheetElementOrdered($Document, $Root, $Node) {
+    $rank = @{
+        sheetPr=10; dimension=20; sheetViews=30; sheetFormatPr=40; cols=45; sheetData=50
+        sheetCalcPr=60; sheetProtection=70; protectedRanges=80; scenarios=90; autoFilter=100
+        sortState=110; dataConsolidate=120; customSheetViews=130; mergeCells=140
+        phoneticPr=145; conditionalFormatting=150; dataValidations=155; hyperlinks=158
+        printOptions=160; pageMargins=170; pageSetup=180; headerFooter=190
+        rowBreaks=200; colBreaks=210; customProperties=220; cellWatches=230
+        ignoredErrors=240; smartTags=250; drawing=270; legacyDrawing=280
+        legacyDrawingHF=290; picture=300; oleObjects=310; controls=320
+        webPublishItems=330; tableParts=340; extLst=1000
+    }
+    $targetRank = if ($rank.ContainsKey([string]$Node.LocalName)) { [int]$rank[[string]$Node.LocalName] } else { 999 }
+    foreach ($child in @($Root.ChildNodes)) {
+        if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+        $childRank = if ($rank.ContainsKey([string]$child.LocalName)) { [int]$rank[[string]$child.LocalName] } else { 999 }
+        if ($childRank -gt $targetRank) {
+            [void]$Root.InsertBefore($Node, $child)
+            return $Node
+        }
+    }
+    [void]$Root.AppendChild($Node)
+    return $Node
+}
+
+function Get-OrCreateWorksheetElement($Document, $Root, [string]$LocalName) {
+    $node = $Root.SelectSingleNode("./*[local-name()='$LocalName']")
+    if ($null -ne $node) { return $node }
+    $node = $Document.CreateElement($LocalName, [string]$Root.NamespaceURI)
+    return (Add-WorksheetElementOrdered $Document $Root $node)
+}
+
+function Prepare-XlsxPrintPackage([string]$XlsxPath) {
+    # PageSetup is one of the slowest Excel COM APIs. For OpenXML workbooks, persist the
+    # standard one-page print profile directly in the local temporary package before Excel opens it.
+    # Excel then only has to open and export the workbook; legacy .xls files retain the COM fallback.
+    if ([string]::IsNullOrWhiteSpace($XlsxPath)) { return [ordered]@{ ok=$true; changed=0; sheetsPrepared=0; printSettingsPrepared=$false; skipped=$true } }
     $ext = [IO.Path]::GetExtension($XlsxPath).ToLowerInvariant()
-    if (@('.xlsx','.xlsm','.xltx','.xltm') -notcontains $ext) { return [ordered]@{ ok = $true; changed = 0; skipped = $true } }
-    if (-not (Test-Path -LiteralPath $XlsxPath)) { return [ordered]@{ ok = $true; changed = 0; skipped = $true } }
+    if (@('.xlsx','.xlsm','.xltx','.xltm') -notcontains $ext) { return [ordered]@{ ok=$true; changed=0; sheetsPrepared=0; printSettingsPrepared=$false; skipped=$true } }
+    if (-not (Test-Path -LiteralPath $XlsxPath)) { return [ordered]@{ ok=$true; changed=0; sheetsPrepared=0; printSettingsPrepared=$false; skipped=$true } }
 
     try {
         Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue | Out-Null
@@ -1860,9 +1902,10 @@ function Remove-XlsxHeaderFooterXml([string]$XlsxPath) {
 
     $zip = $null
     $changed = 0
+    $sheetsPrepared = 0
     try {
         $zip = [System.IO.Compression.ZipFile]::Open($XlsxPath, [System.IO.Compression.ZipArchiveMode]::Update)
-        $targets = @($zip.Entries | Where-Object { [string]$_.FullName -match '^xl/(worksheets|chartsheets)/[^/]+\.xml$' })
+        $targets = @($zip.Entries | Where-Object { [string]$_.FullName -match '^xl/(worksheets|chartsheets)/[^/]+[.]xml$' })
         $utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false
         foreach ($entry in $targets) {
             $name = [string]$entry.FullName
@@ -1876,23 +1919,53 @@ function Remove-XlsxHeaderFooterXml([string]$XlsxPath) {
             }
             if ([string]::IsNullOrWhiteSpace($xml)) { continue }
 
-            $hasHeaderFooter = ([regex]::IsMatch($xml, '(?is)<(?:\w+:)?headerFooter\b'))
-            if (-not $hasHeaderFooter) { continue }
+            $document = New-Object System.Xml.XmlDocument
+            $document.PreserveWhitespace = $true
+            $document.LoadXml($xml)
+            $root = $document.DocumentElement
+            $documentChanged = $false
+            foreach ($headerFooter in @($root.SelectNodes("./*[local-name()='headerFooter']"))) {
+                [void]$root.RemoveChild($headerFooter)
+                $documentChanged = $true
+            }
 
-            $newXml = [regex]::Replace($xml, '(?is)<(?:\w+:)?headerFooter\b[^>]*(?:/>|>.*?</(?:\w+:)?headerFooter>)', '')
-            # Only touch pageMargins when the sheet actually had header/footer content. Rewriting every
-            # sheet XML just to change blank header/footer margins is slow and does not affect page numbers.
-            $newXml = [regex]::Replace($newXml, '(?is)<(?:\w+:)?pageMargins\b[^>]*>', [System.Text.RegularExpressions.MatchEvaluator]{
-                param($m)
-                $tag = [string]$m.Value
-                if ($tag -notmatch '\sheader=') { $tag = $tag -replace '/?>$', ' header="0"$0' }
-                else { $tag = [regex]::Replace($tag, 'header="[^"]*"', 'header="0"') }
-                if ($tag -notmatch '\sfooter=') { $tag = $tag -replace '/?>$', ' footer="0"$0' }
-                else { $tag = [regex]::Replace($tag, 'footer="[^"]*"', 'footer="0"') }
-                return $tag
-            })
+            if ($name -match '^xl/worksheets/') {
+                $sheetPr = $root.SelectSingleNode("./*[local-name()='sheetPr']")
+                if ($null -eq $sheetPr) {
+                    $sheetPr = $document.CreateElement('sheetPr', [string]$root.NamespaceURI)
+                    [void](Add-WorksheetElementOrdered $document $root $sheetPr)
+                }
+                $pageSetUpPr = $sheetPr.SelectSingleNode("./*[local-name()='pageSetUpPr']")
+                if ($null -eq $pageSetUpPr) {
+                    $pageSetUpPr = $document.CreateElement('pageSetUpPr', [string]$root.NamespaceURI)
+                    [void]$sheetPr.AppendChild($pageSetUpPr)
+                }
+                Set-OpenXmlAttributeValue $pageSetUpPr 'fitToPage' '1'
+                Set-OpenXmlAttributeValue $pageSetUpPr 'autoPageBreaks' '0'
 
-            if ($newXml -ne $xml) {
+                $printOptions = Get-OrCreateWorksheetElement $document $root 'printOptions'
+                Set-OpenXmlAttributeValue $printOptions 'horizontalCentered' '1'
+                Set-OpenXmlAttributeValue $printOptions 'verticalCentered' '0'
+
+                $pageMargins = Get-OrCreateWorksheetElement $document $root 'pageMargins'
+                Set-OpenXmlAttributeValue $pageMargins 'left' '0.47244094'
+                Set-OpenXmlAttributeValue $pageMargins 'right' '0.47244094'
+                Set-OpenXmlAttributeValue $pageMargins 'top' '0.31496063'
+                Set-OpenXmlAttributeValue $pageMargins 'bottom' '0.31496063'
+                Set-OpenXmlAttributeValue $pageMargins 'header' '0'
+                Set-OpenXmlAttributeValue $pageMargins 'footer' '0'
+
+                $pageSetup = Get-OrCreateWorksheetElement $document $root 'pageSetup'
+                Set-OpenXmlAttributeValue $pageSetup 'fitToWidth' '1'
+                Set-OpenXmlAttributeValue $pageSetup 'fitToHeight' '1'
+                $scaleAttribute = $pageSetup.Attributes.GetNamedItem('scale')
+                if ($null -ne $scaleAttribute) { [void]$pageSetup.Attributes.Remove($scaleAttribute) }
+                $sheetsPrepared++
+                $documentChanged = $true
+            }
+
+            if ($documentChanged) {
+                $newXml = $document.OuterXml
                 $entry.Delete()
                 $newEntry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
                 $writer = $null
@@ -1905,7 +1978,7 @@ function Remove-XlsxHeaderFooterXml([string]$XlsxPath) {
                 $changed++
             }
         }
-        return [ordered]@{ ok = $true; changed = $changed; skipped = $false }
+        return [ordered]@{ ok=$true; changed=$changed; sheetsPrepared=$sheetsPrepared; printSettingsPrepared=($sheetsPrepared -gt 0); skipped=$false }
     } finally {
         if ($zip) { $zip.Dispose() }
     }
@@ -2544,6 +2617,8 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
     # V5-D1: render-engine -> render_<workbookId> の順で取得する。
     $Script:PendingAnalysis = $null
     $renderResult = Invoke-WithRenderLock $Language $WorkbookId {
+        $renderTimer = [Diagnostics.Stopwatch]::StartNew()
+        $timingsMs = [ordered]@{}
         Add-NotePropertyIfMissing $wb 'lastError' ''
         Add-NotePropertyIfMissing $wb 'lastErrorUser' ''
         Add-NotePropertyIfMissing $wb 'lastErrorAt' $null
@@ -2615,6 +2690,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
         $tmpDir = Join-Path ([string]$paths.dataDir) (Join-Path 'common\tmp' ([Guid]::NewGuid().ToString('N')))
         New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
         $tmpPath = Join-Path $tmpDir ([IO.Path]::GetFileName($sourcePath))
+        $copyTimer = [Diagnostics.Stopwatch]::StartNew()
         $lastCopyError = ''
         $copied = $false
         for ($copyAttempt = 1; $copyAttempt -le 3; $copyAttempt++) {
@@ -2638,6 +2714,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
         if ($copyItem.Length -ne $item.Length -or $sourceAfterCopy.Length -ne $item.Length -or $sourceAfterCopy.LastWriteTimeUtc -ne $item.LastWriteTimeUtc) {
             throw 'コピー中に提出Excelが更新されました。保存が終わってからもう一度PDF作成してください。'
         }
+        $timingsMs.localCopy = [int64]$copyTimer.ElapsedMilliseconds
         # V5-§3.1/§6.2: 提出フォルダの現物からレンダリングする場合は、
         # ヘッダー/フッターXMLを加工する前(L直後)に未加工の検知版を保存する。
         if ([string]::IsNullOrWhiteSpace($SourceSnapshotId) -and (Test-InputHistoryEnabled)) {
@@ -2661,8 +2738,11 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             } catch { }
         }
 
-        $excelPackageScrub = $null
-        try { $excelPackageScrub = Remove-XlsxHeaderFooterXml $tmpPath } catch { $excelPackageScrub = [ordered]@{ ok = $false; error = $_.Exception.Message } }
+        $packageTimer = [Diagnostics.Stopwatch]::StartNew()
+        $excelPackagePreparation = $null
+        try { $excelPackagePreparation = Prepare-XlsxPrintPackage $tmpPath } catch { $excelPackagePreparation = [ordered]@{ ok=$false; printSettingsPrepared=$false; error=$_.Exception.Message } }
+        $packagePrintSettingsPrepared = [bool](Get-DataProperty $excelPackagePreparation 'printSettingsPrepared' $false)
+        $timingsMs.packagePreparation = [int64]$packageTimer.ElapsedMilliseconds
 
         $excel = $SharedExcel
         $ownsExcel = $false
@@ -2674,10 +2754,13 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             if ($ProgressCallback) { & $ProgressCallback 'prepare' $WorkbookId '' }
             if ($null -eq $excel) {
                 $steps += 'Excel COMを起動'
+                $excelStartTimer = [Diagnostics.Stopwatch]::StartNew()
                 $excel = New-ExcelApplicationForRender
+                $timingsMs.excelStartup = [int64]$excelStartTimer.ElapsedMilliseconds
                 $ownsExcel = $true
             } else {
                 $steps += '既存のExcel COMを使用'
+                $timingsMs.excelStartup = 0
                 try { $excel.DisplayAlerts = $false; $excel.EnableEvents = $false; $excel.ScreenUpdating = $false } catch { }
             }
             $envInfo = Get-CachedRenderEnvironment $excel
@@ -2689,22 +2772,28 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 $Script:RenderEnvironmentCompared = $true
             }
 
-            if ($excelPackageScrub -and $excelPackageScrub.ok -eq $true -and [int](Get-DataProperty $excelPackageScrub 'changed' 0) -gt 0) {
-                $steps += "Excel内部のヘッダー/フッターXMLを削除: $([int](Get-DataProperty $excelPackageScrub 'changed' 0)) 件"
-            } elseif ($excelPackageScrub -and $excelPackageScrub.ok -eq $false) {
-                $warnings += "Excel内部ヘッダー/フッターXMLの事前削除に失敗しました。COM設定で削除を続行します: $([string](Get-DataProperty $excelPackageScrub 'error' ''))"
+            if ($packagePrintSettingsPrepared) {
+                $steps += "Excelを開く前に印刷設定を準備: $([int](Get-DataProperty $excelPackagePreparation 'sheetsPrepared' 0)) シート"
+            } elseif ($excelPackagePreparation -and $excelPackagePreparation.ok -eq $false) {
+                $warnings += "Excel内部の印刷設定を事前準備できませんでした。COM設定で続行します: $([string](Get-DataProperty $excelPackagePreparation 'error' ''))"
             }
             $steps += '一時コピーを開く'
             if ($ProgressCallback) { & $ProgressCallback 'open' $WorkbookId '' }
+            $excelOpenTimer = [Diagnostics.Stopwatch]::StartNew()
             $book = Open-ExcelWorkbookSafe $excel $tmpPath $true
+            $timingsMs.excelOpen = [int64]$excelOpenTimer.ElapsedMilliseconds
             try { $book.CheckCompatibility = $false } catch { }
 
+            $sheetSetupTimer = [Diagnostics.Stopwatch]::StartNew()
             $inspected = @()
             $targetSheetNames = @()
             $sheetRenderInfos = @()
             $sheetCount = 0
             try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
-            $deferredPrintCommunication = Set-ExcelPrintCommunicationSafe $excel $false
+            $deferredPrintCommunication = $false
+            if (-not $packagePrintSettingsPrepared) {
+                $deferredPrintCommunication = Set-ExcelPrintCommunicationSafe $excel $false
+            }
             try {
                 for ($i = 1; $i -le $sheetCount; $i++) {
                     $ws = $null
@@ -2722,9 +2811,11 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                             $printArea = ''
                             $inspected += [ordered]@{ sheetName = $sheetName; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
 
-                            $steps += "シート $sheetName の印刷設定を調整"
-                            if ($ProgressCallback) { & $ProgressCallback 'sheet-setup' $WorkbookId $sheetName }
-                            Apply-StandardPrintSettings $ws $excel $deferredPrintCommunication
+                            if (-not $packagePrintSettingsPrepared) {
+                                $steps += "シート $sheetName の印刷設定を調整"
+                                if ($ProgressCallback) { & $ProgressCallback 'sheet-setup' $WorkbookId $sheetName }
+                                Apply-StandardPrintSettings $ws $excel $deferredPrintCommunication
+                            }
                             $outPdf = Join-Path $contentDir "$sheetName.pdf"
                             $sheetRenderInfos += [ordered]@{ sheetName = $sheetName; outPdf = $outPdf; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
                         }
@@ -2735,6 +2826,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             } finally {
                 if ($deferredPrintCommunication) { [void](Set-ExcelPrintCommunicationSafe $excel $true) }
             }
+            $timingsMs.sheetInspectionAndSetup = [int64]$sheetSetupTimer.ElapsedMilliseconds
             if ($targetSheetNames.Count -eq 0) {
                 $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @()
                 # V5-§3.7: 旧世代の個別削除は廃止。世代単位の掃除(Remove-WorkbookContentPdfs)に一本化する。
@@ -2744,6 +2836,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 throw 'PDF化対象のシートがありません。シート名が半角数字のみ（例: 1, 2, 003）のシートを用意してください。'
             }
 
+            $excelExportTimer = [Diagnostics.Stopwatch]::StartNew()
             $batchResult = $null
             if (@($sheetRenderInfos).Count -gt 1) {
                 if ($ProgressCallback) { & $ProgressCallback 'batch' $WorkbookId '' }
@@ -2777,6 +2870,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             }
 
             $usedBatchOutput = ($batchResult -and $batchResult.ok -eq $true)
+            $timingsMs.excelExportAndSplit = [int64]$excelExportTimer.ElapsedMilliseconds
             foreach ($info in @($sheetRenderInfos)) {
                 $sheetName = [string]$info.sheetName
                 $outPdf = [string]$info.outPdf
@@ -2861,7 +2955,8 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 $cat=Require-WorkbookCategory ([string]$lw.category);$vols=@(Get-Array $st.pages|Where-Object{[string]$_.workbookId -eq $WorkbookId}|ForEach-Object{[string]$_.volume}|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique);Mark-VolumeNeedsRebuild $st $Language $cat $vols 'render' 'Excelを1件PDF作成しました'
                 return $sync
             }
-            Write-JsonFile (Join-Path $workspace $logRel) ([ordered]@{ workbookId = $WorkbookId; rendered = $rendered; warnings = $warnings; steps = $steps; sheetSync = $pageSync; at = New-NowIso })
+            $timingsMs.total = [int64]$renderTimer.ElapsedMilliseconds
+            Write-JsonFile (Join-Path $workspace $logRel) ([ordered]@{ workbookId = $WorkbookId; rendered = $rendered; warnings = $warnings; steps = $steps; timingsMs = $timingsMs; sheetSync = $pageSync; at = New-NowIso })
             # V5-P1: 解析はここでは実行しない。
             # レンダリング用Excelを開いたまま、レンダリングロックを保持したまま解析すると、
             # 比較用の再レンダリングが2つ目のExcel COMを起動してしまう(1ジョブ制限に反する)。
@@ -2875,7 +2970,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             if (-not [string]::IsNullOrWhiteSpace($ephemeralCaptureId)) { Remove-EphemeralCopy $Language $ephemeralCaptureId }
             if ($ownsExcel -or -not $KeepExcelOpen) { [GC]::Collect(); [GC]::WaitForPendingFinalizers() }
         }
-        return [ordered]@{ workbookId = $WorkbookId; versionId = $versionId; rendered = $rendered; warnings = $warnings; steps = $steps; sheetSync = $pageSync }
+        return [ordered]@{ workbookId = $WorkbookId; versionId = $versionId; rendered = $rendered; warnings = $warnings; steps = $steps; timingsMs = $timingsMs; sheetSync = $pageSync }
     }
 
     # V5-P1: ここではレンダリングロックもExcelも解放済み。
@@ -6319,7 +6414,9 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
             $work = Join-Path $tmpDir 'source.xlsx'
             Copy-FileSharedRead ([string]$state.sourcePath) $work
             try { Unblock-File -LiteralPath $work -ErrorAction SilentlyContinue } catch { }
-            try { [void](Remove-XlsxHeaderFooterXml $work) } catch { }
+            $comparisonPackagePreparation = $null
+            try { $comparisonPackagePreparation = Prepare-XlsxPrintPackage $work } catch { $comparisonPackagePreparation = [ordered]@{ ok=$false; printSettingsPrepared=$false } }
+            $comparisonPackagePrepared = [bool](Get-DataProperty $comparisonPackagePreparation 'printSettingsPrepared' $false)
             $excel = New-ExcelApplicationForRender
             $envInfo = Get-RenderEnvironment $excel
             $Script:CurrentRenderEnvFingerprint = Get-RenderEnvironmentFingerprint $envInfo
@@ -6335,7 +6432,7 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
                     $sheetName = [string]$ws.Name
                     if (-not (([int]$ws.Visible -eq -1) -and $sheetName -match '^[0-9]+$')) { continue }
                     $outPdf = Join-Path $contentDir ("{0}.pdf" -f $sheetName)
-                    [void](Export-WorksheetToPdfSafe $excel $book $ws $outPdf $sheetName $false)
+                    [void](Export-WorksheetToPdfSafe $excel $book $ws $outPdf $sheetName $comparisonPackagePrepared)
                     if (Test-Path -LiteralPath $outPdf) {
                         $sheets += @{
                             sheetName = $sheetName
