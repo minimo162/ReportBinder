@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory=$false)]
-    [string]$OutputDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'ReportBinderRelease'),
+    [string]$OutputDir = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder\release'),
     [Parameter(Mandatory=$false)]
     [switch]$SharedFolderOnly,
     [Parameter(Mandatory=$false)]
@@ -180,8 +180,65 @@ function Get-UniqueReleasePath([string]$BasePath) {
     return $candidate
 }
 
+function Copy-DirectoryContents([string]$SourceDir, [string]$DestinationDir) {
+    New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
+    foreach ($item in (Get-ChildItem -LiteralPath $SourceDir -Force)) {
+        Copy-Item -LiteralPath $item.FullName -Destination $DestinationDir -Recurse -Force
+    }
+}
+
+function Publish-SharedFolderStage([string]$StageRoot, [string]$TargetRoot) {
+    $moveMessage = ''
+    $publishedByMove = $false
+    try {
+        Move-Item -LiteralPath $StageRoot -Destination $TargetRoot
+        $publishedByMove = $true
+    } catch {
+        $moveMessage = $_.Exception.Message
+        # OneDriveやウイルス対策がディレクトリ移動だけを拒否する場合は、
+        # 完成済みstageの内容をコピーし、コピー先をもう一度検証する。
+        if (-not (Test-Path -LiteralPath $StageRoot) -and (Test-Path -LiteralPath $TargetRoot)) {
+            $publishedByMove = $true
+        } else {
+            if (Test-Path -LiteralPath $TargetRoot) {
+                Remove-Item -LiteralPath $TargetRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            $buildingMarker = Join-Path $TargetRoot '_作成中.txt'
+            try {
+                Copy-DirectoryContents -SourceDir $StageRoot -DestinationDir $TargetRoot
+                New-Item -ItemType File -Path $buildingMarker -Force | Out-Null
+            } catch {
+                if (Test-Path -LiteralPath $TargetRoot) {
+                    Remove-Item -LiteralPath $TargetRoot -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                throw ("完成フォルダーをコピーできませんでした。フォルダー移動: {0} / 内容コピー: {1}" -f $moveMessage, $_.Exception.Message)
+            }
+        }
+    }
+
+    try {
+        Assert-StagedDependencies -StageRoot $TargetRoot -IncludeJava $true
+        Assert-SharedFolderLayout $TargetRoot
+        $buildingMarker = Join-Path $TargetRoot '_作成中.txt'
+        if (Test-Path -LiteralPath $buildingMarker) {
+            Remove-Item -LiteralPath $buildingMarker -Force
+        }
+    } catch {
+        if (Test-Path -LiteralPath $TargetRoot) {
+            Remove-Item -LiteralPath $TargetRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+
+    if (-not $publishedByMove) {
+        Write-Warning ("フォルダー移動が拒否されたため、内容コピーで安全に作成しました: {0}" -f $moveMessage)
+    }
+    return $TargetRoot
+}
+
 function New-SharedFolderRelease {
-    $tempBase = Join-Path $OutputDir ('.building_ReportBinder_' + [guid]::NewGuid().ToString('N'))
+    # OneDrive配下でのstagingは同期処理に掴まれやすいため、OSの一時領域で完成させる。
+    $tempBase = Join-Path ([IO.Path]::GetTempPath()) ('ReportBinderShared_' + [guid]::NewGuid().ToString('N'))
     $stage = Join-Path $tempBase 'ReportBinder'
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
@@ -193,8 +250,7 @@ function New-SharedFolderRelease {
 
         $targetBase = Join-Path $OutputDir ("ReportBinder_共有フォルダー用_{0}" -f $stamp)
         $target = Get-UniqueReleasePath $targetBase
-        Move-Item -LiteralPath $stage -Destination $target
-        return $target
+        return (Publish-SharedFolderStage -StageRoot $stage -TargetRoot $target)
     } finally {
         if (Test-Path -LiteralPath $tempBase) {
             Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction SilentlyContinue
