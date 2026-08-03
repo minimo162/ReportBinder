@@ -22,13 +22,13 @@ VBScriptはWindowsで段階的に廃止されるため、通常の起動入口�
 共有フォルダー用フォルダー作成.cmd
 ```
 
-開発用selfcheckにはログやキャッシュがないクリーンなリポジトリが必要なため、この作成処理からは分離しています。実際に配布するPDF.js、PDFBox、ポータブルJREと完成フォルダー構成を必ず検証した後、デスクトップの
-`ReportBinderRelease\ReportBinder_共有フォルダー用_yyyyMMdd_HHmmss`
+開発用selfcheckにはログやキャッシュがないクリーンなリポジトリが必要なため、この作成処理からは分離しています。実際に配布するPDF.js、PDFBox、ポータブルJREと完成フォルダー構成を必ず検証した後、OneDrive同期の影響を受けない
+`%LOCALAPPDATA%\ReportBinder\release\ReportBinder_共有フォルダー用_yyyyMMdd_HHmmss`
 へ、共有フォルダーへそのままコピーできるオフライン完結版を作成し、作成先をエクスプローラーで開きます。
 
 作成物にはポータブルJRE、PDFBox、PDF.jsを含みます。一方、個人設定、ログ、キャッシュ、管理データ、出力PDF、GitHub設定、テストfixture、Javaビルドソース、パッケージ作成ファイル、移行用VBSは含めません。作成されたフォルダー全体を共有フォルダーへコピーしてください。
 
-PowerShellから作成先を指定する場合は次を実行します。作成先にReportBinderの元フォルダー配下は指定できません。
+PowerShellから作成先を指定する場合は次を実行します。作成先にReportBinderの元フォルダー配下は指定できません。OneDriveや共有フォルダーを指定してディレクトリ移動が拒否された場合は、内容コピー、完成物の再検証、失敗時削除へ自動的に切り替わります。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\package-release.ps1 -SharedFolderOnly -OutputDir "D:\配布作業"
