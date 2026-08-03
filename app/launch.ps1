@@ -404,12 +404,9 @@ function ConvertTo-JsStringLiteral([string]$Value) {
     return '"' + $escaped + '"'
 }
 
-function Write-StartupWaitPage([string]$Path, [string]$AppUrl, [string]$ReadyImageUrl, [string]$ShortcutPath, [string]$LatestLogPath) {
+function Write-StartupWaitPage([string]$Path, [string]$AppUrl, [string]$ReadyImageUrl) {
     $appJs = ConvertTo-JsStringLiteral $AppUrl
     $readyJs = ConvertTo-JsStringLiteral $ReadyImageUrl
-    $shortcutHtml = ConvertTo-HtmlText $ShortcutPath
-    $logHtml = ConvertTo-HtmlText $LatestLogPath
-    $directHtml = ConvertTo-HtmlText $AppUrl
     $appHref = ConvertTo-HtmlText $AppUrl
     $html = @"
 <!doctype html>
@@ -427,16 +424,13 @@ h1{font-size:24px;margin:0 0 12px;}p{font-size:16px;line-height:1.8;margin:8px 0
 <body>
 <main>
 <div class="spinner"></div>
-<h1>ReportBinder を起動しています</h1>
-<p>ローカルサーバーの準備ができたら、自動で画面に切り替わります。</p>
+<h1>ReportBinder を準備しています</h1>
+<p>準備ができたら、自動で画面に切り替わります。更新後の初回起動は少し時間がかかる場合があります。</p>
 <p class="muted">経過: <span id="elapsed">0</span> 秒</p>
 <div class="actions"><a class="button" href="$appHref">準備ができたら画面を開く</a></div>
 <div id="late" class="late">
-<p>起動に時間がかかっています。もう少し待つと自動で切り替わります。</p>
-<p>この画面のまま止まる場合は、上の「準備ができたら画面を開く」ボタン、または以下のEdge起動用ファイルを開いてください。</p>
-<p><code>$shortcutHtml</code></p>
-<p class="muted">起動ログ: <code>$logHtml</code></p>
-<p class="muted">接続先: <code>$directHtml</code></p>
+<p>準備を続けています。この画面は、準備が完了すると自動で切り替わります。</p>
+<p class="muted">しばらく待っても切り替わらない場合は、上のボタンを押してください。</p>
 </div>
 </main>
 <script>
@@ -672,17 +666,13 @@ try {
     $serverQuoted = Quote-ProcessArgument $server
     $argLine = "-NoProfile -ExecutionPolicy Bypass -File $serverQuoted -Mode $Mode -Port $port -Token $token -NoOpen"
     Add-LaunchLog "Starting server.ps1 as a background process. Browser startup wait page will be opened immediately."
-    # サーバーをコンソールウィンドウ表示で起動する。ウィンドウを閉じればプロセスごと終了できる。
-    # (目立たせたくない場合は Normal を Minimized に、完全に隠す場合は Hidden に変更)
-    $proc = Start-Process -FilePath $psExe -ArgumentList $argLine -WindowStyle Normal -PassThru -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
+    # UIサーバーはバックグラウンドで動作する。診断情報はローカルログへ保存し、通常起動ではコンソールを表示しない。
+    $proc = Start-Process -FilePath $psExe -ArgumentList $argLine -WindowStyle Hidden -PassThru -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
     Set-Content -LiteralPath $serverPidFile -Value ([string]$proc.Id) -Encoding ASCII
     Add-LaunchLog "ServerProcessId=$($proc.Id)"
 
-    # コンソールウィンドウの描画が先に完了してからブラウザを前面に出す。
-    Start-Sleep -Milliseconds 100
-
     $readyImageUrl = Get-ReportBinderApiUrl $url '/api/ready.gif'
-    Write-StartupWaitPage $waitPageFile $url $readyImageUrl $edgeCmdFile $latest
+    Write-StartupWaitPage $waitPageFile $url $readyImageUrl
     Add-LaunchLog "Opening startup wait page immediately. It will switch to ReportBinder when the local server is ready."
     $waitPageOpened = Open-EdgeBrowser $waitPageFile
     if (-not $waitPageOpened) {
