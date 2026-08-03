@@ -34,19 +34,6 @@ PowerShellから作成先を指定する場合は次を実行します。作成�
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\package-release.ps1 -SharedFolderOnly -OutputDir "D:\配布作業"
 ```
 
-## V3以前から更新する場合
-
-V4の初回起動では、各言語の`structure.json`をschemaVersion 2へ移行します。共有フォルダで複数人が利用している場合は、次の手順を守ってください。
-
-1. 利用者へ停止を告知します。
-2. 旧版のブラウザとReportBinderプロセスをすべて終了します。30分アイドル終了を待つ場合は35分以上の保守枠を確保します。
-3. 旧ランチャーを退避し、V4だけを起動できる状態にします。
-4. V4を起動します。
-5. `_reportbinder\ja`と`_reportbinder\en`に`structure.json.v1.bak`が作成されたことを確認します。
-6. 移行後は、旧版から同じ`_reportbinder`を開かないでください。
-
-移行は`structure.lock`内で1回だけ行われます。対応上限を超えるschemaVersionを検知した場合、V4は起動を拒否します。
-
 ## 配布形態
 
 ### オフライン完結版
@@ -107,8 +94,9 @@ app\tools\install-thirdparty.cmd
 共有発行（英語）:   提出フォルダ\MMdd_HHmmss_E_Windowsユーザー名
 ```
 
-既存の `提出フォルダ\_reportbinder` と `提出フォルダ\出力` は、各利用者の初回起動時に
-ローカルプロジェクトへ一度だけコピーします。以後、共有側の旧管理データは更新しません。
+既存の `提出フォルダ\_reportbinder` と `提出フォルダ\出力` は参照もコピーもしません。
+新しい利用者または移行未完了の利用者は、空のローカル管理領域から開始します。移行完了マーカーが
+ある既存利用者のローカルデータはそのまま保持します。旧共有管理フォルダーはアプリから自動削除しません。
 
 ## 基本操作
 
