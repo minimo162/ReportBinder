@@ -1518,7 +1518,7 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260731_v1',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260803_v2',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1589,17 +1589,17 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   // 通常は前後PDFが同じ寸法なので、描画済みCanvasをそのまま解析・表示し、
   // 同じ全面Canvasの再作成とdrawImageを2回分省略する。
   const beforeCanvas=normalizeCanvas(beforeRaw),afterCanvas=normalizeCanvas(afterRaw);
-  let regions=[],status='ready',message='';
+  let regions=[],status='ready',message='',analysis=null;
   const exactSame=asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber);
   if(kind==='added')regions=[fullDiffRegion('added',width,height)];
   else if(kind==='removed')regions=[fullDiffRegion('removed',width,height)];
   else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message='信頼できる差分領域を判定できません。';}
   else if(kind!=='unchanged'&&!exactSame){
     setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
-    try{const analyzed=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analyzed.regions);}
+    try{analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);if(analysis.alignmentAdjusted)message='行の追加・削除による位置ずれを補正して差分を絞り込みました。';}
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
   }
-  const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.width!==afterRaw.width||beforeRaw.height!==afterRaw.height),status,message,confidence:status==='unknown'?0:1,changedRatio:regions.length?1:0,regionCount:regions.length,regions};
+  const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.width!==afterRaw.width||beforeRaw.height!==afterRaw.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
   return {sheetKey:String(sheet?.sheetKey||''),pageIndex,page,beforeCanvas,afterCanvas};
 }
 function paintDiffBrowserPage(result){
