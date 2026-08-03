@@ -439,7 +439,8 @@ function hideErrorPanel() {
 function log(message, obj) {
   const time = new Date().toLocaleTimeString();
   const detail = obj ? `\n${typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)}` : '';
-  $('log').textContent = `[${time}] ${message}${detail}\n\n` + $('log').textContent;
+  const target = $('log');
+  if (target) target.textContent = `[${time}] ${message}${detail}\n\n` + target.textContent;
 }
 
 async function api(path, options = {}) {
@@ -1518,7 +1519,7 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260803_v2',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260803_v3',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1596,7 +1597,7 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message='信頼できる差分領域を判定できません。';}
   else if(kind!=='unchanged'&&!exactSame){
     setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
-    try{analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);if(analysis.alignmentAdjusted)message='行の追加・削除による位置ずれを補正して差分を絞り込みました。';}
+    try{analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';}
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
   }
   const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.width!==afterRaw.width||beforeRaw.height!==afterRaw.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
