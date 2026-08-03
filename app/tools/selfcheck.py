@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260803_v3'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260803_v4'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1010,7 +1010,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260803_v65', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260803_v66', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1057,7 +1057,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260803_v65' not in html:
+if 'app.js?v=20260803_v66' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1083,7 +1083,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260803_v65' not in html:
+if 'app.js?v=20260803_v66' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1148,7 +1148,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.03.7':
+if str(runtime_info.get('version','')) != '2026.08.03.8':
     raise SystemExit('two-axis comparison release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1164,5 +1164,19 @@ for forbidden in ['WindowStyle Normal', '起動ログ: <code>', '接続先: <cod
         raise SystemExit(f'development diagnostics are still visible during normal startup: {forbidden}')
 if '<pre id="log" hidden></pre>' not in html:
     raise SystemExit('browser diagnostics sink must remain available without a visible development panel')
+
+# A modified sheet must always lead the user to a visible highlight. Pages known to
+# be unchanged are skipped initially, and sub-threshold pixel changes use a local
+# fallback before the UI resorts to a whole-page indication.
+for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
+               'preferredDiffPageIndex(sheet)', 'preferredDiffPageIndex(preferred)',
+               'このページに変更はありません。シート内の別ページに変更があります。',
+               "if(!regions.length){regions=[fullDiffRegion('modified'", 'analysis.fallbackUsed']:
+    if needed not in appjs:
+        raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
+for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>12',
+               'if(!regions.length)', 'fallbackUsed=true']:
+    if needed not in diff_worker:
+        raise SystemExit(f'small-difference region fallback missing: {needed}')
 
 print('selfcheck ok')

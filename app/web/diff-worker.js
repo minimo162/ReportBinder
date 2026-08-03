@@ -430,27 +430,56 @@ function mergeNearbyComponents(components,width,height){
   }
   return merged;
 }
+function buildFallbackRegion(counts,gridWidth,gridHeight,width,height){
+  let seed=-1,peak=0;
+  for(let index=0;index<counts.length;index++)if(counts[index]>peak){peak=counts[index];seed=index;}
+  if(seed<0||peak<=0)return null;
+  const threshold=Math.max(1,Math.ceil(peak*.25)),visited=new Uint8Array(counts.length),queue=new Int32Array(counts.length);
+  let head=0,tail=0;queue[tail++]=seed;visited[seed]=1;
+  let minGX=seed%gridWidth,maxGX=minGX,minGY=Math.floor(seed/gridWidth),maxGY=minGY,pixels=0,cells=0;
+  while(head<tail){
+    const current=queue[head++],cx=current%gridWidth,cy=Math.floor(current/gridWidth),value=counts[current];
+    if(value<threshold)continue;
+    minGX=Math.min(minGX,cx);maxGX=Math.max(maxGX,cx);minGY=Math.min(minGY,cy);maxGY=Math.max(maxGY,cy);pixels+=value;cells++;
+    for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+      if(!ox&&!oy)continue;
+      const nx=cx+ox,ny=cy+oy;if(nx<0||nx>=gridWidth||ny<0||ny>=gridHeight)continue;
+      const next=ny*gridWidth+nx;if(!visited[next]&&counts[next]>=threshold){visited[next]=1;queue[tail++]=next;}
+    }
+  }
+  if(!cells)return null;
+  const boxWidth=(maxGX-minGX+1)*BLOCK,boxHeight=(maxGY-minGY+1)*BLOCK;
+  // Sparse render noise can connect distant cells. In that case emphasize the strongest
+  // local cell instead of returning another misleading whole-page rectangle.
+  if(boxWidth>width*.75&&boxHeight>height*.75&&pixels/Math.max(1,boxWidth*boxHeight)<.01){
+    const sx=seed%gridWidth,sy=Math.floor(seed/gridWidth);minGX=Math.max(0,sx-2);maxGX=Math.min(gridWidth-1,sx+2);minGY=Math.max(0,sy-2);maxGY=Math.min(gridHeight-1,sy+2);pixels=peak;
+  }
+  const padding=PADDING+4,minX=Math.max(0,minGX*BLOCK-padding),minY=Math.max(0,minGY*BLOCK-padding);
+  const maxX=Math.min(width-1,(maxGX+1)*BLOCK-1+padding),maxY=Math.min(height-1,(maxGY+1)*BLOCK-1+padding);
+  return {regionId:'browser-r0001',kind:'modified',x:minX/width,y:minY/height,width:Math.max(1,maxX-minX+1)/width,height:Math.max(1,maxY-minY+1)/height,confidence:.5,pixelCount:pixels};
+}
 function analyzeBrowserDiff(before,after,width,height){
   const rowAlignment=alignRows(before,after,width,height);
   const columnAlignment=choosePixelColumnMapping(before,after,width,height,rowAlignment);
   refinePixelRowMapping(before,after,width,height,rowAlignment,columnAlignment);
   refinePixelColumnMapping(before,after,width,height,rowAlignment,columnAlignment);
   const gridWidth=Math.ceil(width/BLOCK),gridHeight=Math.ceil(height/BLOCK),cellCount=gridWidth*gridHeight;
-  const mask=new Uint8Array(cellCount),counts=new Uint32Array(cellCount);
+  const mask=new Uint8Array(cellCount),counts=new Uint32Array(cellCount),looseCounts=new Uint32Array(cellCount);
   let totalChanged=0;
   for(let gy=0;gy<gridHeight;gy++)for(let gx=0;gx<gridWidth;gx++){
-    let changed=0;
+    let changed=0,looseChanged=0;
     const x0=gx*BLOCK,y0=gy*BLOCK,x1=Math.min(width,x0+BLOCK),y1=Math.min(height,y0+BLOCK);
     for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
       const ax=mappedColumnX(columnAlignment,x,width),ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4;
-      let different=false;
+      let difference=0;
       if(ax<0||ax>=width||ay<0||ay>=height){
-        different=before[bi]<248||before[bi+1]<248||before[bi+2]<248;
-      }else different=tolerantPixelDifference(before,after,width,height,x,y,ax,ay)>PIXEL_THRESHOLD;
-      if(different)changed++;
+        difference=255-Math.min(before[bi],before[bi+1],before[bi+2]);
+      }else difference=tolerantPixelDifference(before,after,width,height,x,y,ax,ay);
+      if(difference>12)looseChanged++;
+      if(difference>PIXEL_THRESHOLD)changed++;
     }
     const index=gy*gridWidth+gx;
-    counts[index]=changed;totalChanged+=changed;
+    counts[index]=changed;looseCounts[index]=looseChanged;totalChanged+=changed;
     if(changed>=Math.max(2,Math.floor((x1-x0)*(y1-y0)*.2)))mask[index]=1;
   }
   // Rows that have no counterpart are the human-visible insertion/deletion bands.
@@ -520,13 +549,18 @@ function analyzeBrowserDiff(before,after,width,height){
   let components=mergeNearbyComponents(raw,width,height);
   if(components.length>MAX_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_REGIONS);
   components.sort((a,b)=>a.minY-b.minY||a.minX-b.minX);
-  const regions=components.map((component,index)=>({
+  let regions=components.map((component,index)=>({
     regionId:`browser-r${String(index+1).padStart(4,'0')}`,kind:'modified',x:component.minX/width,y:component.minY/height,
     width:Math.max(1,component.maxX-component.minX+1)/width,height:Math.max(1,component.maxY-component.minY+1)/height,
     confidence:Math.max(.55,Math.min(1,component.pixels/Math.max(MIN_PIXELS,(component.maxX-component.minX+1)*(component.maxY-component.minY+1)))),pixelCount:component.pixels
   }));
+  let fallbackUsed=false;
+  if(!regions.length){
+    const fallback=buildFallbackRegion(totalChanged?counts:looseCounts,gridWidth,gridHeight,width,height);
+    if(fallback){regions=[fallback];fallbackUsed=true;}
+  }
   const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||gapRows.length>0;
-  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump)),alignmentMode:`${rowAlignment.alignmentMode}/${columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity'}`,alignmentAdjusted};
+  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump)),alignmentMode:`${rowAlignment.alignmentMode}/${columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity'}`,alignmentAdjusted,fallbackUsed};
 }
 self.onmessage=function handleDiffWorkerMessage(event){
   const payload=event.data||{},id=payload.id;
