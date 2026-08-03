@@ -126,10 +126,19 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260731_v1'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260803_v2'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
-for needed in ['chooseAlignment', 'threshold=24', 'block=4', 'minPixels=24', 'self.onmessage']:
-    if needed not in _diff_worker: raise SystemExit(f'browser diff worker missing: {needed}')
+for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
+               'choosePixelRowMapping', 'pixel-scale-and-row-shift',
+               'scaleY', 'maxLocalShiftJump', 'tolerantPixelDifference',
+               'mergeNearbyComponents', 'gapX=2', 'self.onmessage']:
+    if needed not in _diff_worker: raise SystemExit(f'human-aligned browser diff worker missing: {needed}')
+if 'for(let dy=-4;dy<=4;dy++)' in _diff_worker:
+    raise SystemExit('browser diff worker still uses fixed +/-4px-only alignment')
+for needed in ['analysis.alignmentAdjusted', 'changedRatio:Number(analysis?.changedRatio||0)',
+               '行の追加・削除による位置ずれを補正']:
+    if needed not in _appjs_early:
+        raise SystemExit(f'human-aligned browser diff UI missing: {needed}')
 for forbidden in ['prepareDiffDetail(', "api('/api/history/diff/prepare'", '/api/history/diff-page']:
     if forbidden in _appjs_early: raise SystemExit(f'browser still starts server comparison-image generation: {forbidden}')
 for needle in ['function New-HistoricalSnapshotComparison',
@@ -160,6 +169,24 @@ for needle in [
     if needle not in server: raise SystemExit(f'server feature not found: {needle}')
 if len(re.findall(r'(?<!function )Save-Structure\s',server)):
     raise SystemExit('direct Save-Structure use is forbidden')
+
+# OpenXML workbooks must receive the standard print profile before Excel opens them,
+# avoiding the slow PageSetup COM round-trip on every numeric worksheet.
+if 'function Remove-XlsxHeaderFooterXml' in server:
+    raise SystemExit('header/footer-only package preparation must be replaced by full print preparation')
+_print_package=server.split('function Prepare-XlsxPrintPackage',1)[1].split('\nfunction Clear-ExcelPageSetupHeadersAndFooters',1)[0]
+for needed in ["pageSetUpPr 'fitToPage' '1'", "printOptions 'horizontalCentered' '1'",
+               "pageMargins 'left' '0.47244094'", "pageMargins 'top' '0.31496063'",
+               "pageSetup 'fitToWidth' '1'", "pageSetup 'fitToHeight' '1'",
+               'printSettingsPrepared=($sheetsPrepared -gt 0)']:
+    if needed not in _print_package:
+        raise SystemExit(f'OpenXML print preparation missing: {needed}')
+_render_workbook=server.split('function Render-Workbook(',1)[1].split('\nfunction ',1)[0]
+for needed in ['Prepare-XlsxPrintPackage $tmpPath', '$packagePrintSettingsPrepared',
+               'if (-not $packagePrintSettingsPrepared)', 'timingsMs = $timingsMs',
+               '$timingsMs.excelOpen', '$timingsMs.excelExportAndSplit']:
+    if needed not in _render_workbook:
+        raise SystemExit(f'PDF render optimization/measurement missing: {needed}')
 # First-run setup initializes the selected dataDir before local config is committed.
 for signature in [
     "function Get-WorkspacePath([string]$Language, [string]$DataDir = '')",
@@ -982,7 +1009,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260802_v63', 'style.css?v=20260731_v53']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260803_v64', 'style.css?v=20260731_v53']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1029,7 +1056,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260802_v63' not in html:
+if 'app.js?v=20260803_v64' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1055,7 +1082,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260802_v63' not in html:
+if 'app.js?v=20260803_v64' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
