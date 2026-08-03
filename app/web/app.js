@@ -1433,6 +1433,13 @@ function diffComparisonIdentity(){
 function diffSheetPageCount(sheet){
   return Math.max(0,Number(sheet?.pageCount||0),Number(sheet?.beforePages||0),Number(sheet?.afterPages||0),asArray(sheet?.pages).length);
 }
+function preferredDiffPageIndex(sheet){
+  const pageCount=diffSheetPageCount(sheet);
+  if(String(sheet?.kind||'')!=='modified'||pageCount<=1)return 0;
+  const unchanged=new Set(asArray(sheet?.unchangedPageNumbers).map(Number).filter(Number.isFinite));
+  for(let pageNumber=1;pageNumber<=pageCount;pageNumber++)if(!unchanged.has(pageNumber))return pageNumber-1;
+  return 0;
+}
 function diffBrowserPageKey(sheet,pageIndex){
   return `${diffComparisonIdentity()}|${String(sheet?.sheetKey||'')}|${Number(pageIndex||0)}`;
 }
@@ -1519,7 +1526,7 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260803_v3',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260803_v4',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1597,9 +1604,14 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message='信頼できる差分領域を判定できません。';}
   else if(kind!=='unchanged'&&!exactSame){
     setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
-    try{analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';}
+    try{
+      analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);
+      if(analysis.fallbackUsed)message='小さい差分を検出したため、最も可能性の高い箇所を強調しています。';
+      else if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';
+      if(!regions.length){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
+    }
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
-  }
+  }else if(kind==='modified'&&exactSame)message='このページに変更はありません。シート内の別ページに変更があります。';
   const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.width!==afterRaw.width||beforeRaw.height!==afterRaw.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
   return {sheetKey:String(sheet?.sheetKey||''),pageIndex,page,beforeCanvas,afterCanvas};
 }
@@ -1689,7 +1701,7 @@ function renderDiffSummary(){
     const visible=diffFilteredSheets();
     if(!visible.some(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey)){
       diffViewState.selectedSheetKey=String(visible[0]?.sheetKey||'');
-      diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
+      diffViewState.pageIndex=preferredDiffPageIndex(visible[0]);diffViewState.regionIndex=-1;
     }
     renderDiffSummary();renderDiffSheetList();renderDiffPage();
   }));
@@ -1721,7 +1733,7 @@ function renderDiffSheetList(){
 function selectDiffSheet(sheetKey,focusList=true){
   const sheet=asArray(diffViewState.detail?.sheets).find(s=>String(s.sheetKey||'')===String(sheetKey||''));
   if(!sheet)return;
-  diffViewState.selectedSheetKey=String(sheet.sheetKey||'');diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
+  diffViewState.selectedSheetKey=String(sheet.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(sheet);diffViewState.regionIndex=-1;
   renderDiffSheetList();renderDiffPage();
   if(focusList)$('diff-before-viewport')?.focus();
 }
@@ -1906,7 +1918,7 @@ function renderDiffDetail(detail){
   const sheets=asArray(detail?.sheets);
   if(!sheets.some(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey)){
     const preferred=sheets.find(s=>['modified','added','removed','unknown'].includes(String(s.kind||'')))||sheets[0];
-    diffViewState.selectedSheetKey=String(preferred?.sheetKey||'');diffViewState.pageIndex=0;diffViewState.regionIndex=-1;
+    diffViewState.selectedSheetKey=String(preferred?.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(preferred);diffViewState.regionIndex=-1;
   }
   renderDiffSummary();renderDiffSheetList();renderDiffPage();
   if(['unavailable','failed'].includes(String(detail?.status||''))&&stateBox){stateBox.textContent=detail?.message||'差分詳細を表示できません。';stateBox.classList.remove('hidden');}
