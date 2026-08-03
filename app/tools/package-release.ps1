@@ -1,11 +1,23 @@
 ﻿param(
     [Parameter(Mandatory=$false)]
-    [string]$OutputDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'ReportBinderRelease')
+    [string]$OutputDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'ReportBinderRelease'),
+    [Parameter(Mandatory=$false)]
+    [switch]$SharedFolderOnly,
+    [Parameter(Mandatory=$false)]
+    [switch]$NoOpen
 )
 
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$rootPrefix = $root
+if (-not $rootPrefix.EndsWith([IO.Path]::DirectorySeparatorChar)) {
+    $rootPrefix += [IO.Path]::DirectorySeparatorChar
+}
+if ($OutputDir -eq $root -or $OutputDir.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw '出力先にはReportBinderの元フォルダー配下を指定できません。'
+}
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 function Invoke-SelfCheck {
@@ -52,6 +64,12 @@ function Assert-StagedDependencies([string]$StageRoot, [bool]$IncludeJava) {
     }
 }
 
+function Remove-PathIfExists([string]$Path) {
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
 function Remove-RuntimeFiles([string]$StageRoot) {
     foreach ($path in @(
         (Join-Path $StageRoot 'app\config.json'),
@@ -59,7 +77,7 @@ function Remove-RuntimeFiles([string]$StageRoot) {
         (Join-Path $StageRoot 'app\logs'),
         (Join-Path $StageRoot 'app\lib\pdfbox\classes')
     )) {
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+        Remove-PathIfExists $path
     }
     New-Item -ItemType Directory -Path (Join-Path $StageRoot 'app\logs') -Force | Out-Null
     New-Item -ItemType File -Path (Join-Path $StageRoot 'app\logs\.gitkeep') -Force | Out-Null
@@ -72,8 +90,116 @@ function Remove-RuntimeFiles([string]$StageRoot) {
         Where-Object { $_.Name -eq '__pycache__' } |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $StageRoot -Recurse -Force -Directory |
-        Where-Object { $_.Name -eq '_reportbinder' } |
+        Where-Object { $_.Name -eq '_reportbinder' -or $_.Name -eq '出力' } |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
+    foreach ($relativePath in @(
+        '.git',
+        '.github',
+        '.agents',
+        '.codex',
+        '.gitignore',
+        'CHANGELOG_V4.md',
+        'CHANGELOG_V5.md',
+        '日本語管理.vbs',
+        '英語管理.vbs',
+        '共有フォルダー用フォルダー作成.cmd',
+        'docs\API.md',
+        'docs\ReportBinder_UIUX改修指示書_V4.md',
+        'app\lib\pdfbox\src',
+        'app\lib\pdfbox\build.ps1',
+        'app\tools\fixtures',
+        'app\tools\selfcheck.py',
+        'app\tools\package-release.ps1'
+    )) {
+        Remove-PathIfExists (Join-Path $StageRoot $relativePath)
+    }
+    # 配布先は完成済みのオフライン版なので、空の実行時フォルダーも持ち込まない。
+    Remove-PathIfExists (Join-Path $StageRoot 'app\logs')
+    Remove-PathIfExists (Join-Path $StageRoot 'app\thirdparty-cache')
+}
+
+function Assert-SharedFolderLayout([string]$StageRoot) {
+    $required = @(
+        '日本語管理.cmd',
+        '英語管理.cmd',
+        'README.md',
+        'THIRD_PARTY_NOTICES.md',
+        'app\launch.ps1',
+        'app\server.ps1',
+        'app\default-config.json',
+        'app\runtime-version.json',
+        'app\web\index.html'
+    )
+    $missing = @($required | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $StageRoot $_) -PathType Leaf)
+    })
+    if ($missing.Count -gt 0) {
+        throw ("共有フォルダー用配布物の必須ファイルがありません:`n" + ($missing -join "`n"))
+    }
+
+    $forbidden = @(
+        '日本語管理.vbs',
+        '英語管理.vbs',
+        '共有フォルダー用フォルダー作成.cmd',
+        '.git',
+        '.github',
+        'app\config.json',
+        'app\logs',
+        'app\thirdparty-cache',
+        'app\lib\pdfbox\src',
+        'app\lib\pdfbox\build.ps1',
+        'app\tools\fixtures',
+        'app\tools\selfcheck.py',
+        'app\tools\package-release.ps1'
+    )
+    $remaining = @($forbidden | Where-Object {
+        Test-Path -LiteralPath (Join-Path $StageRoot $_)
+    })
+    if ($remaining.Count -gt 0) {
+        throw ("共有フォルダー用配布物に不要なファイルが残っています:`n" + ($remaining -join "`n"))
+    }
+}
+
+function Copy-ReleaseSource([string]$StageRoot) {
+    foreach ($item in (Get-ChildItem -LiteralPath $root -Force)) {
+        if ($item.Name -eq '.git') { continue }
+        Copy-Item -LiteralPath $item.FullName -Destination $StageRoot -Recurse -Force
+    }
+}
+
+function Get-UniqueReleasePath([string]$BasePath) {
+    $candidate = $BasePath
+    $index = 2
+    while (Test-Path -LiteralPath $candidate) {
+        $candidate = $BasePath + '_' + $index
+        $index++
+    }
+    return $candidate
+}
+
+function New-SharedFolderRelease {
+    $tempBase = Join-Path $OutputDir ('.building_ReportBinder_' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $tempBase 'ReportBinder'
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    try {
+        Copy-ReleaseSource $stage
+        Remove-RuntimeFiles $stage
+        Remove-SharedFolderDevelopmentFiles $stage
+        Assert-StagedDependencies -StageRoot $stage -IncludeJava $true
+        Assert-SharedFolderLayout $stage
+
+        $targetBase = Join-Path $OutputDir ("ReportBinder_共有フォルダー用_{0}" -f $stamp)
+        $target = Get-UniqueReleasePath $targetBase
+        Move-Item -LiteralPath $stage -Destination $target
+        return $target
+    } finally {
+        if (Test-Path -LiteralPath $tempBase) {
+            Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function New-ReleaseZip([string]$Suffix, [bool]$IncludeJava) {
@@ -123,7 +249,22 @@ function New-Utf8Zip([string]$SourceDir, [string]$ZipPath) {
 }
 
 Invoke-SelfCheck
-# PDFBox and PDF.js are included in both release variants.
+if ($SharedFolderOnly) {
+    # 共有フォルダー版は、ネットワーク接続なしで各PCへローカル展開できる完成版に限定する。
+    Invoke-ThirdPartyCheck $true
+    $sharedFolder = New-SharedFolderRelease
+    Write-Host "共有フォルダー用の完成フォルダーを作成しました:`n$sharedFolder"
+    if (-not $NoOpen) {
+        try {
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $sharedFolder)
+        } catch {
+            Write-Warning "エクスプローラーを開けませんでした。作成先を手動で開いてください: $sharedFolder"
+        }
+    }
+    exit 0
+}
+
+# PDFBox and PDF.js are included in both ZIP release variants.
 Invoke-ThirdPartyCheck $false
 # The offline-complete release must contain its own verified portable JRE even if system Java exists.
 Invoke-ThirdPartyCheck $true
