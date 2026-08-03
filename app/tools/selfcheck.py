@@ -1071,21 +1071,31 @@ for needed in ['function Get-LocalProjectKey', '$Script:LocalProjectsRoot',
                "dataDir = (Join-Path $projectRoot 'data')",
                "outputDir = (Join-Path $projectRoot 'output')",
                'function Initialize-LocalProjectConfig',
-               'function Invoke-LegacyProjectMigration']:
+               'function Initialize-CleanLocalProject',
+               'function Move-IncompleteLocalProjectPath']:
     if needed not in server:
         raise SystemExit(f'per-user local project storage is missing: {needed}')
-_migration_stage = server.split('function New-LegacyMigrationStagePath',1)[1].split('\nfunction ',1)[0]
-for needed in ['[IO.Path]::GetTempPath()', "name = 'rbm-'", ".Substring(0,12)",
-               'New-Item -ItemType Directory -Path $candidate -ErrorAction Stop']:
-    if needed not in _migration_stage:
-        raise SystemExit(f'short legacy migration stage missing: {needed}')
-if '$projectRoot' in _migration_stage or "'.migration-'" in _migration_stage:
-    raise SystemExit('legacy migration stage must not be nested under the project path')
-_legacy_migration = server.split('function Invoke-LegacyProjectMigration',1)[1].split('\nfunction ',1)[0]
-if '$stage = New-LegacyMigrationStagePath' not in _legacy_migration:
-    raise SystemExit('legacy migration must use the short temporary stage')
-if "Join-Path $projectRoot ('.migration-'" in _legacy_migration:
-    raise SystemExit('project-nested migration stage can exceed MAX_PATH')
+_clean_project = server.split('function Initialize-CleanLocalProject',1)[1].split('\nfunction ',1)[0]
+for needed in ["initializationMode = 'clean'", 'legacySharedImport = $false',
+               "reason = 'clean-start'", 'Move-IncompleteLocalProjectPath $targetData',
+               'Move-IncompleteLocalProjectPath $targetOutput',
+               "'Local\\ReportBinder.ProjectMigration.'", 'Write-JsonFile $marker']:
+    if needed not in _clean_project:
+        raise SystemExit(f'clean local project initialization missing: {needed}')
+if 'Test-Path -LiteralPath $submissionDir' in _clean_project:
+    raise SystemExit('clean local initialization must not stat the shared submission folder')
+_quarantine_local = server.split('function Move-IncompleteLocalProjectPath',1)[1].split('\nfunction ',1)[0]
+for needed in ["'.preclean-' + $Kind", 'Move-Item -LiteralPath $Path -Destination $backup',
+               'Get-ChildItem -LiteralPath $Path -Force']:
+    if needed not in _quarantine_local:
+        raise SystemExit(f'incomplete local project quarantine missing: {needed}')
+for forbidden in ['function Invoke-LegacyProjectMigration', 'function Copy-DirectoryContents',
+                  'function New-LegacyMigrationStagePath', 'function Update-MigratedOutputPaths',
+                  "Join-Path $submissionDir '_reportbinder'", "Join-Path $submissionDir '出力'"]:
+    if forbidden in server:
+        raise SystemExit(f'legacy shared-folder import must stay removed: {forbidden}')
+if server.count('Initialize-CleanLocalProject') != 5:
+    raise SystemExit('all startup and folder-selection paths must use clean local initialization')
 _default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfunction ',1)[0]
 for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
     if forbidden in _default_paths:
