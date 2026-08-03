@@ -205,8 +205,9 @@ function Publish-SharedFolderStage([string]$StageRoot, [string]$TargetRoot) {
             }
             $buildingMarker = Join-Path $TargetRoot '_作成中.txt'
             try {
-                Copy-DirectoryContents -SourceDir $StageRoot -DestinationDir $TargetRoot
+                New-Item -ItemType Directory -Path $TargetRoot -Force | Out-Null
                 New-Item -ItemType File -Path $buildingMarker -Force | Out-Null
+                Copy-DirectoryContents -SourceDir $StageRoot -DestinationDir $TargetRoot
             } catch {
                 if (Test-Path -LiteralPath $TargetRoot) {
                     Remove-Item -LiteralPath $TargetRoot -Recurse -Force -ErrorAction SilentlyContinue
