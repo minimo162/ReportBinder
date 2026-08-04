@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v10'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v11'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.04.16':
+if str(runtime_info.get('version','')) != '2026.08.04.17':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1176,8 +1176,11 @@ for needed in ['MIN_LAYOUT_SCALE=.82', 'MAX_LAYOUT_SCALE=1.18',
                'function extractTableVerticalRules', 'function detectColumnWidthBoundaryChange',
                "kind:'column-width'", "columnMode=columnBoundaryChange?'column-boundary-width'",
                'beforeMinX:Math.min(left,right)', 'structuralColumnBox.beforeBox', 'structuralColumnBox.afterBox',
-               'if(columnBoundaryChange)components=[structuralColumnBox]', 'const normalizeBox=box=>',
+               'if(columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes', 'const normalizeBox=box=>',
                'function strongestLocalBox', 'structuralRowBoxes', 'structuralSplit',
+               'function findTableGridBands', 'function extractHeaderCellRules',
+               'function detectColumnWidthBoundaryChanges', 'structuralColumnBoxes=[]',
+               'difference>8',
                'verticalBand=null', 'activeMinY', 'dominantHorizontal']:
     if needed not in diff_worker:
         raise SystemExit(f'wide layout-scale correction missing: {needed}')
