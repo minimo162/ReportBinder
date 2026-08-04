@@ -1720,7 +1720,7 @@ function Get-SheetFingerprintFromNames($SheetNames) {
     $names = @($SheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($names.Count -eq 0) { return '' }
     # Worksheet order is significant now that names are not required to be numeric.
-    return ([string]::Join('|', $names))
+    return ([string]::Join('|', [string[]]$names))
 }
 function Set-WorkbookRenderedSheetSnapshot($Workbook, $SheetNames) {
     $names = @($SheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
