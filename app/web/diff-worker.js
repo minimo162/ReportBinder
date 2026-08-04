@@ -596,16 +596,148 @@ function findTableGridBand(before,after,width,height){
   // are too faint or slightly broken by PDF rasterization.
   return horizontalBest||verticalBest;
 }
+function findTableGridBands(before,after,width,height){
+  const segments=[];
+  for(let y=0;y<height;y++){
+    let start=-1,last=-1,inkColumns=0;
+    const finish=()=>{
+      if(start<0)return;
+      const span=last-start+1,density=inkColumns/Math.max(1,span);
+      if(span>width*.14&&density>.82)segments.push({y,start,last,span,inkColumns});
+      start=-1;last=-1;inkColumns=0;
+    };
+    for(let x=0;x<width;x++){
+      const index=(y*width+x)*4,dark=luminance(before,index)<254||luminance(after,index)<254;
+      if(dark){if(start<0)start=x;last=x;inkColumns++;}
+      else if(start>=0&&x-last>3)finish();
+    }
+    finish();
+  }
+  const clusters=[];
+  for(const segment of segments){
+    let target=null;
+    for(let index=clusters.length-1;index>=Math.max(0,clusters.length-24);index--){
+      const candidate=clusters[index];
+      if(segment.y-candidate.lastY>1)break;
+      const overlap=Math.max(0,Math.min(segment.last,candidate.last)-Math.max(segment.start,candidate.start)+1);
+      const spanRatio=Math.min(segment.span,candidate.span)/Math.max(1,Math.max(segment.span,candidate.span));
+      if(overlap/Math.max(1,Math.min(segment.span,candidate.span))>.78&&spanRatio>.72){target=candidate;break;}
+    }
+    if(target){
+      target.firstY=Math.min(target.firstY,segment.y);target.lastY=Math.max(target.lastY,segment.y);
+      target.start=Math.min(target.start,segment.start);target.last=Math.max(target.last,segment.last);
+      target.span=Math.max(target.span,segment.span);target.inkColumns=Math.max(target.inkColumns,segment.inkColumns);
+    }else clusters.push({...segment,firstY:segment.y,lastY:segment.y});
+  }
+  const lines=clusters.filter(cluster=>cluster.lastY-cluster.firstY+1<=8)
+    .map(cluster=>({...cluster,y:Math.round((cluster.firstY+cluster.lastY)/2)}));
+  const candidates=[];
+  for(const seed of lines){
+    const group=lines.filter(line=>{
+      const overlap=Math.max(0,Math.min(seed.last,line.last)-Math.max(seed.start,line.start)+1);
+      const spanRatio=Math.min(seed.span,line.span)/Math.max(1,Math.max(seed.span,line.span));
+      return overlap/Math.max(1,Math.min(seed.span,line.span))>.76&&spanRatio>.7;
+    });
+    if(group.length<4)continue;
+    const starts=group.map(line=>line.start).sort((a,b)=>a-b),lasts=group.map(line=>line.last).sort((a,b)=>a-b);
+    const ys=group.map(line=>line.y).sort((a,b)=>a-b),gaps=[];
+    for(let index=1;index<ys.length;index++){
+      const gap=ys[index]-ys[index-1];
+      if(gap>=6&&gap<=height*.12)gaps.push(gap);
+    }
+    gaps.sort((a,b)=>a-b);
+    const rowHeight=gaps.length?gaps[Math.floor(gaps.length/2)]:null;
+    let firstIndex=0;
+    if(rowHeight)for(let index=0;index+1<ys.length;index++)if(ys[index+1]-ys[index]>rowHeight*3)firstIndex=index+1;
+    const start=Math.max(0,Math.round(ys[firstIndex]-(rowHeight||0)*.55));
+    const last=Math.min(height-1,Math.round(ys[ys.length-1]+(rowHeight||0)*1.8)),span=last-start+1;
+    const minX=starts[Math.floor(starts.length/2)],maxX=lasts[Math.floor(lasts.length/2)];
+    candidates.push({start,last,span,score:group.length*span*(maxX-minX+1)/width,lineCount:group.length,
+      minX,maxX,
+      rowHeight,horizontalLines:ys,detection:'horizontal-multi'});
+  }
+  candidates.sort((a,b)=>b.score-a.score||b.maxX-b.minX-(a.maxX-a.minX));
+  const deduped=[];
+  for(const candidate of candidates){
+    const duplicate=deduped.some(existing=>{
+      const overlapX=Math.max(0,Math.min(existing.maxX,candidate.maxX)-Math.max(existing.minX,candidate.minX)+1);
+      const overlapY=Math.max(0,Math.min(existing.last,candidate.last)-Math.max(existing.start,candidate.start)+1);
+      const spanRatioX=Math.min(existing.maxX-existing.minX+1,candidate.maxX-candidate.minX+1)/
+        Math.max(1,Math.max(existing.maxX-existing.minX+1,candidate.maxX-candidate.minX+1));
+      return overlapX/Math.max(1,Math.min(existing.maxX-existing.minX+1,candidate.maxX-candidate.minX+1))>.78&&spanRatioX>.68&&
+        overlapY/Math.max(1,Math.min(existing.span,candidate.span))>.72;
+    });
+    if(!duplicate)deduped.push(candidate);
+  }
+  const primary=findTableGridBand(before,after,width,height);
+  if(primary&&!deduped.length)deduped.push(primary);
+  else if(primary&&!deduped.some(candidate=>{
+    const overlapX=Math.max(0,Math.min(candidate.maxX,primary.maxX)-Math.max(candidate.minX,primary.minX)+1);
+    const overlapY=Math.max(0,Math.min(candidate.last,primary.last)-Math.max(candidate.start,primary.start)+1);
+    return overlapX/Math.max(1,Math.min(candidate.maxX-candidate.minX+1,primary.maxX-primary.minX+1))>.65&&
+      overlapY/Math.max(1,Math.min(candidate.span,primary.span))>.65;
+  }))deduped.push(primary);
+  deduped.sort((a,b)=>b.score-a.score||b.maxX-b.minX-(a.maxX-a.minX));
+  return deduped.slice(0,6);
+}
+function extractHeaderCellRules(data,width,height,tableBand){
+  if(!tableBand)return null;
+  const margin=Math.max(PADDING,24),minX=Math.max(0,Math.floor(tableBand.minX-margin)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX+margin));
+  const rowHeight=Math.max(12,tableBand.rowHeight||18),searchMinY=Math.max(0,Math.floor(tableBand.start-rowHeight*5.5));
+  const searchMaxY=Math.min(height-1,Math.ceil(tableBand.start+rowHeight*2.5));
+  let best=null,start=-1,last=-1;
+  const finish=()=>{
+    if(start<0)return;
+    const span=last-start+1,center=(start+last)/2,distance=Math.abs(center-tableBand.start);
+    if(span>=4&&(!best||distance<best.distance||distance===best.distance&&span>best.span))best={start,last,span,distance};
+    start=-1;last=-1;
+  };
+  for(let y=searchMinY;y<=searchMaxY;y++){
+    let dark=0;
+    for(let x=minX;x<=maxX;x+=2)if(luminance(data,(y*width+x)*4)<205)dark++;
+    const dense=dark/Math.max(1,Math.ceil((maxX-minX+1)/2))>.42;
+    if(dense){if(start<0)start=y;last=y;}else if(start>=0)finish();
+  }
+  finish();if(!best)return null;
+  const candidates=[];let headerMinX=maxX,headerMaxX=minX;
+  for(let x=minX;x<=maxX;x++){
+    let darkRows=0;
+    for(let y=best.start;y<=best.last;y++)if(luminance(data,(y*width+x)*4)<220)darkRows++;
+    const density=darkRows/Math.max(1,best.span);
+    if(density>.35){headerMinX=Math.min(headerMinX,x);headerMaxX=Math.max(headerMaxX,x);}
+    if(density<.08)candidates.push(x);
+  }
+  if(headerMaxX<headerMinX)return null;
+  const rules=[headerMinX];let clusterStart=-1,clusterLast=-1;
+  const flush=()=>{
+    if(clusterStart<0)return;
+    const clusterWidth=clusterLast-clusterStart+1;
+    if(clusterWidth<=8&&clusterStart>headerMinX&&clusterLast<headerMaxX)rules.push(Math.round((clusterStart+clusterLast)/2));
+    clusterStart=-1;clusterLast=-1;
+  };
+  for(const x of candidates){
+    if(clusterStart<0){clusterStart=x;clusterLast=x;}
+    else if(x-clusterLast<=1)clusterLast=x;
+    else{flush();clusterStart=x;clusterLast=x;}
+  }
+  flush();rules.push(headerMaxX);
+  const normalized=rules.sort((a,b)=>a-b).filter((value,index,array)=>!index||value-array[index-1]>=4);
+  return {rules:normalized,start:best.start,last:best.last,valid:normalized.length>=4&&normalized.length<=20};
+}
 function extractTableVerticalRules(data,width,height,tableBand){
   if(!tableBand)return [];
-  const minX=Math.max(0,Math.floor(tableBand.minX-PADDING)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX+PADDING));
+  // Fit-to-page width changes can move the outer table edge farther than normal
+  // highlight padding. Keep enough horizontal context to retain both edge rules.
+  const ruleMargin=Math.max(PADDING,24);
+  const minX=Math.max(0,Math.floor(tableBand.minX-ruleMargin)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX+ruleMargin));
   const minY=Math.max(0,Math.floor(tableBand.start)),maxY=Math.min(height-1,Math.ceil(tableBand.last)),bandHeight=Math.max(1,maxY-minY+1),candidates=[];
+  const minRuleSpan=Math.max(bandHeight*.14,Math.max(10,tableBand.rowHeight||18)*2.2);
   for(let x=minX;x<=maxX;x++){
     let start=-1,last=-1,inkRows=0,best=null;
     const finish=()=>{
       if(start<0)return;
       const span=last-start+1,density=inkRows/Math.max(1,span);
-      if(span>bandHeight*.32&&density>.28&&(!best||span>best.span||span===best.span&&inkRows>best.inkRows))best={x,start,last,span,inkRows};
+      if(span>minRuleSpan&&density>.28&&(!best||span>best.span||span===best.span&&inkRows>best.inkRows))best={x,start,last,span,inkRows};
       start=-1;last=-1;inkRows=0;
     };
     for(let y=minY;y<=maxY;y++){
@@ -623,14 +755,22 @@ function extractTableVerticalRules(data,width,height,tableBand){
       previous.maxSpan=Math.max(previous.maxSpan,candidate.span);
     }else clusters.push({firstX:candidate.x,lastX:candidate.x,weight:candidate.span,weightedX:candidate.x*candidate.span,maxSpan:candidate.span});
   }
-  return clusters.filter(cluster=>cluster.lastX-cluster.firstX+1<=8&&cluster.maxSpan>bandHeight*.32)
+  const continuous=clusters.filter(cluster=>cluster.lastX-cluster.firstX+1<=8&&cluster.maxSpan>minRuleSpan)
     .map(cluster=>Math.round(cluster.weightedX/Math.max(1,cluster.weight))).filter((value,index,array)=>!index||value-array[index-1]>=4);
+  const header=extractHeaderCellRules(data,width,height,tableBand);
+  if(header){
+    tableBand.headerStart=Number.isFinite(tableBand.headerStart)?Math.min(tableBand.headerStart,header.start):header.start;
+  }
+  if(header?.valid){
+    if(continuous.length<4||header.rules.length===continuous.length)return header.rules;
+  }
+  return continuous;
 }
-function detectColumnWidthBoundaryChange(before,after,width,height,tableBand){
+function detectColumnWidthBoundaryChanges(before,after,width,height,tableBand){
   const beforeRules=extractTableVerticalRules(before,width,height,tableBand),afterRules=extractTableVerticalRules(after,width,height,tableBand);
-  if(beforeRules.length<4||beforeRules.length!==afterRules.length||beforeRules.length>20)return null;
+  if(beforeRules.length<4||beforeRules.length!==afterRules.length||beforeRules.length>20)return [];
   const beforeSpan=beforeRules[beforeRules.length-1]-beforeRules[0],afterSpan=afterRules[afterRules.length-1]-afterRules[0];
-  if(beforeSpan<width*.12||afterSpan<width*.12)return null;
+  if(beforeSpan<width*.12||afterSpan<width*.12)return [];
   const candidates=[];
   for(let index=0;index<beforeRules.length-1;index++){
     const beforeWidth=beforeRules[index+1]-beforeRules[index],afterWidth=afterRules[index+1]-afterRules[index];
@@ -639,13 +779,20 @@ function detectColumnWidthBoundaryChange(before,after,width,height,tableBand){
     candidates.push({index,beforeWidth,afterWidth,normalizedDelta,pixelDelta});
   }
   candidates.sort((a,b)=>b.normalizedDelta-a.normalizedDelta);
-  const best=candidates[0],second=candidates[1]||{normalizedDelta:0};
-  if(!best||best.normalizedDelta<.012||best.pixelDelta<3||best.normalizedDelta<second.normalizedDelta*1.35)return null;
-  const left=beforeRules[best.index],right=beforeRules[best.index+1],afterLeft=afterRules[best.index],afterRight=afterRules[best.index+1];
-  const mappedAfterLeft=beforeRules[0]+(afterLeft-afterRules[0])*beforeSpan/afterSpan,mappedAfterRight=beforeRules[0]+(afterRight-afterRules[0])*beforeSpan/afterSpan;
-  const minX=Math.max(tableBand.minX,Math.floor(Math.min(left,right,mappedAfterLeft,mappedAfterRight))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(left,right,mappedAfterLeft,mappedAfterRight)));
-  return {kind:'column-width',index:best.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(7,(maxX-minX+1)/2),pixelDelta:best.pixelDelta,
-    beforeMinX:Math.min(left,right),beforeMaxX:Math.max(left,right),afterMinX:Math.min(afterLeft,afterRight),afterMaxX:Math.max(afterLeft,afterRight),beforeRules,afterRules};
+  const best=candidates[0];
+  if(!best||best.normalizedDelta<.006||best.pixelDelta<2)return [];
+  const threshold=Math.max(.006,best.normalizedDelta*.35);
+  return candidates.filter(candidate=>candidate.normalizedDelta>=threshold&&candidate.pixelDelta>=2).slice(0,3).map(candidate=>{
+    const left=beforeRules[candidate.index],right=beforeRules[candidate.index+1],afterLeft=afterRules[candidate.index],afterRight=afterRules[candidate.index+1];
+    const mappedAfterLeft=beforeRules[0]+(afterLeft-afterRules[0])*beforeSpan/afterSpan,mappedAfterRight=beforeRules[0]+(afterRight-afterRules[0])*beforeSpan/afterSpan;
+    const minX=Math.max(tableBand.minX,Math.floor(Math.min(left,right,mappedAfterLeft,mappedAfterRight))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(left,right,mappedAfterLeft,mappedAfterRight)));
+    return {kind:'column-width',index:candidate.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(7,(maxX-minX+1)/2),
+      pixelDelta:candidate.pixelDelta,normalizedDelta:candidate.normalizedDelta,
+      beforeMinX:Math.min(left,right),beforeMaxX:Math.max(left,right),afterMinX:Math.min(afterLeft,afterRight),afterMaxX:Math.max(afterLeft,afterRight),beforeRules,afterRules,tableBand};
+  });
+}
+function detectColumnWidthBoundaryChange(before,after,width,height,tableBand){
+  return detectColumnWidthBoundaryChanges(before,after,width,height,tableBand)[0]||null;
 }
 function strongestStructuralRowBox(centerY,tableBand,counts,gridWidth,gridHeight,width,height){
   const rowHeight=Math.max(10,Math.min(40,Math.round(tableBand&&tableBand.rowHeight||18)));
@@ -688,8 +835,16 @@ function structuralColumnInkBounds(before,after,width,height,columnAlignment,cen
 }
 function analyzeBrowserDiff(before,after,width,height){
   const rowAlignment=alignRows(before,after,width,height);
-  const tableBand=findTableGridBand(before,after,width,height);
-  const columnBoundaryChange=detectColumnWidthBoundaryChange(before,after,width,height,tableBand);
+  const tableBands=findTableGridBands(before,after,width,height);
+  let tableBand=tableBands[0]||findTableGridBand(before,after,width,height);
+  const strongestBandScore=tableBands[0]?.score||0;
+  const candidateTableBands=tableBands.filter(band=>band.span>=height*.08&&(!strongestBandScore||band.score>=strongestBandScore*.2));
+  const columnBoundaryChanges=candidateTableBands.flatMap(band=>detectColumnWidthBoundaryChanges(before,after,width,height,band))
+    .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,3);
+  const columnBoundaryChange=columnBoundaryChanges[0]||null;
+  if(columnBoundaryChange)tableBand=columnBoundaryChange.tableBand;
+  const reliableColumnRules=tableBand&&extractTableVerticalRules(before,width,height,tableBand).length>=4&&
+    extractTableVerticalRules(after,width,height,tableBand).length>=4;
   if(rowAlignment.adjusted&&tableBand){
     rowAlignment.activeMinY=Math.max(0,tableBand.start-PADDING);rowAlignment.activeMaxY=Math.min(height-1,tableBand.last+PADDING);
     rowAlignment.activeMinX=Math.max(0,tableBand.minX-PADDING);rowAlignment.activeMaxX=Math.min(width-1,tableBand.maxX+PADDING);
@@ -720,7 +875,7 @@ function analyzeBrowserDiff(before,after,width,height){
       if(ax<0||ax>=width||ay<0||ay>=height){
         difference=255-Math.min(before[bi],before[bi+1],before[bi+2]);
       }else difference=tolerantPixelDifference(before,after,width,height,x,y,ax,ay);
-      if(difference>12)looseChanged++;
+      if(difference>8)looseChanged++;
       if(difference>PIXEL_THRESHOLD)changed++;
     }
     const index=gy*gridWidth+gx;
@@ -728,7 +883,7 @@ function analyzeBrowserDiff(before,after,width,height){
     if(changed>=Math.max(2,Math.floor((x1-x0)*(y1-y0)*.2)))mask[index]=1;
   }
   // Rows that have no counterpart are the human-visible insertion/deletion bands.
-  const gapRows=[],structuralRowBoxes=[];let structuralColumnBox=null;
+  const gapRows=[],structuralRowBoxes=[],structuralColumnBoxes=[];
   for(const row of rowAlignment.deleted){if(rowAlignment.a.ink[row]>4)gapRows.push({beforeRow:row,source:'before'});}
   for(const row of rowAlignment.inserted){
     if(rowAlignment.b.ink[row]<=4)continue;
@@ -760,32 +915,40 @@ function analyzeBrowserDiff(before,after,width,height){
     }
   }
   if((columnAlignment.adjusted||columnBoundaryChange)&&tableBand){
-    let centerX,half;
-    if(columnBoundaryChange){
-      centerX=columnBoundaryChange.centerX;half=columnBoundaryChange.half;
-    }else if(columnAlignment.structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3){
-      centerX=Math.min(width-1,columnAlignment.structuralSplit*COLUMN_STEP);half=Math.max(6,Math.ceil(Math.abs(columnAlignment.structuralJump)/2)+3);
-    }else{
-      let peak=-1,peakScore=-1;
-      for(let column=0;column<columnAlignment.a.columnCount;column++){
-        const target=Math.round(columnAlignment.mapping[column]);if(target<0||target>=columnAlignment.b.columnCount)continue;
-        const score=columnDistance(columnAlignment.a,columnAlignment.b,column,target);
-        if(score>peakScore){peakScore=score;peak=column;}
+    const changes=columnBoundaryChanges.length?columnBoundaryChanges:[null];
+    for(const boundaryChange of changes){
+      let centerX,half;
+      if(boundaryChange){
+        centerX=boundaryChange.centerX;half=boundaryChange.half;
+      }else if(!reliableColumnRules){
+        centerX=(tableBand.minX+tableBand.maxX)/2;half=Math.max(8,(tableBand.maxX-tableBand.minX+1)/2);
+      }else if(columnAlignment.structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3){
+        centerX=Math.min(width-1,columnAlignment.structuralSplit*COLUMN_STEP);half=Math.max(6,Math.ceil(Math.abs(columnAlignment.structuralJump)/2)+3);
+      }else{
+        let peak=-1,peakScore=-1;
+        for(let column=0;column<columnAlignment.a.columnCount;column++){
+          const target=Math.round(columnAlignment.mapping[column]);if(target<0||target>=columnAlignment.b.columnCount)continue;
+          const score=columnDistance(columnAlignment.a,columnAlignment.b,column,target);
+          if(score>peakScore){peakScore=score;peak=column;}
+        }
+        centerX=Math.max(0,Math.min(width-1,(peak>=0?peak:Math.floor(columnAlignment.a.columnCount/2))*COLUMN_STEP));
+        half=Math.max(8,Math.min(Math.ceil(width*.1),Math.ceil(Math.abs(columnAlignment.offset))+COLUMN_STEP*2));
       }
-      centerX=Math.max(0,Math.min(width-1,(peak>=0?peak:Math.floor(columnAlignment.a.columnCount/2))*COLUMN_STEP));
-      half=Math.max(8,Math.min(Math.ceil(width*.1),Math.ceil(Math.abs(columnAlignment.offset))+COLUMN_STEP*2));
-    }
-    const inkBounds=structuralColumnInkBounds(before,after,width,height,columnAlignment,centerX,half);
-    const minGY=Math.max(0,Math.floor(inkBounds.minY/BLOCK)),maxGY=Math.min(gridHeight-1,Math.floor(inkBounds.maxY/BLOCK));
-    const bandMinX=Math.max(0,centerX-half-PADDING),bandMaxX=Math.min(width-1,centerX+half+PADDING);
-    structuralColumnBox={minX:bandMinX,maxX:bandMaxX,minY:inkBounds.minY,maxY:inkBounds.maxY,pixels:(bandMaxX-bandMinX+1)*(inkBounds.maxY-inkBounds.minY+1)};
-    if(columnBoundaryChange){
-      const edgePadding=2;
-      structuralColumnBox.beforeBox={minX:Math.max(0,columnBoundaryChange.beforeMinX-edgePadding),maxX:Math.min(width-1,columnBoundaryChange.beforeMaxX+edgePadding),minY:inkBounds.minY,maxY:inkBounds.maxY};
-      structuralColumnBox.afterBox={minX:Math.max(0,columnBoundaryChange.afterMinX-edgePadding),maxX:Math.min(width-1,columnBoundaryChange.afterMaxX+edgePadding),minY:inkBounds.minY,maxY:inkBounds.maxY};
-    }
-    for(let gx=Math.max(0,Math.floor((centerX-half)/BLOCK));gx<=Math.min(gridWidth-1,Math.floor((centerX+half)/BLOCK));gx++)for(let gy=minGY;gy<=maxGY;gy++){
-      const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
+      const activeBand=boundaryChange?.tableBand||tableBand;
+      const inkBounds=activeBand?{minY:Math.max(0,(activeBand.headerStart??activeBand.start)-PADDING),maxY:Math.min(height-1,activeBand.last+PADDING)}:
+        structuralColumnInkBounds(before,after,width,height,columnAlignment,centerX,half);
+      const minGY=Math.max(0,Math.floor(inkBounds.minY/BLOCK)),maxGY=Math.min(gridHeight-1,Math.floor(inkBounds.maxY/BLOCK));
+      const bandMinX=Math.max(0,centerX-half-PADDING),bandMaxX=Math.min(width-1,centerX+half+PADDING);
+      const structuralColumnBox={minX:bandMinX,maxX:bandMaxX,minY:inkBounds.minY,maxY:inkBounds.maxY,pixels:(bandMaxX-bandMinX+1)*(inkBounds.maxY-inkBounds.minY+1)};
+      if(boundaryChange){
+        const edgePadding=2;
+        structuralColumnBox.beforeBox={minX:Math.max(0,boundaryChange.beforeMinX-edgePadding),maxX:Math.min(width-1,boundaryChange.beforeMaxX+edgePadding),minY:inkBounds.minY,maxY:inkBounds.maxY};
+        structuralColumnBox.afterBox={minX:Math.max(0,boundaryChange.afterMinX-edgePadding),maxX:Math.min(width-1,boundaryChange.afterMaxX+edgePadding),minY:inkBounds.minY,maxY:inkBounds.maxY};
+      }
+      structuralColumnBoxes.push(structuralColumnBox);
+      for(let gx=Math.max(0,Math.floor((centerX-half)/BLOCK));gx<=Math.min(gridWidth-1,Math.floor((centerX+half)/BLOCK));gx++)for(let gy=minGY;gy<=maxGY;gy++){
+        const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
+      }
     }
   }
   // Grow horizontally to combine one logical row, but not vertically across many spreadsheet rows.
@@ -832,26 +995,34 @@ function analyzeBrowserDiff(before,after,width,height){
       return true;
     });
     components.push(...localized.slice(0,3),...rowBoxes);
+    if(rowAlignment.adjusted){
+      const strongestRowPixels=Math.max(...rowBoxes.map(box=>box.pixels||MIN_PIXELS));
+      components=components.filter(component=>
+        rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY)||
+        component.pixels>=strongestRowPixels*.25);
+    }
   }
-  if(structuralColumnBox){
+  if(structuralColumnBoxes.length){
     // Residual antialiasing after an Excel fit-to-page scale can connect every table
     // gridline into one huge rectangle. The discontinuity itself is the useful human
     // signal, so replace such broad residuals with the actual inserted/resized band.
-    if(columnBoundaryChange)components=[structuralColumnBox];
+    if(columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes;
     else{
+      const structuralPixels=Math.max(...structuralColumnBoxes.map(box=>box.pixels||MIN_PIXELS));
       components=components.filter(component=>{
         const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
         const componentArea=componentWidth*componentHeight;
-        return !(componentWidth>width*.42||componentHeight>height*.35||componentArea>width*height*.08);
+        return component.pixels>=structuralPixels*.01&&
+          !(componentWidth>width*.42||componentHeight>height*.35||componentArea>width*height*.08);
       });
-      components.push(structuralColumnBox);
+      components.push(...structuralColumnBoxes);
     }
     if(components.length>MAX_LAYOUT_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_LAYOUT_REGIONS);
   }
   const dominantHorizontal=components
     .filter(component=>(component.maxX-component.minX+1)>width*.2&&(component.maxY-component.minY+1)<height*.05)
     .sort((a,b)=>b.pixels-a.pixels)[0]||null;
-  if(dominantHorizontal){
+  if(dominantHorizontal&&(rowAlignment.adjusted||columnAlignment.adjusted||columnBoundaryChange||gapRows.length>0)){
     components=components.filter(component=>{
       if(component===dominantHorizontal)return true;
       const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
