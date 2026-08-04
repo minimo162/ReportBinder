@@ -2401,7 +2401,6 @@ function applyPageMutationResult(payload){
 }
 
 function scheduleBoardSave() { clearTimeout(boardSaveTimer); boardSaveTimer = setTimeout(saveBoardOrder, 250); }
-async 
 async function saveBoardOrder() {
   try{
     const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes:collectBoardVolumes()}});
@@ -2427,7 +2426,6 @@ async function savePageFromRow(row, numberingChanged=false) {
 
 
 
-async 
 async function sortPagesBySheet(btn=null) {
   if(!confirm('未振り分け・本体・補足の割り当てはそのままで、それぞれの表の中を各Excelのシート順に整えます。よろしいですか？'))return;
   await runBusy(btn||$('sort-by-sheet-btn'),async()=>{
