@@ -1207,8 +1207,7 @@ for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>12',
 
 
 # 2026-08-04 unrestricted worksheet names and assignment inbox -------------
-for forbidden in ["$sheetName -match '^[0-9]+
-", '半角数字だけにしてください', 'シート名が半角数字のみ']:
+for forbidden in ["sheetName -match '^[0-9]+", '半角数字だけにしてください', 'シート名が半角数字のみ']:
     if forbidden in server:
         raise SystemExit(f'numeric-only worksheet restriction remains: {forbidden}')
 for needed in ['function Get-WorksheetStorageStem', 'function New-WorksheetPageId',
