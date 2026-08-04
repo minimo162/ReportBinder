@@ -4,6 +4,7 @@ const BLOCK=4;
 const MIN_PIXELS=28;
 const PADDING=5;
 const MAX_REGIONS=100;
+const MAX_LAYOUT_REGIONS=12;
 
 function pixelDifference(before,after,beforeIndex,afterIndex){
   const dr=Math.abs(before[beforeIndex]-after[afterIndex]);
@@ -42,13 +43,14 @@ function rowDistance(a,b,ai,bi){
   return total/ROW_BINS+Math.abs(a.ink[ai]-b.ink[bi])*.35;
 }
 function rowGapCost(descriptors,index){return 5+Math.min(24,descriptors.ink[index]*.12);}
-function buildColumnDescriptors(data,width,height){
+function buildColumnDescriptors(data,width,height,verticalBand=null){
   const columnCount=Math.ceil(width/COLUMN_STEP),values=new Float32Array(columnCount*COLUMN_BINS),ink=new Float32Array(columnCount);
+  const minY=verticalBand?Math.max(0,Math.floor(verticalBand.start)):0,maxY=verticalBand?Math.min(height-1,Math.ceil(verticalBand.last)):height-1,bandHeight=Math.max(1,maxY-minY+1);
   for(let column=0;column<columnCount;column++){
     const x0=column*COLUMN_STEP,x1=Math.min(width,x0+COLUMN_STEP);
     let total=0;
     for(let bin=0;bin<COLUMN_BINS;bin++){
-      const y0=Math.floor(bin*height/COLUMN_BINS),y1=Math.max(y0+1,Math.floor((bin+1)*height/COLUMN_BINS));
+      const y0=minY+Math.floor(bin*bandHeight/COLUMN_BINS),y1=Math.min(maxY+1,Math.max(y0+1,minY+Math.floor((bin+1)*bandHeight/COLUMN_BINS)));
       let sum=0,count=0;
       for(let x=x0;x<x1;x++)for(let y=y0;y<y1;y+=2){sum+=255-luminance(data,(y*width+x)*4);count++;}
       const value=count?sum/count:0;values[column*COLUMN_BINS+bin]=value;total+=value;
@@ -294,8 +296,8 @@ function mappedRowY(alignment,y,height){
   if(alignment.pixelMapping&&y>=0&&y<alignment.pixelMapping.length)return alignment.pixelMapping[y];
   return mappedCoarseRowY(alignment,y,height);
 }
-function choosePixelColumnMapping(before,after,width,height,rowAlignment){
-  const a=buildColumnDescriptors(before,width,height),b=buildColumnDescriptors(after,width,height),columnCount=a.columnCount;
+function choosePixelColumnMapping(before,after,width,height,rowAlignment,verticalBand=null){
+  const a=buildColumnDescriptors(before,width,height,verticalBand),b=buildColumnDescriptors(after,width,height,verticalBand),columnCount=a.columnCount;
   const identityScore=smoothColumnScore(a,b,1,0);
   let best={scale:1,offset:0,split:-1,jump:0,score:identityScore,fitness:identityScore};
   for(let scaleStep=-8;scaleStep<=8;scaleStep++){
@@ -346,7 +348,8 @@ function mappedCoarseColumnX(alignment,x,width){
   const position=x/COLUMN_STEP,index=Math.max(0,Math.min(alignment.mapping.length-1,Math.floor(position))),next=Math.min(alignment.mapping.length-1,index+1),fraction=position-index;
   return Math.max(0,Math.min(width-1,Math.round((alignment.mapping[index]*(1-fraction)+alignment.mapping[next]*fraction)*COLUMN_STEP)));
 }
-function mappedColumnX(alignment,x,width){
+function mappedColumnX(alignment,x,width,y=-1){
+  if(y>=0&&Number.isFinite(alignment.activeMinY)&&Number.isFinite(alignment.activeMaxY)&&(y<alignment.activeMinY||y>alignment.activeMaxY))return Math.max(0,Math.min(width-1,x));
   if(alignment.pixelMapping&&x>=0&&x<alignment.pixelMapping.length)return alignment.pixelMapping[x];
   return mappedCoarseColumnX(alignment,x,width);
 }
@@ -359,7 +362,7 @@ function refinePixelRowMapping(before,after,width,height,rowAlignment,columnAlig
     for(let candidate=Math.max(0,expected-1);candidate<=Math.min(height-1,expected+1);candidate++){
       let total=0,count=0;
       for(let x=8;x<width-8;x+=8){
-        const ax=mappedColumnX(columnAlignment,x,width);if(ax<0||ax>=width)continue;
+        const ax=mappedColumnX(columnAlignment,x,width,y);if(ax<0||ax>=width)continue;
         const bi=(y*width+x)*4,ai=(candidate*width+ax)*4;
         if(luminance(before,bi)>247&&luminance(after,ai)>247)continue;
         total+=pixelDifference(before,after,bi,ai);count++;
@@ -383,7 +386,9 @@ function refinePixelColumnMapping(before,after,width,height,rowAlignment,columnA
     let bestX=expected,bestScore=Number.MAX_VALUE,foundInk=false;
     for(let candidate=Math.max(0,expected-1);candidate<=Math.min(width-1,expected+1);candidate++){
       let total=0,count=0;
-      for(let y=8;y<height-8;y+=8){
+      const minY=Number.isFinite(columnAlignment.activeMinY)?Math.max(8,Math.floor(columnAlignment.activeMinY)):8;
+      const maxY=Number.isFinite(columnAlignment.activeMaxY)?Math.min(height-8,Math.ceil(columnAlignment.activeMaxY)):height-8;
+      for(let y=minY;y<maxY;y+=8){
         const ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4,ai=(ay*width+candidate)*4;
         if(luminance(before,bi)>247&&luminance(after,ai)>247)continue;
         total+=pixelDifference(before,after,bi,ai);count++;
@@ -460,12 +465,33 @@ function buildFallbackRegion(counts,gridWidth,gridHeight,width,height){
   const maxX=Math.min(width-1,(maxGX+1)*BLOCK-1+padding),maxY=Math.min(height-1,(maxGY+1)*BLOCK-1+padding);
   return {regionId:'browser-r0001',kind:'modified',x:minX/width,y:minY/height,width:Math.max(1,maxX-minX+1)/width,height:Math.max(1,maxY-minY+1)/height,confidence:.5,pixelCount:pixels};
 }
+function longestVerticalInkBand(before,after,width,height){
+  let best=null;
+  for(let x=0;x<width;x++){
+    let start=-1,last=-1,inkRows=0;
+    const finish=()=>{
+      if(start<0)return;
+      const candidate={start,last,inkRows,span:last-start+1};
+      if(candidate.span>height*.1&&(!best||candidate.span>best.span||(candidate.span===best.span&&candidate.inkRows>best.inkRows)))best=candidate;
+      start=-1;last=-1;inkRows=0;
+    };
+    for(let y=0;y<height;y++){
+      const index=(y*width+x)*4,dark=luminance(before,index)<248||luminance(after,index)<248;
+      if(dark){if(start<0)start=y;last=y;inkRows++;}
+      else if(start>=0&&y-last>2)finish();
+    }
+    finish();
+  }
+  return best;
+}
 function structuralColumnInkBounds(before,after,width,height,columnAlignment,centerX,half){
-  const rows=new Uint8Array(height),left=Math.max(0,centerX-half-4),right=Math.min(width-1,centerX+half+4);
+  const verticalBand=longestVerticalInkBand(before,after,width,height);
+  if(verticalBand)return {minY:Math.max(0,verticalBand.start-PADDING),maxY:Math.min(height-1,verticalBand.last+PADDING)};
+  const rows=new Uint8Array(height),probeHalf=Math.max(24,half+12),left=Math.max(0,centerX-probeHalf),right=Math.min(width-1,centerX+probeHalf);
   for(let y=0;y<height;y++){
     let ink=0;
     for(let x=left;x<=right;x+=2){
-      const mapped=mappedColumnX(columnAlignment,x,width),bi=(y*width+x)*4,ai=(y*width+mapped)*4;
+      const mapped=mappedColumnX(columnAlignment,x,width,y),bi=(y*width+x)*4,ai=(y*width+mapped)*4;
       if(luminance(before,bi)<245||luminance(after,ai)<245){ink++;if(ink>=2){rows[y]=1;break;}}
     }
   }
@@ -486,7 +512,18 @@ function structuralColumnInkBounds(before,after,width,height,columnAlignment,cen
 }
 function analyzeBrowserDiff(before,after,width,height){
   const rowAlignment=alignRows(before,after,width,height);
-  const columnAlignment=choosePixelColumnMapping(before,after,width,height,rowAlignment);
+  const tableBand=longestVerticalInkBand(before,after,width,height);
+  const columnAlignment=choosePixelColumnMapping(before,after,width,height,rowAlignment,tableBand);
+  if(columnAlignment.adjusted){
+    let activeBounds=tableBand?{minY:Math.max(0,tableBand.start-PADDING),maxY:Math.min(height-1,tableBand.last+PADDING)}:null;
+    if(columnAlignment.split>=0&&Math.abs(columnAlignment.jump)>=3){
+      const centerX=Math.min(width-1,columnAlignment.split*COLUMN_STEP),half=Math.max(6,Math.ceil(Math.abs(columnAlignment.jump)/2)+3);
+      activeBounds=structuralColumnInkBounds(before,after,width,height,columnAlignment,centerX,half);
+    }
+    if(activeBounds){
+      columnAlignment.activeMinY=activeBounds.minY;columnAlignment.activeMaxY=activeBounds.maxY;
+    }
+  }
   refinePixelRowMapping(before,after,width,height,rowAlignment,columnAlignment);
   refinePixelColumnMapping(before,after,width,height,rowAlignment,columnAlignment);
   const gridWidth=Math.ceil(width/BLOCK),gridHeight=Math.ceil(height/BLOCK),cellCount=gridWidth*gridHeight;
@@ -496,7 +533,7 @@ function analyzeBrowserDiff(before,after,width,height){
     let changed=0,looseChanged=0;
     const x0=gx*BLOCK,y0=gy*BLOCK,x1=Math.min(width,x0+BLOCK),y1=Math.min(height,y0+BLOCK);
     for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-      const ax=mappedColumnX(columnAlignment,x,width),ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4;
+      const ax=mappedColumnX(columnAlignment,x,width,y),ay=mappedRowY(rowAlignment,y,height),bi=(y*width+x)*4;
       let difference=0;
       if(ax<0||ax>=width||ay<0||ay>=height){
         difference=255-Math.min(before[bi],before[bi+1],before[bi+2]);
@@ -524,7 +561,7 @@ function analyzeBrowserDiff(before,after,width,height){
     const centerY=Math.min(height-1,gap.beforeRow*ROW_STEP),half=6;
     let minGX=gridWidth,maxGX=-1;
     for(let y=Math.max(0,centerY-half);y<Math.min(height,centerY+half);y+=4)for(let x=8;x<width-8;x+=8){
-      const bi=(y*width+x)*4,ay=gap.source==='after'?Math.min(height-1,(gap.afterRow||0)*ROW_STEP):mappedRowY(rowAlignment,y,height),ai=(ay*width+mappedColumnX(columnAlignment,x,width))*4;
+      const bi=(y*width+x)*4,ay=gap.source==='after'?Math.min(height-1,(gap.afterRow||0)*ROW_STEP):mappedRowY(rowAlignment,y,height),ai=(ay*width+mappedColumnX(columnAlignment,x,width,y))*4;
       if(luminance(before,bi)<245||luminance(after,ai)<245){minGX=Math.min(minGX,Math.floor(x/BLOCK));maxGX=Math.max(maxGX,Math.floor(x/BLOCK));}
     }
     if(maxGX<minGX){minGX=2;maxGX=gridWidth-3;}
@@ -583,9 +620,22 @@ function analyzeBrowserDiff(before,after,width,height){
     // signal, so replace such broad residuals with the actual inserted/resized band.
     components=components.filter(component=>{
       const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
-      return !(componentWidth>width*.65&&componentHeight>height*.18);
+      const componentArea=componentWidth*componentHeight;
+      return !(componentWidth>width*.42||componentHeight>height*.35||componentArea>width*height*.08);
     });
     components.push(structuralColumnBox);
+    if(components.length>MAX_LAYOUT_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_LAYOUT_REGIONS);
+  }
+  const dominantHorizontal=components
+    .filter(component=>(component.maxX-component.minX+1)>width*.2&&(component.maxY-component.minY+1)<height*.05)
+    .sort((a,b)=>b.pixels-a.pixels)[0]||null;
+  if(dominantHorizontal){
+    components=components.filter(component=>{
+      if(component===dominantHorizontal)return true;
+      const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
+      const topTextJitter=component.maxY<height*.25&&componentWidth<width*.25&&componentHeight<height*.12&&component.pixels<dominantHorizontal.pixels*.8;
+      return !topTextJitter;
+    });
   }
   if(components.length>MAX_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_REGIONS);
   components.sort((a,b)=>a.minY-b.minY||a.minX-b.minX);
