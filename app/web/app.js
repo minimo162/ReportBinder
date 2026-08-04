@@ -211,7 +211,9 @@ function badge(text, cls='') { return `<span class="badge ${cls}">${escapeHtml(t
 function modeTitle(mode) { return ({ja:'日本語管理', en:'英語管理'})[mode] || mode; }
 function mainVolume() { return state?.language === 'en' ? 'en-main' : 'ja-main'; }
 function appendixVolume() { return state?.language === 'en' ? 'en-appendix' : 'ja-appendix'; }
+
 function volumeLabel(v) { return ({'ja-main':'本体','ja-appendix':'補足','en-main':'Main','en-appendix':'Appendix','none':'出力しない'})[v] || v; }
+function assignmentVolumeLabel(v) { return String(v)==='none'?'未振り分け':volumeLabel(v); }
 function configured() { return !!(state?.configured && state?.paths?.submissionDir && state?.paths?.dataDir && state?.paths?.outputDir); }
 function getWorkbook(workbookId) { return (asArray(state?.structure?.workbooks)).find(w => String(w.workbookId) === String(workbookId)); }
 function sheetKey(sheetName) { return String(sheetName ?? '').replace(/[^0-9A-Za-z]+/g, '-'); }
@@ -866,14 +868,13 @@ function renderFolderOverview() {
 }
 
 
+
 function renderPageOverview() {
   const counts=pageCountsByVolume(); const strip=$('page-summary-strip');
-  if(strip)strip.innerHTML=[['本体',counts.main],['補足',counts.appendix],['出力しない',counts.none]].map(([label,n])=>`<div class="page-summary-item"><div class="summary-label">${label}</div><div><span class="summary-value">${n}</span> ページ</div></div>`).join('');
-  const manual=pagesForActivePreset().some(p=>p.orderManual===true); const label=$('sort-state-label'); if(label){label.textContent=manual?'手動':'シート名順';label.classList.toggle('manual',manual);}
+  if(strip)strip.innerHTML=[['未振り分け',counts.none,'attention'],['本体PDF',counts.main,''],['補足PDF',counts.appendix,'']].map(([label,n,cls])=>`<div class="page-summary-item ${cls&&n?'attention':''}"><div class="summary-label">${label}</div><div><span class="summary-value">${n}</span> ページ</div></div>`).join('');
+  const manual=pagesForActivePreset().some(p=>p.orderManual===true); const label=$('sort-state-label'); if(label){label.textContent=manual?'手動':'Excelのシート順';label.classList.toggle('manual',manual);}
   updateBulkSelectionLabel();
 }
-
-
 function renderFinalOverview() {
   const setText=(id,v)=>{const el=$(id);if(el)el.textContent=v;};
   const main=volumeReadiness(mainVolume()), appendix=volumeReadiness(appendixVolume());
@@ -1170,7 +1171,7 @@ async function moveSelectedPagesToVolume(volume, btn) {
     for(const p of [...pagesForActivePreset()].sort(pageSort)){const id=resolvedPageId(p);if(!id||selected.has(id))continue;const v=(p.enabled===false||String(p.volume||main)==='none')?'none':String(p.volume||main);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
     if(!volumes[target])volumes[target]=[];volumes[target].push(...ids);
     const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes}});applyPageMutationResult(response);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
-    showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${volumeLabel(target)}に設定しました。`,null,[{label:'最終PDFへ',view:'final'}]);
+    showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'最終PDFへ',view:'final'}]);
   });
 }
 
@@ -2007,7 +2008,7 @@ async function renderWorkbookIds(ids, btn, options={}) {
     const msg=summarizeRenderResults(finished.results||[]);const hasErrors=finished.status==='failed'||finished.status==='completed-with-errors'||asArray(finished.errors).length>0;
     if(finished.status==='failed')showMessage('danger','PDF作成が停止しました',userFriendlyError(finished.message||'PDF作成を完了できませんでした。'),finished.errors||finished);
     else if(asArray(finished.errors).length)showMessage('danger','PDF作成でエラーがあります',`${finished.failed||finished.errors.length}件のExcelでPDFを作成できませんでした。`,finished.errors);
-    else{const endCount=asArray(finished.results).reduce((n,r)=>n+Number(r?.sheetSync?.insertedAtEndCount||0),0);const suffix=endCount?`\n新しい${endCount}ページを末尾に追加しました。`:'';const actions=[{label:'ページ構成を確認',primary:true,view:'pages',handler:endCount?scrollToHighlightedPages:null}];if(endCount)actions.push({label:'シート名順に並べ替え',view:'pages',handler:sortPagesBySheet});else actions.push({label:'最終PDFへ',view:'final'});showMessage(msg.kind,msg.title,msg.message+suffix,msg.detail,actions,0);setTimeout(hideProgressPanel,1800);}
+    else{const endCount=asArray(finished.results).reduce((n,r)=>n+Number(r?.sheetSync?.insertedAtEndCount||0),0);const suffix=endCount?`\n新しい${endCount}ページを末尾に追加しました。`:'';const actions=[{label:'ページ構成を確認',primary:true,view:'pages',handler:endCount?scrollToHighlightedPages:null}];if(endCount)actions.push({label:'Excelのシート順に整える',view:'pages',handler:sortPagesBySheet});else actions.push({label:'最終PDFへ',view:'final'});showMessage(msg.kind,msg.title,msg.message+suffix,msg.detail,actions,0);setTimeout(hideProgressPanel,1800);}
     if(hasErrors)updateProgressPanel(finished);
   },false);}finally{renderJobActive=false;updateRenderTargetUi();}
 }
@@ -2092,18 +2093,19 @@ async function renderSelectedPages(btn) {
   await renderWorkbookIds(ids, btn);
 }
 
+
 function pageSort(a,b) {
-  const ao = Number(a.order);
-  const bo = Number(b.order);
-  if (Number.isFinite(ao) && Number.isFinite(bo) && ao !== bo) return ao - bo;
-  const as = sheetNumberValue(a.sheetName);
-  const bs = sheetNumberValue(b.sheetName);
-  if (as !== bs) return as - bs;
-  const aw = getWorkbook(a.workbookId);
-  const bw = getWorkbook(b.workbookId);
-  const af = fileOrderValue(aw?.fileName || aw?.displayName || a.workbookId);
-  const bf = fileOrderValue(bw?.fileName || bw?.displayName || b.workbookId);
-  if (af !== bf) return af - bf;
+  const ao=Number(a.order),bo=Number(b.order);
+  if(Number.isFinite(ao)&&Number.isFinite(bo)&&ao!==bo)return ao-bo;
+  const aw=getWorkbook(a.workbookId),bw=getWorkbook(b.workbookId);
+  const af=fileOrderValue(aw?.fileName||aw?.displayName||a.workbookId),bf=fileOrderValue(bw?.fileName||bw?.displayName||b.workbookId);
+  if(af!==bf)return af-bf;
+  const fileCompare=String(aw?.fileName||'').localeCompare(String(bw?.fileName||''),'ja',{numeric:true,sensitivity:'base'});
+  if(fileCompare)return fileCompare;
+  const ai=Number(a.sheetIndex),bi=Number(b.sheetIndex);
+  if(Number.isFinite(ai)&&Number.isFinite(bi)&&ai!==bi)return ai-bi;
+  const sheetCompare=String(a.sheetName||'').localeCompare(String(b.sheetName||''),'ja',{numeric:true,sensitivity:'base'});
+  if(sheetCompare)return sheetCompare;
   return resolvedPageId(a).localeCompare(resolvedPageId(b));
 }
 function numberingSelectValue(page) { return page.numberingManual ? (page.numberingMode || 'visible') : 'auto'; }
@@ -2131,16 +2133,24 @@ function applyChangedOnlyFilter(pages){
   const filtered = pages.filter(pageIsChanged);
   return filtered.length ? filtered : pages;
 }
+
 function renderPages() {
   const box=$('page-board');if(!box)return;const allPages=applyChangedOnlyFilter([...pagesForActivePreset()].sort(pageSort));
   const needsPdf=workbooksForActivePreset().filter(w=>!isLatestPdfWorkbook(w));const agg=aggregateFinalState();
-  const signature=JSON.stringify([allPages.map(p=>[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf]),needsPdf.map(w=>w.workbookId),agg.state]);
+  const signature=JSON.stringify([allPages.map(p=>[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf,p.sheetIndex]),needsPdf.map(w=>w.workbookId),agg.state]);
   if(lastPageBoardRenderSignature===signature&&box.childElementCount)return;lastPageBoardRenderSignature=signature;
   const scrollSnap=capturePageBoardScroll();selectedPages=new Set([...selectedPages].filter(id=>allPages.some(p=>resolvedPageId(p)===id)));
-  const banners=[];if(needsPdf.length)banners.push(`<div class="page-status-banner"><strong>PDF作成が必要なExcelがあります</strong><span>${needsPdf.length}件。先にPDF作成してください。</span></div>`);if(agg.state==='needs-rebuild')banners.push('<div class="page-status-banner"><strong>ページ構成またはPDF入力が変更されています</strong><span>最終PDFの再出力が必要です。</span></div>');
-  box.className='board';box.innerHTML=banners.join('')+[mainVolume(),appendixVolume(),'none'].map(volume=>{const pages=allPages.filter(p=>volume==='none'?(String(p.volume)==='none'||p.enabled===false):(String(p.volume||mainVolume())===volume&&p.enabled!==false));return `<section class="volume-panel" data-volume-panel="${volume}"><div class="volume-head"><h3>${escapeHtml(volumeLabel(volume))}</h3><span>${pages.length}ページ</span></div><div class="table-wrap"><table class="page-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-pages="${volume}" aria-label="${escapeHtml(volumeLabel(volume))}をすべて選択"></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${volume}">${pages.map((p,i)=>pageRowHtml(p,i)).join('')||'<tr class="empty-row"><td colspan="6">ここに置く</td></tr>'}</tbody></table></div></section>`;}).join('');attachBoardEvents();restorePageBoardScroll(scrollSnap);
+  const banners=[];const unassigned=allPages.filter(p=>String(p.volume)==='none'||p.enabled===false).length;
+  if(unassigned)banners.push(`<div class="page-status-banner attention"><strong>未振り分けのページが ${unassigned} ページあります</strong><span>本体または補足へ移したページだけが最終PDFに含まれます。</span></div>`);
+  if(needsPdf.length)banners.push(`<div class="page-status-banner"><strong>PDF作成が必要なExcelがあります</strong><span>${needsPdf.length}件。先にPDF作成してください。</span></div>`);
+  if(agg.state==='needs-rebuild')banners.push('<div class="page-status-banner"><strong>ページ構成またはPDF入力が変更されています</strong><span>最終PDFの再出力が必要です。</span></div>');
+  const panels=[
+    {volume:'none',title:'未振り分け（出力しない）',description:'新規ページはここに入ります。必要なページを選び、本体または補足へ移してください。'},
+    {volume:mainVolume(),title:volumeLabel(mainVolume()),description:'ここへ入れたページが本体PDFに含まれます。'},
+    {volume:appendixVolume(),title:volumeLabel(appendixVolume()),description:'ここへ入れたページが補足PDFに含まれます。'}
+  ];
+  box.className='board';box.innerHTML=banners.join('')+panels.map(panel=>{const volume=panel.volume;const pages=allPages.filter(p=>volume==='none'?(String(p.volume)==='none'||p.enabled===false):(String(p.volume||mainVolume())===volume&&p.enabled!==false));return `<section class="volume-panel ${volume==='none'?'inbox':''}" data-volume-panel="${volume}"><div class="volume-head"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span>${pages.length}ページ</span></div><div class="table-wrap"><table class="page-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-pages="${volume}" aria-label="${escapeHtml(panel.title)}をすべて選択"></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${volume}">${pages.map((p,i)=>pageRowHtml(p,i)).join('')||'<tr class="empty-row"><td colspan="6">ここに置く</td></tr>'}</tbody></table></div></section>`;}).join('');attachBoardEvents();restorePageBoardScroll(scrollSnap);
 }
-
 function pageRowHtml(p, idx) {
   const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
   return `<tr tabindex="0" class="page-row ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="check-col"><input type="checkbox" data-page-check value="${escapeAttr(pid)}" ${checked?'checked':''}></td><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="drag-col"><span class="drag-handle" title="ドラッグして移動">${iconUse('i-drag')}</span></td><td class="page-main-cell"><input class="title-input" data-page-title value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / シート ${escapeHtml(p.sheetName||'')}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div></td></tr>`;
@@ -2391,19 +2401,17 @@ function applyPageMutationResult(payload){
 }
 
 function scheduleBoardSave() { clearTimeout(boardSaveTimer); boardSaveTimer = setTimeout(saveBoardOrder, 250); }
+async 
 async function saveBoardOrder() {
   try{
     const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes:collectBoardVolumes()}});
     applyPageMutationResult(response);
-    showMessage('ok','ページ構成を保存しました','本体・補足の並びを反映しました。',null,[{label:'最終PDFへ',view:'final'}]);
+    showMessage('ok','ページ構成を保存しました','未振り分け・本体・補足の割り当てと並びを反映しました。',null,[{label:'最終PDFへ',view:'final'}]);
   }catch(e){
     showMessage('danger','並び替えを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);
     lastPageBoardRenderSignature='';
   }
 }
-
-
-
 async function savePageFromRow(row, numberingChanged=false) {
   if(!row)return;
   const pageId=row.getAttribute('data-page-id'),page=getPage(pageId);
@@ -2419,17 +2427,15 @@ async function savePageFromRow(row, numberingChanged=false) {
 
 
 
+async 
 async function sortPagesBySheet(btn=null) {
-  if(!confirm('本体・補足・出力しないの割り当てはそのままで、それぞれの表の中だけをシート名の数字順に並べ替えます。よろしいですか？'))return;
+  if(!confirm('未振り分け・本体・補足の割り当てはそのままで、それぞれの表の中を各Excelのシート順に整えます。よろしいですか？'))return;
   await runBusy(btn||$('sort-by-sheet-btn'),async()=>{
     const response=await api('/api/pages/sort-by-sheet',{method:'POST',body:{category:activePreset,volumes:[mainVolume(),appendixVolume(),'none']}});
     applyPageMutationResult(response);
-    showMessage('ok','シート名順に並べ替えました','本体・補足・出力しないの各表を整列しました。',null,[{label:'最終PDFへ',view:'final'}]);
+    showMessage('ok','Excelのシート順に整えました','未振り分け・本体・補足の各表を整列しました。',null,[{label:'最終PDFへ',view:'final'}]);
   });
 }
-
-
-
 function pageFallbackFromRow(row) {
   return {
     pageId: row?.getAttribute('data-page-id') || '',
@@ -2744,7 +2750,7 @@ async function loadLayoutSnapshots(){
     const r=await api(`/api/layout/snapshots?category=${encodeURIComponent(activePreset)}`);
     const list=asArray(r.snapshots);
     if(!list.length){box.innerHTML='<div class="caption">保存されたページ構成はまだありません。</div>';return;}
-    const reasonLabel={reorder:'並べ替え','sort-by-sheet':'シート名順に並べ替え','volume-change':'出力先の変更',numbering:'ページ番号の変更',enabled:'出力対象の変更','final-build':'最終PDF出力時',restore:'復元',
+    const reasonLabel={reorder:'並べ替え','sort-by-sheet':'Excelのシート順に整える','volume-change':'出力先の変更',numbering:'ページ番号の変更',enabled:'出力対象の変更','final-build':'最終PDF出力時',restore:'復元',
       'pre-restore':'復元の直前'};
     box.innerHTML=list.map(x=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(x.createdAt))}</span><span>${escapeHtml(reasonLabel[String(x.reason||'')]||String(x.reason||''))}</span><span class="subtext">${Number(x.pageCount||0)}ページ</span><button class="btn ghost compact" type="button" data-restore-layout="${escapeAttr(x.snapshotId)}">この状態に戻す</button></div>`).join('');
     box.querySelectorAll('[data-restore-layout]').forEach(b=>b.addEventListener('click',()=>previewLayoutRestore(b.getAttribute('data-restore-layout'))));

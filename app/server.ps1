@@ -1026,20 +1026,38 @@ function Ensure-Package($Paths, [string[]]$Languages = @('ja','en')) {
 }
 
 
+
+function Get-WorksheetStorageStem([string]$SheetName) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$SheetName))
+        $shortHash = -join @($bytes[0..7] | ForEach-Object { $_.ToString('x2') })
+        return "sheet-$shortHash"
+    } finally {
+        if ($sha) { $sha.Dispose() }
+    }
+}
+
+function New-WorksheetPageId([string]$WorkbookId, [string]$SheetName) {
+    if ([string]::IsNullOrWhiteSpace($WorkbookId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
+    return "$WorkbookId-$(Get-WorksheetStorageStem $SheetName)"
+}
+
+function Get-PageSheetIndex($Page) {
+    $value = Get-DataProperty $Page 'sheetIndex' $null
+    $parsed = 0
+    if ($null -ne $value -and [int]::TryParse([string]$value, [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+    return (Get-SheetOrderNumber ([string](Get-DataProperty $Page 'sheetName' '')))
+}
+
 function Resolve-PageId($Page) {
     if ($null -eq $Page) { return '' }
     $existing = [string]$Page.pageId
     if (-not [string]::IsNullOrWhiteSpace($existing)) { return $existing }
     $legacy = [string]$Page.id
     if (-not [string]::IsNullOrWhiteSpace($legacy)) { return $legacy }
-    $wb = [string]$Page.workbookId
-    $sheetName = [string]$Page.sheetName
-    if ([string]::IsNullOrWhiteSpace($wb) -or [string]::IsNullOrWhiteSpace($sheetName)) { return '' }
-    $sheetKey = [regex]::Replace($sheetName, '[^0-9A-Za-z]+', '-')
-    if ([string]::IsNullOrWhiteSpace($sheetKey)) { $sheetKey = 'sheet' }
-    return "$wb-$sheetKey"
+    return (New-WorksheetPageId ([string]$Page.workbookId) ([string]$Page.sheetName))
 }
-
 function Set-NoteProperty($Object, [string]$Name, $Value) {
     if ($null -eq $Object) { return }
     if ($Object -is [System.Collections.IDictionary]) {
@@ -1276,11 +1294,11 @@ function Get-VolumeList([string]$Language) {
     return @('en-main','en-appendix','none')
 }
 
-function Get-DefaultVolume([string]$Language) {
-    if ($Language -eq 'ja') { return 'ja-main' }
-    return 'en-main'
-}
 
+function Get-DefaultVolume([string]$Language) {
+    # New pages are intentionally staged outside the final PDFs until the user assigns them.
+    return 'none'
+}
 function Get-LanguageFromFileName([string]$FileName) {
     $name = [string]$FileName
     if ($name -match '(^|[_-])(J|JA|JPN)([_-]|$)') { return 'ja' }
@@ -1496,6 +1514,7 @@ function Open-ExcelWorkbookSafe($Excel, [string]$FullPath, [bool]$ReadOnly) {
     throw $openError
 }
 
+
 function Inspect-ExcelWorkbook([string]$FullPath) {
     $excel = $null
     $book = $null
@@ -1517,7 +1536,7 @@ function Inspect-ExcelWorkbook([string]$FullPath) {
                 $ws = $book.Worksheets.Item($i)
                 $sheetName = [string]$ws.Name
                 $visible = ([int]$ws.Visible -eq -1)
-                if ($visible -and $sheetName -match '^[0-9]+$') {
+                if ($visible) {
                     $a1 = ''
                     try { $a1 = [string]$ws.Range('A1').Text } catch { $a1 = '' }
                     if ([string]::IsNullOrWhiteSpace($a1)) { $a1 = '' }
@@ -1527,6 +1546,7 @@ function Inspect-ExcelWorkbook([string]$FullPath) {
                     try { $printArea = [string]$ws.PageSetup.PrintArea } catch { }
                     $sheets += [ordered]@{
                         sheetName = $sheetName
+                        sheetIndex = $i
                         titleSource = 'A1'
                         detectedTitle = $a1
                         zoom = $zoom
@@ -1544,7 +1564,6 @@ function Inspect-ExcelWorkbook([string]$FullPath) {
     }
     return $sheets
 }
-
 function Add-NotePropertyIfMissing($Object, [string]$Name, $Value) {
     if ($null -eq $Object) { return }
     if ($Object -is [System.Collections.IDictionary]) {
@@ -1571,6 +1590,7 @@ function Renumber-VolumeOrder($Structure, [string]$Volume, [string]$Category) {
     return $pages
 }
 
+
 function Insert-PageInSheetOrder($Structure, $NewPage, [string]$Volume, [string]$Category) {
     $cat = Require-WorkbookCategory $Category
     $existing = @(Renumber-VolumeOrder $Structure $Volume $cat)
@@ -1583,25 +1603,28 @@ function Insert-PageInSheetOrder($Structure, $NewPage, [string]$Volume, [string]
     } else {
         $newWb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$NewPage.workbookId } | Select-Object -First 1)
         $newFile = if ($newWb.Count) { [string]$newWb[0].fileName } else { '' }
-        $newSheet = Get-SheetOrderNumber ([string]$NewPage.sheetName)
         $newFileOrder = Get-FileOrderNumber $newFile
+        $newSheetIndex = Get-PageSheetIndex $NewPage
         $at = $existing.Count
         for ($i=0; $i -lt $existing.Count; $i++) {
             $p = $existing[$i]
             $wb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$p.workbookId } | Select-Object -First 1)
             $file = if ($wb.Count) { [string]$wb[0].fileName } else { '' }
-            $sheet = Get-SheetOrderNumber ([string]$p.sheetName)
             $fileOrder = Get-FileOrderNumber $file
-            if ($sheet -gt $newSheet -or ($sheet -eq $newSheet -and $fileOrder -gt $newFileOrder) -or ($sheet -eq $newSheet -and $fileOrder -eq $newFileOrder -and [StringComparer]::OrdinalIgnoreCase.Compare($file,$newFile) -gt 0)) { $at=$i; break }
+            $sheetIndex = Get-PageSheetIndex $p
+            $fileCompare = [StringComparer]::OrdinalIgnoreCase.Compare($file, $newFile)
+            if ($fileOrder -gt $newFileOrder -or
+                ($fileOrder -eq $newFileOrder -and $fileCompare -gt 0) -or
+                ($fileOrder -eq $newFileOrder -and $fileCompare -eq 0 -and $sheetIndex -gt $newSheetIndex)) {
+                $at = $i
+                break
+            }
         }
-        $ordered.Insert($at,$NewPage)
+        $ordered.Insert($at, $NewPage)
     }
     for ($i=0; $i -lt $ordered.Count; $i++) { Set-NoteProperty $ordered[$i] 'order' (($i+1)*10) }
-    # Windows PowerShell 5.1 can throw "Argument types do not match" when
-    # @() directly converts List[object] through PSToObjectArrayBinder.
     return [ordered]@{ insertedAtEnd=$insertedAtEnd; pages=$ordered.ToArray() }
 }
-
 function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = '') {
     $workspace = Get-WorkspacePath $Language $DataDir
     $lockPath = Join-Path $workspace 'locks\structure.lock'
@@ -1674,7 +1697,7 @@ function ConvertTo-UserRenderError([string]$Message) {
     $rawTail = if ($text.Length -gt 250) { ' (元のエラー: ' + $text.Substring(0, 250) + '…)' } else { ' (元のエラー: ' + $text + ')' }
     if ($text -match 'Open プロパティを取得できません|Unable to get the Open property') { return 'Excelがこのファイルを開けませんでした。ファイルが保護ビュー対象（インターネット由来）・暗号化（秘密度ラベル/IRM）・破損のいずれかの可能性があります。ファイルを右クリック→プロパティ→「許可する」にチェック後、もう一度PDF作成してください。' }
     if ($text -match 'このオブジェクトにプロパティ|stateSavedAt|プロパティ.*見つかりません|property.*not found|does not contain a property') { return 'PDF作成の進捗状態を更新できませんでした。ReportBinderを更新してから、もう一度PDF作成してください。' }
-    if ($text -match 'PDF化対象のシート|半角数字') { return 'PDF化対象のシートがありません。シート名を半角数字だけにしてください。例: 1, 2, 3' }
+    if ($text -match 'PDF化対象のシート|PDF化対象の表示シート') { return 'PDF化対象の表示シートがありません。Excelで少なくとも1つのワークシートを表示してください。' }
     if ($text -match '提出ファイル|ファイルが見つかりません|ブックが見つかりません|not found|missing') { return '提出ファイルが見つかりません。削除・移動・名前変更されていないか確認してください。' }
     if ($text -match 'コピー前後|提出中|使用中|locked|lock|ロック') { return ('Excelが保存中または他の処理中です。保存が終わってから再度確認します。' + $rawTail) }
     if ($text -match 'Excel|COM|HRESULT|ExportAsFixedFormat|RPC') { return ('ExcelでPDF化できませんでした。' + $rawTail) }
@@ -1692,12 +1715,13 @@ function Get-SheetNameListFromInspection($Sheets) {
     return @($names)
 }
 
+
 function Get-SheetFingerprintFromNames($SheetNames) {
     $names = @($SheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($names.Count -eq 0) { return '' }
-    return ([string]::Join('|', @($names | Sort-Object { Get-SheetOrderNumber $_ }, { [string]$_ })))
+    # Worksheet order is significant now that names are not required to be numeric.
+    return ([string]::Join('|', [string[]]$names))
 }
-
 function Set-WorkbookRenderedSheetSnapshot($Workbook, $SheetNames) {
     $names = @($SheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     Set-NoteProperty $Workbook 'lastRenderedSheets' @($names)
@@ -1786,45 +1810,93 @@ function Remove-ContentPdfFileSafe([string]$Workspace, [string]$RelativePdf) {
     } catch { }
 }
 
+
 function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets) {
-    $workbookId=[string](Get-DataProperty $Workbook 'workbookId' '')
-    $cat=Require-WorkbookCategory ([string](Get-DataProperty $Workbook 'category' ''))
-    $pages=@(Get-Array $Structure.pages)
-    $sortedSheets=@(Get-Array $Sheets | Sort-Object @{Expression={Get-SheetOrderNumber ([string](Get-DataProperty $_ 'sheetName' ''))};Ascending=$true}, @{Expression={[string](Get-DataProperty $_ 'sheetName' '')};Ascending=$true})
-    $current=@{}; foreach($s in $sortedSheets){$n=[string](Get-DataProperty $s 'sheetName' '');if($n){$current[$n]=$true}}
-    $removed=@(); $kept=@()
-    foreach($p in $pages){ if([string]$p.workbookId -eq $workbookId -and (-not $current.ContainsKey([string]$p.sheetName))){$removed+= $p}else{$kept+=$p} }
-    $pages=@($kept); $Structure.pages=$pages
-    $known=@{}; foreach($p in $pages){$known[(Resolve-PageId $p)]=$p}
-    $added=@();$updated=@();$atEnd=@();$inOrder=0
-    foreach($s in $sortedSheets){
-        $sheet=[string](Get-DataProperty $s 'sheetName' ''); if(-not $sheet){continue}
-        $pageId="$workbookId-$([regex]::Replace($sheet,'[^0-9A-Za-z]+','-'))"
-        $title=[string](Get-DataProperty $s 'detectedTitle' '');if(-not $title){$title="$([string]$Workbook.fileName) / $sheet"}
-        if($known.ContainsKey($pageId)){
-            $p=$known[$pageId];Set-NoteProperty $p 'sheetName' $sheet;Set-NoteProperty $p 'detectedTitle' $title;if(-not [string]$p.title){Set-NoteProperty $p 'title' $title};$updated+=$pageId
-        }else{
-            # V5-P3: pages は JSON 由来の PSCustomObject で構成される。新規ページだけ OrderedDictionary にすると
-            #        Windows PowerShell 5.1 が Sort-Object 等の型比較で「引数の型が一致しません」を投げることがある。
-            #        コレクションの要素型を必ず揃える。
-            $p=[pscustomobject][ordered]@{pageId=$pageId;workbookId=$workbookId;sheetName=$sheet;titleSource='A1';detectedTitle=$title;title=$title;volume=(Get-DefaultVolume $Language);order=0;orderManual=$false;numberingMode='visible';numberingManual=$false;numberingDefault='first-page-none';enabled=$true;contentPdf=$null;status='not-rendered';warnings=@();updatedAt=New-NowIso}
-            $ins=Insert-PageInSheetOrder $Structure $p ([string]$p.volume) $cat
-            $Structure.pages=@(Get-Array $Structure.pages)+@($p)
-            if($ins.insertedAtEnd){$atEnd+=$pageId}else{$inOrder++}
-            $added+=$pageId;$known[$pageId]=$p
+    $workbookId = [string](Get-DataProperty $Workbook 'workbookId' '')
+    $cat = Require-WorkbookCategory ([string](Get-DataProperty $Workbook 'category' ''))
+    $pages = @(Get-Array $Structure.pages)
+    $sortedSheets = @(Get-Array $Sheets | Sort-Object @{Expression={[int](Get-DataProperty $_ 'sheetIndex' 999999)};Ascending=$true}, @{Expression={Get-SheetOrderNumber ([string](Get-DataProperty $_ 'sheetName' ''))};Ascending=$true}, @{Expression={[string](Get-DataProperty $_ 'sheetName' '')};Ascending=$true})
+
+    $current = @{}
+    foreach ($sheetInfo in $sortedSheets) {
+        $name = [string](Get-DataProperty $sheetInfo 'sheetName' '')
+        if (-not [string]::IsNullOrWhiteSpace($name)) { $current[$name.ToLowerInvariant()] = $true }
+    }
+
+    $removed = @()
+    $kept = @()
+    foreach ($page in $pages) {
+        $belongs = ([string]$page.workbookId -eq $workbookId)
+        $sheetKey = ([string]$page.sheetName).ToLowerInvariant()
+        if ($belongs -and (-not $current.ContainsKey($sheetKey))) { $removed += $page } else { $kept += $page }
+    }
+    $pages = @($kept)
+    $Structure.pages = $pages
+
+    # Keep existing IDs and assignments. Match existing pages by workbook + sheet name so
+    # upgrading from legacy numeric IDs does not reset a user's page composition.
+    $knownBySheet = @{}
+    foreach ($page in $pages) {
+        if ([string]$page.workbookId -ne $workbookId) { continue }
+        $sheetKey = ([string]$page.sheetName).ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($sheetKey)) { $knownBySheet[$sheetKey] = $page }
+    }
+
+    $added = @()
+    $updated = @()
+    $atEnd = @()
+    $inOrder = 0
+    foreach ($sheetInfo in $sortedSheets) {
+        $sheet = [string](Get-DataProperty $sheetInfo 'sheetName' '')
+        if ([string]::IsNullOrWhiteSpace($sheet)) { continue }
+        $sheetKey = $sheet.ToLowerInvariant()
+        $sheetIndex = [int](Get-DataProperty $sheetInfo 'sheetIndex' 999999)
+        $title = [string](Get-DataProperty $sheetInfo 'detectedTitle' '')
+        if ([string]::IsNullOrWhiteSpace($title)) { $title = "$([string]$Workbook.fileName) / $sheet" }
+
+        if ($knownBySheet.ContainsKey($sheetKey)) {
+            $page = $knownBySheet[$sheetKey]
+            $pageId = Resolve-PageId $page
+            if ([string]::IsNullOrWhiteSpace([string](Get-DataProperty $page 'pageId' ''))) { Set-NoteProperty $page 'pageId' $pageId }
+            Set-NoteProperty $page 'sheetName' $sheet
+            Set-NoteProperty $page 'sheetIndex' $sheetIndex
+            Set-NoteProperty $page 'detectedTitle' $title
+            if ([string]::IsNullOrWhiteSpace([string]$page.title)) { Set-NoteProperty $page 'title' $title }
+            $updated += $pageId
+            continue
+        }
+
+        $pageId = New-WorksheetPageId $workbookId $sheet
+        $page = [pscustomobject][ordered]@{
+            pageId=$pageId; workbookId=$workbookId; sheetName=$sheet; sheetIndex=$sheetIndex
+            titleSource='A1'; detectedTitle=$title; title=$title
+            volume='none'; order=0; orderManual=$false
+            numberingMode='visible'; numberingManual=$false; numberingDefault='first-page-none'
+            enabled=$false; contentPdf=$null; status='not-rendered'; warnings=@(); updatedAt=New-NowIso
+        }
+        $insert = Insert-PageInSheetOrder $Structure $page 'none' $cat
+        $Structure.pages = @(Get-Array $Structure.pages) + @($page)
+        if ($insert.insertedAtEnd) { $atEnd += $pageId } else { $inOrder++ }
+        $added += $pageId
+        $knownBySheet[$sheetKey] = $page
+    }
+
+    foreach ($volume in @(Get-VolumeList $Language)) { [void](Renumber-VolumeOrder $Structure $volume $cat) }
+    if ($removed.Count -gt 0) {
+        $affected = @($removed | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+        if ($affected.Count -gt 0) {
+            Mark-VolumeNeedsRebuild $Structure $Language $cat $affected 'render' 'Excelのシート構成が変更されました'
         }
     }
-    foreach($vol in @(Get-VolumeList $Language)){[void](Renumber-VolumeOrder $Structure $vol $cat)}
-    if($removed.Count -gt 0 -or $added.Count -gt 0){
-        $affected=@($removed|ForEach-Object{[string]$_.volume})
-        if($added.Count -gt 0){$affected+=@((Get-DefaultVolume $Language))}
-        Mark-VolumeNeedsRebuild $Structure $Language $cat @($affected|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique) 'render' 'Excelのシート構成が変更されました'
-    }
     Apply-DefaultNumberingPerVolume $Language $Structure $cat
-    $names=@($sortedSheets|ForEach-Object{[string]$_.sheetName})
-    return [ordered]@{addedPageIds=@($added);updatedPageIds=@($updated);removedPages=@($removed);sheetNames=$names;sheetFingerprint=(Get-SheetFingerprintFromNames $names);addedCount=$added.Count;insertedInOrderCount=$inOrder;insertedAtEndCount=$atEnd.Count;insertedAtEndPageIds=@($atEnd)}
+    $names = @($sortedSheets | ForEach-Object { [string]$_.sheetName })
+    return [ordered]@{
+        addedPageIds=@($added); updatedPageIds=@($updated); removedPages=@($removed)
+        sheetNames=$names; sheetFingerprint=(Get-SheetFingerprintFromNames $names)
+        addedCount=$added.Count; insertedInOrderCount=$inOrder; insertedAtEndCount=$atEnd.Count
+        insertedAtEndPageIds=@($atEnd); newPagesAreUnassigned=$true
+    }
 }
-
 function Clear-ExcelHeaderFooterParts($Target) {
     if ($null -eq $Target) { return }
     foreach ($part in @('LeftHeader','CenterHeader','RightHeader','LeftFooter','CenterFooter','RightFooter')) {
@@ -2438,7 +2510,6 @@ function Register-Workbook([string]$Language, [string]$RelativePath, [string]$Ca
             if (-not [string]::IsNullOrWhiteSpace([string]$candidate.lastRenderedExcelHash)) { Set-NoteProperty $candidate 'status' $(if ($candidate.currentExcelHash -ne $candidate.lastRenderedExcelHash) {'excel-updated'} else {[string]$old.status}) }
         }
         $structure.workbooks=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -ne [string]$candidate.workbookId }) + @($candidate)
-        Mark-VolumeNeedsRebuild $structure $Language $cat @((Get-DefaultVolume $Language)) 'register' 'Excelを1件登録しました'
         return [ordered]@{ workbook=$candidate; sheets=@(); registered=$true; inspected=$false }
     }
 }
@@ -2801,7 +2872,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                         $ws = $book.Worksheets.Item($i)
                         $sheetName = [string]$ws.Name
                         $visible = ([int]$ws.Visible -eq -1)
-                        if ($visible -and $sheetName -match '^[0-9]+$') {
+                        if ($visible) {
                             $targetSheetNames += $sheetName
                             $a1 = ''
                             try { $a1 = [string]$ws.Range('A1').Text } catch { }
@@ -2809,15 +2880,15 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                             # Reading PageSetup.PrintArea is another slow COM call and is only diagnostic.
                             # Keep it blank in render logs to avoid delaying PDF作成.
                             $printArea = ''
-                            $inspected += [ordered]@{ sheetName = $sheetName; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
+                            $inspected += [ordered]@{ sheetName = $sheetName; sheetIndex = $i; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
 
                             if (-not $packagePrintSettingsPrepared) {
                                 $steps += "シート $sheetName の印刷設定を調整"
                                 if ($ProgressCallback) { & $ProgressCallback 'sheet-setup' $WorkbookId $sheetName }
                                 Apply-StandardPrintSettings $ws $excel $deferredPrintCommunication
                             }
-                            $outPdf = Join-Path $contentDir "$sheetName.pdf"
-                            $sheetRenderInfos += [ordered]@{ sheetName = $sheetName; outPdf = $outPdf; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
+                            $outPdf = Join-Path $contentDir ("{0}.pdf" -f (Get-WorksheetStorageStem $sheetName))
+                            $sheetRenderInfos += [ordered]@{ sheetName = $sheetName; sheetIndex = $i; outPdf = $outPdf; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
                         }
                     } finally {
                         Invoke-ComRelease $ws
@@ -2833,7 +2904,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 # 個別に消すと、保持しているはずの世代フォルダの中身が欠損する。
                 Set-WorkbookRenderedSheetSnapshot $wb @()
                 Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @());Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
-                throw 'PDF化対象のシートがありません。シート名が半角数字のみ（例: 1, 2, 003）のシートを用意してください。'
+                throw 'PDF化対象の表示シートがありません。Excelで少なくとも1つのワークシートを表示してください。'
             }
 
             $excelExportTimer = [Diagnostics.Stopwatch]::StartNew()
@@ -3636,39 +3707,71 @@ function Reorder-Pages([string]$Language, $Body) {
     }
 }
 
+
 function Update-Page([string]$Language, $Body) {
-    $cat=Require-WorkbookCategory ([string]$Body.category)
+    $cat = Require-WorkbookCategory ([string]$Body.category)
     return Update-StructureLocked $Language {
         param($structure)
-        $page=@(Get-Array $structure.pages|Where-Object{(Resolve-PageId $_)-eq [string]$Body.pageId}|Select-Object -First 1);if($page.Count -eq 0){throw "Pageが見つかりません: $($Body.pageId)"};$p=$page[0]
-        if((Get-PageCategory $structure $p) -ne $cat){throw [ArgumentException]::new('指定カテゴリのページではありません。')}
-        $beforeVol=[string]$p.volume;$beforeEnabled=[bool](Get-DataProperty $p 'enabled' $true);$beforeNum=[string]$p.numberingMode;$structural=$false
-        if($null -ne $Body.title){Set-NoteProperty $p 'title' ([string]$Body.title)}
-        if($null -ne $Body.volume){if((Get-VolumeList $Language)-notcontains [string]$Body.volume){throw [ArgumentException]::new('不正なvolumeです。')};Set-NoteProperty $p 'volume' ([string]$Body.volume);$structural=$true}
-        if($null -ne $Body.numberingMode){if(@('none','visible')-notcontains [string]$Body.numberingMode){throw [ArgumentException]::new('不正なnumberingModeです。')};Set-NoteProperty $p 'numberingMode' ([string]$Body.numberingMode);Set-NoteProperty $p 'numberingManual' $true;$structural=$true}
-        if($null -ne $Body.numberingManual){Set-NoteProperty $p 'numberingManual' ([bool]$Body.numberingManual);$structural=$true}
-        if($null -ne $Body.resetNumbering -and [bool]$Body.resetNumbering){Set-NoteProperty $p 'numberingManual' $false;$structural=$true}
-        if($null -ne $Body.enabled){Set-NoteProperty $p 'enabled' ([bool]$Body.enabled);$structural=$true}
-        Set-NoteProperty $p 'updatedAt' (New-NowIso);foreach($vol in @(Get-VolumeList $Language)){[void](Renumber-VolumeOrder $structure $vol $cat)};Apply-DefaultNumberingPerVolume $Language $structure $cat
-        if($structural){$affected=@($beforeVol,[string]$p.volume)|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique;Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました'}
+        $page = @(Get-Array $structure.pages | Where-Object { (Resolve-PageId $_) -eq [string]$Body.pageId } | Select-Object -First 1)
+        if ($page.Count -eq 0) { throw "Pageが見つかりません: $($Body.pageId)" }
+        $p = $page[0]
+        if ((Get-PageCategory $structure $p) -ne $cat) { throw [ArgumentException]::new('指定カテゴリのページではありません。') }
+        $beforeVol = [string]$p.volume
+        $structural = $false
+
+        if ($null -ne $Body.title) { Set-NoteProperty $p 'title' ([string]$Body.title) }
+        if ($null -ne $Body.volume) {
+            $targetVolume = [string]$Body.volume
+            if ((Get-VolumeList $Language) -notcontains $targetVolume) { throw [ArgumentException]::new('不正なvolumeです。') }
+            Set-NoteProperty $p 'volume' $targetVolume
+            Set-NoteProperty $p 'enabled' ($targetVolume -ne 'none')
+            $structural = $true
+        }
+        if ($null -ne $Body.numberingMode) {
+            if (@('none','visible') -notcontains [string]$Body.numberingMode) { throw [ArgumentException]::new('不正なnumberingModeです。') }
+            Set-NoteProperty $p 'numberingMode' ([string]$Body.numberingMode)
+            Set-NoteProperty $p 'numberingManual' $true
+            $structural = $true
+        }
+        if ($null -ne $Body.numberingManual) { Set-NoteProperty $p 'numberingManual' ([bool]$Body.numberingManual); $structural = $true }
+        if ($null -ne $Body.resetNumbering -and [bool]$Body.resetNumbering) { Set-NoteProperty $p 'numberingManual' $false; $structural = $true }
+        if ($null -ne $Body.enabled) {
+            if ([bool]$Body.enabled) {
+                if ([string](Get-DataProperty $p 'volume' 'none') -eq 'none') {
+                    throw [ArgumentException]::new('出力するページは、本体または補足へ割り当ててください。')
+                }
+                Set-NoteProperty $p 'enabled' $true
+            } else {
+                Set-NoteProperty $p 'enabled' $false
+                Set-NoteProperty $p 'volume' 'none'
+            }
+            $structural = $true
+        }
+
+        Set-NoteProperty $p 'updatedAt' (New-NowIso)
+        foreach ($volume in @(Get-VolumeList $Language)) { [void](Renumber-VolumeOrder $structure $volume $cat) }
+        Apply-DefaultNumberingPerVolume $Language $structure $cat
+        if ($structural) {
+            $affected = @($beforeVol, [string]$p.volume) | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique
+            Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました'
+        }
         return [ordered]@{ page=$p; volumes=$structure.volumes }
     }
 }
-
 function Confirm-Page([string]$Language, $Body) {
     $cat=Require-WorkbookCategory ([string]$Body.category)
     return Update-StructureLocked $Language { param($structure) $page=@(Get-Array $structure.pages|Where-Object{(Resolve-PageId $_)-eq [string]$Body.pageId}|Select-Object -First 1);if($page.Count -eq 0){throw "Pageが見つかりません: $($Body.pageId)"};if((Get-PageCategory $structure $page[0]) -ne $cat){throw [ArgumentException]::new('指定カテゴリのページではありません。')};switch([string]$Body.action){'confirm'{Set-NoteProperty $page[0] 'status' 'confirmed'}'reject'{Set-NoteProperty $page[0] 'status' 'rejected'}default{throw [ArgumentException]::new('action は confirm または reject を指定してください。')}};Set-NoteProperty $page[0] 'updatedAt' (New-NowIso);return $page[0] }
 }
 
+
 function Sort-PagesBySheet([string]$Language, $Body) {
     $cat = Require-WorkbookCategory ([string]$Body.category)
     return Update-StructureLocked $Language {
         param($structure)
-        $volumes = @()
-        if ($Body.volumes) {
-            $volumes = @(Get-Array $Body.volumes | ForEach-Object { [string]$_ })
+        $volumes = if ($Body.volumes) {
+            @(Get-Array $Body.volumes | ForEach-Object { [string]$_ })
         } else {
-            $volumes = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
+            @(Get-VolumeList $Language)
         }
         $wbMap = @{}
         foreach ($wb in @(Get-Array $structure.workbooks | Where-Object { Test-WorkbookCategory $_ $cat })) {
@@ -3683,14 +3786,10 @@ function Sort-PagesBySheet([string]$Language, $Body) {
                     ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
                 )
             } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_})
-            $sorted = @($current | Sort-Object `
-                @{Expression={Get-SheetOrderNumber ([string]$_.sheetName)};Ascending=$true}, `
-                @{Expression={Get-FileOrderNumber ([string]$wbMap[[string]$_.workbookId].fileName)};Ascending=$true}, `
-                @{Expression={[string]$wbMap[[string]$_.workbookId].fileName};Ascending=$true}, `
-                @{Expression={Resolve-PageId $_};Ascending=$true})
+            $sorted = @($current | Sort-Object @{Expression={Get-FileOrderNumber ([string]$wbMap[[string]$_.workbookId].fileName)};Ascending=$true}, @{Expression={[string]$wbMap[[string]$_.workbookId].fileName};Ascending=$true}, @{Expression={Get-PageSheetIndex $_};Ascending=$true}, @{Expression={[string]$_.sheetName};Ascending=$true}, @{Expression={Resolve-PageId $_};Ascending=$true})
             $beforeIds = @($current | ForEach-Object { Resolve-PageId $_ })
             $afterIds = @($sorted | ForEach-Object { Resolve-PageId $_ })
-            $inputChanged = (($beforeIds -join "`n") -ne ($afterIds -join "`n"))
+            $inputChanged = (($beforeIds -join [Environment]::NewLine) -ne ($afterIds -join [Environment]::NewLine))
             for ($i=0; $i -lt $sorted.Count; $i++) {
                 $expected = ($i + 1) * 10
                 if ([double](Get-DataProperty $sorted[$i] 'order' 0) -ne $expected) { $inputChanged = $true }
@@ -3702,12 +3801,11 @@ function Sort-PagesBySheet([string]$Language, $Body) {
         }
         Apply-DefaultNumberingPerVolume $Language $structure $cat
         if ($affected.Count -gt 0) {
-            Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページをシート名順に並べ替えました'
+            Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページをExcelのシート順に並べ替えました'
         }
         return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; category=$cat; affectedVolumes=@($affected) }
     }
 }
-
 function Resolve-JavaExe {
     # 一度見つかったパスはキャッシュする(共有フォルダ上のTest-Pathの瞬断対策も兼ねる)。
     if (-not [string]::IsNullOrWhiteSpace($Script:CachedJavaExe)) { return $Script:CachedJavaExe }
@@ -6443,8 +6541,8 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
                 try {
                     $ws = $book.Worksheets.Item($i)
                     $sheetName = [string]$ws.Name
-                    if (-not (([int]$ws.Visible -eq -1) -and $sheetName -match '^[0-9]+$')) { continue }
-                    $outPdf = Join-Path $contentDir ("{0}.pdf" -f $sheetName)
+                    if ([int]$ws.Visible -ne -1) { continue }
+                    $outPdf = Join-Path $contentDir ("{0}.pdf" -f (Get-WorksheetStorageStem $sheetName))
                     [void](Export-WorksheetToPdfSafe $excel $book $ws $outPdf $sheetName $comparisonPackagePrepared)
                     if (Test-Path -LiteralPath $outPdf) {
                         $sheets += @{
@@ -7406,15 +7504,21 @@ function Get-ContentPdfSheetIndex([string]$Language, [string]$WorkbookId, [strin
     return $index
 }
 
+
 function Resolve-ContentPdfSheetPathFromIndex($Index, [string]$SheetName) {
     if ($null -eq $Index -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
-    foreach ($candidate in @($SheetName, ([regex]::Replace($SheetName, '[^0-9A-Za-z]+', '-')))) {
+    # Hashed storage names are safe for every Excel sheet name. Legacy candidates keep
+    # previously rendered numeric/ASCII workbooks readable during an upgrade.
+    foreach ($candidate in @(
+        (Get-WorksheetStorageStem $SheetName),
+        $SheetName,
+        ([regex]::Replace($SheetName, '[^0-9A-Za-z]+', '-'))
+    )) {
         $key = ([string]$candidate).ToLowerInvariant()
         if ($Index.ContainsKey($key)) { return [string]$Index[$key] }
     }
     return ''
 }
-
 function Resolve-ContentPdfSheetPathExact([string]$Language, [string]$WorkbookId, [string]$VersionId, [string]$SheetName) {
     if ([string]::IsNullOrWhiteSpace($VersionId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
     $index = Get-ContentPdfSheetIndex $Language $WorkbookId $VersionId
