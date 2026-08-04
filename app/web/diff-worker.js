@@ -596,6 +596,56 @@ function findTableGridBand(before,after,width,height){
   // are too faint or slightly broken by PDF rasterization.
   return horizontalBest||verticalBest;
 }
+function extractTableVerticalRules(data,width,height,tableBand){
+  if(!tableBand)return [];
+  const minX=Math.max(0,Math.floor(tableBand.minX-PADDING)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX+PADDING));
+  const minY=Math.max(0,Math.floor(tableBand.start)),maxY=Math.min(height-1,Math.ceil(tableBand.last)),bandHeight=Math.max(1,maxY-minY+1),candidates=[];
+  for(let x=minX;x<=maxX;x++){
+    let start=-1,last=-1,inkRows=0,best=null;
+    const finish=()=>{
+      if(start<0)return;
+      const span=last-start+1,density=inkRows/Math.max(1,span);
+      if(span>bandHeight*.32&&density>.28&&(!best||span>best.span||span===best.span&&inkRows>best.inkRows))best={x,start,last,span,inkRows};
+      start=-1;last=-1;inkRows=0;
+    };
+    for(let y=minY;y<=maxY;y++){
+      const dark=luminance(data,(y*width+x)*4)<252;
+      if(dark){if(start<0)start=y;last=y;inkRows++;}
+      else if(start>=0&&y-last>3)finish();
+    }
+    finish();if(best)candidates.push(best);
+  }
+  const clusters=[];
+  for(const candidate of candidates){
+    const previous=clusters[clusters.length-1];
+    if(previous&&candidate.x-previous.lastX<=1){
+      previous.lastX=candidate.x;previous.weight+=candidate.span;previous.weightedX+=candidate.x*candidate.span;
+      previous.maxSpan=Math.max(previous.maxSpan,candidate.span);
+    }else clusters.push({firstX:candidate.x,lastX:candidate.x,weight:candidate.span,weightedX:candidate.x*candidate.span,maxSpan:candidate.span});
+  }
+  return clusters.filter(cluster=>cluster.lastX-cluster.firstX+1<=8&&cluster.maxSpan>bandHeight*.32)
+    .map(cluster=>Math.round(cluster.weightedX/Math.max(1,cluster.weight))).filter((value,index,array)=>!index||value-array[index-1]>=4);
+}
+function detectColumnWidthBoundaryChange(before,after,width,height,tableBand){
+  const beforeRules=extractTableVerticalRules(before,width,height,tableBand),afterRules=extractTableVerticalRules(after,width,height,tableBand);
+  if(beforeRules.length<4||beforeRules.length!==afterRules.length||beforeRules.length>20)return null;
+  const beforeSpan=beforeRules[beforeRules.length-1]-beforeRules[0],afterSpan=afterRules[afterRules.length-1]-afterRules[0];
+  if(beforeSpan<width*.12||afterSpan<width*.12)return null;
+  const candidates=[];
+  for(let index=0;index<beforeRules.length-1;index++){
+    const beforeWidth=beforeRules[index+1]-beforeRules[index],afterWidth=afterRules[index+1]-afterRules[index];
+    const normalizedBefore=beforeWidth/beforeSpan,normalizedAfter=afterWidth/afterSpan,normalizedDelta=Math.abs(normalizedAfter-normalizedBefore);
+    const pixelDelta=normalizedDelta*(beforeSpan+afterSpan)/2;
+    candidates.push({index,beforeWidth,afterWidth,normalizedDelta,pixelDelta});
+  }
+  candidates.sort((a,b)=>b.normalizedDelta-a.normalizedDelta);
+  const best=candidates[0],second=candidates[1]||{normalizedDelta:0};
+  if(!best||best.normalizedDelta<.012||best.pixelDelta<3||best.normalizedDelta<second.normalizedDelta*1.35)return null;
+  const left=beforeRules[best.index],right=beforeRules[best.index+1],afterLeft=afterRules[best.index],afterRight=afterRules[best.index+1];
+  const mappedAfterLeft=beforeRules[0]+(afterLeft-afterRules[0])*beforeSpan/afterSpan,mappedAfterRight=beforeRules[0]+(afterRight-afterRules[0])*beforeSpan/afterSpan;
+  const minX=Math.max(tableBand.minX,Math.floor(Math.min(left,right,mappedAfterLeft,mappedAfterRight))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(left,right,mappedAfterLeft,mappedAfterRight)));
+  return {kind:'column-width',index:best.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(7,(maxX-minX+1)/2),pixelDelta:best.pixelDelta,beforeRules,afterRules};
+}
 function strongestStructuralRowBox(centerY,tableBand,counts,gridWidth,gridHeight,width,height){
   const rowHeight=Math.max(10,Math.min(40,Math.round(tableBand&&tableBand.rowHeight||18)));
   const minX=tableBand?Math.max(0,tableBand.minX-PADDING):BLOCK,maxX=tableBand?Math.min(width-1,tableBand.maxX+PADDING):width-BLOCK-1;
@@ -638,6 +688,7 @@ function structuralColumnInkBounds(before,after,width,height,columnAlignment,cen
 function analyzeBrowserDiff(before,after,width,height){
   const rowAlignment=alignRows(before,after,width,height);
   const tableBand=findTableGridBand(before,after,width,height);
+  const columnBoundaryChange=detectColumnWidthBoundaryChange(before,after,width,height,tableBand);
   if(rowAlignment.adjusted&&tableBand){
     rowAlignment.activeMinY=Math.max(0,tableBand.start-PADDING);rowAlignment.activeMaxY=Math.min(height-1,tableBand.last+PADDING);
     rowAlignment.activeMinX=Math.max(0,tableBand.minX-PADDING);rowAlignment.activeMaxX=Math.min(width-1,tableBand.maxX+PADDING);
@@ -707,9 +758,11 @@ function analyzeBrowserDiff(before,after,width,height){
       const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
     }
   }
-  if(columnAlignment.adjusted&&tableBand){
+  if((columnAlignment.adjusted||columnBoundaryChange)&&tableBand){
     let centerX,half;
-    if(columnAlignment.structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3){
+    if(columnBoundaryChange){
+      centerX=columnBoundaryChange.centerX;half=columnBoundaryChange.half;
+    }else if(columnAlignment.structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3){
       centerX=Math.min(width-1,columnAlignment.structuralSplit*COLUMN_STEP);half=Math.max(6,Math.ceil(Math.abs(columnAlignment.structuralJump)/2)+3);
     }else{
       let peak=-1,peakScore=-1;
@@ -778,12 +831,15 @@ function analyzeBrowserDiff(before,after,width,height){
     // Residual antialiasing after an Excel fit-to-page scale can connect every table
     // gridline into one huge rectangle. The discontinuity itself is the useful human
     // signal, so replace such broad residuals with the actual inserted/resized band.
-    components=components.filter(component=>{
-      const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
-      const componentArea=componentWidth*componentHeight;
-      return !(componentWidth>width*.42||componentHeight>height*.35||componentArea>width*height*.08);
-    });
-    components.push(structuralColumnBox);
+    if(columnBoundaryChange)components=[structuralColumnBox];
+    else{
+      components=components.filter(component=>{
+        const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
+        const componentArea=componentWidth*componentHeight;
+        return !(componentWidth>width*.42||componentHeight>height*.35||componentArea>width*height*.08);
+      });
+      components.push(structuralColumnBox);
+    }
     if(components.length>MAX_LAYOUT_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_LAYOUT_REGIONS);
   }
   const dominantHorizontal=components
@@ -809,8 +865,9 @@ function analyzeBrowserDiff(before,after,width,height){
     const fallback=buildFallbackRegion(totalChanged?counts:looseCounts,gridWidth,gridHeight,width,height);
     if(fallback){regions=[fallback];fallbackUsed=true;}
   }
-  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||gapRows.length>0;
-  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump)),alignmentMode:`${rowAlignment.alignmentMode}/${columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity'}`,alignmentAdjusted,fallbackUsed};
+  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||gapRows.length>0;
+  const columnMode=columnBoundaryChange?'column-boundary-width':columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity';
+  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowAlignment.alignmentMode}/${columnMode}`,alignmentAdjusted,fallbackUsed};
 }
 self.onmessage=function handleDiffWorkerMessage(event){
   const payload=event.data||{},id=payload.id;
