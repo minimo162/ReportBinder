@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v11'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v12'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.04.17':
+if str(runtime_info.get('version','')) != '2026.08.04.18':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1204,6 +1204,9 @@ for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
     if needed not in appjs:
         raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
 for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>8',
+               'function buildMicroTextFallbackRegion', 'exactCounts',
+               'MICRO_EXACT_THRESHOLD=24', 'MIN_MICRO_PIXELS=6',
+               '!fallback&&!alignmentAdjusted',
                'if(!regions.length)', 'fallbackUsed=true']:
     if needed not in diff_worker:
         raise SystemExit(f'small-difference region fallback missing: {needed}')
