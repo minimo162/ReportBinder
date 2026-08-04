@@ -644,7 +644,8 @@ function detectColumnWidthBoundaryChange(before,after,width,height,tableBand){
   const left=beforeRules[best.index],right=beforeRules[best.index+1],afterLeft=afterRules[best.index],afterRight=afterRules[best.index+1];
   const mappedAfterLeft=beforeRules[0]+(afterLeft-afterRules[0])*beforeSpan/afterSpan,mappedAfterRight=beforeRules[0]+(afterRight-afterRules[0])*beforeSpan/afterSpan;
   const minX=Math.max(tableBand.minX,Math.floor(Math.min(left,right,mappedAfterLeft,mappedAfterRight))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(left,right,mappedAfterLeft,mappedAfterRight)));
-  return {kind:'column-width',index:best.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(7,(maxX-minX+1)/2),pixelDelta:best.pixelDelta,beforeRules,afterRules};
+  return {kind:'column-width',index:best.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(7,(maxX-minX+1)/2),pixelDelta:best.pixelDelta,
+    beforeMinX:Math.min(left,right),beforeMaxX:Math.max(left,right),afterMinX:Math.min(afterLeft,afterRight),afterMaxX:Math.max(afterLeft,afterRight),beforeRules,afterRules};
 }
 function strongestStructuralRowBox(centerY,tableBand,counts,gridWidth,gridHeight,width,height){
   const rowHeight=Math.max(10,Math.min(40,Math.round(tableBand&&tableBand.rowHeight||18)));
@@ -778,6 +779,11 @@ function analyzeBrowserDiff(before,after,width,height){
     const minGY=Math.max(0,Math.floor(inkBounds.minY/BLOCK)),maxGY=Math.min(gridHeight-1,Math.floor(inkBounds.maxY/BLOCK));
     const bandMinX=Math.max(0,centerX-half-PADDING),bandMaxX=Math.min(width-1,centerX+half+PADDING);
     structuralColumnBox={minX:bandMinX,maxX:bandMaxX,minY:inkBounds.minY,maxY:inkBounds.maxY,pixels:(bandMaxX-bandMinX+1)*(inkBounds.maxY-inkBounds.minY+1)};
+    if(columnBoundaryChange){
+      const edgePadding=2;
+      structuralColumnBox.beforeBox={minX:Math.max(0,columnBoundaryChange.beforeMinX-edgePadding),maxX:Math.min(width-1,columnBoundaryChange.beforeMaxX+edgePadding),minY:inkBounds.minY,maxY:inkBounds.maxY};
+      structuralColumnBox.afterBox={minX:Math.max(0,columnBoundaryChange.afterMinX-edgePadding),maxX:Math.min(width-1,columnBoundaryChange.afterMaxX+edgePadding),minY:inkBounds.minY,maxY:inkBounds.maxY};
+    }
     for(let gx=Math.max(0,Math.floor((centerX-half)/BLOCK));gx<=Math.min(gridWidth-1,Math.floor((centerX+half)/BLOCK));gx++)for(let gy=minGY;gy<=maxGY;gy++){
       const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
     }
@@ -855,11 +861,13 @@ function analyzeBrowserDiff(before,after,width,height){
   }
   if(components.length>MAX_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_REGIONS);
   components.sort((a,b)=>a.minY-b.minY||a.minX-b.minX);
-  let regions=components.map((component,index)=>({
-    regionId:`browser-r${String(index+1).padStart(4,'0')}`,kind:'modified',x:component.minX/width,y:component.minY/height,
-    width:Math.max(1,component.maxX-component.minX+1)/width,height:Math.max(1,component.maxY-component.minY+1)/height,
-    confidence:Math.max(.55,Math.min(1,component.pixels/Math.max(MIN_PIXELS,(component.maxX-component.minX+1)*(component.maxY-component.minY+1)))),pixelCount:component.pixels
-  }));
+  const normalizeBox=box=>({x:box.minX/width,y:box.minY/height,width:Math.max(1,box.maxX-box.minX+1)/width,height:Math.max(1,box.maxY-box.minY+1)/height});
+  let regions=components.map((component,index)=>{
+    const region={regionId:`browser-r${String(index+1).padStart(4,'0')}`,kind:'modified',...normalizeBox(component),
+      confidence:Math.max(.55,Math.min(1,component.pixels/Math.max(MIN_PIXELS,(component.maxX-component.minX+1)*(component.maxY-component.minY+1)))),pixelCount:component.pixels};
+    if(component.beforeBox&&component.afterBox){region.before=normalizeBox(component.beforeBox);region.after=normalizeBox(component.afterBox);}
+    return region;
+  });
   let fallbackUsed=false;
   if(!regions.length){
     const fallback=buildFallbackRegion(totalChanged?counts:looseCounts,gridWidth,gridHeight,width,height);
