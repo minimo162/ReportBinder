@@ -1526,7 +1526,7 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260804_v9',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260804_v10',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1785,12 +1785,13 @@ function renderDiffRegionLayer(side,regions){
   const showModifiedTags=visible.length<=12;
   for(const region of visible){
     const kind=['modified','added','removed','unknown'].includes(String(region?.kind||''))?String(region.kind):'modified';
+    const geometry=region?.[side]||region;
     const box=document.createElement('span');
     box.className=`diff-region-box ${kind}`;
-    const x=Math.max(0,Math.min(1,Number(region?.x||0)));
-    const y=Math.max(0,Math.min(1,Number(region?.y||0)));
-    const width=Math.max(0,Math.min(1-x,Number(region?.width||0)));
-    const height=Math.max(0,Math.min(1-y,Number(region?.height||0)));
+    const x=Math.max(0,Math.min(1,Number(geometry?.x||0)));
+    const y=Math.max(0,Math.min(1,Number(geometry?.y||0)));
+    const width=Math.max(0,Math.min(1-x,Number(geometry?.width||0)));
+    const height=Math.max(0,Math.min(1-y,Number(geometry?.height||0)));
     box.style.left=`${x*100}%`;box.style.top=`${y*100}%`;box.style.width=`${width*100}%`;box.style.height=`${height*100}%`;
     if(y<.018)box.classList.add('tag-inside');
     if(kind!=='modified'||showModifiedTags){
@@ -1867,14 +1868,15 @@ function focusCurrentDiffRegion(){
     if(!focus)continue;
     focus.classList.toggle('hidden',!region);
     if(!region)continue;
-    focus.style.left=`${Number(region.x||0)*100}%`;
-    focus.style.top=`${Number(region.y||0)*100}%`;
-    focus.style.width=`${Number(region.width||0)*100}%`;
-    focus.style.height=`${Number(region.height||0)*100}%`;
+    const geometry=region?.[side]||region;
+    focus.style.left=`${Number(geometry.x||0)*100}%`;
+    focus.style.top=`${Number(geometry.y||0)*100}%`;
+    focus.style.width=`${Number(geometry.width||0)*100}%`;
+    focus.style.height=`${Number(geometry.height||0)*100}%`;
     const stage=$(`diff-${side}-stage`),viewport=$(`diff-${side}-viewport`);
     if(stage&&viewport&&viewport.offsetParent!==null){
-      const centerX=(Number(region.x||0)+Number(region.width||0)/2)*stage.offsetWidth;
-      const centerY=(Number(region.y||0)+Number(region.height||0)/2)*stage.offsetHeight;
+      const centerX=(Number(geometry.x||0)+Number(geometry.width||0)/2)*stage.offsetWidth;
+      const centerY=(Number(geometry.y||0)+Number(geometry.height||0)/2)*stage.offsetHeight;
       viewport.scrollTo({left:Math.max(0,centerX-viewport.clientWidth/2),top:Math.max(0,centerY-viewport.clientHeight/2),behavior:'smooth'});
     }
   }
