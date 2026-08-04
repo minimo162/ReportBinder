@@ -1203,7 +1203,7 @@ for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
                "if(!regions.length){regions=[fullDiffRegion('modified'", 'analysis.fallbackUsed']:
     if needed not in appjs:
         raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
-for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>12',
+for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>8',
                'if(!regions.length)', 'fallbackUsed=true']:
     if needed not in diff_worker:
         raise SystemExit(f'small-difference region fallback missing: {needed}')
