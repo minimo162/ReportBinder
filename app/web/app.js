@@ -1526,7 +1526,7 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260804_v7',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260804_v8',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
