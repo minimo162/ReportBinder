@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v9'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v10'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -855,6 +855,9 @@ for needed in ["canvas.style.visibility='hidden'", 'beginDiffBrowserRender', 'ta
 for needed in ['getImageData(0,0,width,height)', 'postMessage({id,width,height', 'diffAnalysisPending']:
     if needed not in appjs:
         raise SystemExit(f'non-blocking browser diff analysis missing: {needed}')
+for needed in ["const geometry=region?.[side]||region", 'Number(geometry.x||0)', 'Number(geometry.width||0)']:
+    if needed not in appjs:
+        raise SystemExit(f'side-specific diff region rendering missing: {needed}')
 
 # Third-party installation must stay reproducible and fail closed.
 installer = (root/'app/tools/install-thirdparty.ps1').read_text(encoding='utf-8-sig')
@@ -1172,7 +1175,8 @@ for needed in ['MIN_LAYOUT_SCALE=.82', 'MAX_LAYOUT_SCALE=1.18',
                'function strongestStructuralRowBox', 'rowAlignment.activeMinX',
                'function extractTableVerticalRules', 'function detectColumnWidthBoundaryChange',
                "kind:'column-width'", "columnMode=columnBoundaryChange?'column-boundary-width'",
-               'if(columnBoundaryChange)components=[structuralColumnBox]',
+               'beforeMinX:Math.min(left,right)', 'structuralColumnBox.beforeBox', 'structuralColumnBox.afterBox',
+               'if(columnBoundaryChange)components=[structuralColumnBox]', 'const normalizeBox=box=>',
                'function strongestLocalBox', 'structuralRowBoxes', 'structuralSplit',
                'verticalBand=null', 'activeMinY', 'dominantHorizontal']:
     if needed not in diff_worker:
