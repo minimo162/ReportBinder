@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260804_v74' not in html:
+if 'app.js?v=20260805_v75' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.05.19':
+if str(runtime_info.get('version','')) != '2026.08.05.20':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1211,12 +1211,17 @@ for forbidden in ['buildMicroTextFallbackRegion', 'exactCounts',
                   'MICRO_EXACT_THRESHOLD', 'MIN_MICRO_PIXELS']:
     if forbidden in diff_worker:
         raise SystemExit(f'noise-prone exact-pixel fallback remains: {forbidden}')
-for needed in ['extractDiffPdfTextItems', 'buildNumericTextDiffRegions',
-               'mergeDiffRegionsWithText', 'isDiffNumericText',
-               "source:'pdf-text'", 'PDF内の数値を照合しています。',
-               "!regions.length||analysis.fallbackUsed||Number(analysis.changedRatio||0)<.01"]:
+for needed in ['extractDiffPdfTextItems', 'buildNumericTextDiffResult',
+               'buildNumericTextDiffRegions', 'mergeDiffRegionsWithText',
+               'diffPdfNumericSignature', 'diffPdfTextGroupHasNumericChange',
+               'isDiffNumericText', "source:'pdf-text'",
+               'const textPromise=beforeRaw&&afterRaw', 'numericOnly',
+               'const preferNumericOnly=textDiff.numericOnly&&textRegions.length<=8',
+               '数値が変わった箇所だけを強調しました。']:
     if needed not in appjs:
         raise SystemExit(f'PDF numeric-text diff supplement missing: {needed}')
+if "!regions.length||analysis.fallbackUsed||Number(analysis.changedRatio||0)<.01" in appjs:
+    raise SystemExit('numeric text inspection must not be skipped because raster noise exceeded one percent')
 
 
 # 2026-08-04 unrestricted worksheet names and assignment inbox -------------
