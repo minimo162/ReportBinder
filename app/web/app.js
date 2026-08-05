@@ -1592,7 +1592,7 @@ function diffRegionOverlapsPdfText(region,items,width,height){
     Math.min(bottom,Number(item.y||0)+Number(item.height||0))-Math.max(top,Number(item.y||0))>1);
 }
 function shouldSuppressDiffRasterNoise(beforeItems,afterItems,analysis,regions,width,height){
-  if(!beforeItems.length||!afterItems.length||!regions.length||regions.length>6||analysis?.alignmentAdjusted||analysis?.fallbackUsed)return false;
+  if(!beforeItems.length||!afterItems.length||!regions.length||regions.length>24||analysis?.alignmentAdjusted||analysis?.fallbackUsed)return false;
   if(diffPdfTextLayoutFingerprint(beforeItems)!==diffPdfTextLayoutFingerprint(afterItems))return false;
   const changedRatio=Number(analysis?.changedRatio||0);
   if(changedRatio>=.001)return false;
@@ -1780,6 +1780,21 @@ function mergeDiffRegionsWithText(imageRegions,textRegions){
   merged.sort((a,b)=>Number(a?.y||0)-Number(b?.y||0)||Number(a?.x||0)-Number(b?.x||0));
   return merged.map((region,index)=>({...region,regionId:`browser-r${String(index+1).padStart(4,'0')}`}));
 }
+function diffHasLocalizedRowSignal(analysis,imageRegions,rowRegions){
+  if(analysis?.rowStructureAdjusted||analysis?.tableRowStructureDetected)return true;
+  if(analysis?.fallbackUsed||!imageRegions.length||!rowRegions.length)return false;
+  return rowRegions.every(textRegion=>imageRegions.some(imageRegion=>{
+    for(const side of ['before','after']){
+      const image=imageRegion?.[side]||imageRegion,text=textRegion?.[side]||textRegion;
+      const imageTop=Number(image?.y||0),imageHeight=Number(image?.height||0),textTop=Number(text?.y||0),textHeight=Number(text?.height||0);
+      const overlap=Math.min(imageTop+imageHeight,textTop+textHeight)-Math.max(imageTop,textTop);
+      const imageWidth=Number(image?.width||0),textWidth=Number(text?.width||0);
+      if(overlap/Math.max(.0000001,Math.min(imageHeight,textHeight))>=.45&&
+        imageWidth>=Math.max(.12,textWidth*.65)&&imageHeight<=Math.max(.1,textHeight*4.5))return true;
+    }
+    return false;
+  }));
+}
 function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,imageRegions){
   const textDiff=buildNumericTextDiffResult(beforeItems,afterItems,width,height),textRegions=textDiff.regions;
   // A small numeric-only edit is stronger evidence than PDF.js row grouping. Excel
@@ -1790,7 +1805,7 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
   const rowDiff=buildTextRowStructureDiffResult(beforeItems,afterItems,width,height);
   // Text-row LCS alone is not enough. Require an independent raster row-shift signal
   // so harmless PDF text fragmentation cannot replace a valid numeric result.
-  if(rowDiff.confident&&analysis?.rowStructureAdjusted){
+  if(rowDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,rowDiff.regions)){
     return {mode:'row',regions:mergeDiffRegionsWithText([],rowDiff.regions),message:'PDF内の文字行を照合し、追加・削除された行だけを強調しました。'};
   }
   if(textRegions.length){
@@ -1800,7 +1815,7 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v17',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v18',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;

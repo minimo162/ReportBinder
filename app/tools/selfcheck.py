@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v17'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v18'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1020,7 +1020,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v83', 'style.css?v=20260804_v54']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v84', 'style.css?v=20260804_v54']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260805_v83' not in html:
+if 'app.js?v=20260805_v84' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1093,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260805_v83' not in html:
+if 'app.js?v=20260805_v84' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.05.28':
+if str(runtime_info.get('version','')) != '2026.08.05.29':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1242,7 +1242,7 @@ for needed in ['dedupeDiffPdfRowItems', 'groupDiffPdfTextRows', 'matchDiffPdfTex
                'buildTextRowStructureDiffResult', 'new Uint16Array',
                "kind=delta>0?'added':'removed'", "source:'pdf-row'",
                'const rowDiff=buildTextRowStructureDiffResult',
-               'rowDiff.confident&&analysis?.rowStructureAdjusted', '追加・削除された行だけを強調しました。']:
+               'diffHasLocalizedRowSignal', 'rowDiff.confident&&diffHasLocalizedRowSignal', '追加・削除された行だけを強調しました。']:
     if needed not in appjs:
         raise SystemExit(f'semantic PDF row localization missing: {needed}')
 for needed in ['rowStructureAdjusted', 'rowStructureRegions',
@@ -1250,9 +1250,10 @@ for needed in ['rowStructureAdjusted', 'rowStructureRegions',
                'structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3']:
     if needed not in diff_worker:
         raise SystemExit(f'structural diff regression guard missing: {needed}')
-for needed in ['function extractTableHorizontalRules', 'function detectRowHeightChanges',
+for needed in ['function extractTableHorizontalRules', 'function tableRowRasterDistance', 'function detectTableRowInsertionDeletion',
+               'tableRowStructureDetected:!!tableRowStructureChange', 'function detectRowHeightChanges',
                'function detectAlignedRowHeightChange', "kind:'row-height'",
-               'rowHeightAdjusted', "rowMode=rowHeightAdjusted?'row-boundary-height'",
+               'rowHeightAdjusted', "const rowMode=rowHeightAdjusted?'row-boundary-height'",
                'function detectColumnInsertionDeletion', "kind:added?'added':'removed'",
                'columnStructureKind', '`column-${columnStructureChange.kind}`',
                "kind:component.kind==='added'||component.kind==='removed'?component.kind:'modified'"]:
@@ -1263,7 +1264,12 @@ for needed in ['row-height region needs side-specific geometry', "columnAdded.re
                "columnRemoved.regions[0].kind,'removed'", 'added column is localized', 'removed column is localized',
                'duplicate PDF glyph rows must not multiply an inserted row',
                'column-width change highlights the whole column on both sides',
-               'sparse noise overlapping unchanged text must be suppressed']:
+               'sparse noise overlapping unchanged text must be suppressed',
+               'dense mixed-content report still recognizes one inserted row',
+               'rich report column resize highlights the complete table column',
+               'many scattered antialiasing specks on a dense report must be suppressed together',
+               'two changed values stay detectable among paragraphs and multiple tables',
+               'actual rich-report font-color pixels are not classified as raster noise']:
     if needed not in diff_regression:
         raise SystemExit(f'structural regression test missing: {needed}')
 if 'centerX=(tableBand.minX+tableBand.maxX)/2;half=Math.max(8,(tableBand.maxX-tableBand.minX+1)/2)' in diff_worker:
