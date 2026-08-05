@@ -766,6 +766,90 @@ function extractTableVerticalRules(data,width,height,tableBand){
   }
   return continuous;
 }
+function extractTableHorizontalRules(data,width,height,tableBand){
+  if(!tableBand)return [];
+  const margin=Math.max(PADDING,12),minX=Math.max(0,Math.floor(tableBand.minX)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX));
+  const minY=Math.max(0,Math.floor(tableBand.start-margin)),maxY=Math.min(height-1,Math.ceil(tableBand.last+margin));
+  const span=Math.max(1,maxX-minX+1),candidates=[];
+  for(let y=minY;y<=maxY;y++){
+    let dark=0;
+    for(let x=minX;x<=maxX;x+=2)if(luminance(data,(y*width+x)*4)<248)dark++;
+    if(dark/Math.max(1,Math.ceil(span/2))>.28)candidates.push({y,weight:dark});
+  }
+  const clusters=[];
+  for(const candidate of candidates){
+    const previous=clusters[clusters.length-1];
+    if(previous&&candidate.y-previous.lastY<=1){previous.lastY=candidate.y;previous.weight+=candidate.weight;previous.weightedY+=candidate.y*candidate.weight;}
+    else clusters.push({firstY:candidate.y,lastY:candidate.y,weight:candidate.weight,weightedY:candidate.y*candidate.weight});
+  }
+  return clusters.filter(cluster=>cluster.lastY-cluster.firstY+1<=7)
+    .map(cluster=>Math.round(cluster.weightedY/Math.max(1,cluster.weight)))
+    .filter((value,index,array)=>!index||value-array[index-1]>=4);
+}
+function detectRowHeightChanges(before,after,width,height,tableBand){
+  const beforeRules=extractTableHorizontalRules(before,width,height,tableBand),afterRules=extractTableHorizontalRules(after,width,height,tableBand);
+  if(beforeRules.length<5||beforeRules.length!==afterRules.length||beforeRules.length>80)return [];
+  const beforeSpan=beforeRules.at(-1)-beforeRules[0],afterSpan=afterRules.at(-1)-afterRules[0];
+  if(beforeSpan<height*.08||afterSpan<height*.08)return [];
+  const candidates=[];
+  for(let index=0;index<beforeRules.length-1;index++){
+    const beforeHeight=beforeRules[index+1]-beforeRules[index],afterHeight=afterRules[index+1]-afterRules[index];
+    const normalizedDelta=Math.abs(afterHeight/afterSpan-beforeHeight/beforeSpan),pixelDelta=Math.abs(afterHeight-beforeHeight);
+    if(normalizedDelta>=.004&&pixelDelta>=3)candidates.push({index,beforeHeight,afterHeight,normalizedDelta,pixelDelta});
+  }
+  candidates.sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta);
+  if(!candidates.length)return [];
+  const best=candidates[0],threshold=Math.max(.004,best.normalizedDelta*.45),changes=[];
+  for(const candidate of candidates.filter(value=>value.normalizedDelta>=threshold&&value.pixelDelta>=3)){
+    const beforeTop=beforeRules[candidate.index],beforeBottom=beforeRules[candidate.index+1];
+    const afterTop=afterRules[candidate.index],afterBottom=afterRules[candidate.index+1];
+    const padding=3,minX=Math.max(0,tableBand.minX-PADDING),maxX=Math.min(width-1,tableBand.maxX+PADDING);
+    changes.push({kind:'row-height',index:candidate.index,minX,maxX,
+      minY:Math.max(0,Math.min(beforeTop,afterTop)-padding),maxY:Math.min(height-1,Math.max(beforeBottom,afterBottom)+padding),
+      beforeBox:{minX,maxX,minY:Math.max(0,beforeTop-padding),maxY:Math.min(height-1,beforeBottom+padding)},
+      afterBox:{minX,maxX,minY:Math.max(0,afterTop-padding),maxY:Math.min(height-1,afterBottom+padding)},
+      normalizedDelta:candidate.normalizedDelta,pixelDelta:candidate.pixelDelta,tableBand});
+    if(changes.length>=3)break;
+  }
+  return changes;
+}
+function detectAlignedRowHeightChange(rowAlignment,width,height,tableBand){
+  if(!tableBand||!rowAlignment.adjusted||rowAlignment.splitRow<0||rowAlignment.deleted.length||rowAlignment.inserted.length)return null;
+  const beforeBottom=Math.min(height-1,rowAlignment.splitRow*ROW_STEP);
+  const mappedRow=rowAlignment.mapping[rowAlignment.splitRow];
+  if(mappedRow<0)return null;
+  const afterBottom=Math.min(height-1,mappedRow*ROW_STEP),pixelDelta=Math.abs(afterBottom-beforeBottom);
+  const nominalHeight=Math.max(10,Math.min(48,Math.round(tableBand.rowHeight||18)));
+  if(pixelDelta<3||pixelDelta>nominalHeight*1.75||beforeBottom<tableBand.start||beforeBottom>tableBand.last+nominalHeight)return null;
+  const top=Math.max(0,Math.min(beforeBottom,afterBottom)-nominalHeight),padding=3;
+  const minX=Math.max(0,tableBand.minX-PADDING),maxX=Math.min(width-1,tableBand.maxX+PADDING);
+  const beforeBox={minX,maxX,minY:Math.max(0,top-padding),maxY:Math.min(height-1,beforeBottom+padding)};
+  const afterBox={minX,maxX,minY:Math.max(0,top-padding),maxY:Math.min(height-1,afterBottom+padding)};
+  return {kind:'row-height',minX,maxX,minY:Math.min(beforeBox.minY,afterBox.minY),maxY:Math.max(beforeBox.maxY,afterBox.maxY),
+    beforeBox,afterBox,pixelDelta,normalizedDelta:pixelDelta/Math.max(1,tableBand.span),tableBand};
+}
+function detectColumnInsertionDeletion(before,after,width,height,tableBand){
+  const beforeRules=extractTableVerticalRules(before,width,height,tableBand),afterRules=extractTableVerticalRules(after,width,height,tableBand);
+  if(Math.abs(beforeRules.length-afterRules.length)!==1||Math.min(beforeRules.length,afterRules.length)<4)return null;
+  const added=afterRules.length>beforeRules.length,longRules=added?afterRules:beforeRules,shortRules=added?beforeRules:afterRules;
+  const normalize=rules=>rules.map(value=>(value-rules[0])/Math.max(1,rules.at(-1)-rules[0]));
+  const shortNormalized=normalize(shortRules);let best=null;
+  for(let extra=1;extra<longRules.length-1;extra++){
+    const reduced=longRules.filter((_,index)=>index!==extra),reducedNormalized=normalize(reduced);
+    const score=reducedNormalized.reduce((sum,value,index)=>sum+Math.abs(value-shortNormalized[index]),0)/shortNormalized.length;
+    if(!best||score<best.score)best={extra,score};
+  }
+  if(!best||best.score>.045)return null;
+  const left={min:longRules[best.extra-1],max:longRules[best.extra]},right={min:longRules[best.extra],max:longRules[best.extra+1]};
+  const interval=(left.max-left.min)<=(right.max-right.min)?left:right;
+  const minY=Math.max(0,(tableBand.headerStart??tableBand.start)-PADDING),maxY=Math.min(height-1,tableBand.last+PADDING),edgePadding=3;
+  const fullBox={minX:Math.max(0,interval.min-edgePadding),maxX:Math.min(width-1,interval.max+edgePadding),minY,maxY};
+  const anchor=longRules[best.extra],anchorBox={minX:Math.max(0,anchor-edgePadding),maxX:Math.min(width-1,anchor+edgePadding),minY,maxY};
+  return {kind:added?'added':'removed',score:best.score,tableBand,
+    minX:fullBox.minX,maxX:fullBox.maxX,minY,maxY,pixels:(fullBox.maxX-fullBox.minX+1)*(maxY-minY+1),
+    beforeBox:added?anchorBox:fullBox,afterBox:added?fullBox:anchorBox,
+    beforeRules,afterRules};
+}
 function detectColumnWidthBoundaryChanges(before,after,width,height,tableBand){
   const beforeRules=extractTableVerticalRules(before,width,height,tableBand),afterRules=extractTableVerticalRules(after,width,height,tableBand);
   if(beforeRules.length<4||beforeRules.length!==afterRules.length||beforeRules.length>20)return [];
@@ -847,10 +931,18 @@ function analyzeBrowserDiff(before,after,width,height){
   let tableBand=tableBands[0]||findTableGridBand(before,after,width,height);
   const strongestBandScore=tableBands[0]?.score||0;
   const candidateTableBands=tableBands.filter(band=>band.span>=height*.08&&(!strongestBandScore||band.score>=strongestBandScore*.2));
-  const columnBoundaryChanges=candidateTableBands.flatMap(band=>detectColumnWidthBoundaryChanges(before,after,width,height,band))
+  let rowHeightChanges=candidateTableBands.flatMap(band=>detectRowHeightChanges(before,after,width,height,band))
+    .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,3);
+  let rowHeightChange=rowHeightChanges[0]||null;
+  const columnStructureChanges=candidateTableBands.map(band=>detectColumnInsertionDeletion(before,after,width,height,band))
+    .filter(Boolean).sort((a,b)=>a.score-b.score);
+  const columnStructureChange=columnStructureChanges[0]||null;
+  const columnBoundaryChanges=columnStructureChange?[]:candidateTableBands.flatMap(band=>detectColumnWidthBoundaryChanges(before,after,width,height,band))
     .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,3);
   const columnBoundaryChange=columnBoundaryChanges[0]||null;
-  if(columnBoundaryChange)tableBand=columnBoundaryChange.tableBand;
+  if(columnStructureChange)tableBand=columnStructureChange.tableBand;
+  else if(rowHeightChange)tableBand=rowHeightChange.tableBand;
+  else if(columnBoundaryChange)tableBand=columnBoundaryChange.tableBand;
   const reliableColumnRules=tableBand&&extractTableVerticalRules(before,width,height,tableBand).length>=4&&
     extractTableVerticalRules(after,width,height,tableBand).length>=4;
   if(rowAlignment.adjusted&&tableBand){
@@ -858,6 +950,11 @@ function analyzeBrowserDiff(before,after,width,height){
     rowAlignment.activeMinX=Math.max(0,tableBand.minX-PADDING);rowAlignment.activeMaxX=Math.min(width-1,tableBand.maxX+PADDING);
   }
   const columnAlignment=choosePixelColumnMapping(before,after,width,height,rowAlignment,tableBand);
+  if(!rowHeightChange&&!columnAlignment.adjusted&&!columnStructureChange&&!columnBoundaryChange){
+    const aligned=candidateTableBands.map(band=>detectAlignedRowHeightChange(rowAlignment,width,height,band)).filter(Boolean)
+      .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta)[0];
+    if(aligned){rowHeightChanges=[aligned];rowHeightChange=aligned;tableBand=aligned.tableBand;}
+  }
   if(columnAlignment.adjusted){
     let activeBounds=tableBand?{minY:Math.max(0,tableBand.start-PADDING),maxY:Math.min(height-1,tableBand.last+PADDING)}:null;
     if(columnAlignment.structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3){
@@ -892,6 +989,13 @@ function analyzeBrowserDiff(before,after,width,height){
   }
   // Rows that have no counterpart are the human-visible insertion/deletion bands.
   const gapRows=[],structuralRowBoxes=[],structuralColumnBoxes=[];
+  for(const change of rowHeightChanges){
+    change.pixels=Math.max(MIN_PIXELS,(change.maxX-change.minX+1)*(change.maxY-change.minY+1));
+    structuralRowBoxes.push(change);
+    for(let gy=Math.max(0,Math.floor(change.minY/BLOCK));gy<=Math.min(gridHeight-1,Math.floor(change.maxY/BLOCK));gy++)for(let gx=Math.max(0,Math.floor(change.minX/BLOCK));gx<=Math.min(gridWidth-1,Math.floor(change.maxX/BLOCK));gx++){
+      const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
+    }
+  }
   for(const row of rowAlignment.deleted){if(rowAlignment.a.ink[row]>4)gapRows.push({beforeRow:row,source:'before'});}
   for(const row of rowAlignment.inserted){
     if(rowAlignment.b.ink[row]<=4)continue;
@@ -902,7 +1006,7 @@ function analyzeBrowserDiff(before,after,width,height){
     }
     gapRows.push({beforeRow,afterRow:row,source:'after'});
   }
-  for(const gap of gapRows){
+  for(const gap of rowHeightChange?[]:gapRows){
     const centerY=Math.min(height-1,gap.beforeRow*ROW_STEP),half=6;
     let minGX=gridWidth,maxGX=-1;
     for(let y=Math.max(0,centerY-half);y<Math.min(height,centerY+half);y+=4)for(let x=8;x<width-8;x+=8){
@@ -915,23 +1019,30 @@ function analyzeBrowserDiff(before,after,width,height){
       const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
     }
   }
-  if(rowAlignment.splitRow>=0&&Math.abs(rowAlignment.jumpPixels)>=3){
+  if(!rowHeightChange&&rowAlignment.splitRow>=0&&Math.abs(rowAlignment.jumpPixels)>=3){
     const centerY=Math.min(height-1,rowAlignment.splitRow*ROW_STEP),rowBox=strongestStructuralRowBox(centerY,tableBand,counts,gridWidth,gridHeight,width,height);
     structuralRowBoxes.push(rowBox);
     for(let gy=Math.max(0,Math.floor(rowBox.minY/BLOCK));gy<=Math.min(gridHeight-1,Math.floor(rowBox.maxY/BLOCK));gy++)for(let gx=Math.max(0,Math.floor(rowBox.minX/BLOCK));gx<=Math.min(gridWidth-1,Math.floor(rowBox.maxX/BLOCK));gx++){
       const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
     }
   }
-  if((columnAlignment.adjusted||columnBoundaryChange)&&tableBand){
+  if(columnStructureChange){
+    structuralColumnBoxes.push(columnStructureChange);
+    for(let gx=Math.max(0,Math.floor(columnStructureChange.minX/BLOCK));gx<=Math.min(gridWidth-1,Math.floor(columnStructureChange.maxX/BLOCK));gx++)for(let gy=Math.max(0,Math.floor(columnStructureChange.minY/BLOCK));gy<=Math.min(gridHeight-1,Math.floor(columnStructureChange.maxY/BLOCK));gy++){
+      const index=gy*gridWidth+gx;mask[index]=1;counts[index]=Math.max(counts[index],2);
+    }
+  }else if((columnAlignment.adjusted||columnBoundaryChange)&&tableBand){
     const changes=columnBoundaryChanges.length?columnBoundaryChanges:[null];
     for(const boundaryChange of changes){
       let centerX,half;
       if(boundaryChange){
         centerX=boundaryChange.centerX;half=boundaryChange.half;
-      }else if(!reliableColumnRules){
-        centerX=(tableBand.minX+tableBand.maxX)/2;half=Math.max(8,(tableBand.maxX-tableBand.minX+1)/2);
       }else if(columnAlignment.structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3){
         centerX=Math.min(width-1,columnAlignment.structuralSplit*COLUMN_STEP);half=Math.max(6,Math.ceil(Math.abs(columnAlignment.structuralJump)/2)+3);
+      }else if(!reliableColumnRules){
+        // Without a detected boundary or a local discontinuity, highlighting the
+        // whole table is misleading. Leave localization to the residual regions.
+        continue;
       }else{
         let peak=-1,peakScore=-1;
         for(let column=0;column<columnAlignment.a.columnCount;column++){
@@ -987,10 +1098,11 @@ function analyzeBrowserDiff(before,after,width,height){
     if(pixels<MIN_PIXELS||maxX<minX||maxY<minY)continue;
     raw.push({minX:Math.max(0,minX-PADDING),minY:Math.max(0,minY-PADDING),maxX:Math.min(width-1,maxX+PADDING),maxY:Math.min(height-1,maxY+PADDING),pixels});
   }
-  let components=mergeNearbyComponents(raw,width,height);
+  let components=mergeNearbyComponents(raw,width,height),rowStructureBoxes=[];
   if(structuralRowBoxes.length){
     const rowBoxes=[];
     for(const box of structuralRowBoxes)if(!rowBoxes.some(item=>Math.abs(item.minY-box.minY)<BLOCK*2))rowBoxes.push(box);
+    rowStructureBoxes=rowBoxes;
     const localized=[];
     components=components.filter(component=>{
       if(rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY))return false;
@@ -1003,18 +1115,17 @@ function analyzeBrowserDiff(before,after,width,height){
       return true;
     });
     components.push(...localized.slice(0,3),...rowBoxes);
-    if(rowAlignment.adjusted){
-      const strongestRowPixels=Math.max(...rowBoxes.map(box=>box.pixels||MIN_PIXELS));
-      components=components.filter(component=>
-        rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY)||
-        component.pixels>=strongestRowPixels*.25);
+    if(rowAlignment.adjusted||rowHeightChange){
+      // Page-height growth and shifted totals can leave strong residuals far from
+      // the inserted row. Once a structural row is found, keep only its band.
+      components=components.filter(component=>rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY));
     }
   }
   if(structuralColumnBoxes.length){
     // Residual antialiasing after an Excel fit-to-page scale can connect every table
     // gridline into one huge rectangle. The discontinuity itself is the useful human
     // signal, so replace such broad residuals with the actual inserted/resized band.
-    if(columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes;
+    if(columnStructureChange||columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes;
     else{
       const structuralPixels=Math.max(...structuralColumnBoxes.map(box=>box.pixels||MIN_PIXELS));
       components=components.filter(component=>{
@@ -1042,7 +1153,7 @@ function analyzeBrowserDiff(before,after,width,height){
   components.sort((a,b)=>a.minY-b.minY||a.minX-b.minX);
   const normalizeBox=box=>({x:box.minX/width,y:box.minY/height,width:Math.max(1,box.maxX-box.minX+1)/width,height:Math.max(1,box.maxY-box.minY+1)/height});
   let regions=components.map((component,index)=>{
-    const region={regionId:`browser-r${String(index+1).padStart(4,'0')}`,kind:'modified',...normalizeBox(component),
+    const region={regionId:`browser-r${String(index+1).padStart(4,'0')}`,kind:component.kind==='added'||component.kind==='removed'?component.kind:'modified',...normalizeBox(component),
       confidence:Math.max(.55,Math.min(1,component.pixels/Math.max(MIN_PIXELS,(component.maxX-component.minX+1)*(component.maxY-component.minY+1)))),pixelCount:component.pixels};
     if(component.beforeBox&&component.afterBox){region.before=normalizeBox(component.beforeBox);region.after=normalizeBox(component.afterBox);}
     return region;
@@ -1052,9 +1163,17 @@ function analyzeBrowserDiff(before,after,width,height){
     const fallback=buildFallbackRegion(totalChanged?counts:looseCounts,gridWidth,gridHeight,width,height);
     if(fallback){regions=[fallback];fallbackUsed=true;}
   }
-  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||gapRows.length>0;
-  const columnMode=columnBoundaryChange?'column-boundary-width':columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity';
-  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowAlignment.alignmentMode}/${columnMode}`,alignmentAdjusted,fallbackUsed};
+  const rowHeightAdjusted=!!rowHeightChange;
+  const rowStructureAdjusted=rowStructureBoxes.length>0&&(rowAlignment.adjusted||gapRows.length>0||rowHeightAdjusted);
+  const rowStructureRegions=rowStructureBoxes.map(box=>{
+    if(!box.beforeBox||!box.afterBox)return normalizeBox(box);
+    const beforeHeight=box.beforeBox.maxY-box.beforeBox.minY,afterHeight=box.afterBox.maxY-box.afterBox.minY;
+    return normalizeBox(beforeHeight<=afterHeight?box.beforeBox:box.afterBox);
+  });
+  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||!!columnStructureChange||rowHeightAdjusted||gapRows.length>0;
+  const rowMode=rowHeightAdjusted?'row-boundary-height':rowAlignment.alignmentMode;
+  const columnMode=columnStructureChange?`column-${columnStructureChange.kind}`:columnBoundaryChange?'column-boundary-width':columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity';
+  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowMode}/${columnMode}`,alignmentAdjusted,rowStructureAdjusted,rowStructureRegions,rowHeightAdjusted,columnStructureKind:columnStructureChange?.kind||'',fallbackUsed};
 }
 self.onmessage=function handleDiffWorkerMessage(event){
   const payload=event.data||{},id=payload.id;

@@ -1603,11 +1603,25 @@ function shouldSuppressDiffRasterNoise(beforeItems,afterItems,analysis,regions,w
   });
 }
 function diffPdfNumericItems(items){
-  return items.flatMap((item,parentIndex)=>diffPdfNumericFragments(item.text).map((fragment,fragmentIndex)=>{
+  const fragments=items.flatMap((item,parentIndex)=>diffPdfNumericFragments(item.text).map((fragment,fragmentIndex)=>{
     const text=normalizeDiffPdfText(item.text),total=Math.max(1,[...text].length);
     const start=[...text.slice(0,fragment.offset)].length/total,length=Math.max(1,[...fragment.text].length)/total;
     return {...item,text:fragment.text,x:Number(item.x||0)+Number(item.width||0)*start,width:Math.max(1,Number(item.width||0)*length),parentIndex,fragmentIndex,signature:fragment.signature};
   }));
+  // PDF.js may expose the same Excel glyph run twice on nearly identical baselines.
+  // Treat those as one number without collapsing legitimate repeats in adjacent rows.
+  const unique=[];
+  for(const fragment of fragments){
+    const duplicate=unique.some(previous=>{
+      if(previous.signature!==fragment.signature)return false;
+      const dx=Math.abs((previous.x+previous.width/2)-(fragment.x+fragment.width/2));
+      const dy=Math.abs((previous.y+previous.height/2)-(fragment.y+fragment.height/2));
+      return dx<=Math.max(3,Math.min(previous.width,fragment.width)*.35)&&
+        dy<=Math.max(4,Math.max(previous.height,fragment.height)*1.35);
+    });
+    if(!duplicate)unique.push(fragment);
+  }
+  return unique;
 }
 function diffPdfNumericCenterDistance(before,after,width,height){
   const beforeX=before.x+before.width/2,afterX=after.x+after.width/2;
@@ -1748,9 +1762,27 @@ function mergeDiffRegionsWithText(imageRegions,textRegions){
   merged.sort((a,b)=>Number(a?.y||0)-Number(b?.y||0)||Number(a?.x||0)-Number(b?.x||0));
   return merged.map((region,index)=>({...region,regionId:`browser-r${String(index+1).padStart(4,'0')}`}));
 }
+function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,imageRegions){
+  const textDiff=buildNumericTextDiffResult(beforeItems,afterItems,width,height),textRegions=textDiff.regions;
+  // A small numeric-only edit is stronger evidence than PDF.js row grouping. Excel
+  // PDFs sometimes duplicate a glyph run on a nearby baseline and fake an extra row.
+  if(textDiff.numericOnly&&textRegions.length>0&&textRegions.length<=8){
+    return {mode:'numeric',regions:mergeDiffRegionsWithText([],textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'};
+  }
+  const rowDiff=buildTextRowStructureDiffResult(beforeItems,afterItems,width,height);
+  // Text-row LCS alone is not enough. Require an independent raster row-shift signal
+  // so harmless PDF text fragmentation cannot replace a valid numeric result.
+  if(rowDiff.confident&&analysis?.rowStructureAdjusted){
+    return {mode:'row',regions:mergeDiffRegionsWithText([],rowDiff.regions),message:'PDF内の文字行を照合し、追加・削除された行だけを強調しました。'};
+  }
+  if(textRegions.length){
+    return {mode:'numeric-supplement',regions:mergeDiffRegionsWithText(imageRegions,textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。'};
+  }
+  return {mode:'image',regions:imageRegions,message:''};
+}
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v14',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v16',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1842,24 +1874,11 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
       const textPair=await textPromise;
       if(serial!==diffBrowserRenderSerial)return null;
       if(textPair){
-        const rowDiff=buildTextRowStructureDiffResult(textPair[0],textPair[1],width,height);
-        if(rowDiff.confident){
-          regions=mergeDiffRegionsWithText([],rowDiff.regions);noiseSuppressed=false;
-          message='PDF内の文字行を照合し、追加・削除された行だけを強調しました。';
-        }else{
-          const textDiff=buildNumericTextDiffResult(textPair[0],textPair[1],width,height),textRegions=textDiff.regions;
-          if(textRegions.length){
-            // PDF上の変更文字が少数の数値だけなら文字座標を正解として扱う。
-            // 画像側の離れた領域は位置ずれやアンチエイリアスなので残さない。
-            const preferNumericOnly=textDiff.numericOnly&&textRegions.length<=8;
-            regions=preferNumericOnly?mergeDiffRegionsWithText([],textRegions):mergeDiffRegionsWithText(regions,textRegions);
-            message=preferNumericOnly
-              ?'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'
-              :'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';
-          }
-          if(shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
-            regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
-          }
+        const semantic=selectDiffSemanticResult(textPair[0],textPair[1],width,height,analysis,regions);
+        regions=semantic.regions;
+        if(semantic.message)message=semantic.message;
+        if(semantic.mode!=='row'&&shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
+          regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
         }
       }
       if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
