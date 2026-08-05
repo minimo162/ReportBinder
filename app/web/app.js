@@ -1585,9 +1585,16 @@ function diffPdfTextLayoutFingerprint(items){
     return `${normalizeDiffPdfText(item.text)}@${q(item.x)},${q(item.y)},${q(item.width)},${q(item.height)}`;
   }).join('\n');
 }
+function diffRegionOverlapsPdfText(region,items,width,height){
+  const box=region?.after||region?.before||region,left=Number(box?.x||0)*width,top=Number(box?.y||0)*height;
+  const right=left+Number(box?.width||0)*width,bottom=top+Number(box?.height||0)*height;
+  return items.some(item=>Math.min(right,Number(item.x||0)+Number(item.width||0))-Math.max(left,Number(item.x||0))>1&&
+    Math.min(bottom,Number(item.y||0)+Number(item.height||0))-Math.max(top,Number(item.y||0))>1);
+}
 function shouldSuppressDiffRasterNoise(beforeItems,afterItems,analysis,regions,width,height){
   if(!beforeItems.length||!afterItems.length||!regions.length||regions.length>3||analysis?.alignmentAdjusted||analysis?.fallbackUsed)return false;
   if(diffPdfTextLayoutFingerprint(beforeItems)!==diffPdfTextLayoutFingerprint(afterItems))return false;
+  if(regions.some(region=>diffRegionOverlapsPdfText(region,beforeItems,width,height)||diffRegionOverlapsPdfText(region,afterItems,width,height)))return false;
   if(Number(analysis?.changedRatio||0)>=.00035)return false;
   return regions.every(region=>{
     const box=region?.after||region?.before||region,rw=Math.max(1,Number(box?.width||0)*width),rh=Math.max(1,Number(box?.height||0)*height);
@@ -1650,6 +1657,48 @@ function diffPdfTextPixelBox(items,padding,width,height){
   const minX=Math.max(0,Math.min(...items.map(item=>item.x))-padding),minY=Math.max(0,Math.min(...items.map(item=>item.y))-padding);
   const maxX=Math.min(width,Math.max(...items.map(item=>item.x+item.width))+padding),maxY=Math.min(height,Math.max(...items.map(item=>item.y+item.height))+padding);
   return {x:minX/width,y:minY/height,width:Math.max(1,maxX-minX)/width,height:Math.max(1,maxY-minY)/height};
+}
+function groupDiffPdfTextRows(items){
+  const rows=[];
+  for(const item of [...items].sort((a,b)=>(Number(a.y||0)+Number(a.height||0)/2)-(Number(b.y||0)+Number(b.height||0)/2)||Number(a.x||0)-Number(b.x||0))){
+    const center=Number(item.y||0)+Number(item.height||0)/2,last=rows[rows.length-1],tolerance=Math.max(3,Math.min(12,Number(item.height||0)*.7));
+    if(!last||Math.abs(center-last.center)>Math.max(tolerance,last.tolerance)){rows.push({items:[item],center,tolerance});continue;}
+    last.items.push(item);last.center=(last.center*(last.items.length-1)+center)/last.items.length;last.tolerance=Math.max(last.tolerance,tolerance);
+  }
+  return rows.map(row=>{
+    row.items.sort((a,b)=>Number(a.x||0)-Number(b.x||0));
+    row.signature=diffPdfTextTemplate(row.items.map(item=>item.text).join(' ')).replace(/\s+/g,'');
+    return row;
+  }).filter(row=>row.signature);
+}
+function matchDiffPdfTextRows(beforeRows,afterRows){
+  const n=beforeRows.length,m=afterRows.length,stride=m+1,dp=new Uint16Array((n+1)*(m+1));
+  for(let i=n-1;i>=0;i--)for(let j=m-1;j>=0;j--)dp[i*stride+j]=beforeRows[i].signature===afterRows[j].signature?dp[(i+1)*stride+j+1]+1:Math.max(dp[(i+1)*stride+j],dp[i*stride+j+1]);
+  const matches=[];let i=0,j=0;
+  while(i<n&&j<m){
+    if(beforeRows[i].signature===afterRows[j].signature){matches.push([i,j]);i++;j++;}
+    else if(dp[(i+1)*stride+j]>=dp[i*stride+j+1])i++;else j++;
+  }
+  return matches;
+}
+function buildTextRowStructureDiffResult(beforeItems,afterItems,width,height){
+  const empty={regions:[],confident:false},beforeRows=groupDiffPdfTextRows(beforeItems),afterRows=groupDiffPdfTextRows(afterItems);
+  const delta=afterRows.length-beforeRows.length;
+  if(!delta||Math.abs(delta)>3||beforeRows.length<3||afterRows.length<3)return empty;
+  const matches=matchDiffPdfTextRows(beforeRows,afterRows),beforeMatched=new Set(matches.map(pair=>pair[0])),afterMatched=new Set(matches.map(pair=>pair[1]));
+  const beforeMissing=beforeRows.map((row,index)=>({row,index})).filter(item=>!beforeMatched.has(item.index));
+  const afterMissing=afterRows.map((row,index)=>({row,index})).filter(item=>!afterMatched.has(item.index));
+  if(delta>0&&(beforeMissing.length||afterMissing.length!==delta)||delta<0&&(afterMissing.length||beforeMissing.length!==-delta))return empty;
+  const missing=delta>0?afterMissing:beforeMissing,kind=delta>0?'added':'removed',regions=[];
+  for(const entry of missing){
+    const changedBox=diffPdfTextPixelBox(entry.row.items,5,width,height);if(!changedBox)continue;
+    const otherRows=delta>0?beforeRows:afterRows,insertionIndex=matches.filter(pair=>(delta>0?pair[1]:pair[0])<entry.index).length;
+    const anchorRow=otherRows[Math.min(insertionIndex,otherRows.length-1)]||otherRows[otherRows.length-1],anchorBox=anchorRow?diffPdfTextPixelBox(anchorRow.items,5,width,height):changedBox;
+    const beforeBox=delta>0?{...anchorBox,x:changedBox.x,width:changedBox.width}:changedBox;
+    const afterBox=delta>0?changedBox:{...anchorBox,x:changedBox.x,width:changedBox.width};
+    regions.push({regionId:'',kind,...changedBox,before:beforeBox,after:afterBox,confidence:1,pixelCount:0,source:'pdf-row'});
+  }
+  return {regions,confident:regions.length===Math.abs(delta)};
 }
 function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
   const empty={regions:[],changedGroupCount:0,numericGroupCount:0,numericOnly:false};
@@ -1793,18 +1842,24 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
       const textPair=await textPromise;
       if(serial!==diffBrowserRenderSerial)return null;
       if(textPair){
-        const textDiff=buildNumericTextDiffResult(textPair[0],textPair[1],width,height),textRegions=textDiff.regions;
-        if(textRegions.length){
-          // PDF上の変更文字が少数の数値だけなら文字座標を正解として扱う。
-          // 画像側の離れた領域は位置ずれやアンチエイリアスなので残さない。
-          const preferNumericOnly=textDiff.numericOnly&&textRegions.length<=8;
-          regions=preferNumericOnly?mergeDiffRegionsWithText([],textRegions):mergeDiffRegionsWithText(regions,textRegions);
-          message=preferNumericOnly
-            ?'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'
-            :'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';
-        }
-        if(shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
-          regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
+        const rowDiff=buildTextRowStructureDiffResult(textPair[0],textPair[1],width,height);
+        if(rowDiff.confident){
+          regions=mergeDiffRegionsWithText([],rowDiff.regions);noiseSuppressed=false;
+          message='PDF内の文字行を照合し、追加・削除された行だけを強調しました。';
+        }else{
+          const textDiff=buildNumericTextDiffResult(textPair[0],textPair[1],width,height),textRegions=textDiff.regions;
+          if(textRegions.length){
+            // PDF上の変更文字が少数の数値だけなら文字座標を正解として扱う。
+            // 画像側の離れた領域は位置ずれやアンチエイリアスなので残さない。
+            const preferNumericOnly=textDiff.numericOnly&&textRegions.length<=8;
+            regions=preferNumericOnly?mergeDiffRegionsWithText([],textRegions):mergeDiffRegionsWithText(regions,textRegions);
+            message=preferNumericOnly
+              ?'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'
+              :'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';
+          }
+          if(shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
+            regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
+          }
         }
       }
       if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
