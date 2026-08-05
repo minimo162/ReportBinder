@@ -1750,7 +1750,7 @@ function mergeDiffRegionsWithText(imageRegions,textRegions){
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v13',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v14',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
