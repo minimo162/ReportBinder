@@ -220,14 +220,14 @@ java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit=Update-
 if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commit order is invalid')
 
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
-for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage']:
+for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor']:
     if needle not in appjs: raise SystemExit(f'ui feature not found: {needle}')
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
 if "body:{volumes:collectBoardVolumes()}" in appjs: raise SystemExit('page reorder must send category')
 
 html=(root/'app/web/index.html').read_text(encoding='utf-8')
-for needle in ['workspace-top','step-bar','data-preset="ecm"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','final-main-fix','final-appendix-fix','notice-actions','language-popover','<symbol id="i-home"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"']:
+for needle in ['workspace-top','step-bar','data-preset="ecm"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','final-main-fix','final-appendix-fix','notice-actions','language-popover','<symbol id="i-home"','<symbol id="i-edit"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"','id="page-view-thumbnail-btn"','id="page-layout-undo-btn"','id="page-command-bar"','id="page-search-input"','id="page-thumbnail-size"']:
     if needle not in html: raise SystemExit(f'html feature not found: {needle}')
 for dead in ['collapse-hint','pagination-lite','info-dot','menu-col','recent-folder-list','page-output-summary','category-card','workflow-card']:
     if dead in html: raise SystemExit(f'dead ui remains: {dead}')
@@ -235,7 +235,7 @@ for symbol in '⌂□▦▤▣△⋮◉⌄↻⌕⊘›':
     if symbol in html: raise SystemExit(f'font symbol remains in html: {symbol}')
 
 css=(root/'app/web/style.css').read_text(encoding='utf-8')
-for needle in ['--accent:#5e6ad2','--sidebar-w:240px','backdrop-filter','box-shadow:none','.badge.attention','background:var(--attention-subtle)','font-weight:600','.modal-card','.drop-placeholder','.notice{position:fixed','.diff-dialog{width:min(1800px,94vw)','.diff-viewers.overlay-mode','@media(max-width:1100px)']:
+for needle in ['--accent:#5e6ad2','--sidebar-w:240px','backdrop-filter','box-shadow:none','.badge.attention','background:var(--attention-subtle)','font-weight:600','.modal-card','.drop-placeholder','.notice{position:fixed','.diff-dialog{width:min(1800px,94vw)','.diff-viewers.overlay-mode','@media(max-width:1100px)','.thumbnail-grid','.page-command-bar.has-selection','.page-thumb-editor','.page-thumb-card.editing']:
     if needle not in css: raise SystemExit(f'css feature not found: {needle}')
 if 'font-weight:900' in css or 'radial-gradient' in css: raise SystemExit('old visual style remains')
 
@@ -1020,7 +1020,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v86', 'style.css?v=20260804_v54']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260806_v92', 'style.css?v=20260806_v61']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260805_v86' not in html:
+if 'app.js?v=20260806_v92' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1093,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260805_v86' not in html:
+if 'app.js?v=20260806_v92' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.05.31':
+if str(runtime_info.get('version','')) != '2026.08.06.37':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1326,6 +1326,57 @@ for needed in ['未振り分け（出力しない）', '本体または補足へ
                'Excelのシート順に整える', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
+
+
+# 2026-08-06 page-preview organizer controls -------------------------------
+for needed in ['id="preview-page-tools"', 'id="preview-prev-page"',
+               'id="preview-next-page"', 'id="preview-page-position"',
+               'id="preview-move-main"', 'id="preview-move-appendix"',
+               'id="preview-move-none"']:
+    if needed not in html:
+        raise SystemExit(f'page-preview organizer markup missing: {needed}')
+for needed in ['function previewOrganizerPageIds', 'function syncPreviewOrganizerControls',
+               'function navigatePreviewPage', 'function moveCurrentPreviewPageToVolume',
+               "['ArrowLeft','ArrowRight'].includes(e.key)", 'originalFocus?.isConnected',
+               "currentCard?.querySelector('[data-preview-page]')"]:
+    if needed not in appjs:
+        raise SystemExit(f'page-preview organizer behavior missing: {needed}')
+for needed in ['.preview-page-tools', '.preview-page-assign', '.notice{z-index:120}']:
+    if needed not in css:
+        raise SystemExit(f'page-preview organizer styling missing: {needed}')
+
+
+# 2026-08-06 multi-step page layout undo/redo ------------------------------
+for needed in ['id="page-layout-undo-btn"', 'id="page-layout-redo-btn"',
+               'aria-label="ページ構成の操作履歴"', 'id="i-undo"', 'id="i-redo"']:
+    if needed not in html:
+        raise SystemExit(f'page layout history markup missing: {needed}')
+for needed in ['pageLayoutUndoStack', 'pageLayoutRedoStack', 'PAGE_LAYOUT_HISTORY_LIMIT = 20',
+               'function clonePageVolumes', 'function pageVolumeSnapshotsEqual',
+               'function clearPageLayoutHistory', 'async function applyPageLayoutHistory',
+               'async function redoLastPageLayout', "shortcutKey==='z'", "shortcutKey==='y'",
+               'pageLayoutRedoStack=[]', 'syncPageSelectionUi();']:
+    if needed not in appjs:
+        raise SystemExit(f'multi-step page layout history behavior missing: {needed}')
+for needed in ['.page-history-actions', '.page-history-actions .btn']:
+    if needed not in css:
+        raise SystemExit(f'page layout history styling missing: {needed}')
+
+
+# 2026-08-06 keyboard-first page board ------------------------------------
+for needed in ['class="page-keyboard-hint"', '<kbd>Space</kbd>', '<kbd>Ctrl+A</kbd>',
+               '<kbd>Alt+矢印</kbd>']:
+    if needed not in html:
+        raise SystemExit(f'page keyboard guide missing: {needed}')
+for needed in ['focusPageId', 'function visiblePageRowsForKeyboard',
+               'function pageRowKeyboardTarget', 'function handlePageRowNavigation',
+               "e.key==='Spacebar'", "shortcutKey==='a'", "row.setAttribute('aria-keyshortcuts'",
+               "row.setAttribute('aria-label',`${n}ページ目 ${title}`)"]:
+    if needed not in appjs:
+        raise SystemExit(f'page keyboard behavior missing: {needed}')
+for needed in ['.page-keyboard-hint', '.page-row:focus-visible']:
+    if needed not in css:
+        raise SystemExit(f'page keyboard styling missing: {needed}')
 
 
 # Browser startup must not be interrupted before navigation handlers and the

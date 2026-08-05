@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260804_v54">
+  <link rel="stylesheet" href="style.css?v=20260806_v61">
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -20,9 +20,12 @@
     <symbol id="i-chevron-down" viewBox="0 0 16 16"><path d="m3.5 6 4.5 4.5L12.5 6"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 5.5V2.75l-1.35 1.3A5.5 5.5 0 1 0 13.3 9"/></symbol>
     <symbol id="i-history" viewBox="0 0 16 16"><path d="M8 2.25a5.75 5.75 0 1 1-5.1 3.1"/><path d="M2.25 2.75v3.5h3.5M8 4.75V8l2.25 1.5"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 16 16"><path d="m5.75 3.5-3.5 3.5 3.5 3.5"/><path d="M2.75 7H9a4 4 0 0 1 4 4v1.5"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 16 16"><path d="m10.25 3.5 3.5 3.5-3.5 3.5"/><path d="M13.25 7H7a4 4 0 0 0-4 4v1.5"/></symbol>
     <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></symbol>
     <symbol id="i-close" viewBox="0 0 16 16"><path d="m3.5 3.5 9 9M12.5 3.5l-9 9"/></symbol>
     <symbol id="i-drag" viewBox="0 0 16 16"><circle cx="5" cy="4" r=".7"/><circle cx="11" cy="4" r=".7"/><circle cx="5" cy="8" r=".7"/><circle cx="11" cy="8" r=".7"/><circle cx="5" cy="12" r=".7"/><circle cx="11" cy="12" r=".7"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 16 16"><path d="m3 11.75-.5 2 2-.5 7.75-7.75-1.5-1.5Z"/><path d="m9.75 5 1.5 1.5M10.75 4l1-1a1.05 1.05 0 0 1 1.5 0 1.05 1.05 0 0 1 0 1.5l-1 1"/></symbol>
     <symbol id="i-external" viewBox="0 0 16 16"><path d="M9 2.5h4.5V7M13.25 2.75 7.5 8.5"/><path d="M12 9v4H2.5V3.5h4"/></symbol>
   </svg>
 
@@ -96,10 +99,11 @@
         </section>
 
         <section data-view-panel="pages" class="view-panel">
-          <div class="page-head"><div><h2>ページ構成</h2><p>新規ページは未振り分けに入ります。本体・補足へ移したページだけが最終PDFになります。</p></div><div class="sort-control"><span>並び順：<strong id="sort-state-label">Excelのシート順</strong></span><button id="sort-by-sheet-btn" class="btn secondary" type="button">Excelのシート順に整える</button></div></div>
+          <div class="page-head"><div><h2>ページ構成</h2><p>ページを見ながら、未振り分け・本体・補足へ直感的に整理できます。</p></div><div class="page-head-actions"><div class="segmented page-view-switch" aria-label="ページ表示"><button id="page-view-thumbnail-btn" class="active" type="button" aria-pressed="true"><svg class="icon"><use href="#i-grid"/></svg>サムネイル</button><button id="page-view-detail-btn" type="button" aria-pressed="false"><svg class="icon"><use href="#i-list"/></svg>詳細</button></div><label id="page-thumbnail-size-control" class="page-thumbnail-size">表示サイズ<input id="page-thumbnail-size" type="range" min="150" max="260" step="10" value="190" aria-label="サムネイルの表示サイズ"><output id="page-thumbnail-size-label" for="page-thumbnail-size">標準</output></label><div class="page-history-actions" aria-label="ページ構成の操作履歴"><button id="page-layout-undo-btn" class="btn ghost" type="button" disabled><svg class="icon"><use href="#i-undo"/></svg>元に戻す</button><button id="page-layout-redo-btn" class="btn ghost" type="button" disabled><svg class="icon"><use href="#i-redo"/></svg>やり直す</button></div><div class="sort-control"><span>並び順：<strong id="sort-state-label">Excelのシート順</strong></span><button id="sort-by-sheet-btn" class="btn secondary" type="button">Excelのシート順に整える</button></div></div></div>
           <div id="page-summary-strip" class="summary-strip"></div>
           <div class="assignment-guide" aria-label="ページ振り分けの流れ"><strong>1. 未振り分けから選択</strong><span aria-hidden="true">→</span><strong>2. 本体または補足へ移動</strong><span aria-hidden="true">→</span><strong>3. 振り分けたページだけPDF出力</strong></div>
-          <section class="card page-card"><div class="card-head"><div class="toolbar"><button id="select-all-pages-btn" class="btn ghost" type="button">すべて選択</button><button id="clear-selected-pages-btn" class="btn ghost" type="button">選択解除</button><span id="bulk-selected-count" class="caption">（選択中：0ページ）</span><label class="check-inline"><input type="checkbox" id="changed-only-toggle"> 変更分のみ表示</label></div><div class="toolbar"><button id="bulk-main-btn" class="btn secondary" type="button">本体へ入れる</button><button id="bulk-appendix-btn" class="btn secondary" type="button">補足へ入れる</button><button id="bulk-none-btn" class="btn secondary" type="button">未振り分けへ戻す</button></div></div><div id="page-board"></div></section>
+          <div class="page-keyboard-hint" aria-label="キーボード操作"><span>キーボード</span><kbd>矢印</kbd>カード移動 <kbd>Space</kbd>選択 <kbd>Ctrl+A</kbd>表示分を選択 <kbd>Alt+矢印</kbd>並べ替え</div>
+          <section class="card page-card"><div id="page-command-bar" class="card-head page-command-bar"><div class="toolbar page-selection-tools"><strong id="bulk-selected-count" class="page-selection-count">ページを選択</strong><div class="page-search"><label class="sr-only" for="page-search-input">ページを検索</label><input id="page-search-input" type="search" placeholder="ページ名・Excel・シートを検索" autocomplete="off"><button id="page-search-clear" class="btn ghost compact hidden" type="button">クリア</button></div><button id="select-all-pages-btn" class="btn ghost" type="button">表示分を選択</button><button id="clear-selected-pages-btn" class="btn ghost" type="button" disabled>選択解除</button><label class="check-inline"><input type="checkbox" id="changed-only-toggle"> 変更分のみ</label></div><div class="toolbar page-destination-actions" aria-label="選択ページの移動先"><span class="caption">移動先</span><button id="bulk-main-btn" class="btn secondary" type="button" disabled>本体へ入れる</button><button id="bulk-appendix-btn" class="btn secondary" type="button" disabled>補足へ入れる</button><button id="bulk-none-btn" class="btn secondary" type="button" disabled>未振り分けへ戻す</button></div></div><div id="page-board"></div></section>
         </section>
 
         <section data-view-panel="final" class="view-panel">
@@ -165,8 +169,8 @@
   </div>
 
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
-    <div class="modal-card"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
+    <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" aria-label="表示中ページの移動先"><span>このページを</span><button id="preview-move-main" class="btn secondary compact" type="button">本体へ</button><button id="preview-move-appendix" class="btn secondary compact" type="button">補足へ</button><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260805_v86"></script>
+  <script src="app.js?v=20260806_v92"></script>
 </body>
 </html>
