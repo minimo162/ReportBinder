@@ -1732,6 +1732,21 @@ function buildTextRowStructureDiffResult(beforeItems,afterItems,width,height){
   }
   return {regions,confident:regions.length===Math.abs(delta)};
 }
+function diffPdfTextItemsInBand(items,band,width,height){
+  if(!band)return [];
+  const left=Number(band.x||0)*width,top=Number(band.y||0)*height;
+  const right=left+Number(band.width||0)*width,bottom=top+Number(band.height||0)*height;
+  return items.filter(item=>{
+    const centerX=Number(item.x||0)+Number(item.width||0)/2,centerY=Number(item.y||0)+Number(item.height||0)/2;
+    return centerX>=left&&centerX<=right&&centerY>=top&&centerY<=bottom;
+  });
+}
+function buildLocalizedTextRowStructureDiffResult(beforeItems,afterItems,width,height,analysis){
+  if(!analysis?.tableRowStructureDetected||!analysis?.tableRowStructureBand)return {regions:[],confident:false};
+  return buildTextRowStructureDiffResult(
+    diffPdfTextItemsInBand(beforeItems,analysis.tableRowStructureBand,width,height),
+    diffPdfTextItemsInBand(afterItems,analysis.tableRowStructureBand,width,height),width,height);
+}
 function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
   const empty={regions:[],changedGroupCount:0,numericGroupCount:0,numericOnly:false};
   if(beforeItems.length>1500||afterItems.length>1500)return empty;
@@ -1802,7 +1817,8 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
   if(textDiff.numericOnly&&textRegions.length>0&&textRegions.length<=8){
     return {mode:'numeric',regions:mergeDiffRegionsWithText([],textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'};
   }
-  const rowDiff=buildTextRowStructureDiffResult(beforeItems,afterItems,width,height);
+  const pageRowDiff=buildTextRowStructureDiffResult(beforeItems,afterItems,width,height);
+  const rowDiff=pageRowDiff.confident?pageRowDiff:buildLocalizedTextRowStructureDiffResult(beforeItems,afterItems,width,height,analysis);
   // Text-row LCS alone is not enough. Require an independent raster row-shift signal
   // so harmless PDF text fragmentation cannot replace a valid numeric result.
   if(rowDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,rowDiff.regions)){
@@ -1815,7 +1831,7 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v18',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v19',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
