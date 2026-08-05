@@ -424,15 +424,22 @@ function refinePixelColumnMapping(before,after,width,height,rowAlignment,columnA
 function tolerantPixelDifference(before,after,width,height,x,y,ax,ay){
   const bi=(y*width+x)*4;
   const exactIndex=(ay*width+ax)*4;
-  let best=pixelDifference(before,after,bi,exactIndex);
-  if(best<=PIXEL_THRESHOLD)return best;
+  const exact=pixelDifference(before,after,bi,exactIndex);
+  if(exact<=PIXEL_THRESHOLD)return exact;
+  let forward=exact,reverse=exact;
   for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
     if(!ox&&!oy)continue;
     const sx=ax+ox,sy=ay+oy;
     if(sx<0||sx>=width||sy<0||sy>=height)continue;
-    best=Math.min(best,pixelDifference(before,after,bi,(sy*width+sx)*4));
+    forward=Math.min(forward,pixelDifference(before,after,bi,(sy*width+sx)*4));
+    const bx=x+ox,by=y+oy;
+    if(bx>=0&&bx<width&&by>=0&&by<height)reverse=Math.min(reverse,pixelDifference(before,after,(by*width+bx)*4,exactIndex));
   }
-  return best;
+  // The one-way minimum can erase a genuine thin addition: a white source
+  // pixel simply finds neighboring white beside the new glyph or rule.  Both
+  // directions must have a nearby match before the difference is treated as
+  // harmless sub-pixel raster movement.
+  return Math.max(forward,reverse);
 }
 function mergeNearbyComponents(components,width,height){
   const sorted=components.slice().sort((a,b)=>a.minY-b.minY||a.minX-b.minX),merged=[];
@@ -786,6 +793,55 @@ function extractTableHorizontalRules(data,width,height,tableBand){
     .map(cluster=>Math.round(cluster.weightedY/Math.max(1,cluster.weight)))
     .filter((value,index,array)=>!index||value-array[index-1]>=4);
 }
+function tableRowRasterDistance(before,after,width,beforeTop,beforeBottom,afterTop,afterBottom,minX,maxX){
+  let total=0,count=0;
+  for(let band=0;band<8;band++){
+    const beforeY=Math.max(0,Math.round(beforeTop+(beforeBottom-beforeTop)*(band+.5)/8));
+    const afterY=Math.max(0,Math.round(afterTop+(afterBottom-afterTop)*(band+.5)/8));
+    for(let x=minX+3;x<=maxX-3;x+=4){
+      const beforeIndex=(beforeY*width+x)*4,afterIndex=(afterY*width+x)*4;
+      if(luminance(before,beforeIndex)>247&&luminance(after,afterIndex)>247)continue;
+      let difference=pixelDifference(before,after,beforeIndex,afterIndex);
+      if(x>minX)difference=Math.min(difference,pixelDifference(before,after,beforeIndex,afterIndex-4));
+      if(x<maxX)difference=Math.min(difference,pixelDifference(before,after,beforeIndex,afterIndex+4));
+      total+=Math.min(80,difference);count++;
+    }
+  }
+  return count?total/count:0;
+}
+function detectTableRowInsertionDeletion(before,after,width,height,tableBand){
+  const beforeRules=extractTableHorizontalRules(before,width,height,tableBand),afterRules=extractTableHorizontalRules(after,width,height,tableBand);
+  const beforeCount=beforeRules.length-1,afterCount=afterRules.length-1;
+  if(Math.abs(beforeCount-afterCount)!==1||Math.min(beforeCount,afterCount)<4||Math.max(beforeCount,afterCount)>80)return null;
+  const added=afterCount>beforeCount,longRules=added?afterRules:beforeRules,shortRules=added?beforeRules:afterRules;
+  const longData=added?after:before,shortData=added?before:after;
+  const minX=Math.max(0,Math.floor(tableBand.minX)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX));
+  const rowDistance=(shortIndex,longIndex)=>tableRowRasterDistance(shortData,longData,width,
+    shortRules[shortIndex],shortRules[shortIndex+1],longRules[longIndex],longRules[longIndex+1],minX,maxX);
+  let best=null,identity=0;
+  for(let index=0;index<shortRules.length-1;index++)identity+=rowDistance(index,index);
+  identity/=Math.max(1,shortRules.length-1);
+  for(let extra=0;extra<longRules.length-1;extra++){
+    let score=0;
+    for(let index=0;index<shortRules.length-1;index++)score+=rowDistance(index,index<extra?index:index+1);
+    score/=Math.max(1,shortRules.length-1);
+    if(!best||score<best.score)best={extra,score};
+  }
+  if(!best||best.score>24||identity>1&&best.score>identity*.78)return null;
+  const shortHeights=[];for(let index=0;index<shortRules.length-1;index++)shortHeights.push(shortRules[index+1]-shortRules[index]);
+  shortHeights.sort((a,b)=>a-b);const nominalHeight=shortHeights[Math.floor(shortHeights.length/2)]||1;
+  const extraHeight=longRules[best.extra+1]-longRules[best.extra];
+  // A newly drawn border can split one existing row into two short intervals.
+  // Do not reinterpret that border-format edit as a newly inserted data row.
+  if(extraHeight<nominalHeight*.55||extraHeight>nominalHeight*2.5)return null;
+  const longTop=longRules[best.extra],longBottom=longRules[best.extra+1];
+  const anchorIndex=Math.min(best.extra,shortRules.length-2),shortTop=shortRules[anchorIndex],shortBottom=shortRules[anchorIndex+1],padding=3;
+  const longBox={minX:Math.max(0,minX-PADDING),maxX:Math.min(width-1,maxX+PADDING),minY:Math.max(0,longTop-padding),maxY:Math.min(height-1,longBottom+padding)};
+  const shortBox={minX:longBox.minX,maxX:longBox.maxX,minY:Math.max(0,shortTop-padding),maxY:Math.min(height-1,shortBottom+padding)};
+  return {kind:added?'added':'removed',score:best.score,identityScore:identity,tableBand,
+    minX:longBox.minX,maxX:longBox.maxX,minY:longBox.minY,maxY:longBox.maxY,pixels:(longBox.maxX-longBox.minX+1)*(longBox.maxY-longBox.minY+1),
+    beforeBox:added?shortBox:longBox,afterBox:added?longBox:shortBox};
+}
 function detectRowHeightChanges(before,after,width,height,tableBand){
   const beforeRules=extractTableHorizontalRules(before,width,height,tableBand),afterRules=extractTableHorizontalRules(after,width,height,tableBand);
   if(beforeRules.length<5||beforeRules.length!==afterRules.length||beforeRules.length>80)return [];
@@ -933,6 +989,9 @@ function analyzeBrowserDiff(before,after,width,height){
   let tableBand=tableBands[0]||findTableGridBand(before,after,width,height);
   const strongestBandScore=tableBands[0]?.score||0;
   const candidateTableBands=tableBands.filter(band=>band.span>=height*.08&&(!strongestBandScore||band.score>=strongestBandScore*.2));
+  const tableRowStructureChanges=candidateTableBands.map(band=>detectTableRowInsertionDeletion(before,after,width,height,band))
+    .filter(Boolean).sort((a,b)=>a.score-b.score);
+  const tableRowStructureChange=tableRowStructureChanges[0]||null;
   let rowHeightChanges=candidateTableBands.flatMap(band=>detectRowHeightChanges(before,after,width,height,band))
     .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,1);
   let rowHeightChange=rowHeightChanges[0]||null;
@@ -1175,7 +1234,7 @@ function analyzeBrowserDiff(before,after,width,height){
   const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||!!columnStructureChange||rowHeightAdjusted||gapRows.length>0;
   const rowMode=rowHeightAdjusted?'row-boundary-height':rowAlignment.alignmentMode;
   const columnMode=columnStructureChange?`column-${columnStructureChange.kind}`:columnBoundaryChange?'column-boundary-width':columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity';
-  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowMode}/${columnMode}`,alignmentAdjusted,rowStructureAdjusted,rowStructureRegions,rowHeightAdjusted,columnStructureKind:columnStructureChange?.kind||'',fallbackUsed};
+  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowMode}/${columnMode}`,alignmentAdjusted,rowStructureAdjusted,rowStructureRegions,rowHeightAdjusted,tableRowStructureDetected:!!tableRowStructureChange,columnStructureKind:columnStructureChange?.kind||'',fallbackUsed};
 }
 self.onmessage=function handleDiffWorkerMessage(event){
   const payload=event.data||{},id=payload.id;
