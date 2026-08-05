@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260804_v12'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v13'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1204,12 +1204,19 @@ for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
     if needed not in appjs:
         raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
 for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>8',
-               'function buildMicroTextFallbackRegion', 'exactCounts',
-               'MICRO_EXACT_THRESHOLD=24', 'MIN_MICRO_PIXELS=6',
-               '!fallback&&!alignmentAdjusted',
                'if(!regions.length)', 'fallbackUsed=true']:
     if needed not in diff_worker:
         raise SystemExit(f'small-difference region fallback missing: {needed}')
+for forbidden in ['buildMicroTextFallbackRegion', 'exactCounts',
+                  'MICRO_EXACT_THRESHOLD', 'MIN_MICRO_PIXELS']:
+    if forbidden in diff_worker:
+        raise SystemExit(f'noise-prone exact-pixel fallback remains: {forbidden}')
+for needed in ['extractDiffPdfTextItems', 'buildNumericTextDiffRegions',
+               'mergeDiffRegionsWithText', 'isDiffNumericText',
+               "source:'pdf-text'", 'PDF内の数値を照合しています。',
+               "!regions.length||analysis.fallbackUsed||Number(analysis.changedRatio||0)<.01"]:
+    if needed not in appjs:
+        raise SystemExit(f'PDF numeric-text diff supplement missing: {needed}')
 
 
 # 2026-08-04 unrestricted worksheet names and assignment inbox -------------
