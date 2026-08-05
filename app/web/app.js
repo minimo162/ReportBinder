@@ -1579,6 +1579,22 @@ function diffPdfNonNumericFingerprint(items){
     .replace(/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g,'')
     .replace(/\s+/g,'')).filter(Boolean).join('');
 }
+function diffPdfTextLayoutFingerprint(items){
+  return [...items].sort((a,b)=>Number(a.y||0)-Number(b.y||0)||Number(a.x||0)-Number(b.x||0)).map(item=>{
+    const q=value=>Math.round(Number(value||0)/2);
+    return `${normalizeDiffPdfText(item.text)}@${q(item.x)},${q(item.y)},${q(item.width)},${q(item.height)}`;
+  }).join('\n');
+}
+function shouldSuppressDiffRasterNoise(beforeItems,afterItems,analysis,regions,width,height){
+  if(!beforeItems.length||!afterItems.length||!regions.length||regions.length>3||analysis?.alignmentAdjusted||analysis?.fallbackUsed)return false;
+  if(diffPdfTextLayoutFingerprint(beforeItems)!==diffPdfTextLayoutFingerprint(afterItems))return false;
+  if(Number(analysis?.changedRatio||0)>=.00035)return false;
+  return regions.every(region=>{
+    const box=region?.after||region?.before||region,rw=Math.max(1,Number(box?.width||0)*width),rh=Math.max(1,Number(box?.height||0)*height);
+    const area=rw*rh,density=Number(region?.pixelCount||0)/Math.max(1,area),aspect=Math.max(rw/rh,rh/rw);
+    return rw<width*.12&&rh<height*.08&&aspect<6&&density<.12;
+  });
+}
 function diffPdfNumericItems(items){
   return items.flatMap((item,parentIndex)=>diffPdfNumericFragments(item.text).map((fragment,fragmentIndex)=>{
     const text=normalizeDiffPdfText(item.text),total=Math.max(1,[...text].length);
@@ -1757,7 +1773,7 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   // 通常は前後PDFが同じ寸法なので、描画済みCanvasをそのまま解析・表示し、
   // 同じ全面Canvasの再作成とdrawImageを2回分省略する。
   const beforeCanvas=normalizeCanvas(beforeRaw),afterCanvas=normalizeCanvas(afterRaw);
-  let regions=[],status='ready',message='',analysis=null;
+  let regions=[],status='ready',message='',analysis=null,noiseSuppressed=false;
   const exactSame=asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber);
   if(kind==='added')regions=[fullDiffRegion('added',width,height)];
   else if(kind==='removed')regions=[fullDiffRegion('removed',width,height)];
@@ -1787,8 +1803,11 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
             ?'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'
             :'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';
         }
+        if(shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
+          regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
+        }
       }
-      if(!regions.length){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
+      if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
     }
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
   }else if(kind==='modified'&&exactSame)message='このページに変更はありません。シート内の別ページに変更があります。';
