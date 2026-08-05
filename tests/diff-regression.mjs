@@ -20,7 +20,7 @@ const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTempla
   'diffPdfNonNumericFingerprint','diffPdfNumericItems','diffPdfNumericCenterDistance','unmatchedDiffPdfNumericItems',
   'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
   'buildTextRowStructureDiffResult','buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
-  'mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
+  'diffPdfTextItemsInBand','buildLocalizedTextRowStructureDiffResult','mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
   'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
 vm.runInContext(names.map(name=>functionSource(appCode,name)).join('\n'),app);
@@ -48,6 +48,22 @@ const duplicateAfterRows=[...afterRows,{...afterRows[2],y:afterRows[2].y+10}];
 const duplicateRow=app.selectDiffSemanticResult(beforeRows,duplicateAfterRows,600,400,
   {rowStructureAdjusted:true,alignmentAdjusted:true,fallbackUsed:false},[]);
 assert.equal(duplicateRow.mode,'row');assert.equal(duplicateRow.regions.length,1,'duplicate PDF glyph rows must not multiply an inserted row');
+
+// Independent side-by-side tables can occupy the same Y positions. A row added
+// only to the left table must be compared inside the raster-confirmed table band;
+// otherwise the unchanged right table keeps the page-level row count constant.
+const sideBySideBefore=[item('L1',40,100,180),item('L2',40,120,180),item('L3',40,140,180),
+  item('R1',360,100,120),item('R2',360,120,120),item('R3',360,140,120),item('R4',360,160,120)];
+const sideBySideAfter=[item('L1',40,100,180),item('L-new',40,120,180),item('L2',40,140,180),item('L3',40,160,180),
+  item('R1',360,100,120),item('R2',360,120,120),item('R3',360,140,120),item('R4',360,160,120)];
+assert.equal(app.buildTextRowStructureDiffResult(sideBySideBefore,sideBySideAfter,600,400).confident,false,
+  'page-level row count is intentionally masked by the side table');
+const sideBySideAnalysis={tableRowStructureDetected:true,tableRowStructureBand:{x:.04,y:.2,width:.48,height:.3},fallbackUsed:false};
+const localizedSideBySide=app.buildLocalizedTextRowStructureDiffResult(sideBySideBefore,sideBySideAfter,600,400,sideBySideAnalysis);
+assert.equal(localizedSideBySide.confident,true,'raster-confirmed table band restores the inserted text row');
+assert.equal(localizedSideBySide.regions.length,1);assert.equal(localizedSideBySide.regions[0].kind,'added');
+const sideBySideSemantic=app.selectDiffSemanticResult(sideBySideBefore,sideBySideAfter,600,400,sideBySideAnalysis,[]);
+assert.equal(sideBySideSemantic.mode,'row');assert.equal(sideBySideSemantic.regions.length,1,'side table must not split the inserted row');
 
 const stableText=[item('提出状況確認',100,200,120,18)];
 const glyphNoise=[{x:.165,y:.22,width:.045,height:.025,pixelCount:20}];
@@ -104,13 +120,17 @@ function ruledTable(horizontalRules,verticalRules){
 const resizedColumn=analyze(ruledTable([100,120,140,160,180,200,220,240,260,280,300,320],[50,100,220,320,420,520]),
   ruledTable([100,120,140,160,180,200,220,240,260,280,300,320],[50,100,280,380,480,520]),WIDTH,HEIGHT);
 assert.equal(resizedColumn.regions.length,1,'one width change remains one full-column region');
+assert.equal(resizedColumn.columnStructureKind,'','a width change is not an inserted column');
+assert.match(resizedColumn.alignmentMode,/column-boundary-width/);
 assert.ok(resizedColumn.regions[0].before.width>.12&&resizedColumn.regions[0].after.width>.18,
   'column-width change highlights the whole column on both sides');
+assert.ok(resizedColumn.regions[0].before.y>.1,'column-width highlight does not climb into a distant title band');
 
 const normalRows=[100,120,140,160,180,200,220,240,260,280,300,320];
 const tallRows=[100,120,140,160,200,220,240,260,280,300,320,340];
 const rowHeight=analyze(ruledTable(normalRows,[50,100,220,320,420,520]),ruledTable(tallRows,[50,100,220,320,420,520]),WIDTH,HEIGHT);
 assert.equal(rowHeight.regions.length,1,'one resized row remains one region');
+assert.equal(rowHeight.rowHeightAdjusted,true);assert.equal(rowHeight.columnStructureKind,'','a taller row is not an inserted column');
 assert.ok(rowHeight.regions[0].before&&rowHeight.regions[0].after,'row-height region needs side-specific geometry');
 assert.ok(rowHeight.regions[0].after.height>rowHeight.regions[0].before.height*1.5,'after side shows the taller row');
 const noisyInsertedRows=[100,120,140,160,180,200,240,260,280,300,320,340];
@@ -125,6 +145,11 @@ assert.ok(columnAdded.regions[0].after.width<.09&&columnAdded.regions[0].after.w
 const columnRemoved=analyze(ruledTable(normalRows,insertedColumns),ruledTable(normalRows,baseColumns),WIDTH,HEIGHT);
 assert.equal(columnRemoved.regions.length,1);assert.equal(columnRemoved.regions[0].kind,'removed');
 assert.ok(columnRemoved.regions[0].before.width<.09&&columnRemoved.regions[0].before.width>.04,'removed column is localized');
+
+const manyColumns=Array.from({length:25},(_,index)=>50+index*20);
+const manyColumnsWithExtra=[...manyColumns.slice(0,18),manyColumns[17]+10,...manyColumns.slice(18)];
+const mergedGridNoise=analyze(ruledTable(normalRows,manyColumns),ruledTable(normalRows,manyColumnsWithExtra),WIDTH,HEIGHT);
+assert.equal(mergedGridNoise.columnStructureKind,'','more than twenty vertical rules are not one credible table column model');
 
 // A dense report page: title, explanatory paragraphs, two independent tables,
 // a KPI box and notes.  The fixtures below deliberately keep unrelated content

@@ -681,7 +681,11 @@ function findTableGridBands(before,after,width,height){
   else if(primary&&!deduped.some(candidate=>{
     const overlapX=Math.max(0,Math.min(candidate.maxX,primary.maxX)-Math.max(candidate.minX,primary.minX)+1);
     const overlapY=Math.max(0,Math.min(candidate.last,primary.last)-Math.max(candidate.start,primary.start)+1);
-    return overlapX/Math.max(1,Math.min(candidate.maxX-candidate.minX+1,primary.maxX-primary.minX+1))>.65&&
+    const spanRatioX=Math.min(candidate.maxX-candidate.minX+1,primary.maxX-primary.minX+1)/
+      Math.max(1,Math.max(candidate.maxX-candidate.minX+1,primary.maxX-primary.minX+1));
+    // A narrow text/rule strip can sit inside the real table and overlap it on
+    // both axes. It is not a duplicate unless their horizontal spans also agree.
+    return overlapX/Math.max(1,Math.min(candidate.maxX-candidate.minX+1,primary.maxX-primary.minX+1))>.65&&spanRatioX>.68&&
       overlapY/Math.max(1,Math.min(candidate.span,primary.span))>.65;
   }))deduped.push(primary);
   deduped.sort((a,b)=>b.score-a.score||b.maxX-b.minX-(a.maxX-a.minX));
@@ -765,17 +769,21 @@ function extractTableVerticalRules(data,width,height,tableBand){
   const continuous=clusters.filter(cluster=>cluster.lastX-cluster.firstX+1<=8&&cluster.maxSpan>minRuleSpan)
     .map(cluster=>Math.round(cluster.weightedX/Math.max(1,cluster.weight))).filter((value,index,array)=>!index||value-array[index-1]>=4);
   const header=extractHeaderCellRules(data,width,height,tableBand);
-  if(header){
+  const headerNearTable=header&&header.start>=tableBand.start-Math.max(36,(tableBand.rowHeight||18)*3);
+  if(headerNearTable){
     tableBand.headerStart=Number.isFinite(tableBand.headerStart)?Math.min(tableBand.headerStart,header.start):header.start;
   }
-  if(header?.valid){
+  if(headerNearTable&&header.valid){
     if(continuous.length<4||header.rules.length===continuous.length)return header.rules;
   }
   return continuous;
 }
 function extractTableHorizontalRules(data,width,height,tableBand){
   if(!tableBand)return [];
-  const margin=Math.max(PADDING,12),minX=Math.max(0,Math.floor(tableBand.minX)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX));
+  // Excel fit-to-page can move the first/last rule by more than the ordinary
+  // component padding when one row becomes taller. Keep two nominal rows of
+  // vertical context so the unchanged table edge is not dropped.
+  const margin=Math.max(PADDING,12,Math.min(36,Math.round(tableBand.rowHeight||18)*2)),minX=Math.max(0,Math.floor(tableBand.minX)),maxX=Math.min(width-1,Math.ceil(tableBand.maxX));
   const minY=Math.max(0,Math.floor(tableBand.start-margin)),maxY=Math.min(height-1,Math.ceil(tableBand.last+margin));
   const span=Math.max(1,maxX-minX+1),candidates=[];
   for(let y=minY;y<=maxY;y++){
@@ -827,7 +835,10 @@ function detectTableRowInsertionDeletion(before,after,width,height,tableBand){
     score/=Math.max(1,shortRules.length-1);
     if(!best||score<best.score)best={extra,score};
   }
-  if(!best||best.score>24||identity>1&&best.score>identity*.78)return null;
+  // PDF text-row LCS is still required before this raster hint becomes a final
+  // insertion/deletion result. Allow modest Excel glyph antialiasing here while
+  // retaining a clear improvement over identity row matching.
+  if(!best||best.score>24||identity>1&&best.score>identity*.85)return null;
   const shortHeights=[];for(let index=0;index<shortRules.length-1;index++)shortHeights.push(shortRules[index+1]-shortRules[index]);
   shortHeights.sort((a,b)=>a-b);const nominalHeight=shortHeights[Math.floor(shortHeights.length/2)]||1;
   const extraHeight=longRules[best.extra+1]-longRules[best.extra];
@@ -886,7 +897,13 @@ function detectAlignedRowHeightChange(rowAlignment,width,height,tableBand){
 }
 function detectColumnInsertionDeletion(before,after,width,height,tableBand){
   const beforeRules=extractTableVerticalRules(before,width,height,tableBand),afterRules=extractTableVerticalRules(after,width,height,tableBand);
-  if(Math.abs(beforeRules.length-afterRules.length)!==1||Math.min(beforeRules.length,afterRules.length)<4)return null;
+  // A merged band spanning several neighboring tables can expose dozens of
+  // unrelated vertical edges. It is not a credible single-table column model.
+  if(Math.abs(beforeRules.length-afterRules.length)!==1||Math.min(beforeRules.length,afterRules.length)<4||Math.max(beforeRules.length,afterRules.length)>20)return null;
+  // One taller Excel row can rescale the printed page and bring an adjacent
+  // table edge into this band's horizontal margin. Prefer direct row-boundary
+  // evidence over interpreting that edge as a newly inserted column.
+  if(detectRowHeightChanges(before,after,width,height,tableBand).length)return null;
   const added=afterRules.length>beforeRules.length,longRules=added?afterRules:beforeRules,shortRules=added?beforeRules:afterRules;
   const normalize=rules=>rules.map(value=>(value-rules[0])/Math.max(1,rules.at(-1)-rules[0]));
   const shortNormalized=normalize(shortRules);let best=null;
@@ -1231,10 +1248,14 @@ function analyzeBrowserDiff(before,after,width,height){
     const beforeHeight=box.beforeBox.maxY-box.beforeBox.minY,afterHeight=box.afterBox.maxY-box.afterBox.minY;
     return normalizeBox(beforeHeight<=afterHeight?box.beforeBox:box.afterBox);
   });
+  const tableRowStructureBand=tableRowStructureChange?normalizeBox({
+    minX:Math.max(0,tableRowStructureChange.tableBand.minX-PADDING),maxX:Math.min(width-1,tableRowStructureChange.tableBand.maxX+PADDING),
+    minY:Math.max(0,tableRowStructureChange.tableBand.start-PADDING),maxY:Math.min(height-1,tableRowStructureChange.tableBand.last+PADDING)
+  }):null;
   const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||!!columnStructureChange||rowHeightAdjusted||gapRows.length>0;
   const rowMode=rowHeightAdjusted?'row-boundary-height':rowAlignment.alignmentMode;
   const columnMode=columnStructureChange?`column-${columnStructureChange.kind}`:columnBoundaryChange?'column-boundary-width':columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity';
-  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowMode}/${columnMode}`,alignmentAdjusted,rowStructureAdjusted,rowStructureRegions,rowHeightAdjusted,tableRowStructureDetected:!!tableRowStructureChange,columnStructureKind:columnStructureChange?.kind||'',fallbackUsed};
+  return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowMode}/${columnMode}`,alignmentAdjusted,rowStructureAdjusted,rowStructureRegions,rowHeightAdjusted,tableRowStructureDetected:!!tableRowStructureChange,tableRowStructureBand,columnStructureKind:columnStructureChange?.kind||'',fallbackUsed};
 }
 self.onmessage=function handleDiffWorkerMessage(event){
   const payload=event.data||{},id=payload.id;
