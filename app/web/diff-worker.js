@@ -5,9 +5,6 @@ const MIN_PIXELS=28;
 const PADDING=5;
 const MAX_REGIONS=100;
 const MAX_LAYOUT_REGIONS=12;
-const MICRO_EXACT_THRESHOLD=24;
-const MIN_MICRO_PIXELS=6;
-const MAX_MICRO_PIXELS=240;
 
 function pixelDifference(before,after,beforeIndex,afterIndex){
   const dr=Math.abs(before[beforeIndex]-after[afterIndex]);
@@ -424,10 +421,10 @@ function refinePixelColumnMapping(before,after,width,height,rowAlignment,columnA
   for(let x=1;x<width;x++)mapping[x]=Math.max(mapping[x-1],mapping[x]);
   columnAlignment.pixelMapping=mapping;
 }
-function tolerantPixelDifference(before,after,width,height,x,y,ax,ay,exactDifference=-1){
+function tolerantPixelDifference(before,after,width,height,x,y,ax,ay){
   const bi=(y*width+x)*4;
   const exactIndex=(ay*width+ax)*4;
-  let best=exactDifference>=0?exactDifference:pixelDifference(before,after,bi,exactIndex);
+  let best=pixelDifference(before,after,bi,exactIndex);
   if(best<=PIXEL_THRESHOLD)return best;
   for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
     if(!ox&&!oy)continue;
@@ -484,33 +481,6 @@ function buildFallbackRegion(counts,gridWidth,gridHeight,width,height){
   const padding=PADDING+4,minX=Math.max(0,minGX*BLOCK-padding),minY=Math.max(0,minGY*BLOCK-padding);
   const maxX=Math.min(width-1,(maxGX+1)*BLOCK-1+padding),maxY=Math.min(height-1,(maxGY+1)*BLOCK-1+padding);
   return {regionId:'browser-r0001',kind:'modified',x:minX/width,y:minY/height,width:Math.max(1,maxX-minX+1)/width,height:Math.max(1,maxY-minY+1)/height,confidence:.5,pixelCount:pixels};
-}
-function buildMicroTextFallbackRegion(counts,gridWidth,gridHeight,width,height){
-  const visited=new Uint8Array(counts.length),queue=new Int32Array(counts.length);
-  let totalPixels=0;for(const count of counts)totalPixels+=count;
-  if(totalPixels<MIN_MICRO_PIXELS||totalPixels>MAX_MICRO_PIXELS*2)return null;
-  let best=null;
-  for(let seed=0;seed<counts.length;seed++){
-    if(!counts[seed]||visited[seed])continue;
-    let head=0,tail=0;queue[tail++]=seed;visited[seed]=1;
-    let minGX=seed%gridWidth,maxGX=minGX,minGY=Math.floor(seed/gridWidth),maxGY=minGY,pixels=0,cells=0;
-    while(head<tail){
-      const current=queue[head++],cx=current%gridWidth,cy=Math.floor(current/gridWidth);
-      pixels+=counts[current];cells++;minGX=Math.min(minGX,cx);maxGX=Math.max(maxGX,cx);minGY=Math.min(minGY,cy);maxGY=Math.max(maxGY,cy);
-      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
-        if(!ox&&!oy)continue;
-        const nx=cx+ox,ny=cy+oy;if(nx<0||nx>=gridWidth||ny<0||ny>=gridHeight)continue;
-        const next=ny*gridWidth+nx;if(!visited[next]&&counts[next]){visited[next]=1;queue[tail++]=next;}
-      }
-    }
-    const boxWidth=(maxGX-minGX+1)*BLOCK,boxHeight=(maxGY-minGY+1)*BLOCK;
-    if(pixels<MIN_MICRO_PIXELS||pixels>MAX_MICRO_PIXELS||cells>24||boxWidth>48||boxHeight>40)continue;
-    if(!best||pixels>best.pixels)best={minGX,maxGX,minGY,maxGY,pixels};
-  }
-  if(!best||best.pixels/totalPixels<.25)return null;
-  const padding=PADDING+3,minX=Math.max(0,best.minGX*BLOCK-padding),minY=Math.max(0,best.minGY*BLOCK-padding);
-  const maxX=Math.min(width-1,(best.maxGX+1)*BLOCK-1+padding),maxY=Math.min(height-1,(best.maxGY+1)*BLOCK-1+padding);
-  return {regionId:'browser-r0001',kind:'modified',x:minX/width,y:minY/height,width:Math.max(1,maxX-minX+1)/width,height:Math.max(1,maxY-minY+1)/height,confidence:.5,pixelCount:best.pixels};
 }
 function strongestLocalBox(component,counts,gridWidth,gridHeight,width,height){
   const minGX=Math.max(0,Math.floor(component.minX/BLOCK)),maxGX=Math.min(gridWidth-1,Math.floor(component.maxX/BLOCK));
@@ -894,27 +864,22 @@ function analyzeBrowserDiff(before,after,width,height){
   refinePixelRowMapping(before,after,width,height,rowAlignment,columnAlignment);
   refinePixelColumnMapping(before,after,width,height,rowAlignment,columnAlignment);
   const gridWidth=Math.ceil(width/BLOCK),gridHeight=Math.ceil(height/BLOCK),cellCount=gridWidth*gridHeight;
-  const mask=new Uint8Array(cellCount),counts=new Uint32Array(cellCount),looseCounts=new Uint32Array(cellCount),exactCounts=new Uint32Array(cellCount);
+  const mask=new Uint8Array(cellCount),counts=new Uint32Array(cellCount),looseCounts=new Uint32Array(cellCount);
   let totalChanged=0;
   for(let gy=0;gy<gridHeight;gy++)for(let gx=0;gx<gridWidth;gx++){
-    let changed=0,looseChanged=0,exactChanged=0;
+    let changed=0,looseChanged=0;
     const x0=gx*BLOCK,y0=gy*BLOCK,x1=Math.min(width,x0+BLOCK),y1=Math.min(height,y0+BLOCK);
     for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
       const ax=mappedColumnX(columnAlignment,x,width,y),ay=mappedRowY(rowAlignment,y,height,x),bi=(y*width+x)*4;
       let difference=0;
       if(ax<0||ax>=width||ay<0||ay>=height){
         difference=255-Math.min(before[bi],before[bi+1],before[bi+2]);
-      }else{
-        const exactIndex=(ay*width+ax)*4;
-        const exactDifference=pixelDifference(before,after,bi,exactIndex);
-        if(exactDifference>MICRO_EXACT_THRESHOLD)exactChanged++;
-        difference=tolerantPixelDifference(before,after,width,height,x,y,ax,ay,exactDifference);
-      }
+      }else difference=tolerantPixelDifference(before,after,width,height,x,y,ax,ay);
       if(difference>8)looseChanged++;
       if(difference>PIXEL_THRESHOLD)changed++;
     }
     const index=gy*gridWidth+gx;
-    counts[index]=changed;looseCounts[index]=looseChanged;exactCounts[index]=exactChanged;totalChanged+=changed;
+    counts[index]=changed;looseCounts[index]=looseChanged;totalChanged+=changed;
     if(changed>=Math.max(2,Math.floor((x1-x0)*(y1-y0)*.2)))mask[index]=1;
   }
   // Rows that have no counterpart are the human-visible insertion/deletion bands.
@@ -1074,13 +1039,12 @@ function analyzeBrowserDiff(before,after,width,height){
     if(component.beforeBox&&component.afterBox){region.before=normalizeBox(component.beforeBox);region.after=normalizeBox(component.afterBox);}
     return region;
   });
-  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||gapRows.length>0;
   let fallbackUsed=false;
   if(!regions.length){
     const fallback=buildFallbackRegion(totalChanged?counts:looseCounts,gridWidth,gridHeight,width,height);
-    const microFallback=!fallback&&!alignmentAdjusted?buildMicroTextFallbackRegion(exactCounts,gridWidth,gridHeight,width,height):null;
-    if(fallback||microFallback){regions=[fallback||microFallback];fallbackUsed=true;}
+    if(fallback){regions=[fallback];fallbackUsed=true;}
   }
+  const alignmentAdjusted=rowAlignment.adjusted||columnAlignment.adjusted||!!columnBoundaryChange||gapRows.length>0;
   const columnMode=columnBoundaryChange?'column-boundary-width':columnAlignment.adjusted?(columnAlignment.split>=0?'column-scale-and-shift':'column-scale'):'column-identity';
   return {regions,changedRatio:totalChanged/Math.max(1,width*height),offsetX:columnAlignment.offset,offsetY:0,scaleX:columnAlignment.scale,scaleY:rowAlignment.scaleY,maxLocalShiftJump:Math.max(rowAlignment.maxLocalShiftJump,Math.abs(columnAlignment.jump),columnBoundaryChange?.pixelDelta||0),alignmentMode:`${rowAlignment.alignmentMode}/${columnMode}`,alignmentAdjusted,fallbackUsed};
 }
