@@ -1540,10 +1540,13 @@ async function extractDiffPdfTextItems(rendered,serial){
     return {text,x:Number(point[0]||0),y:Number(point[1]||0)-height,width:Math.max(1,Math.abs(Number(item.width||0))*scale),height};
   }).filter(Boolean);
 }
+function diffPdfNumericFragments(value){
+  const text=normalizeDiffPdfText(value),pattern=/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g,fragments=[];
+  for(const match of text.matchAll(pattern))fragments.push({text:match[0],signature:match[0].replace(/[\s,]/g,'').replace(/％/g,'%'),offset:Number(match.index||0)});
+  return fragments;
+}
 function diffPdfNumericSignature(value){
-  const text=normalizeDiffPdfText(value);
-  const matches=text.match(/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g)||[];
-  return matches.map(item=>item.replace(/[\s,]/g,'').replace(/％/g,'%')).join('|');
+  return diffPdfNumericFragments(value).map(item=>item.signature).join('|');
 }
 function isDiffNumericText(value){
   return !!diffPdfNumericSignature(value);
@@ -1577,7 +1580,11 @@ function diffPdfNonNumericFingerprint(items){
     .replace(/\s+/g,'')).filter(Boolean).join('');
 }
 function diffPdfNumericItems(items){
-  return items.map((item,index)=>({...item,index,signature:diffPdfNumericSignature(item.text)})).filter(item=>item.signature);
+  return items.flatMap((item,parentIndex)=>diffPdfNumericFragments(item.text).map((fragment,fragmentIndex)=>{
+    const text=normalizeDiffPdfText(item.text),total=Math.max(1,[...text].length);
+    const start=[...text.slice(0,fragment.offset)].length/total,length=Math.max(1,[...fragment.text].length)/total;
+    return {...item,text:fragment.text,x:Number(item.x||0)+Number(item.width||0)*start,width:Math.max(1,Number(item.width||0)*length),parentIndex,fragmentIndex,signature:fragment.signature};
+  }));
 }
 function diffPdfNumericCenterDistance(before,after,width,height){
   const beforeX=before.x+before.width/2,afterX=after.x+after.width/2;
