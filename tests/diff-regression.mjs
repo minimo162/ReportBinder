@@ -20,7 +20,7 @@ const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTempla
   'diffPdfNonNumericFingerprint','diffPdfNumericItems','diffPdfNumericCenterDistance','unmatchedDiffPdfNumericItems',
   'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
   'buildTextRowStructureDiffResult','buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
-  'mergeDiffRegionsWithText','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
+  'mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
   'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
 vm.runInContext(names.map(name=>functionSource(appCode,name)).join('\n'),app);
@@ -68,7 +68,7 @@ function white(){const data=new Uint8ClampedArray(WIDTH*HEIGHT*4);data.fill(255)
 function gray(data,x,y,value=90){const index=(y*WIDTH+x)*4;data[index]=data[index+1]=data[index+2]=value;data[index+3]=255;}
 function horizontal(data,x1,x2,y){for(let x=x1;x<=x2;x++)gray(data,x,y);}
 function vertical(data,x,y1,y2){for(let y=y1;y<=y2;y++)gray(data,x,y);}
-function glyphs(data,x,y,length=8){for(let glyph=0;glyph<length;glyph++)for(let dy=0;dy<7;dy++)for(let dx=0;dx<2;dx++)gray(data,x+glyph*4+dx,y+dy,105);}
+function glyphs(data,x,y,length=8,value=105){for(let glyph=0;glyph<length;glyph++)for(let dy=0;dy<7;dy++)for(let dx=0;dx<2;dx++)gray(data,x+glyph*4+dx,y+dy,value);}
 
 function rowTable(rows){
   const data=white(),columns=[50,100,220,320,420,520];
@@ -125,5 +125,104 @@ assert.ok(columnAdded.regions[0].after.width<.09&&columnAdded.regions[0].after.w
 const columnRemoved=analyze(ruledTable(normalRows,insertedColumns),ruledTable(normalRows,baseColumns),WIDTH,HEIGHT);
 assert.equal(columnRemoved.regions.length,1);assert.equal(columnRemoved.regions[0].kind,'removed');
 assert.ok(columnRemoved.regions[0].before.width<.09&&columnRemoved.regions[0].before.width>.04,'removed column is localized');
+
+// A dense report page: title, explanatory paragraphs, two independent tables,
+// a KPI box and notes.  The fixtures below deliberately keep unrelated content
+// on the page so layout detection cannot succeed by treating the only table as
+// the whole document.
+function fill(data,x1,y1,x2,y2,value=220){for(let y=y1;y<=y2;y++)for(let x=x1;x<=x2;x++)gray(data,x,y,value);}
+function textLine(data,x,y,length=28,value=105){glyphs(data,x,y,length,value);}
+function drawRuledTable(data,horizontalRules,verticalRules,tone=105,rowIds=null){
+  const top=horizontalRules[0],bottom=horizontalRules.at(-1),left=verticalRules[0],right=verticalRules.at(-1);
+  fill(data,left,top,right,top+8,225);
+  for(const y of horizontalRules)horizontal(data,left,right,y);
+  for(const x of verticalRules)vertical(data,x,top,bottom);
+  for(let rowIndex=0;rowIndex<horizontalRules.length-1;rowIndex++)for(let columnIndex=0;columnIndex<verticalRules.length-1;columnIndex++){
+    const available=verticalRules[columnIndex+1]-verticalRules[columnIndex]-10;
+    const identity=rowIds?.[rowIndex]??rowIndex,base=Math.max(2,Math.min(12,available>>2));
+    glyphs(data,verticalRules[columnIndex]+5,horizontalRules[rowIndex]+7,Math.max(2,base-(identity+columnIndex)%3),tone);
+  }
+}
+function richReport({mainRows=[110,130,150,170,190,210,230,250,270,290,310],mainColumns=[40,100,240,330,420,510],mainRowIds=null,colorCell=false,noise=[]}={}){
+  const data=white();
+  fill(data,40,25,750,45,75);textLine(data,48,31,42,250);
+  textLine(data,40,58,70);textLine(data,40,72,54);textLine(data,430,72,34);
+  drawRuledTable(data,mainRows,mainColumns,105,mainRowIds);
+  drawRuledTable(data,[110,135,160,185,210,235],[550,610,680,750]);
+  fill(data,550,255,750,310,238);textLine(data,565,267,34);textLine(data,565,286,26);
+  textLine(data,40,342,78);textLine(data,40,356,74);textLine(data,40,370,65);textLine(data,40,384,82);
+  drawRuledTable(data,[430,452,474,496,518,540,562],[40,110,300,410,520,640,750]);
+  textLine(data,40,580,62);textLine(data,430,580,44);
+  if(colorCell)for(let y=177;y<=183;y++)for(let x=247;x<=267;x++)if(data[(y*WIDTH+x)*4]<200)gray(data,x,y,190);
+  for(const point of noise)gray(data,point.x,point.y,point.value??150);
+  return data;
+}
+function richTextRows(includeAdded=false){
+  const items=[item('月次業績報告 2026年8月',40,25,280,18),item('当月の業績と主要指標を報告します。',40,58,310,11),
+    item('単位 百万円',620,72,90,11)];
+  const labels=['売上高 12,500','営業利益 980','材料費 4,200','物流費 750','人件費 3,600','開発費 1,250','その他 420','小計 23,700','調整額 80','合計 23,780'];
+  labels.forEach((text,index)=>items.push(item(text,45,117+index*20,320,11)));
+  if(includeAdded){
+    items.splice(3+5,0,item('追加監査費 150',45,117+5*20,320,11));
+    for(let index=3+6;index<items.length;index++)items[index]={...items[index],y:items[index].y+20};
+  }
+  items.push(item('主要KPI 前年比 103.2%',555,117,170,11),item('為替影響 240',555,142,140,11));
+  items.push(item('概況：国内販売は堅調に推移し、海外販売は一部地域で減少しました。',40,342,650,11));
+  items.push(item('今後の見通し：原材料価格と為替変動を継続して注視します。',40,370,610,11));
+  for(let index=0;index<6;index++)items.push(item(`${index+1} 部門別明細 ${1000+index*125}`,45,437+index*22,500,11));
+  items.push(item('注：数値は速報値であり、確定値と異なる場合があります。',40,580,520,11));
+  return items;
+}
+
+const richBeforeText=richTextRows(false),richAfterText=richTextRows(true);
+const richRowSemantic=app.selectDiffSemanticResult(richBeforeText,richAfterText,WIDTH,HEIGHT,
+  {rowStructureAdjusted:true,alignmentAdjusted:true,fallbackUsed:false},[]);
+assert.equal(richRowSemantic.mode,'row','dense mixed-content report still recognizes one inserted row');
+assert.equal(richRowSemantic.regions.length,1,'unrelated paragraphs and tables must not multiply the inserted row');
+
+const richInsertedRows=[110,130,150,170,190,210,230,250,270,290,310,330];
+const richRowBefore=richReport({mainRowIds:[0,1,2,3,4,5,6,7,8,9]}),
+  richRowAfter=richReport({mainRows:richInsertedRows,mainRowIds:[0,1,2,3,4,99,5,6,7,8,9]});
+const richRowRaster=analyze(richRowBefore,richRowAfter,WIDTH,HEIGHT);
+assert.equal(richRowRaster.tableRowStructureDetected,true,'rich report row-count evidence survives unrelated content');
+assert.ok(richRowRaster.regions.every(region=>region.width*region.height<.08),'raw rich-report candidates never cover the page');
+const richRowIntegrated=app.selectDiffSemanticResult(richBeforeText,richAfterText,WIDTH,HEIGHT,richRowRaster,richRowRaster.regions);
+assert.equal(richRowIntegrated.mode,'row','localized raster evidence promotes the exact PDF text row on a rich report');
+assert.equal(richRowIntegrated.regions.length,1,'integrated rich report row result keeps one M marker');
+const richRowRemovedRaster=analyze(richRowAfter,richRowBefore,WIDTH,HEIGHT);
+assert.equal(richRowRemovedRaster.tableRowStructureDetected,true,'reverse rich report comparison keeps row-count evidence');
+const richRowRemovedIntegrated=app.selectDiffSemanticResult(richAfterText,richBeforeText,WIDTH,HEIGHT,richRowRemovedRaster,richRowRemovedRaster.regions);
+assert.equal(richRowRemovedIntegrated.mode,'row');assert.equal(richRowRemovedIntegrated.regions.length,1);
+
+const richWidthRaster=analyze(richReport(),richReport({mainColumns:[40,100,280,370,460,510]}),WIDTH,HEIGHT);
+assert.equal(richWidthRaster.regions.length,1,'rich report column resize remains one region');
+assert.ok(richWidthRaster.regions[0].before&&richWidthRaster.regions[0].after,'rich report column resize preserves side-specific boxes');
+assert.ok(richWidthRaster.regions[0].before.height>.3&&richWidthRaster.regions[0].after.height>.3,
+  'rich report column resize highlights the complete table column');
+
+const richStableText=richTextRows(false),manySparseTextNoise=Array.from({length:12},(_,index)=>({
+  x:(48+(index%6)*38)/WIDTH,y:(58+Math.floor(index/6)*14)/HEIGHT,width:7/WIDTH,height:7/HEIGHT,pixelCount:1
+}));
+assert.equal(app.shouldSuppressDiffRasterNoise(richStableText,richStableText,
+  {changedRatio:.00018,alignmentAdjusted:false,fallbackUsed:false},manySparseTextNoise,WIDTH,HEIGHT),true,
+  'many scattered antialiasing specks on a dense report must be suppressed together');
+const meaningfulColorRegion=[{x:240/WIDTH,y:174/HEIGHT,width:32/WIDTH,height:16/HEIGHT,pixelCount:220}];
+assert.equal(app.shouldSuppressDiffRasterNoise(richStableText,richStableText,
+  {changedRatio:.0004,alignmentAdjusted:false,fallbackUsed:false},meaningfulColorRegion,WIDTH,HEIGHT),false,
+  'a real font-color change inside a dense report must remain visible');
+
+const richNumericAfter=richTextRows(false).map(value=>({...value}));
+richNumericAfter.find(value=>value.text==='売上高 12,500').text='売上高 12,510';
+richNumericAfter.find(value=>value.text==='合計 23,780').text='合計 23,790';
+const richNumeric=app.selectDiffSemanticResult(richStableText,richNumericAfter,WIDTH,HEIGHT,
+  {rowStructureAdjusted:false,alignmentAdjusted:false,fallbackUsed:false},manySparseTextNoise);
+assert.equal(richNumeric.mode,'numeric','two changed values stay detectable among paragraphs and multiple tables');
+assert.equal(richNumeric.regions.length,2,'only the two changed numeric fragments are highlighted');
+
+const richColorRaster=analyze(richReport(),richReport({colorCell:true}),WIDTH,HEIGHT);
+assert.ok(richColorRaster.regions.length>=1&&richColorRaster.regions.length<=2,'font-color edit remains localized on a rich report');
+assert.ok(richColorRaster.regions.every(region=>region.width<.12&&region.height<.08),'font-color edit does not spread across its row or page');
+assert.equal(app.shouldSuppressDiffRasterNoise(richStableText,richStableText,richColorRaster,richColorRaster.regions,WIDTH,HEIGHT),false,
+  'actual rich-report font-color pixels are not classified as raster noise');
 
 console.log('diff regression tests OK');
