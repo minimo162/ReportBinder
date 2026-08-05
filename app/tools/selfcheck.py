@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v13'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v14'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1020,7 +1020,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v79', 'style.css?v=20260804_v54']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v80', 'style.css?v=20260804_v54']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260805_v79' not in html:
+if 'app.js?v=20260805_v80' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1093,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260805_v79' not in html:
+if 'app.js?v=20260805_v80' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.05.24':
+if str(runtime_info.get('version','')) != '2026.08.05.25':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1175,7 +1175,8 @@ for needed in ['MIN_LAYOUT_SCALE=.82', 'MAX_LAYOUT_SCALE=1.18',
                'function strongestStructuralRowBox', 'rowAlignment.activeMinX',
                'function extractTableVerticalRules', 'function detectColumnWidthBoundaryChange',
                "kind:'column-width'", "columnMode=columnBoundaryChange?'column-boundary-width'",
-               'beforeMinX:Math.min(left,right)', 'structuralColumnBox.beforeBox', 'structuralColumnBox.afterBox',
+               'beforeMinX:beforeBoundary-edgePadding', 'mappedAfterBoundary', 'changes.length>=3',
+               'structuralColumnBox.beforeBox', 'structuralColumnBox.afterBox',
                'if(columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes', 'const normalizeBox=box=>',
                'function strongestLocalBox', 'structuralRowBoxes', 'structuralSplit',
                'function findTableGridBands', 'function extractHeaderCellRules',
@@ -1235,8 +1236,19 @@ if "!regions.length||analysis.fallbackUsed||Number(analysis.changedRatio||0)<.01
     raise SystemExit('numeric text inspection must not be skipped because raster noise exceeded one percent')
 
 
+# 2026-08-05 semantic row insertion/deletion localization --------------------
+for needed in ['groupDiffPdfTextRows', 'matchDiffPdfTextRows',
+               'buildTextRowStructureDiffResult', 'new Uint16Array',
+               "kind=delta>0?'added':'removed'", "source:'pdf-row'",
+               'const rowDiff=buildTextRowStructureDiffResult',
+               'if(rowDiff.confident)', '追加・削除された行だけを強調しました。']:
+    if needed not in appjs:
+        raise SystemExit(f'semantic PDF row localization missing: {needed}')
+
+
 # 2026-08-05 identical-layout raster noise suppression ----------------------
-for needed in ['diffPdfTextLayoutFingerprint', 'shouldSuppressDiffRasterNoise',
+for needed in ['diffPdfTextLayoutFingerprint', 'diffRegionOverlapsPdfText',
+               'shouldSuppressDiffRasterNoise', 'diffRegionOverlapsPdfText(region,beforeItems',
                'analysis?.changedRatio||0)>=.00035', 'aspect<6&&density<.12',
                'if(!regions.length&&!noiseSuppressed)',
                '微小な画像描画ノイズを除外しました。']:
