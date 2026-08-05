@@ -1567,6 +1567,15 @@ function diffPdfTextTemplatesMatch(beforeItems,afterItems){
   for(const [key,count] of before)if(after.get(key)!==count)return false;
   return true;
 }
+function diffPdfNonNumericFingerprint(items){
+  const sorted=[...items].sort((a,b)=>{
+    const ay=Number(a.y||0)+Number(a.height||0)/2,by=Number(b.y||0)+Number(b.height||0)/2;
+    return Math.abs(ay-by)>4?ay-by:Number(a.x||0)-Number(b.x||0);
+  });
+  return sorted.map(item=>normalizeDiffPdfText(item.text)
+    .replace(/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g,'')
+    .replace(/\s+/g,'')).filter(Boolean).join('');
+}
 function diffPdfNumericItems(items){
   return items.map((item,index)=>({...item,index,signature:diffPdfNumericSignature(item.text)})).filter(item=>item.signature);
 }
@@ -1633,8 +1642,9 @@ function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
     if(!combined)continue;
     regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||afterBox||combined,after:afterBox||beforeBox||combined,confidence:1,pixelCount:0,source:'pdf-text'});
   }
-  const numericOnly=regions.length>0&&matched.unmatchedBefore===regions.length&&matched.unmatchedAfter===regions.length&&
-    diffPdfTextTemplatesMatch(beforeItems,afterItems);
+  const sameNonNumericContent=diffPdfTextTemplatesMatch(beforeItems,afterItems)||
+    diffPdfNonNumericFingerprint(beforeItems)===diffPdfNonNumericFingerprint(afterItems);
+  const numericOnly=regions.length>0&&matched.unmatchedBefore===regions.length&&matched.unmatchedAfter===regions.length&&sameNonNumericContent;
   return {regions,changedGroupCount:matched.unmatchedBefore+matched.unmatchedAfter,numericGroupCount:regions.length,numericOnly};
 }
 function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
@@ -1649,9 +1659,20 @@ function diffRegionsOverlap(first,second){
   const intersection=(right-left)*(bottom-top),smaller=Math.max(.0000001,Math.min(Number(a?.width||0)*Number(a?.height||0),Number(b?.width||0)*Number(b?.height||0)));
   return intersection/smaller>=.2;
 }
+function diffRegionsShareTextRow(imageRegion,textRegion){
+  for(const side of ['before','after']){
+    const image=imageRegion?.[side]||imageRegion,text=textRegion?.[side]||textRegion;
+    const imageTop=Number(image?.y||0),imageHeight=Number(image?.height||0),textTop=Number(text?.y||0),textHeight=Number(text?.height||0);
+    const overlap=Math.min(imageTop+imageHeight,textTop+textHeight)-Math.max(imageTop,textTop);
+    const verticalRatio=overlap/Math.max(.0000001,Math.min(imageHeight,textHeight));
+    const rowLike=Number(image?.width||0)>=Math.max(.18,Number(text?.width||0)*2.5)&&imageHeight<=Math.max(.12,textHeight*4);
+    if(verticalRatio>=.55&&rowLike)return true;
+  }
+  return false;
+}
 function mergeDiffRegionsWithText(imageRegions,textRegions){
   const merged=[...textRegions];
-  for(const region of imageRegions)if(!textRegions.some(textRegion=>diffRegionsOverlap(region,textRegion)))merged.push(region);
+  for(const region of imageRegions)if(!textRegions.some(textRegion=>diffRegionsOverlap(region,textRegion)||diffRegionsShareTextRow(region,textRegion)))merged.push(region);
   merged.sort((a,b)=>Number(a?.y||0)-Number(b?.y||0)||Number(a?.x||0)-Number(b?.x||0));
   return merged.map((region,index)=>({...region,regionId:`browser-r${String(index+1).padStart(4,'0')}`}));
 }
