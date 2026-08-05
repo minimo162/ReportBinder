@@ -19,7 +19,9 @@ function functionSource(code,name){
 const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTemplate','diffPdfTextTemplatesMatch',
   'diffPdfNonNumericFingerprint','diffPdfNumericItems','diffPdfNumericCenterDistance','unmatchedDiffPdfNumericItems',
   'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
-  'buildTextRowStructureDiffResult','buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
+  'diffPdfTextBoxUnion','mergeAdjacentDiffTextRegions','buildTextRowStructureDiffResult','findDiffPdfTextColumnSplit',
+  'buildColumnTextRowStructureDiffResult','buildDocumentTextRowStructureDiffResult','buildTextLayoutShiftDiffResult',
+  'buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
   'diffPdfTextItemsInBand','buildLocalizedTextRowStructureDiffResult','mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
   'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
@@ -64,6 +66,46 @@ assert.equal(localizedSideBySide.confident,true,'raster-confirmed table band res
 assert.equal(localizedSideBySide.regions.length,1);assert.equal(localizedSideBySide.regions[0].kind,'added');
 const sideBySideSemantic=app.selectDiffSemanticResult(sideBySideBefore,sideBySideAfter,600,400,sideBySideAnalysis,[]);
 assert.equal(sideBySideSemantic.mode,'row');assert.equal(sideBySideSemantic.regions.length,1,'side table must not split the inserted row');
+
+// A wrapped prose paragraph is several PDF rows but one human edit. Adjacent
+// inserted lines must collapse into one marker instead of one marker per line.
+const proseBefore=[item('A',40,40,300),item('B',40,60,300),item('C',40,80,300),item('D',40,100,300)];
+const proseAfter=[item('A',40,40,300),item('B',40,60,300),item('NEW first line',40,80,300),
+  item('NEW second line',40,100,260),item('C',40,120,300),item('D',40,140,300)];
+const proseInsert=app.buildTextRowStructureDiffResult(proseBefore,proseAfter,600,400);
+assert.equal(proseInsert.confident,true);assert.equal(proseInsert.regions.length,1,'wrapped paragraph lines merge into one edit');
+
+// Page-wide rows can also be masked by a two-column resume. Detect the split
+// from text geometry and compare the affected column independently.
+const columnBefore=[item('L1',40,80,180),item('L2',40,100,180),item('L3',40,120,180),item('L4',40,140,180),
+  item('R1',360,80,180),item('R2',360,100,180),item('R3',360,120,180),item('R4',360,140,180),item('R5',360,160,180)];
+const columnAfter=[item('L1',40,80,180),item('L-new',40,100,180),item('L2',40,120,180),item('L3',40,140,180),item('L4',40,160,180),
+  item('R1',360,80,180),item('R2',360,100,180),item('R3',360,120,180),item('R4',360,140,180),item('R5',360,160,180)];
+assert.equal(app.buildTextRowStructureDiffResult(columnBefore,columnAfter,600,400).confident,false);
+const columnInsert=app.buildColumnTextRowStructureDiffResult(columnBefore,columnAfter,600,400);
+assert.equal(columnInsert.confident,true);assert.equal(columnInsert.regions.length,1);assert.equal(columnInsert.regions[0].kind,'added');
+const columnDelete=app.buildColumnTextRowStructureDiffResult(columnAfter,columnBefore,600,400);
+assert.equal(columnDelete.confident,true);assert.equal(columnDelete.regions.length,1);assert.equal(columnDelete.regions[0].kind,'removed');
+
+// Whole-document LCS distinguishes a real paragraph inserted on page 1 from
+// unchanged rows merely repaginated onto page 2.
+const docBefore=[[item('A',40,40),item('B',40,60),item('C',40,80),item('D',40,100),item('E',40,120),item('F',40,140)],
+  [item('G',40,40),item('H',40,60),item('I',40,80)]];
+const docAfter=[[item('A',40,40),item('B',40,60),item('NEW 1',40,80),item('NEW 2',40,100),item('C',40,120),item('D',40,140)],
+  [item('E',40,40),item('F',40,60),item('G',40,80),item('H',40,100),item('I',40,120)]];
+const docPage1=app.buildDocumentTextRowStructureDiffResult(docBefore,docAfter,600,200,1);
+assert.equal(docPage1.confident,true);assert.equal(docPage1.regions.length,1);assert.equal(docPage1.regions[0].kind,'added');
+const docPage2=app.buildDocumentTextRowStructureDiffResult(docBefore,docAfter,600,200,2);
+assert.equal(docPage2.confident,true);assert.equal(docPage2.regions.length,0,'repaginated unchanged text is not an edit on page 2');
+const docDeletePage1=app.buildDocumentTextRowStructureDiffResult(docAfter,docBefore,600,200,1);
+assert.equal(docDeletePage1.confident,true);assert.equal(docDeletePage1.regions.length,1);assert.equal(docDeletePage1.regions[0].kind,'removed');
+
+// A local line-spacing/border change shifts all following rows. Highlight the
+// transition band once instead of every downstream text line.
+const spacingBefore=[item('A',40,40,300),item('B',40,60,300),item('C',40,80,300),item('D',40,100,300),item('E',40,120,300)];
+const spacingAfter=[item('A',40,40,300),item('B',40,60,300),item('C',40,88,300),item('D',40,108,300),item('E',40,128,300)];
+const spacing=app.buildTextLayoutShiftDiffResult(spacingBefore,spacingAfter,600,400);
+assert.equal(spacing.confident,true);assert.equal(spacing.regions.length,1);assert.equal(spacing.regions[0].source,'pdf-layout');
 
 const stableText=[item('提出状況確認',100,200,120,18)];
 const glyphNoise=[{x:.165,y:.22,width:.045,height:.025,pixelCount:20}];

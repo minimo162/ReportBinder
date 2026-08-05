@@ -7804,7 +7804,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 19
+$Script:DiffDetailAlgorithmVersion = 20
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24

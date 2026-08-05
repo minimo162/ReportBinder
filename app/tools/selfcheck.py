@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v19'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v20'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -829,8 +829,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 19' not in server:
-    raise SystemExit('direct-PDF comparison changes must bump DiffDetailAlgorithmVersion to 19')
+if '$Script:DiffDetailAlgorithmVersion = 20' not in server:
+    raise SystemExit('direct-PDF comparison changes must bump DiffDetailAlgorithmVersion to 20')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -920,7 +920,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 3',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 19',
+    '$Script:DiffDetailAlgorithmVersion = 20',
 ]:
     if needed not in server:
         raise SystemExit(f'comparison tolerance/browser setting missing: {needed}')
@@ -1020,7 +1020,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v85', 'style.css?v=20260804_v54']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v86', 'style.css?v=20260804_v54']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260805_v85' not in html:
+if 'app.js?v=20260805_v86' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1093,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260805_v85' not in html:
+if 'app.js?v=20260805_v86' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.05.30':
+if str(runtime_info.get('version','')) != '2026.08.05.31':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1279,6 +1279,23 @@ for needed in ['row-height region needs side-specific geometry', "columnAdded.re
         raise SystemExit(f'structural regression test missing: {needed}')
 if 'centerX=(tableBand.minX+tableBand.maxX)/2;half=Math.max(8,(tableBand.maxX-tableBand.minX+1)/2)' in diff_worker:
     raise SystemExit('unreliable column rules must not highlight the whole table')
+
+
+# 2026-08-05 Word prose/resume/column layout localization -------------------
+for needed in ['diffPdfTextDocumentCache', 'extractDiffPdfDocumentTextPages',
+               'diffPdfTextBoxUnion', 'mergeAdjacentDiffTextRegions',
+               'findDiffPdfTextColumnSplit', 'buildColumnTextRowStructureDiffResult',
+               'buildDocumentTextRowStructureDiffResult', 'buildTextLayoutShiftDiffResult',
+               "source:'pdf-document-row'", "source:'pdf-layout'", "mode:'document-reflow'",
+               'if(semantic.suppressRaster)noiseSuppressed=true']:
+    if needed not in appjs:
+        raise SystemExit(f'Word prose/resume PDF localization missing: {needed}')
+for needed in ['wrapped paragraph lines merge into one edit',
+               'repaginated unchanged text is not an edit on page 2',
+               'Page-wide rows can also be masked by a two-column resume',
+               "spacing.regions[0].source,'pdf-layout'"]:
+    if needed not in diff_regression:
+        raise SystemExit(f'Word prose/resume regression missing: {needed}')
 
 
 # 2026-08-05 identical-layout raster noise suppression ----------------------
