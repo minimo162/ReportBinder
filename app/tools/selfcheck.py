@@ -1200,7 +1200,7 @@ if '<pre id="log" hidden></pre>' not in html:
 for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
                'preferredDiffPageIndex(sheet)', 'preferredDiffPageIndex(preferred)',
                'このページに変更はありません。シート内の別ページに変更があります。',
-               "if(!regions.length){regions=[fullDiffRegion('modified'", 'analysis.fallbackUsed']:
+               "if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified'", 'analysis.fallbackUsed']:
     if needed not in appjs:
         raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
 for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>8',
