@@ -1540,9 +1540,18 @@ async function extractDiffPdfTextItems(rendered,serial){
     return {text,x:Number(point[0]||0),y:Number(point[1]||0)-height,width:Math.max(1,Math.abs(Number(item.width||0))*scale),height};
   }).filter(Boolean);
 }
+function diffPdfNumericSignature(value){
+  const text=normalizeDiffPdfText(value);
+  const matches=text.match(/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g)||[];
+  return matches.map(item=>item.replace(/[\s,]/g,'').replace(/％/g,'%')).join('|');
+}
 function isDiffNumericText(value){
-  const text=normalizeDiffPdfText(value).replace(/[\s,]/g,'');
-  return /^(?:[¥$€£]|JPY|USD)?[△▲▼+\-−(]*\d[\d.:%/()\-−+]*%?$/.test(text);
+  return !!diffPdfNumericSignature(value);
+}
+function diffPdfTextGroupHasNumericChange(group){
+  const before=group.before.map(item=>diffPdfNumericSignature(item.text)).filter(Boolean).join('|');
+  const after=group.after.map(item=>diffPdfNumericSignature(item.text)).filter(Boolean).join('|');
+  return !!(before||after)&&before!==after;
 }
 function groupChangedDiffPdfText(beforeItems,afterItems){
   const groups=[];let beforeIndex=0,afterIndex=0;const lookahead=12;
@@ -1572,14 +1581,15 @@ function diffPdfTextPixelBox(items,padding,width,height){
   const maxX=Math.min(width,Math.max(...items.map(item=>item.x+item.width))+padding),maxY=Math.min(height,Math.max(...items.map(item=>item.y+item.height))+padding);
   return {x:minX/width,y:minY/height,width:Math.max(1,maxX-minX)/width,height:Math.max(1,maxY-minY)/height};
 }
-function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
-  if(beforeItems.length>1500||afterItems.length>1500)return [];
+function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
+  const empty={regions:[],changedGroupCount:0,numericGroupCount:0,numericOnly:false};
+  if(beforeItems.length>1500||afterItems.length>1500)return empty;
   const groups=groupChangedDiffPdfText(beforeItems,afterItems);
-  if(groups.length>32)return [];
-  const regions=[];
+  if(groups.length>32)return empty;
+  const regions=[];let nonNumericGroupCount=0;
   for(const group of groups){
     const beforeNumeric=group.before.filter(item=>isDiffNumericText(item.text)),afterNumeric=group.after.filter(item=>isDiffNumericText(item.text));
-    if(!beforeNumeric.length&&!afterNumeric.length)continue;
+    if(!diffPdfTextGroupHasNumericChange(group)){nonNumericGroupCount++;continue;}
     const beforeBox=diffPdfTextPixelBox(beforeNumeric.length?beforeNumeric:group.before,4,width,height);
     const afterBox=diffPdfTextPixelBox(afterNumeric.length?afterNumeric:group.after,4,width,height);
     const combinedItems=[...(beforeNumeric.length?beforeNumeric:group.before),...(afterNumeric.length?afterNumeric:group.after)];
@@ -1587,7 +1597,11 @@ function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
     if(!combined)continue;
     regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||afterBox||combined,after:afterBox||beforeBox||combined,confidence:1,pixelCount:0,source:'pdf-text'});
   }
-  return regions.slice(0,16);
+  const limited=regions.slice(0,16);
+  return {regions:limited,changedGroupCount:groups.length,numericGroupCount:limited.length,numericOnly:limited.length>0&&!nonNumericGroupCount&&limited.length===groups.length};
+}
+function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
+  return buildNumericTextDiffResult(beforeItems,afterItems,width,height).regions;
 }
 function diffRegionsOverlap(first,second){
   const a=first?.after||first?.before||first,b=second?.after||second?.before||second;
@@ -1686,18 +1700,28 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   else if(kind!=='unchanged'&&!exactSame){
     setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
     try{
+      // 画像側が位置ずれを差分として拾っても数値照合を省略しない。PDF文字抽出は
+      // ワーカー解析と並行して開始し、変更ページの待ち時間増加を抑える。
+      const textPromise=beforeRaw&&afterRaw
+        ?Promise.all([extractDiffPdfTextItems(beforeRaw,serial),extractDiffPdfTextItems(afterRaw,serial)]).catch(()=>null)
+        :Promise.resolve(null);
       analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);
       if(analysis.fallbackUsed)message='小さい差分を検出したため、最も可能性の高い箇所を強調しています。';
       else if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';
-      const inspectPdfText=!!beforeRaw&&!!afterRaw&&(!regions.length||analysis.fallbackUsed||Number(analysis.changedRatio||0)<.01);
-      if(inspectPdfText){
-        try{
-          setDiffBrowserProgress(true,'PDF内の数値を照合しています。',85);
-          const [beforeText,afterText]=await Promise.all([extractDiffPdfTextItems(beforeRaw,serial),extractDiffPdfTextItems(afterRaw,serial)]);
-          if(serial!==diffBrowserRenderSerial)return null;
-          const textRegions=buildNumericTextDiffRegions(beforeText,afterText,width,height);
-          if(textRegions.length){regions=mergeDiffRegionsWithText(regions,textRegions);message='PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';}
-        }catch{}
+      setDiffBrowserProgress(true,'PDF内の数値を照合しています。',85);
+      const textPair=await textPromise;
+      if(serial!==diffBrowserRenderSerial)return null;
+      if(textPair){
+        const textDiff=buildNumericTextDiffResult(textPair[0],textPair[1],width,height),textRegions=textDiff.regions;
+        if(textRegions.length){
+          // PDF上の変更文字が少数の数値だけなら文字座標を正解として扱う。
+          // 画像側の離れた領域は位置ずれやアンチエイリアスなので残さない。
+          const preferNumericOnly=textDiff.numericOnly&&textRegions.length<=8;
+          regions=preferNumericOnly?mergeDiffRegionsWithText([],textRegions):mergeDiffRegionsWithText(regions,textRegions);
+          message=preferNumericOnly
+            ?'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'
+            :'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';
+        }
       }
       if(!regions.length){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
     }
