@@ -18,9 +18,10 @@ function functionSource(code,name){
 }
 const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTemplate','diffPdfTextTemplatesMatch',
   'diffPdfNonNumericFingerprint','diffPdfNumericItems','diffPdfNumericCenterDistance','unmatchedDiffPdfNumericItems',
-  'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','groupDiffPdfTextRows','matchDiffPdfTextRows',
+  'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
   'buildTextRowStructureDiffResult','buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
-  'mergeDiffRegionsWithText','selectDiffSemanticResult'];
+  'mergeDiffRegionsWithText','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
+  'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
 vm.runInContext(names.map(name=>functionSource(appCode,name)).join('\n'),app);
 const item=(text,x,y,width=60,height=12)=>({text,x,y,width,height});
@@ -43,6 +44,18 @@ const afterRows=[item('Report',40,20,80),item('Header',40,60,180),item('1 Financ
 const row=app.selectDiffSemanticResult(beforeRows,afterRows,600,400,
   {rowStructureAdjusted:true,alignmentAdjusted:true,fallbackUsed:false},[]);
 assert.equal(row.mode,'row');assert.equal(row.regions.length,1);assert.equal(row.regions[0].kind,'added');
+const duplicateAfterRows=[...afterRows,{...afterRows[2],y:afterRows[2].y+10}];
+const duplicateRow=app.selectDiffSemanticResult(beforeRows,duplicateAfterRows,600,400,
+  {rowStructureAdjusted:true,alignmentAdjusted:true,fallbackUsed:false},[]);
+assert.equal(duplicateRow.mode,'row');assert.equal(duplicateRow.regions.length,1,'duplicate PDF glyph rows must not multiply an inserted row');
+
+const stableText=[item('提出状況確認',100,200,120,18)];
+const glyphNoise=[{x:.165,y:.22,width:.045,height:.025,pixelCount:20}];
+assert.equal(app.shouldSuppressDiffRasterNoise(stableText,stableText,{changedRatio:.0002,alignmentAdjusted:false,fallbackUsed:false},glyphNoise,1200,900),true,
+  'sparse noise overlapping unchanged text must be suppressed');
+const fontColorChange=[{...glyphNoise[0],pixelCount:190}];
+assert.equal(app.shouldSuppressDiffRasterNoise(stableText,stableText,{changedRatio:.0002,alignmentAdjusted:false,fallbackUsed:false},fontColorChange,1200,900),false,
+  'dense text color changes must remain visible');
 
 function analyze(before,after,width,height){
   let result=null;const self={postMessage:value=>{result=value;}};
@@ -88,12 +101,21 @@ function ruledTable(horizontalRules,verticalRules){
   return data;
 }
 
+const resizedColumn=analyze(ruledTable([100,120,140,160,180,200,220,240,260,280,300,320],[50,100,220,320,420,520]),
+  ruledTable([100,120,140,160,180,200,220,240,260,280,300,320],[50,100,280,380,480,520]),WIDTH,HEIGHT);
+assert.equal(resizedColumn.regions.length,1,'one width change remains one full-column region');
+assert.ok(resizedColumn.regions[0].before.width>.12&&resizedColumn.regions[0].after.width>.18,
+  'column-width change highlights the whole column on both sides');
+
 const normalRows=[100,120,140,160,180,200,220,240,260,280,300,320];
 const tallRows=[100,120,140,160,200,220,240,260,280,300,320,340];
 const rowHeight=analyze(ruledTable(normalRows,[50,100,220,320,420,520]),ruledTable(tallRows,[50,100,220,320,420,520]),WIDTH,HEIGHT);
 assert.equal(rowHeight.regions.length,1,'one resized row remains one region');
 assert.ok(rowHeight.regions[0].before&&rowHeight.regions[0].after,'row-height region needs side-specific geometry');
 assert.ok(rowHeight.regions[0].after.height>rowHeight.regions[0].before.height*1.5,'after side shows the taller row');
+const noisyInsertedRows=[100,120,140,160,180,200,240,260,280,300,320,340];
+const noisyRowInsert=analyze(ruledTable(normalRows,[50,100,220,320,420,520]),ruledTable(noisyInsertedRows,[50,100,220,320,420,520]),WIDTH,HEIGHT);
+assert.equal(noisyRowInsert.regions.length,1,'row insertion must discard page-wide residual regions');
 
 const baseColumns=[50,100,220,320,420,520,620];
 const insertedColumns=[50,100,220,320,420,470,520,620];

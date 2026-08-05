@@ -873,11 +873,13 @@ function detectColumnWidthBoundaryChanges(before,after,width,height,tableBand){
     const useLeft=Math.abs(mappedAfterLeft-left)>Math.abs(mappedAfterRight-right),beforeBoundary=useLeft?left:right,afterBoundary=useLeft?afterLeft:afterRight;
     const mappedAfterBoundary=useLeft?mappedAfterLeft:mappedAfterRight;
     if(changes.some(change=>Math.abs(change.beforeBoundary-beforeBoundary)<=3&&Math.abs(change.mappedAfterBoundary-mappedAfterBoundary)<=3))continue;
-    const minX=Math.max(tableBand.minX,Math.floor(Math.min(beforeBoundary,mappedAfterBoundary))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(beforeBoundary,mappedAfterBoundary)));
-    const edgePadding=4;
-    changes.push({kind:'column-width',index:candidate.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(5,(maxX-minX+1)/2+3),
+    const edgePadding=3;
+    const beforeMinX=Math.max(tableBand.minX,left-edgePadding),beforeMaxX=Math.min(tableBand.maxX,right+edgePadding);
+    const afterMinX=Math.max(tableBand.minX,afterLeft-edgePadding),afterMaxX=Math.min(tableBand.maxX,afterRight+edgePadding);
+    const minX=Math.min(beforeMinX,afterMinX),maxX=Math.max(beforeMaxX,afterMaxX);
+    changes.push({kind:'column-width',index:candidate.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(5,(maxX-minX+1)/2),
       pixelDelta:candidate.pixelDelta,normalizedDelta:candidate.normalizedDelta,beforeBoundary,afterBoundary,mappedAfterBoundary,
-      beforeMinX:beforeBoundary-edgePadding,beforeMaxX:beforeBoundary+edgePadding,afterMinX:afterBoundary-edgePadding,afterMaxX:afterBoundary+edgePadding,
+      beforeMinX,beforeMaxX,afterMinX,afterMaxX,
       beforeRules,afterRules,tableBand});
     if(changes.length>=3)break;
   }
@@ -932,13 +934,13 @@ function analyzeBrowserDiff(before,after,width,height){
   const strongestBandScore=tableBands[0]?.score||0;
   const candidateTableBands=tableBands.filter(band=>band.span>=height*.08&&(!strongestBandScore||band.score>=strongestBandScore*.2));
   let rowHeightChanges=candidateTableBands.flatMap(band=>detectRowHeightChanges(before,after,width,height,band))
-    .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,3);
+    .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,1);
   let rowHeightChange=rowHeightChanges[0]||null;
   const columnStructureChanges=candidateTableBands.map(band=>detectColumnInsertionDeletion(before,after,width,height,band))
     .filter(Boolean).sort((a,b)=>a.score-b.score);
   const columnStructureChange=columnStructureChanges[0]||null;
   const columnBoundaryChanges=columnStructureChange?[]:candidateTableBands.flatMap(band=>detectColumnWidthBoundaryChanges(before,after,width,height,band))
-    .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,3);
+    .sort((a,b)=>b.normalizedDelta-a.normalizedDelta||b.pixelDelta-a.pixelDelta).slice(0,1);
   const columnBoundaryChange=columnBoundaryChanges[0]||null;
   if(columnStructureChange)tableBand=columnStructureChange.tableBand;
   else if(rowHeightChange)tableBand=rowHeightChange.tableBand;

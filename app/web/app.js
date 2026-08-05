@@ -1592,14 +1592,17 @@ function diffRegionOverlapsPdfText(region,items,width,height){
     Math.min(bottom,Number(item.y||0)+Number(item.height||0))-Math.max(top,Number(item.y||0))>1);
 }
 function shouldSuppressDiffRasterNoise(beforeItems,afterItems,analysis,regions,width,height){
-  if(!beforeItems.length||!afterItems.length||!regions.length||regions.length>3||analysis?.alignmentAdjusted||analysis?.fallbackUsed)return false;
+  if(!beforeItems.length||!afterItems.length||!regions.length||regions.length>6||analysis?.alignmentAdjusted||analysis?.fallbackUsed)return false;
   if(diffPdfTextLayoutFingerprint(beforeItems)!==diffPdfTextLayoutFingerprint(afterItems))return false;
-  if(regions.some(region=>diffRegionOverlapsPdfText(region,beforeItems,width,height)||diffRegionOverlapsPdfText(region,afterItems,width,height)))return false;
-  if(Number(analysis?.changedRatio||0)>=.00035)return false;
+  const changedRatio=Number(analysis?.changedRatio||0);
+  if(changedRatio>=.001)return false;
   return regions.every(region=>{
     const box=region?.after||region?.before||region,rw=Math.max(1,Number(box?.width||0)*width),rh=Math.max(1,Number(box?.height||0)*height);
     const area=rw*rh,density=Number(region?.pixelCount||0)/Math.max(1,area),aspect=Math.max(rw/rh,rh/rw);
-    return rw<width*.12&&rh<height*.08&&aspect<6&&density<.12;
+    if(rw>=width*.15||rh>=height*.1||aspect>=8)return false;
+    const overlapsText=diffRegionOverlapsPdfText(region,beforeItems,width,height)||diffRegionOverlapsPdfText(region,afterItems,width,height);
+    if(overlapsText)return changedRatio<.00045&&density<.035&&Number(region?.pixelCount||0)<80;
+    return changedRatio<.00055&&density<.12;
   });
 }
 function diffPdfNumericItems(items){
@@ -1672,9 +1675,24 @@ function diffPdfTextPixelBox(items,padding,width,height){
   const maxX=Math.min(width,Math.max(...items.map(item=>item.x+item.width))+padding),maxY=Math.min(height,Math.max(...items.map(item=>item.y+item.height))+padding);
   return {x:minX/width,y:minY/height,width:Math.max(1,maxX-minX)/width,height:Math.max(1,maxY-minY)/height};
 }
+function dedupeDiffPdfRowItems(items){
+  const unique=[];
+  for(const item of [...items].sort((a,b)=>Number(a.y||0)-Number(b.y||0)||Number(a.x||0)-Number(b.x||0))){
+    const text=normalizeDiffPdfText(item.text),centerX=Number(item.x||0)+Number(item.width||0)/2,centerY=Number(item.y||0)+Number(item.height||0)/2;
+    const duplicate=unique.some(previous=>{
+      if(normalizeDiffPdfText(previous.text)!==text)return false;
+      const previousX=Number(previous.x||0)+Number(previous.width||0)/2,previousY=Number(previous.y||0)+Number(previous.height||0)/2;
+      const height=Math.max(Number(previous.height||0),Number(item.height||0));
+      return Math.abs(centerX-previousX)<=Math.max(3,Math.min(Number(previous.width||0),Number(item.width||0))*.12)&&
+        Math.abs(centerY-previousY)<=Math.max(4,height*.9);
+    });
+    if(!duplicate)unique.push(item);
+  }
+  return unique;
+}
 function groupDiffPdfTextRows(items){
   const rows=[];
-  for(const item of [...items].sort((a,b)=>(Number(a.y||0)+Number(a.height||0)/2)-(Number(b.y||0)+Number(b.height||0)/2)||Number(a.x||0)-Number(b.x||0))){
+  for(const item of dedupeDiffPdfRowItems(items).sort((a,b)=>(Number(a.y||0)+Number(a.height||0)/2)-(Number(b.y||0)+Number(b.height||0)/2)||Number(a.x||0)-Number(b.x||0))){
     const center=Number(item.y||0)+Number(item.height||0)/2,last=rows[rows.length-1],tolerance=Math.max(3,Math.min(12,Number(item.height||0)*.7));
     if(!last||Math.abs(center-last.center)>Math.max(tolerance,last.tolerance)){rows.push({items:[item],center,tolerance});continue;}
     last.items.push(item);last.center=(last.center*(last.items.length-1)+center)/last.items.length;last.tolerance=Math.max(last.tolerance,tolerance);
@@ -1782,7 +1800,7 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v16',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v17',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
