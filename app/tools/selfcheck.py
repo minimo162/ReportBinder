@@ -8,7 +8,7 @@ required = [
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
-    'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md'
+    'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json','tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -126,7 +126,7 @@ for forbidden in ['diff-detail.json', 'diff-job.json', 'Read-RenderJobStatus']:
     if forbidden in _get_detail: raise SystemExit(f'diff detail still depends on server-generated comparison assets: {forbidden}')
 _appjs_early=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 _diff_worker=(root/'app/web/diff-worker.js').read_text(encoding='utf-8-sig')
-for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v14'"]:
+for needed in ['ensureDiffPdfJs', 'fetchDiffPdfDocument', 'renderDiffPdfPage', 'buildDiffBrowserPage', 'diffBrowserPageCache', "new Worker(new URL('diff-worker.js?v=20260805_v16'"]:
     if needed not in _appjs_early: raise SystemExit(f'browser PDF comparison missing: {needed}')
 for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_BAND',
                'choosePixelRowMapping', 'pixel-scale-and-row-shift', 'clearlyImproves',
@@ -1020,7 +1020,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v80', 'style.css?v=20260804_v54']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260805_v82', 'style.css?v=20260804_v54']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260805_v80' not in html:
+if 'app.js?v=20260805_v82' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1093,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260805_v80' not in html:
+if 'app.js?v=20260805_v82' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.05.25':
+if str(runtime_info.get('version','')) != '2026.08.05.27':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
@@ -1177,7 +1177,7 @@ for needed in ['MIN_LAYOUT_SCALE=.82', 'MAX_LAYOUT_SCALE=1.18',
                "kind:'column-width'", "columnMode=columnBoundaryChange?'column-boundary-width'",
                'beforeMinX:beforeBoundary-edgePadding', 'mappedAfterBoundary', 'changes.length>=3',
                'structuralColumnBox.beforeBox', 'structuralColumnBox.afterBox',
-               'if(columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes', 'const normalizeBox=box=>',
+               'if(columnStructureChange||columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes', 'const normalizeBox=box=>',
                'function strongestLocalBox', 'structuralRowBoxes', 'structuralSplit',
                'function findTableGridBands', 'function extractHeaderCellRules',
                'function detectColumnWidthBoundaryChanges', 'structuralColumnBoxes=[]',
@@ -1224,7 +1224,7 @@ for needed in ['extractDiffPdfTextItems', 'buildNumericTextDiffResult',
                'diffPdfNonNumericFingerprint(beforeItems)===diffPdfNonNumericFingerprint(afterItems)',
                'isDiffNumericText', "source:'pdf-text'",
                'const textPromise=beforeRaw&&afterRaw', 'numericOnly',
-               'const preferNumericOnly=textDiff.numericOnly&&textRegions.length<=8',
+               'selectDiffSemanticResult', "mode:'numeric'", 'rowStructureAdjusted',
                '数値が変わった箇所だけを強調しました。']:
     if needed not in appjs:
         raise SystemExit(f'PDF numeric-text diff supplement missing: {needed}')
@@ -1241,9 +1241,29 @@ for needed in ['groupDiffPdfTextRows', 'matchDiffPdfTextRows',
                'buildTextRowStructureDiffResult', 'new Uint16Array',
                "kind=delta>0?'added':'removed'", "source:'pdf-row'",
                'const rowDiff=buildTextRowStructureDiffResult',
-               'if(rowDiff.confident)', '追加・削除された行だけを強調しました。']:
+               'rowDiff.confident&&analysis?.rowStructureAdjusted', '追加・削除された行だけを強調しました。']:
     if needed not in appjs:
         raise SystemExit(f'semantic PDF row localization missing: {needed}')
+for needed in ['rowStructureAdjusted', 'rowStructureRegions',
+               'components=components.filter(component=>rowBoxes.some',
+               'structuralSplit>=0&&Math.abs(columnAlignment.structuralJump)>=3']:
+    if needed not in diff_worker:
+        raise SystemExit(f'structural diff regression guard missing: {needed}')
+for needed in ['function extractTableHorizontalRules', 'function detectRowHeightChanges',
+               'function detectAlignedRowHeightChange', "kind:'row-height'",
+               'rowHeightAdjusted', "rowMode=rowHeightAdjusted?'row-boundary-height'",
+               'function detectColumnInsertionDeletion', "kind:added?'added':'removed'",
+               'columnStructureKind', '`column-${columnStructureChange.kind}`',
+               "kind:component.kind==='added'||component.kind==='removed'?component.kind:'modified'"]:
+    if needed not in diff_worker:
+        raise SystemExit(f'row-height or column add/remove localization missing: {needed}')
+diff_regression=(root/'tests/diff-regression.mjs').read_text(encoding='utf-8')
+for needed in ['row-height region needs side-specific geometry', "columnAdded.regions[0].kind,'added'",
+               "columnRemoved.regions[0].kind,'removed'", 'added column is localized', 'removed column is localized']:
+    if needed not in diff_regression:
+        raise SystemExit(f'structural regression test missing: {needed}')
+if 'centerX=(tableBand.minX+tableBand.maxX)/2;half=Math.max(8,(tableBand.maxX-tableBand.minX+1)/2)' in diff_worker:
+    raise SystemExit('unreliable column rules must not highlight the whole table')
 
 
 # 2026-08-05 identical-layout raster noise suppression ----------------------
