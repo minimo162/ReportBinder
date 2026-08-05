@@ -1548,32 +1548,70 @@ function diffPdfNumericSignature(value){
 function isDiffNumericText(value){
   return !!diffPdfNumericSignature(value);
 }
-function diffPdfTextGroupHasNumericChange(group){
-  const before=group.before.map(item=>diffPdfNumericSignature(item.text)).filter(Boolean).join('|');
-  const after=group.after.map(item=>diffPdfNumericSignature(item.text)).filter(Boolean).join('|');
-  return !!(before||after)&&before!==after;
+function diffPdfTextTemplate(value){
+  return normalizeDiffPdfText(value)
+    .replace(/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g,'#')
+    .replace(/\s+/g,' ').trim();
 }
-function groupChangedDiffPdfText(beforeItems,afterItems){
-  const groups=[];let beforeIndex=0,afterIndex=0;const lookahead=12;
-  while(beforeIndex<beforeItems.length||afterIndex<afterItems.length){
-    if(beforeIndex<beforeItems.length&&afterIndex<afterItems.length&&beforeItems[beforeIndex].text===afterItems[afterIndex].text){beforeIndex++;afterIndex++;continue;}
-    let sync=null;
-    for(let beforeSkip=0;beforeSkip<=lookahead&&beforeIndex+beforeSkip<beforeItems.length;beforeSkip++)for(let afterSkip=0;afterSkip<=lookahead&&afterIndex+afterSkip<afterItems.length;afterSkip++){
-      if(!beforeSkip&&!afterSkip||beforeItems[beforeIndex+beforeSkip].text!==afterItems[afterIndex+afterSkip].text)continue;
-      const beforeItem=beforeItems[beforeIndex+beforeSkip],afterItem=afterItems[afterIndex+afterSkip];
-      const score=(beforeSkip+afterSkip)*1000+Math.abs(beforeItem.x-afterItem.x)+Math.abs(beforeItem.y-afterItem.y);
-      if(!sync||score<sync.score)sync={beforeSkip,afterSkip,score};
+function diffPdfTextTemplatesMatch(beforeItems,afterItems){
+  const counts=items=>{
+    const map=new Map();
+    for(const item of items){
+      const key=diffPdfTextTemplate(item.text);if(!key)continue;
+      map.set(key,(map.get(key)||0)+1);
     }
-    if(sync){
-      if(sync.beforeSkip||sync.afterSkip)groups.push({before:beforeItems.slice(beforeIndex,beforeIndex+sync.beforeSkip),after:afterItems.slice(afterIndex,afterIndex+sync.afterSkip)});
-      beforeIndex+=sync.beforeSkip;afterIndex+=sync.afterSkip;
-    }else{
-      const beforeTake=Math.min(1,beforeItems.length-beforeIndex),afterTake=Math.min(1,afterItems.length-afterIndex);
-      groups.push({before:beforeItems.slice(beforeIndex,beforeIndex+beforeTake),after:afterItems.slice(afterIndex,afterIndex+afterTake)});
-      beforeIndex+=beforeTake;afterIndex+=afterTake;
-    }
+    return map;
+  };
+  const before=counts(beforeItems),after=counts(afterItems);
+  if(before.size!==after.size)return false;
+  for(const [key,count] of before)if(after.get(key)!==count)return false;
+  return true;
+}
+function diffPdfNumericItems(items){
+  return items.map((item,index)=>({...item,index,signature:diffPdfNumericSignature(item.text)})).filter(item=>item.signature);
+}
+function diffPdfNumericCenterDistance(before,after,width,height){
+  const beforeX=before.x+before.width/2,afterX=after.x+after.width/2;
+  const beforeY=before.y+before.height/2,afterY=after.y+after.height/2;
+  const dx=Math.abs(beforeX-afterX)/Math.max(1,width),dy=Math.abs(beforeY-afterY)/Math.max(1,height);
+  return {dx,dy,score:dy*6+dx};
+}
+function unmatchedDiffPdfNumericItems(beforeItems,afterItems,width,height){
+  const before=diffPdfNumericItems(beforeItems),after=diffPdfNumericItems(afterItems);
+  const beforeUsed=new Uint8Array(before.length),afterUsed=new Uint8Array(after.length),bySignature=new Map();
+  for(let index=0;index<after.length;index++){
+    const bucket=bySignature.get(after[index].signature)||[];bucket.push(index);bySignature.set(after[index].signature,bucket);
   }
-  return groups.filter(group=>group.before.length||group.after.length);
+  const candidates=[];
+  for(let beforeIndex=0;beforeIndex<before.length;beforeIndex++)for(const afterIndex of bySignature.get(before[beforeIndex].signature)||[]){
+    candidates.push({beforeIndex,afterIndex,...diffPdfNumericCenterDistance(before[beforeIndex],after[afterIndex],width,height)});
+  }
+  candidates.sort((a,b)=>a.score-b.score);
+  for(const candidate of candidates){
+    if(beforeUsed[candidate.beforeIndex]||afterUsed[candidate.afterIndex])continue;
+    beforeUsed[candidate.beforeIndex]=1;afterUsed[candidate.afterIndex]=1;
+  }
+  return {
+    before:before.filter((item,index)=>!beforeUsed[index]),
+    after:after.filter((item,index)=>!afterUsed[index])
+  };
+}
+function pairChangedDiffPdfNumbers(beforeItems,afterItems,width,height){
+  const unmatched=unmatchedDiffPdfNumericItems(beforeItems,afterItems,width,height),candidates=[];
+  for(let beforeIndex=0;beforeIndex<unmatched.before.length;beforeIndex++)for(let afterIndex=0;afterIndex<unmatched.after.length;afterIndex++){
+    const distance=diffPdfNumericCenterDistance(unmatched.before[beforeIndex],unmatched.after[afterIndex],width,height);
+    const rowTolerance=Math.max(.012,(unmatched.before[beforeIndex].height+unmatched.after[afterIndex].height)*1.5/Math.max(1,height));
+    const columnTolerance=Math.max(.04,(unmatched.before[beforeIndex].width+unmatched.after[afterIndex].width)*2/Math.max(1,width));
+    if(distance.dy<=rowTolerance&&distance.dx<=Math.min(.12,columnTolerance))candidates.push({beforeIndex,afterIndex,...distance});
+  }
+  candidates.sort((a,b)=>a.score-b.score);
+  const beforeUsed=new Uint8Array(unmatched.before.length),afterUsed=new Uint8Array(unmatched.after.length),pairs=[];
+  for(const candidate of candidates){
+    if(beforeUsed[candidate.beforeIndex]||afterUsed[candidate.afterIndex])continue;
+    beforeUsed[candidate.beforeIndex]=1;afterUsed[candidate.afterIndex]=1;
+    pairs.push({before:unmatched.before[candidate.beforeIndex],after:unmatched.after[candidate.afterIndex]});
+  }
+  return {pairs,unmatchedBefore:unmatched.before.length,unmatchedAfter:unmatched.after.length};
 }
 function diffPdfTextPixelBox(items,padding,width,height){
   if(!items.length)return null;
@@ -1584,21 +1622,20 @@ function diffPdfTextPixelBox(items,padding,width,height){
 function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
   const empty={regions:[],changedGroupCount:0,numericGroupCount:0,numericOnly:false};
   if(beforeItems.length>1500||afterItems.length>1500)return empty;
-  const groups=groupChangedDiffPdfText(beforeItems,afterItems);
-  if(groups.length>32)return empty;
-  const regions=[];let nonNumericGroupCount=0;
-  for(const group of groups){
-    const beforeNumeric=group.before.filter(item=>isDiffNumericText(item.text)),afterNumeric=group.after.filter(item=>isDiffNumericText(item.text));
-    if(!diffPdfTextGroupHasNumericChange(group)){nonNumericGroupCount++;continue;}
-    const beforeBox=diffPdfTextPixelBox(beforeNumeric.length?beforeNumeric:group.before,4,width,height);
-    const afterBox=diffPdfTextPixelBox(afterNumeric.length?afterNumeric:group.after,4,width,height);
-    const combinedItems=[...(beforeNumeric.length?beforeNumeric:group.before),...(afterNumeric.length?afterNumeric:group.after)];
-    const combined=diffPdfTextPixelBox(combinedItems,4,width,height);
+  const matched=pairChangedDiffPdfNumbers(beforeItems,afterItems,width,height);
+  // A small semantic edit should yield only a few spatial pairs. Reject a noisy
+  // extraction-order/layout cascade instead of flooding the page with highlights.
+  if(!matched.pairs.length||matched.pairs.length>8)return {...empty,changedGroupCount:matched.unmatchedBefore+matched.unmatchedAfter};
+  const regions=[];
+  for(const pair of matched.pairs){
+    const beforeBox=diffPdfTextPixelBox([pair.before],4,width,height),afterBox=diffPdfTextPixelBox([pair.after],4,width,height);
+    const combined=diffPdfTextPixelBox([pair.before,pair.after],4,width,height);
     if(!combined)continue;
     regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||afterBox||combined,after:afterBox||beforeBox||combined,confidence:1,pixelCount:0,source:'pdf-text'});
   }
-  const limited=regions.slice(0,16);
-  return {regions:limited,changedGroupCount:groups.length,numericGroupCount:limited.length,numericOnly:limited.length>0&&!nonNumericGroupCount&&limited.length===groups.length};
+  const numericOnly=regions.length>0&&matched.unmatchedBefore===regions.length&&matched.unmatchedAfter===regions.length&&
+    diffPdfTextTemplatesMatch(beforeItems,afterItems);
+  return {regions,changedGroupCount:matched.unmatchedBefore+matched.unmatchedAfter,numericGroupCount:regions.length,numericOnly};
 }
 function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
   return buildNumericTextDiffResult(beforeItems,afterItems,width,height).regions;
