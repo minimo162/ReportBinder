@@ -1523,11 +1523,90 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
   const task=page.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport,background:'rgb(255,255,255)'});
   diffActiveRenderTasks.add(task);
   try{await task.promise;}finally{diffActiveRenderTasks.delete(task);}
-  return serial===diffBrowserRenderSerial?canvas:null;
+  return serial===diffBrowserRenderSerial?{canvas,page,viewport}:null;
+}
+function normalizeDiffPdfText(value){
+  return String(value||'').normalize('NFKC').replace(/\s+/g,' ').trim();
+}
+async function extractDiffPdfTextItems(rendered,serial){
+  if(!rendered?.page||!rendered?.viewport)return [];
+  const content=await rendered.page.getTextContent();
+  if(serial!==diffBrowserRenderSerial)return [];
+  const viewport=rendered.viewport,scale=Math.abs(Number(viewport.scale||DIFF_RENDER_SCALE))||DIFF_RENDER_SCALE;
+  return asArray(content?.items).map(item=>{
+    const text=normalizeDiffPdfText(item?.str);if(!text||!Array.isArray(item?.transform))return null;
+    const point=viewport.convertToViewportPoint(Number(item.transform[4]||0),Number(item.transform[5]||0));
+    const height=Math.max(1,Math.abs(Number(item.height||Math.hypot(Number(item.transform[2]||0),Number(item.transform[3]||0))))*scale);
+    return {text,x:Number(point[0]||0),y:Number(point[1]||0)-height,width:Math.max(1,Math.abs(Number(item.width||0))*scale),height};
+  }).filter(Boolean);
+}
+function isDiffNumericText(value){
+  const text=normalizeDiffPdfText(value).replace(/[\s,]/g,'');
+  return /^(?:[¥$€£]|JPY|USD)?[△▲▼+\-−(]*\d[\d.:%/()\-−+]*%?$/.test(text);
+}
+function groupChangedDiffPdfText(beforeItems,afterItems){
+  const groups=[];let beforeIndex=0,afterIndex=0;const lookahead=12;
+  while(beforeIndex<beforeItems.length||afterIndex<afterItems.length){
+    if(beforeIndex<beforeItems.length&&afterIndex<afterItems.length&&beforeItems[beforeIndex].text===afterItems[afterIndex].text){beforeIndex++;afterIndex++;continue;}
+    let sync=null;
+    for(let beforeSkip=0;beforeSkip<=lookahead&&beforeIndex+beforeSkip<beforeItems.length;beforeSkip++)for(let afterSkip=0;afterSkip<=lookahead&&afterIndex+afterSkip<afterItems.length;afterSkip++){
+      if(!beforeSkip&&!afterSkip||beforeItems[beforeIndex+beforeSkip].text!==afterItems[afterIndex+afterSkip].text)continue;
+      const beforeItem=beforeItems[beforeIndex+beforeSkip],afterItem=afterItems[afterIndex+afterSkip];
+      const score=(beforeSkip+afterSkip)*1000+Math.abs(beforeItem.x-afterItem.x)+Math.abs(beforeItem.y-afterItem.y);
+      if(!sync||score<sync.score)sync={beforeSkip,afterSkip,score};
+    }
+    if(sync){
+      if(sync.beforeSkip||sync.afterSkip)groups.push({before:beforeItems.slice(beforeIndex,beforeIndex+sync.beforeSkip),after:afterItems.slice(afterIndex,afterIndex+sync.afterSkip)});
+      beforeIndex+=sync.beforeSkip;afterIndex+=sync.afterSkip;
+    }else{
+      const beforeTake=Math.min(1,beforeItems.length-beforeIndex),afterTake=Math.min(1,afterItems.length-afterIndex);
+      groups.push({before:beforeItems.slice(beforeIndex,beforeIndex+beforeTake),after:afterItems.slice(afterIndex,afterIndex+afterTake)});
+      beforeIndex+=beforeTake;afterIndex+=afterTake;
+    }
+  }
+  return groups.filter(group=>group.before.length||group.after.length);
+}
+function diffPdfTextPixelBox(items,padding,width,height){
+  if(!items.length)return null;
+  const minX=Math.max(0,Math.min(...items.map(item=>item.x))-padding),minY=Math.max(0,Math.min(...items.map(item=>item.y))-padding);
+  const maxX=Math.min(width,Math.max(...items.map(item=>item.x+item.width))+padding),maxY=Math.min(height,Math.max(...items.map(item=>item.y+item.height))+padding);
+  return {x:minX/width,y:minY/height,width:Math.max(1,maxX-minX)/width,height:Math.max(1,maxY-minY)/height};
+}
+function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
+  if(beforeItems.length>1500||afterItems.length>1500)return [];
+  const groups=groupChangedDiffPdfText(beforeItems,afterItems);
+  if(groups.length>32)return [];
+  const regions=[];
+  for(const group of groups){
+    const beforeNumeric=group.before.filter(item=>isDiffNumericText(item.text)),afterNumeric=group.after.filter(item=>isDiffNumericText(item.text));
+    if(!beforeNumeric.length&&!afterNumeric.length)continue;
+    const beforeBox=diffPdfTextPixelBox(beforeNumeric.length?beforeNumeric:group.before,4,width,height);
+    const afterBox=diffPdfTextPixelBox(afterNumeric.length?afterNumeric:group.after,4,width,height);
+    const combinedItems=[...(beforeNumeric.length?beforeNumeric:group.before),...(afterNumeric.length?afterNumeric:group.after)];
+    const combined=diffPdfTextPixelBox(combinedItems,4,width,height);
+    if(!combined)continue;
+    regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||afterBox||combined,after:afterBox||beforeBox||combined,confidence:1,pixelCount:0,source:'pdf-text'});
+  }
+  return regions.slice(0,16);
+}
+function diffRegionsOverlap(first,second){
+  const a=first?.after||first?.before||first,b=second?.after||second?.before||second;
+  const left=Math.max(Number(a?.x||0),Number(b?.x||0)),top=Math.max(Number(a?.y||0),Number(b?.y||0));
+  const right=Math.min(Number(a?.x||0)+Number(a?.width||0),Number(b?.x||0)+Number(b?.width||0));
+  const bottom=Math.min(Number(a?.y||0)+Number(a?.height||0),Number(b?.y||0)+Number(b?.height||0));
+  if(right<=left||bottom<=top)return false;
+  const intersection=(right-left)*(bottom-top),smaller=Math.max(.0000001,Math.min(Number(a?.width||0)*Number(a?.height||0),Number(b?.width||0)*Number(b?.height||0)));
+  return intersection/smaller>=.2;
+}
+function mergeDiffRegionsWithText(imageRegions,textRegions){
+  const merged=[...textRegions];
+  for(const region of imageRegions)if(!textRegions.some(textRegion=>diffRegionsOverlap(region,textRegion)))merged.push(region);
+  merged.sort((a,b)=>Number(a?.y||0)-Number(b?.y||0)||Number(a?.x||0)-Number(b?.x||0));
+  return merged.map((region,index)=>({...region,regionId:`browser-r${String(index+1).padStart(4,'0')}`}));
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260804_v12',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v13',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1587,9 +1666,10 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   setDiffBrowserProgress(true,'PDFを表示用に描画しています。',25);
   const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
   if(serial!==diffBrowserRenderSerial)return null;
-  const width=Math.max(beforeRaw?.width||0,afterRaw?.width||0),height=Math.max(beforeRaw?.height||0,afterRaw?.height||0);
+  const width=Math.max(beforeRaw?.canvas?.width||0,afterRaw?.canvas?.width||0),height=Math.max(beforeRaw?.canvas?.height||0,afterRaw?.canvas?.height||0);
   if(!width||!height)throw new Error('表示できるPDFページがありません。');
-  const normalizeCanvas=raw=>{
+  const normalizeCanvas=rendered=>{
+    const raw=rendered?.canvas||null;
     if(raw&&raw.width===width&&raw.height===height)return raw;
     const canvas=createWhiteDiffCanvas(width,height);
     if(raw)canvas.getContext('2d',{alpha:false}).drawImage(raw,0,0);
@@ -1609,11 +1689,21 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
       analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);
       if(analysis.fallbackUsed)message='小さい差分を検出したため、最も可能性の高い箇所を強調しています。';
       else if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';
+      const inspectPdfText=!!beforeRaw&&!!afterRaw&&(!regions.length||analysis.fallbackUsed||Number(analysis.changedRatio||0)<.01);
+      if(inspectPdfText){
+        try{
+          setDiffBrowserProgress(true,'PDF内の数値を照合しています。',85);
+          const [beforeText,afterText]=await Promise.all([extractDiffPdfTextItems(beforeRaw,serial),extractDiffPdfTextItems(afterRaw,serial)]);
+          if(serial!==diffBrowserRenderSerial)return null;
+          const textRegions=buildNumericTextDiffRegions(beforeText,afterText,width,height);
+          if(textRegions.length){regions=mergeDiffRegionsWithText(regions,textRegions);message='PDF内の文字情報を照合し、数値が変わった箇所を補足しました。';}
+        }catch{}
+      }
       if(!regions.length){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
     }
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
   }else if(kind==='modified'&&exactSame)message='このページに変更はありません。シート内の別ページに変更があります。';
-  const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.width!==afterRaw.width||beforeRaw.height!==afterRaw.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
+  const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.canvas.width!==afterRaw.canvas.width||beforeRaw.canvas.height!==afterRaw.canvas.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
   return {sheetKey:String(sheet?.sheetKey||''),pageIndex,page,beforeCanvas,afterCanvas};
 }
 function paintDiffBrowserPage(result){
