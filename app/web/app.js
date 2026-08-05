@@ -57,6 +57,7 @@ let diffAnalysisRequestSerial = 0;
 const diffAnalysisPending = new Map();
 const diffActiveRenderTasks = new Set();
 const diffPdfDocumentCache = new Map();
+const diffPdfTextDocumentCache = new Map();
 const diffBrowserPageCache = new Map();
 const diffDetailResponseCache = new Map();
 const DIFF_RENDER_SCALE = 120 / 72;
@@ -1528,17 +1529,35 @@ async function renderDiffPdfPage(side,sheet,pageNumber,serial){
 function normalizeDiffPdfText(value){
   return String(value||'').normalize('NFKC').replace(/\s+/g,' ').trim();
 }
-async function extractDiffPdfTextItems(rendered,serial){
-  if(!rendered?.page||!rendered?.viewport)return [];
-  const content=await rendered.page.getTextContent();
-  if(serial!==diffBrowserRenderSerial)return [];
-  const viewport=rendered.viewport,scale=Math.abs(Number(viewport.scale||DIFF_RENDER_SCALE))||DIFF_RENDER_SCALE;
+function mapDiffPdfTextContentItems(content,viewport){
+  const scale=Math.abs(Number(viewport?.scale||DIFF_RENDER_SCALE))||DIFF_RENDER_SCALE;
   return asArray(content?.items).map(item=>{
     const text=normalizeDiffPdfText(item?.str);if(!text||!Array.isArray(item?.transform))return null;
     const point=viewport.convertToViewportPoint(Number(item.transform[4]||0),Number(item.transform[5]||0));
     const height=Math.max(1,Math.abs(Number(item.height||Math.hypot(Number(item.transform[2]||0),Number(item.transform[3]||0))))*scale);
     return {text,x:Number(point[0]||0),y:Number(point[1]||0)-height,width:Math.max(1,Math.abs(Number(item.width||0))*scale),height};
   }).filter(Boolean);
+}
+async function extractDiffPdfTextItems(rendered,serial){
+  if(!rendered?.page||!rendered?.viewport)return [];
+  const content=await rendered.page.getTextContent();
+  if(serial!==diffBrowserRenderSerial)return [];
+  return mapDiffPdfTextContentItems(content,rendered.viewport);
+}
+async function extractDiffPdfDocumentTextPages(side,sheet){
+  const key=`${diffPdfDocumentKey(side,sheet)}|text-v1`;
+  if(diffPdfTextDocumentCache.has(key))return diffPdfTextDocumentCache.get(key);
+  const promise=(async()=>{
+    const doc=await fetchDiffPdfDocument(side,sheet),pages=[];
+    for(let pageNumber=1;pageNumber<=doc.numPages;pageNumber++){
+      const page=await doc.getPage(pageNumber),viewport=page.getViewport({scale:DIFF_RENDER_SCALE});
+      pages.push(mapDiffPdfTextContentItems(await page.getTextContent(),viewport));
+    }
+    return pages;
+  })();
+  diffPdfTextDocumentCache.set(key,promise);
+  while(diffPdfTextDocumentCache.size>DIFF_PDF_CACHE_LIMIT)diffPdfTextDocumentCache.delete(diffPdfTextDocumentCache.keys().next().value);
+  try{return await promise;}catch(error){diffPdfTextDocumentCache.delete(key);throw error;}
 }
 function diffPdfNumericFragments(value){
   const text=normalizeDiffPdfText(value),pattern=/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g,fragments=[];
@@ -1675,6 +1694,34 @@ function diffPdfTextPixelBox(items,padding,width,height){
   const maxX=Math.min(width,Math.max(...items.map(item=>item.x+item.width))+padding),maxY=Math.min(height,Math.max(...items.map(item=>item.y+item.height))+padding);
   return {x:minX/width,y:minY/height,width:Math.max(1,maxX-minX)/width,height:Math.max(1,maxY-minY)/height};
 }
+function diffPdfTextBoxUnion(boxes){
+  const valid=boxes.filter(Boolean);if(!valid.length)return null;
+  const minX=Math.min(...valid.map(box=>Number(box.x||0))),minY=Math.min(...valid.map(box=>Number(box.y||0)));
+  const maxX=Math.max(...valid.map(box=>Number(box.x||0)+Number(box.width||0)));
+  const maxY=Math.max(...valid.map(box=>Number(box.y||0)+Number(box.height||0)));
+  return {x:minX,y:minY,width:Math.max(.000001,maxX-minX),height:Math.max(.000001,maxY-minY)};
+}
+function mergeAdjacentDiffTextRegions(regions){
+  const merged=[];
+  for(const region of [...regions].sort((a,b)=>Number(a.y||0)-Number(b.y||0)||Number(a.x||0)-Number(b.x||0))){
+    const previous=merged[merged.length-1],changedBox=value=>value?.kind==='removed'?(value?.before||value?.after||value):(value?.after||value?.before||value);
+    const a=changedBox(previous),b=changedBox(region);
+    if(previous&&previous.kind===region.kind){
+      const gap=Number(b.y||0)-(Number(a.y||0)+Number(a.height||0));
+      const overlap=Math.min(Number(a.x||0)+Number(a.width||0),Number(b.x||0)+Number(b.width||0))-Math.max(Number(a.x||0),Number(b.x||0));
+      const horizontalRatio=overlap/Math.max(.000001,Math.min(Number(a.width||0),Number(b.width||0)));
+      const near=gap>=-.01&&gap<=Math.max(.018,Number(a.height||0)*1.25,Number(b.height||0)*1.25);
+      if(near&&(horizontalRatio>=.25||Math.abs(Number(a.x||0)-Number(b.x||0))<=.035)){
+        const before=diffPdfTextBoxUnion([previous.before,region.before]),after=diffPdfTextBoxUnion([previous.after,region.after]);
+        const combined=diffPdfTextBoxUnion([previous,region,before,after]);
+        Object.assign(previous,combined,{before:before||after||combined,after:after||before||combined});
+        continue;
+      }
+    }
+    merged.push({...region,before:region.before?{...region.before}:region.before,after:region.after?{...region.after}:region.after});
+  }
+  return merged;
+}
 function dedupeDiffPdfRowItems(items){
   const unique=[];
   for(const item of [...items].sort((a,b)=>Number(a.y||0)-Number(b.y||0)||Number(a.x||0)-Number(b.x||0))){
@@ -1716,10 +1763,19 @@ function matchDiffPdfTextRows(beforeRows,afterRows){
 function buildTextRowStructureDiffResult(beforeItems,afterItems,width,height){
   const empty={regions:[],confident:false},beforeRows=groupDiffPdfTextRows(beforeItems),afterRows=groupDiffPdfTextRows(afterItems);
   const delta=afterRows.length-beforeRows.length;
-  if(!delta||Math.abs(delta)>3||beforeRows.length<3||afterRows.length<3)return empty;
+  if(!delta||Math.abs(delta)>6||beforeRows.length<3||afterRows.length<3)return empty;
   const matches=matchDiffPdfTextRows(beforeRows,afterRows),beforeMatched=new Set(matches.map(pair=>pair[0])),afterMatched=new Set(matches.map(pair=>pair[1]));
-  const beforeMissing=beforeRows.map((row,index)=>({row,index})).filter(item=>!beforeMatched.has(item.index));
-  const afterMissing=afterRows.map((row,index)=>({row,index})).filter(item=>!afterMatched.has(item.index));
+  let beforeMissing=beforeRows.map((row,index)=>({row,index})).filter(item=>!beforeMatched.has(item.index));
+  let afterMissing=afterRows.map((row,index)=>({row,index})).filter(item=>!afterMatched.has(item.index));
+  // Repagination can move a heading across otherwise matched rows. Cancel exact
+  // unmatched signatures on both sides before deciding what was truly added.
+  const movedAfter=new Set(),movedBefore=new Set();
+  for(let beforeIndex=0;beforeIndex<beforeMissing.length;beforeIndex++){
+    const afterIndex=afterMissing.findIndex((entry,index)=>!movedAfter.has(index)&&entry.row.signature===beforeMissing[beforeIndex].row.signature);
+    if(afterIndex>=0){movedBefore.add(beforeIndex);movedAfter.add(afterIndex);}
+  }
+  beforeMissing=beforeMissing.filter((entry,index)=>!movedBefore.has(index));
+  afterMissing=afterMissing.filter((entry,index)=>!movedAfter.has(index));
   if(delta>0&&(beforeMissing.length||afterMissing.length!==delta)||delta<0&&(afterMissing.length||beforeMissing.length!==-delta))return empty;
   const missing=delta>0?afterMissing:beforeMissing,kind=delta>0?'added':'removed',regions=[];
   for(const entry of missing){
@@ -1730,7 +1786,76 @@ function buildTextRowStructureDiffResult(beforeItems,afterItems,width,height){
     const afterBox=delta>0?changedBox:{...anchorBox,x:changedBox.x,width:changedBox.width};
     regions.push({regionId:'',kind,...changedBox,before:beforeBox,after:afterBox,confidence:1,pixelCount:0,source:'pdf-row'});
   }
-  return {regions,confident:regions.length===Math.abs(delta)};
+  const confident=regions.length===Math.abs(delta);
+  return {regions:confident?mergeAdjacentDiffTextRegions(regions):regions,confident};
+}
+function findDiffPdfTextColumnSplit(beforeItems,afterItems,width){
+  const usable=[...beforeItems,...afterItems].filter(item=>Number(item.width||0)<width*.58);
+  if(usable.length<12)return null;
+  const centers=usable.map(item=>Number(item.x||0)+Number(item.width||0)/2).sort((a,b)=>a-b),candidates=[];
+  for(let index=1;index<centers.length;index++){
+    const gap=centers[index]-centers[index-1],split=(centers[index]+centers[index-1])/2;
+    if(gap<width*.12||split<width*.28||split>width*.72)continue;
+    const sideCounts=items=>items.reduce((counts,item)=>{(Number(item.x||0)+Number(item.width||0)/2)<split?counts[0]++:counts[1]++;return counts;},[0,0]);
+    const beforeCounts=sideCounts(beforeItems),afterCounts=sideCounts(afterItems);
+    if(Math.min(...beforeCounts,...afterCounts)<3)continue;
+    const crossing=usable.filter(item=>Number(item.x||0)<split&&Number(item.x||0)+Number(item.width||0)>split).length;
+    if(crossing>Math.max(2,usable.length*.08))continue;
+    candidates.push({split,score:gap-crossing*width*.04});
+  }
+  return candidates.sort((a,b)=>b.score-a.score)[0]?.split||null;
+}
+function buildColumnTextRowStructureDiffResult(beforeItems,afterItems,width,height){
+  const empty={regions:[],confident:false},split=findDiffPdfTextColumnSplit(beforeItems,afterItems,width);if(!split)return empty;
+  const side=(items,left)=>items.filter(item=>((Number(item.x||0)+Number(item.width||0)/2)<split)===left),results=[];
+  for(const left of [true,false]){
+    const result=buildTextRowStructureDiffResult(side(beforeItems,left),side(afterItems,left),width,height);
+    if(result.confident)results.push(result);
+  }
+  return results.length===1?results[0]:empty;
+}
+function buildDocumentTextRowStructureDiffResult(beforePages,afterPages,width,height,pageNumber){
+  const empty={regions:[],confident:false,documentChanged:false};
+  if(!Array.isArray(beforePages)||!Array.isArray(afterPages)||Math.max(beforePages.length,afterPages.length)<2)return empty;
+  const stride=height+20,pageCount=Math.max(beforePages.length,afterPages.length),totalHeight=stride*pageCount;
+  // Repeated running headers/footers interrupt the reading order when text that
+  // merely repaginates crosses a page boundary. Exclude only the outer 5% from
+  // the document-wide LCS; page-local comparison still checks that furniture.
+  const flatten=pages=>pages.flatMap((items,index)=>items.filter(item=>{
+    const center=Number(item.y||0)+Number(item.height||0)/2;return center>=height*.05&&center<=height*.95;
+  }).map(item=>({...item,y:Number(item.y||0)+index*stride})));
+  const result=buildTextRowStructureDiffResult(flatten(beforePages),flatten(afterPages),width,totalHeight);
+  if(!result.confident)return empty;
+  const target=Math.max(0,Number(pageNumber||1)-1);
+  const localBox=box=>{
+    if(!box)return null;
+    const absoluteY=Number(box.y||0)*totalHeight,index=Math.max(0,Math.min(pageCount-1,Math.floor(absoluteY/stride)));
+    if(index!==target)return null;
+    return {...box,y:Math.max(0,(absoluteY-index*stride)/height),height:Math.min(1,Number(box.height||0)*totalHeight/height)};
+  };
+  const regions=[];
+  for(const region of result.regions){
+    const before=localBox(region.before),after=localBox(region.after);if(!before&&!after)continue;
+    const combined=diffPdfTextBoxUnion([before,after]);
+    regions.push({...region,...combined,before:before||after||combined,after:after||before||combined,source:'pdf-document-row'});
+  }
+  return {regions:mergeAdjacentDiffTextRegions(regions),confident:true,documentChanged:result.regions.length>0};
+}
+function buildTextLayoutShiftDiffResult(beforeItems,afterItems,width,height){
+  const empty={regions:[],confident:false},bodyRows=items=>groupDiffPdfTextRows(items).filter(row=>row.center>=height*.05&&row.center<=height*.95);
+  const beforeRows=bodyRows(beforeItems),afterRows=bodyRows(afterItems);
+  if(beforeRows.length<4||beforeRows.length!==afterRows.length||beforeRows.length>500)return empty;
+  if(beforeRows.some((row,index)=>row.signature!==afterRows[index].signature))return empty;
+  const offsets=beforeRows.map((row,index)=>afterRows[index].center-row.center);
+  const rowHeight=Math.max(1,...beforeRows.flatMap(row=>row.items.map(item=>Number(item.height||0))));
+  const threshold=Math.max(1.5,rowHeight*.14),jumps=[];
+  for(let index=1;index<offsets.length;index++)if(Math.abs(offsets[index]-offsets[index-1])>=threshold)jumps.push(index);
+  if(!jumps.length||jumps.length>6)return empty;
+  const start=Math.max(0,jumps[0]-1),end=Math.min(beforeRows.length-1,jumps[jumps.length-1]);
+  const beforeBox=diffPdfTextPixelBox(beforeRows.slice(start,end+1).flatMap(row=>row.items),5,width,height);
+  const afterBox=diffPdfTextPixelBox(afterRows.slice(start,end+1).flatMap(row=>row.items),5,width,height);
+  const combined=diffPdfTextBoxUnion([beforeBox,afterBox]);if(!combined)return empty;
+  return {regions:[{regionId:'',kind:'modified',...combined,before:beforeBox||combined,after:afterBox||combined,confidence:1,pixelCount:0,source:'pdf-layout'}],confident:true};
 }
 function diffPdfTextItemsInBand(items,band,width,height){
   if(!band)return [];
@@ -1810,19 +1935,28 @@ function diffHasLocalizedRowSignal(analysis,imageRegions,rowRegions){
     return false;
   }));
 }
-function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,imageRegions){
+function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,imageRegions,documentRowDiff=null){
   const textDiff=buildNumericTextDiffResult(beforeItems,afterItems,width,height),textRegions=textDiff.regions;
   // A small numeric-only edit is stronger evidence than PDF.js row grouping. Excel
   // PDFs sometimes duplicate a glyph run on a nearby baseline and fake an extra row.
   if(textDiff.numericOnly&&textRegions.length>0&&textRegions.length<=8){
     return {mode:'numeric',regions:mergeDiffRegionsWithText([],textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'};
   }
+  if(documentRowDiff?.confident&&documentRowDiff.documentChanged){
+    if(documentRowDiff.regions.length)return {mode:'row',regions:mergeDiffRegionsWithText([],documentRowDiff.regions),message:'PDF文書全体の文字行を照合し、追加・削除された段落だけを強調しました。'};
+    return {mode:'document-reflow',regions:[],suppressRaster:true,message:'変更箇所は別ページにあり、このページは改ページによる移動だけのため強調を省略しました。'};
+  }
   const pageRowDiff=buildTextRowStructureDiffResult(beforeItems,afterItems,width,height);
-  const rowDiff=pageRowDiff.confident?pageRowDiff:buildLocalizedTextRowStructureDiffResult(beforeItems,afterItems,width,height,analysis);
+  const tableRowDiff=pageRowDiff.confident?pageRowDiff:buildLocalizedTextRowStructureDiffResult(beforeItems,afterItems,width,height,analysis);
+  const rowDiff=tableRowDiff.confident?tableRowDiff:buildColumnTextRowStructureDiffResult(beforeItems,afterItems,width,height);
   // Text-row LCS alone is not enough. Require an independent raster row-shift signal
   // so harmless PDF text fragmentation cannot replace a valid numeric result.
   if(rowDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,rowDiff.regions)){
     return {mode:'row',regions:mergeDiffRegionsWithText([],rowDiff.regions),message:'PDF内の文字行を照合し、追加・削除された行だけを強調しました。'};
+  }
+  const layoutDiff=buildTextLayoutShiftDiffResult(beforeItems,afterItems,width,height);
+  if(layoutDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,layoutDiff.regions)){
+    return {mode:'layout',regions:mergeDiffRegionsWithText([],layoutDiff.regions),message:'PDF内の文字配置を照合し、行間や境界が変わった箇所だけを強調しました。'};
   }
   if(textRegions.length){
     return {mode:'numeric-supplement',regions:mergeDiffRegionsWithText(imageRegions,textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。'};
@@ -1831,7 +1965,7 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v19',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v20',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -1880,6 +2014,7 @@ function clearDiffBrowserResources(dropDocuments=false){
     if(diffAnalysisWorker){try{diffAnalysisWorker.terminate();}catch{}diffAnalysisWorker=null;}
     for(const promise of diffPdfDocumentCache.values())Promise.resolve(promise).then(doc=>doc?.destroy?.()).catch(()=>{});
     diffPdfDocumentCache.clear();
+    diffPdfTextDocumentCache.clear();
   }
   diffBrowserPageCache.clear();setDiffBrowserProgress(false);
   for(const id of ['diff-before-base','diff-after-underlay','diff-after-base'])clearDiffCanvas(id);
@@ -1916,16 +2051,22 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
       const textPromise=beforeRaw&&afterRaw
         ?Promise.all([extractDiffPdfTextItems(beforeRaw,serial),extractDiffPdfTextItems(afterRaw,serial)]).catch(()=>null)
         :Promise.resolve(null);
+      const documentTextPromise=beforeRaw&&afterRaw&&diffSheetPageCount(sheet)>1
+        ?Promise.all([extractDiffPdfDocumentTextPages('before',sheet),extractDiffPdfDocumentTextPages('after',sheet)]).catch(()=>null)
+        :Promise.resolve(null);
       analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);
       if(analysis.fallbackUsed)message='小さい差分を検出したため、最も可能性の高い箇所を強調しています。';
       else if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';
-      setDiffBrowserProgress(true,'PDF内の数値を照合しています。',85);
+      setDiffBrowserProgress(true,'PDF内の文字を照合しています。',85);
       const textPair=await textPromise;
+      const documentTextPair=await documentTextPromise;
       if(serial!==diffBrowserRenderSerial)return null;
       if(textPair){
-        const semantic=selectDiffSemanticResult(textPair[0],textPair[1],width,height,analysis,regions);
+        const documentRowDiff=documentTextPair?buildDocumentTextRowStructureDiffResult(documentTextPair[0],documentTextPair[1],width,height,pageNumber):null;
+        const semantic=selectDiffSemanticResult(textPair[0],textPair[1],width,height,analysis,regions,documentRowDiff);
         regions=semantic.regions;
         if(semantic.message)message=semantic.message;
+        if(semantic.suppressRaster)noiseSuppressed=true;
         if(semantic.mode!=='row'&&shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
           regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
         }
