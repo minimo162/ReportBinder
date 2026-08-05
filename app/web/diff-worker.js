@@ -782,14 +782,22 @@ function detectColumnWidthBoundaryChanges(before,after,width,height,tableBand){
   const best=candidates[0];
   if(!best||best.normalizedDelta<.006||best.pixelDelta<2)return [];
   const threshold=Math.max(.006,best.normalizedDelta*.35);
-  return candidates.filter(candidate=>candidate.normalizedDelta>=threshold&&candidate.pixelDelta>=2).slice(0,3).map(candidate=>{
+  const changes=[];
+  for(const candidate of candidates.filter(candidate=>candidate.normalizedDelta>=threshold&&candidate.pixelDelta>=2)){
     const left=beforeRules[candidate.index],right=beforeRules[candidate.index+1],afterLeft=afterRules[candidate.index],afterRight=afterRules[candidate.index+1];
     const mappedAfterLeft=beforeRules[0]+(afterLeft-afterRules[0])*beforeSpan/afterSpan,mappedAfterRight=beforeRules[0]+(afterRight-afterRules[0])*beforeSpan/afterSpan;
-    const minX=Math.max(tableBand.minX,Math.floor(Math.min(left,right,mappedAfterLeft,mappedAfterRight))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(left,right,mappedAfterLeft,mappedAfterRight)));
-    return {kind:'column-width',index:candidate.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(7,(maxX-minX+1)/2),
-      pixelDelta:candidate.pixelDelta,normalizedDelta:candidate.normalizedDelta,
-      beforeMinX:Math.min(left,right),beforeMaxX:Math.max(left,right),afterMinX:Math.min(afterLeft,afterRight),afterMaxX:Math.max(afterLeft,afterRight),beforeRules,afterRules,tableBand};
-  });
+    const useLeft=Math.abs(mappedAfterLeft-left)>Math.abs(mappedAfterRight-right),beforeBoundary=useLeft?left:right,afterBoundary=useLeft?afterLeft:afterRight;
+    const mappedAfterBoundary=useLeft?mappedAfterLeft:mappedAfterRight;
+    if(changes.some(change=>Math.abs(change.beforeBoundary-beforeBoundary)<=3&&Math.abs(change.mappedAfterBoundary-mappedAfterBoundary)<=3))continue;
+    const minX=Math.max(tableBand.minX,Math.floor(Math.min(beforeBoundary,mappedAfterBoundary))),maxX=Math.min(tableBand.maxX,Math.ceil(Math.max(beforeBoundary,mappedAfterBoundary)));
+    const edgePadding=4;
+    changes.push({kind:'column-width',index:candidate.index,minX,maxX,centerX:(minX+maxX)/2,half:Math.max(5,(maxX-minX+1)/2+3),
+      pixelDelta:candidate.pixelDelta,normalizedDelta:candidate.normalizedDelta,beforeBoundary,afterBoundary,mappedAfterBoundary,
+      beforeMinX:beforeBoundary-edgePadding,beforeMaxX:beforeBoundary+edgePadding,afterMinX:afterBoundary-edgePadding,afterMaxX:afterBoundary+edgePadding,
+      beforeRules,afterRules,tableBand});
+    if(changes.length>=3)break;
+  }
+  return changes;
 }
 function detectColumnWidthBoundaryChange(before,after,width,height,tableBand){
   return detectColumnWidthBoundaryChanges(before,after,width,height,tableBand)[0]||null;
