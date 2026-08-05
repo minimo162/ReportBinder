@@ -1158,7 +1158,7 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.04.18':
+if str(runtime_info.get('version','')) != '2026.08.05.19':
     raise SystemExit('worksheet inbox release must bump the immutable runtime version')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
