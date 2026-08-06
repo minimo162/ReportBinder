@@ -22,10 +22,10 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 function Invoke-SelfCheck {
     $script = Join-Path $root 'app\tools\selfcheck.py'
-    $python = Get-Command py -ErrorAction SilentlyContinue
-    if ($python) { & $python.Source -3 $script; if ($LASTEXITCODE -ne 0) { throw 'selfcheckに失敗しました。' }; return }
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) { & $python.Source $script; if ($LASTEXITCODE -ne 0) { throw 'selfcheckに失敗しました。' }; return }
+    $python = Get-Command py -ErrorAction SilentlyContinue
+    if ($python) { & $python.Source -3 $script; if ($LASTEXITCODE -ne 0) { throw 'selfcheckに失敗しました。' }; return }
     throw 'Pythonが見つかりません。先に app\tools\selfcheck.py を実行してください。'
 }
 
@@ -62,6 +62,13 @@ function Assert-StagedDependencies([string]$StageRoot, [bool]$IncludeJava) {
     if ($missing.Count -gt 0) {
         throw ("配布物に必要な依存ファイルがありません:`n" + ($missing -join "`n"))
     }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    $composer = [IO.Compression.ZipFile]::OpenRead((Join-Path $StageRoot 'app\lib\pdfbox\ReportPdfComposer.jar'))
+    try {
+        foreach ($entry in @('ReportPdfComposer.class','ReportPdfComposer$ContentSpec.class','BatchPdfSplitter.class','PdfPageAnalyzer.class','PdfBatchRasterizer.class')) {
+            if ($null -eq $composer.GetEntry($entry)) { throw "配布物のPDF組版jarに必要なクラスがありません: $entry" }
+        }
+    } finally { $composer.Dispose() }
 }
 
 function Remove-PathIfExists([string]$Path) {
@@ -94,6 +101,40 @@ function Remove-RuntimeFiles([string]$StageRoot) {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+function Remove-ReleaseDevelopmentFiles([string]$StageRoot) {
+    foreach ($relativePath in @(
+        '.git', '.github', '.agents', '.codex', '.gitignore',
+        'app\lib\pdfbox\src', 'app\lib\pdfbox\build.ps1',
+        'app\tools\fixtures', 'app\tools\selfcheck.py',
+        'app\tools\schema-v3-selfcheck.ps1', 'app\tools\source-adapter-selfcheck.ps1',
+        'app\tools\pdf-source-adapter-selfcheck.ps1', 'app\tools\word-source-adapter-selfcheck.ps1',
+        'app\tools\history-generalization-selfcheck.ps1', 'app\tools\final-composition-selfcheck.py',
+        'app\tools\create-word-adapter-fixtures.py', 'app\tools\operational-readiness-selfcheck.ps1',
+        'app\tools\create-scale-benchmark-fixtures.py', 'app\tools\create-scale-benchmark-workbooks.mjs',
+        'app\tools\scale-benchmark.ps1', 'docs\SCALE_BENCHMARK.md', 'docs\benchmarks',
+        'app\tools\package-release.ps1'
+    )) { Remove-PathIfExists (Join-Path $StageRoot $relativePath) }
+}
+
+function Write-ReleaseManifest([string]$StageRoot, [string]$Flavor, [bool]$IncludeJava) {
+    $runtimeVersion = 'legacy'
+    $runtimePath = Join-Path $StageRoot 'app\runtime-version.json'
+    if (Test-Path -LiteralPath $runtimePath) {
+        try { $runtimeVersion = [string]((Get-Content -LiteralPath $runtimePath -Raw -Encoding UTF8 | ConvertFrom-Json).version) } catch { }
+    }
+    $composerPath = Join-Path $StageRoot 'app\lib\pdfbox\ReportPdfComposer.jar'
+    $pdfboxPath = Join-Path $StageRoot 'app\lib\pdfbox\pdfbox-app.jar'
+    $manifest = [ordered]@{
+        schemaVersion=1; product='ReportBinder'; flavor=$Flavor; runtimeVersion=$runtimeVersion
+        createdAt=(Get-Date).ToString('o'); portableJavaIncluded=$IncludeJava
+        sha256=[ordered]@{
+            composer=(Get-FileHash -LiteralPath $composerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            pdfbox=(Get-FileHash -LiteralPath $pdfboxPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    [IO.File]::WriteAllText((Join-Path $StageRoot 'release-manifest.json'), ($manifest | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+}
+
 function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
     foreach ($relativePath in @(
         '.git',
@@ -112,6 +153,11 @@ function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
         'app\lib\pdfbox\build.ps1',
         'app\tools\fixtures',
         'app\tools\selfcheck.py',
+        'app\tools\create-scale-benchmark-fixtures.py',
+        'app\tools\create-scale-benchmark-workbooks.mjs',
+        'app\tools\scale-benchmark.ps1',
+        'docs\SCALE_BENCHMARK.md',
+        'docs\benchmarks',
         'app\tools\package-release.ps1'
     )) {
         Remove-PathIfExists (Join-Path $StageRoot $relativePath)
@@ -127,6 +173,7 @@ function Assert-SharedFolderLayout([string]$StageRoot) {
         '英語管理.cmd',
         'README.md',
         'THIRD_PARTY_NOTICES.md',
+        'release-manifest.json',
         'app\launch.ps1',
         'app\server.ps1',
         'app\default-config.json',
@@ -153,7 +200,20 @@ function Assert-SharedFolderLayout([string]$StageRoot) {
         'app\lib\pdfbox\build.ps1',
         'app\tools\fixtures',
         'app\tools\selfcheck.py',
-        'app\tools\package-release.ps1'
+        'app\tools\package-release.ps1',
+        'app\tools\schema-v3-selfcheck.ps1',
+        'app\tools\source-adapter-selfcheck.ps1',
+        'app\tools\pdf-source-adapter-selfcheck.ps1',
+        'app\tools\word-source-adapter-selfcheck.ps1',
+        'app\tools\history-generalization-selfcheck.ps1',
+        'app\tools\final-composition-selfcheck.py',
+        'app\tools\create-word-adapter-fixtures.py',
+        'app\tools\operational-readiness-selfcheck.ps1',
+        'app\tools\create-scale-benchmark-fixtures.py',
+        'app\tools\create-scale-benchmark-workbooks.mjs',
+        'app\tools\scale-benchmark.ps1',
+        'docs\SCALE_BENCHMARK.md',
+        'docs\benchmarks'
     )
     $remaining = @($forbidden | Where-Object {
         Test-Path -LiteralPath (Join-Path $StageRoot $_)
@@ -164,8 +224,9 @@ function Assert-SharedFolderLayout([string]$StageRoot) {
 }
 
 function Copy-ReleaseSource([string]$StageRoot) {
+    $excludedTopLevelNames = @('.git', '.github', '.agents', '.codex', '.gitignore', 'tmp')
     foreach ($item in (Get-ChildItem -LiteralPath $root -Force)) {
-        if ($item.Name -eq '.git') { continue }
+        if ($excludedTopLevelNames -contains $item.Name) { continue }
         Copy-Item -LiteralPath $item.FullName -Destination $StageRoot -Recurse -Force
     }
 }
@@ -245,7 +306,9 @@ function New-SharedFolderRelease {
     try {
         Copy-ReleaseSource $stage
         Remove-RuntimeFiles $stage
+        Remove-ReleaseDevelopmentFiles $stage
         Remove-SharedFolderDevelopmentFiles $stage
+        Write-ReleaseManifest $stage 'shared-folder-offline' $true
         Assert-StagedDependencies -StageRoot $stage -IncludeJava $true
         Assert-SharedFolderLayout $stage
 
@@ -264,12 +327,14 @@ function New-ReleaseZip([string]$Suffix, [bool]$IncludeJava) {
     $stage = Join-Path $tempBase 'ReportBinder'
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
-        Copy-Item -Path (Join-Path $root '*') -Destination $stage -Recurse -Force
+        Copy-ReleaseSource $stage
         Remove-RuntimeFiles $stage
+        Remove-ReleaseDevelopmentFiles $stage
         if (-not $IncludeJava) {
             $java = Join-Path $stage 'app\lib\java'
             if (Test-Path -LiteralPath $java) { Remove-Item -LiteralPath $java -Recurse -Force }
         }
+        Write-ReleaseManifest $stage $Suffix $IncludeJava
         Assert-StagedDependencies -StageRoot $stage -IncludeJava $IncludeJava
         $zip = Join-Path $OutputDir "ReportBinder_V5_${Suffix}_${stamp}.zip"
         if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }

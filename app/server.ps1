@@ -73,13 +73,17 @@ $Script:IdleTimeoutSeconds = 1800
 $Script:NoClientStartupTimeoutSeconds = 600
 $Script:ReadyGifBytes = [Convert]::FromBase64String('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==')
 $Script:ExcelPrintProfileVersion = 2026072201
-$Script:FinalPdfComposerProfileVersion = 20260604
+$Script:PdfImportProfileVersion = 2026080601
+$Script:WordRenderProfileVersion = 2026080601
+$Script:WordRenderTimeoutSeconds = 120
+$Script:FinalPdfComposerProfileVersion = 20260806
 $Script:RenderEnvironmentCache = $null
 $Script:RenderEnvironmentCompared = $false
 $Script:CurrentRenderEnvFingerprint = ''
 $Script:CurrentRenderEnvInfo = $null
 $Script:LastRenderAttempt = $null
 $Script:PdfPageAnalyzerVersion = 1
+$Script:SourceAdapterContractVersion = 1
 $Script:JavaRuntimeSignature = ''
 $Script:PendingAnalysis = $null
 $Script:PdfPageAnalyzerAvailable = $null
@@ -243,9 +247,17 @@ function Get-FileLastWriteSnapshot([string]$Path) {
     }
 }
 
+function ConvertTo-Win32ExtendedPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or [Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $Path.StartsWith('\\?\')) { return $Path }
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full.Length -lt 240) { return $full }
+    if ($full.StartsWith('\\')) { return '\\?\UNC\' + $full.Substring(2) }
+    return '\\?\' + $full
+}
+
 function Read-TextFileShared([string]$Path) {
     $share = [IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete)
-    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+    $fs = [IO.File]::Open((ConvertTo-Win32ExtendedPath $Path), [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
     try {
         $reader = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8, $true)
         try { return $reader.ReadToEnd() }
@@ -258,7 +270,7 @@ function Read-TextFileShared([string]$Path) {
 function Read-JsonFile([string]$Path, $DefaultValue) {
     for ($attempt = 0; $attempt -lt 10; $attempt++) {
         try {
-            if (-not (Test-Path -LiteralPath $Path)) { return $DefaultValue }
+            if (-not [IO.File]::Exists((ConvertTo-Win32ExtendedPath $Path))) { return $DefaultValue }
             $text = Read-TextFileShared $Path
             if ([string]::IsNullOrWhiteSpace($text)) { return $DefaultValue }
             return $text | ConvertFrom-Json
@@ -287,7 +299,7 @@ function Write-Utf8NoBomFile([string]$Path, [string]$Text) {
     # Windows PowerShell 5.1's Set-Content -Encoding UTF8 writes a BOM.
     # ReportPdfComposer's compact JSON reader expects plain UTF-8, so write JSON files without BOM.
     $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
-    [IO.File]::WriteAllText($Path, $Text, $encoding)
+    [IO.File]::WriteAllText((ConvertTo-Win32ExtendedPath $Path), $Text, $encoding)
 }
 
 function Write-Utf8NoBomFileShared([string]$Path, [string]$Text) {
@@ -297,12 +309,13 @@ function Write-Utf8NoBomFileShared([string]$Path, [string]$Text) {
     $encoding = New-Object System.Text.UTF8Encoding -ArgumentList $false
     $bytes = $encoding.GetBytes($Text)
     $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $extendedParent = ConvertTo-Win32ExtendedPath $parent
+    if (-not [IO.Directory]::Exists($extendedParent)) { [void][IO.Directory]::CreateDirectory($extendedParent) }
     for ($attempt = 0; $attempt -lt 12; $attempt++) {
         $fs = $null
         try {
             $share = [IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete)
-            $fs = [IO.File]::Open($Path, [IO.FileMode]::Create, [IO.FileAccess]::Write, $share)
+            $fs = [IO.File]::Open((ConvertTo-Win32ExtendedPath $Path), [IO.FileMode]::Create, [IO.FileAccess]::Write, $share)
             $fs.Write($bytes, 0, $bytes.Length)
             try { $fs.Flush($true) } catch { $fs.Flush() }
             return
@@ -318,16 +331,18 @@ function Write-Utf8NoBomFileShared([string]$Path, [string]$Text) {
 }
 
 function Move-FileAtomicCompat([string]$SourcePath, [string]$DestinationPath) {
+    $sourceIoPath = ConvertTo-Win32ExtendedPath $SourcePath
+    $destinationIoPath = ConvertTo-Win32ExtendedPath $DestinationPath
     for ($attempt = 0; $attempt -lt 12; $attempt++) {
         try {
-            if (Test-Path -LiteralPath $DestinationPath) {
-                [IO.File]::Replace($SourcePath, $DestinationPath, $null, $true)
+            if ([IO.File]::Exists($destinationIoPath)) {
+                [IO.File]::Replace($sourceIoPath, $destinationIoPath, $null, $true)
             } else {
-                [IO.File]::Move($SourcePath, $DestinationPath)
+                [IO.File]::Move($sourceIoPath, $destinationIoPath)
             }
             return
         } catch [System.IO.FileNotFoundException] {
-            try { [IO.File]::Move($SourcePath, $DestinationPath); return } catch { if ($attempt -ge 11) { throw } }
+            try { [IO.File]::Move($sourceIoPath, $destinationIoPath); return } catch { if ($attempt -ge 11) { throw } }
         } catch [System.IO.IOException] {
             if ($attempt -ge 11) { throw }
         } catch [System.UnauthorizedAccessException] {
@@ -339,7 +354,8 @@ function Move-FileAtomicCompat([string]$SourcePath, [string]$DestinationPath) {
 
 function Write-JsonFile([string]$Path, $Value) {
     $parent = Split-Path -Parent $Path
-    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $extendedParent = ConvertTo-Win32ExtendedPath $parent
+    if (-not [IO.Directory]::Exists($extendedParent)) { [void][IO.Directory]::CreateDirectory($extendedParent) }
     $tmp = "$Path.tmp.$([Guid]::NewGuid().ToString('N'))"
     $json = ConvertTo-Json -InputObject $Value -Depth 50
     $atomicError = ''
@@ -360,7 +376,8 @@ function Write-JsonFile([string]$Path, $Value) {
             throw "JSON保存に失敗しました: $Path / atomic=$atomicError / shared=$($_.Exception.Message)"
         }
     } finally {
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        $tmpIoPath = ConvertTo-Win32ExtendedPath $tmp
+        if ([IO.File]::Exists($tmpIoPath)) { try { [IO.File]::Delete($tmpIoPath) } catch { } }
     }
 }
 
@@ -412,10 +429,15 @@ function Set-ArrayProperty($Object, [string]$Name) {
 
 function Normalize-StructureCollections($Structure) {
     if ($null -eq $Structure) { return $Structure }
+    $version = 0
+    try { $version = [int](Get-DataProperty $Structure 'schemaVersion' 0) } catch { $version = 0 }
+    if ($version -eq 3) { Update-LegacyCompatibilityViewFromV3 $Structure }
     Set-ArrayProperty $Structure 'workbooks'
     Set-ArrayProperty $Structure 'pages'
-    if ($null -eq $Structure.volumes) {
-        $Structure | Add-Member -NotePropertyName 'volumes' -NotePropertyValue ([ordered]@{}) -Force
+    if (-not (Test-ConfigHasKey $Structure 'volumes') -or $null -eq (Get-DataProperty $Structure 'volumes' $null)) { Set-NoteProperty $Structure 'volumes' ([ordered]@{}) }
+    if ($version -eq 3) {
+        foreach ($name in @('packs','sources','units','items','artifacts','migrationIssues')) { Set-ArrayProperty $Structure $name }
+        if (-not (Test-ConfigHasKey $Structure 'outputs') -or $null -eq (Get-DataProperty $Structure 'outputs' $null)) { Set-NoteProperty $Structure 'outputs' ([ordered]@{}) }
     }
     return $Structure
 }
@@ -967,6 +989,198 @@ function Get-VolumeStateKey([string]$Volume, [string]$Category) {
     return "$Volume|$cat"
 }
 
+function Test-DirectWordRelativePath([string]$RelativePath) {
+    Test-RelativePath $RelativePath | Out-Null
+    if ($RelativePath -match '[\/]') { throw '提出フォルダ直下のWord原稿だけ登録できます。子フォルダ内のファイルは対象外です。' }
+    $ext = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    if ($ext -ne '.docx') { throw '拡張子が .docx のWord原稿だけ登録できます。' }
+    if ([IO.Path]::GetFileName($RelativePath) -like '~$*') { throw 'Wordの一時ファイルは登録できません。' }
+    return $true
+}
+
+function Get-BuiltinPackId([string]$Category) {
+    $cat = Normalize-WorkbookCategory $Category ''
+    if ([string]::IsNullOrWhiteSpace($cat)) { return '' }
+    return "pack_$cat"
+}
+
+function Get-CategoryFromBuiltinPackId([string]$PackId) {
+    $value = ([string]$PackId).Trim().ToLowerInvariant()
+    if ($value -match '^pack_(ecm|bod|dmm)$') { return [string]$matches[1] }
+    return ''
+}
+
+function Get-TargetIdFromLegacyVolume([string]$Volume) {
+    $value = ([string]$Volume).Trim().ToLowerInvariant()
+    if ($value -eq 'none' -or $value -eq 'unassigned') { return 'unassigned' }
+    if ($value -match '^(ja|en)-(main|appendix)$') { return [string]$matches[2] }
+    if ($value -in @('main','appendix')) { return $value }
+    return 'unassigned'
+}
+
+function Get-LegacyVolumeFromTargetId([string]$Language, [string]$TargetId) {
+    $target = ([string]$TargetId).Trim().ToLowerInvariant()
+    if ($target -eq 'main') { return "${Language}-main" }
+    if ($target -eq 'appendix') { return "${Language}-appendix" }
+    return 'none'
+}
+
+function New-BuiltinPack([string]$Category, [string]$Language, $Existing = $null) {
+    $cat = Require-WorkbookCategory $Category
+    $display = $cat.ToUpperInvariant()
+    return [pscustomobject][ordered]@{
+        packId = Get-BuiltinPackId $cat
+        templateId = "builtin-$cat"
+        templateVersion = Get-IntDataProperty $Existing 'templateVersion' 1
+        displayName = [string](Get-DataProperty $Existing 'displayName' $display)
+        language = $Language
+        createdAt = Get-DataProperty $Existing 'createdAt' (New-NowIso)
+        settings = Get-DataProperty $Existing 'settings' ([ordered]@{})
+        legacyCategory = $cat
+    }
+}
+
+function Get-DefaultPackSettings([string]$Language, [string]$DisplayName) {
+    $name = ([string]$DisplayName).Trim()
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'ReportBinder' }
+    return [ordered]@{
+        documentTitle = $name
+        documentSubtitle = ''
+        includeCover = $false
+        includeToc = $false
+        includeSectionDividers = $false
+        outputFileNamePattern = $(if ($Language -eq 'en') { '{projectId}_E_{targetName}.pdf' } else { '{projectId}_J_{targetName}.pdf' })
+    }
+}
+
+function Get-ResolvedPackSettings($Pack, [string]$Language) {
+    $defaults = Get-DefaultPackSettings $Language ([string](Get-DataProperty $Pack 'displayName' 'ReportBinder'))
+    $saved = Get-DataProperty $Pack 'settings' $null
+    foreach ($name in @('documentTitle','documentSubtitle','outputFileNamePattern')) {
+        $value = [string](Get-DataProperty $saved $name (Get-DataProperty $defaults $name ''))
+        $defaults[$name] = $value
+    }
+    foreach ($name in @('includeCover','includeToc','includeSectionDividers')) {
+        $defaults[$name] = [bool](Get-DataProperty $saved $name (Get-DataProperty $defaults $name $false))
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$defaults.documentTitle)) { $defaults.documentTitle = [string](Get-DataProperty $Pack 'displayName' 'ReportBinder') }
+    if ([string]::IsNullOrWhiteSpace([string]$defaults.outputFileNamePattern)) { $defaults.outputFileNamePattern = $(if ($Language -eq 'en') { '{projectId}_E_{targetName}.pdf' } else { '{projectId}_J_{targetName}.pdf' }) }
+    return $defaults
+}
+
+function ConvertTo-NormalizedPageRange($Value) {
+    if ($null -eq $Value) { return $null }
+    $start = 0; $end = 0
+    if ($Value -is [string]) {
+        $text = ([string]$Value).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        if ($text -notmatch '^(?<start>\d+)(?:\s*-\s*(?<end>\d+))?$') { throw [ArgumentException]::new('ページ範囲は「2」または「2-5」の形式で入力してください。') }
+        $start = [int]$matches.start; $end = if ($matches.end) { [int]$matches.end } else { $start }
+    } else {
+        $start = Get-IntDataProperty $Value 'start' 0
+        $end = Get-IntDataProperty $Value 'end' $start
+    }
+    if ($start -lt 1 -or $end -lt $start) { throw [ArgumentException]::new('ページ範囲は1以上で、開始ページが終了ページを超えないようにしてください。') }
+    return [ordered]@{ start = $start; end = $end }
+}
+
+function Get-TargetDisplayName([string]$Language, [string]$Volume) {
+    if ($Volume -match 'appendix$') { return $(if ($Language -eq 'en') { 'Appendix' } else { '補足' }) }
+    return $(if ($Language -eq 'en') { 'Main' } else { '本体' })
+}
+
+function Resolve-OutputFileNamePattern([string]$Pattern, [string]$ProjectId, [string]$PackName, [string]$TargetName) {
+    $value = ([string]$Pattern).Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { $value = '{projectId}_{targetName}.pdf' }
+    $unknown = [regex]::Matches($value, '\{[^{}]+\}') | ForEach-Object { $_.Value } | Where-Object { $_ -notin @('{projectId}','{packName}','{targetName}','{yyyyMMdd}') } | Select-Object -Unique
+    if (@($unknown).Count -gt 0) { throw [ArgumentException]::new("未対応のファイル名プレースホルダーです: $(@($unknown) -join ', ')") }
+    $resolved = $value.Replace('{projectId}', $ProjectId).Replace('{packName}', $PackName).Replace('{targetName}', $TargetName).Replace('{yyyyMMdd}', (Get-Date -Format 'yyyyMMdd'))
+    if ($resolved.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $resolved -match '[\\/]') { throw [ArgumentException]::new('出力ファイル名に使用できない文字が含まれています。') }
+    if (-not $resolved.EndsWith('.pdf', [StringComparison]::OrdinalIgnoreCase)) { $resolved += '.pdf' }
+    return $resolved
+}
+
+function Update-PackSettings([string]$Language, [string]$PackId, $Patch) {
+    $id = ([string]$PackId).Trim()
+    if ([string]::IsNullOrWhiteSpace($id)) { throw [ArgumentException]::new('packId が必要です。') }
+    return Update-StructureLocked $Language {
+        param($structure)
+        $matches = @(Get-Array (Get-DataProperty $structure 'packs' @()) | Where-Object { [string](Get-DataProperty $_ 'packId' '') -eq $id } | Select-Object -First 1)
+        if ($matches.Count -eq 0) { throw [ArgumentException]::new('指定された資料パックが見つかりません。') }
+        $pack = $matches[0]; $settings = Get-ResolvedPackSettings $pack $Language
+        foreach ($name in @('documentTitle','documentSubtitle','outputFileNamePattern')) {
+            if ($null -ne (Get-DataProperty $Patch $name $null)) { $settings[$name] = ([string](Get-DataProperty $Patch $name '')).Trim() }
+        }
+        foreach ($name in @('includeCover','includeToc','includeSectionDividers')) {
+            if ($null -ne (Get-DataProperty $Patch $name $null)) { $settings[$name] = [bool](Get-DataProperty $Patch $name $false) }
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$settings.documentTitle)) { throw [ArgumentException]::new('資料タイトルを入力してください。') }
+        [void](Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) 'PROJECT' ([string]$pack.displayName) (Get-TargetDisplayName $Language ("$Language-main")))
+        Set-NoteProperty $pack 'settings' $settings
+        $category = Get-CategoryFromBuiltinPackId $id
+        if (-not [string]::IsNullOrWhiteSpace($category)) { Mark-VolumeNeedsRebuild $structure $Language $category @("$Language-main","$Language-appendix") 'document-settings' '資料の仕上げ設定を変更しました' }
+        return [ordered]@{ packId=$id; settings=$settings; updatedAt=(New-NowIso) }
+    }
+}
+
+function Get-PackTemplateCatalog([string]$Language) {
+    if ($Language -notin @('ja','en')) { $Language = 'ja' }
+    $targets = @(
+        [pscustomobject][ordered]@{ targetId = 'main'; displayName = $(if ($Language -eq 'en') { 'Main' } else { '本体' }); required = $false },
+        [pscustomobject][ordered]@{ targetId = 'appendix'; displayName = $(if ($Language -eq 'en') { 'Appendix' } else { '補足' }); required = $false }
+    )
+    return @('ecm','bod','dmm') | ForEach-Object {
+        $category = $_
+        [pscustomobject][ordered]@{
+            templateId = "builtin-$category"
+            templateVersion = 1
+            packId = Get-BuiltinPackId $category
+            displayName = $category.ToUpperInvariant()
+            description = $(if ($Language -eq 'en') { "Built-in $($category.ToUpperInvariant()) document pack" } else { "$($category.ToUpperInvariant()) 資料パック" })
+            acceptedSourceTypes = @('excel','word','pdf')
+            targets = @($targets)
+            workflowAvailable = $true
+            builtIn = $true
+        }
+    }
+}
+
+function Get-PublicPackList($Structure, [string]$Language) {
+    $templates = @{}; foreach ($template in @(Get-PackTemplateCatalog $Language)) { $templates[[string]$template.templateId] = $template }
+    $result = @()
+    foreach ($pack in @(Get-Array (Get-DataProperty $Structure 'packs' @()))) {
+        $templateId = [string](Get-DataProperty $pack 'templateId' '')
+        $template = if ($templates.ContainsKey($templateId)) { $templates[$templateId] } else { $null }
+        $category = Get-CategoryFromBuiltinPackId ([string](Get-DataProperty $pack 'packId' ''))
+        $result += [pscustomobject][ordered]@{
+            packId = [string](Get-DataProperty $pack 'packId' '')
+            templateId = $templateId
+            templateVersion = Get-IntDataProperty $pack 'templateVersion' 1
+            displayName = [string](Get-DataProperty $pack 'displayName' '')
+            language = [string](Get-DataProperty $pack 'language' $Language)
+            category = $category
+            acceptedSourceTypes = [object[]](Get-Array (Get-DataProperty $template 'acceptedSourceTypes' @()))
+            targets = [object[]](Get-Array (Get-DataProperty $template 'targets' @()))
+            workflowAvailable = (-not [string]::IsNullOrWhiteSpace($category))
+            builtIn = ($null -ne $template)
+            createdAt = Get-DataProperty $pack 'createdAt' $null
+            settings = Get-ResolvedPackSettings $pack $Language
+        }
+    }
+    return @($result)
+}
+
+function New-WorksheetUnitId([string]$SourceId, [string]$SheetName) {
+    if ([string]::IsNullOrWhiteSpace($SourceId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
+    return "unit-$SourceId-$(Get-WorksheetStorageStem $SheetName)"
+}
+
+function New-ArtifactId([string]$SourceId, [string]$UnitId, [string]$SnapshotId, [string]$VersionId, [string]$RelativePdfPath) {
+    $identity = @($SourceId,$UnitId,$SnapshotId,$VersionId,(([string]$RelativePdfPath -replace '\\','/').ToLowerInvariant())) -join '|'
+    if ([string]::IsNullOrWhiteSpace($identity.Replace('|',''))) { return '' }
+    return 'artifact-' + (Get-Sha256Text $identity).Substring(7, 20)
+}
+
 function New-EmptyStructure([string]$Language) {
     $volumes = [ordered]@{}
     foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
@@ -974,14 +1188,24 @@ function New-EmptyStructure([string]$Language) {
             $volumes[(Get-VolumeStateKey $volume $category)] = New-EmptyVolumeState
         }
     }
-    return [ordered]@{
-        schemaVersion = 2
+    $structure = [pscustomobject][ordered]@{
+        schemaVersion = 3
         language = $Language
+        packs = @()
+        sources = @()
+        units = @()
+        items = @()
+        artifacts = @()
+        outputs = [ordered]@{}
+        migrationIssues = @()
+        compatibility = [ordered]@{ schemaVersion = 2; mode = 'legacy-mirror'; updatedAt = New-NowIso }
         workbooks = @()
         pages = @()
         volumes = $volumes
         updatedAt = New-NowIso
     }
+    Sync-StructureV3FromLegacy $structure $Language | Out-Null
+    return $structure
 }
 
 function Ensure-Package($Paths, [string[]]$Languages = @('ja','en')) {
@@ -1091,16 +1315,271 @@ function Get-IntDataProperty($Object, [string]$Name, [int]$DefaultValue = 0) {
     try { return [int](Get-DataProperty $Object $Name $DefaultValue) } catch { return $DefaultValue }
 }
 
+function Update-LegacyCompatibilityViewFromV3($Structure) {
+    if ($null -eq $Structure) { return }
+    $sources = @(Get-Array (Get-DataProperty $Structure 'sources' @()))
+    $items = @(Get-Array (Get-DataProperty $Structure 'items' @()))
+    $workbooks = @(Get-Array (Get-DataProperty $Structure 'workbooks' @()))
+    $pages = @(Get-Array (Get-DataProperty $Structure 'pages' @()))
+    if ($workbooks.Count -eq 0 -and $sources.Count -gt 0) {
+        $rebuilt = @()
+        foreach ($source in $sources) {
+            $legacy = Get-DataProperty $source 'legacyWorkbook' $null
+            if ($null -eq $legacy) {
+                $legacy = [pscustomobject][ordered]@{
+                    workbookId = [string](Get-DataProperty $source 'sourceId' '')
+                    relativePath = [string](Get-DataProperty $source 'relativePath' '')
+                    fileName = [IO.Path]::GetFileName([string](Get-DataProperty $source 'relativePath' ''))
+                    displayName = [string](Get-DataProperty $source 'displayName' '')
+                    category = Get-CategoryFromBuiltinPackId ([string](Get-DataProperty $source 'packId' ''))
+                    status = [string](Get-DataProperty $source 'status' 'new')
+                    currentExcelHash = [string](Get-DataProperty $source 'currentSourceHash' '')
+                    currentSnapshotId = [string](Get-DataProperty $source 'currentSnapshotId' '')
+                    lastRenderedSnapshotId = [string](Get-DataProperty $source 'lastRenderedSnapshotId' '')
+                    lastRenderedVersionId = [string](Get-DataProperty $source 'lastRenderedVersionId' '')
+                    lastRenderedAt = Get-DataProperty $source 'lastRenderedAt' $null
+                }
+            }
+            $rebuilt += $legacy
+        }
+        Set-NoteProperty $Structure 'workbooks' @($rebuilt)
+    }
+    if ($pages.Count -eq 0 -and $items.Count -gt 0) {
+        $rebuiltPages = @()
+        foreach ($item in $items) {
+            $legacy = Get-DataProperty $item 'legacyPage' $null
+            if ($null -eq $legacy) {
+                $legacy = [pscustomobject][ordered]@{
+                    pageId = [string](Get-DataProperty $item 'itemId' '')
+                    workbookId = [string](Get-DataProperty $item 'sourceId' '')
+                    sheetName = [string](Get-DataProperty $item 'sourceTitle' (Get-DataProperty $item 'title' ''))
+                    title = [string](Get-DataProperty $item 'title' '')
+                    volume = Get-LegacyVolumeFromTargetId ([string](Get-DataProperty $Structure 'language' 'ja')) ([string](Get-DataProperty $item 'targetId' 'unassigned'))
+                    order = Get-DataProperty $item 'order' 0
+                    enabled = [bool](Get-DataProperty $item 'enabled' $true)
+                    numberingMode = [string](Get-DataProperty $item 'numberingMode' 'visible')
+                    numberingManual = [bool](Get-DataProperty $item 'numberingManual' $false)
+                    pageRange = Get-DataProperty $item 'pageRange' $null
+                    contentPdf = [string](Get-DataProperty $item 'legacyContentPdf' '')
+                }
+            }
+            $rebuiltPages += $legacy
+        }
+        Set-NoteProperty $Structure 'pages' @($rebuiltPages)
+    }
+    $volumes = Get-DataProperty $Structure 'volumes' $null
+    if ($null -eq $volumes -or @(Get-ConfigKeyNames $volumes).Count -eq 0) {
+        $rebuiltVolumes = [ordered]@{}
+        $outputs = Get-DataProperty $Structure 'outputs' ([ordered]@{})
+        foreach ($key in @(Get-ConfigKeyNames $outputs)) {
+            $output = Get-DataProperty $outputs $key $null
+            if ($null -eq $output) { continue }
+            $packId = [string](Get-DataProperty $output 'packId' '')
+            $targetId = [string](Get-DataProperty $output 'targetId' '')
+            $category = Get-CategoryFromBuiltinPackId $packId
+            if ([string]::IsNullOrWhiteSpace($category)) { continue }
+            $legacyVolume = Get-LegacyVolumeFromTargetId ([string](Get-DataProperty $Structure 'language' 'ja')) $targetId
+            if ($legacyVolume -eq 'none') { continue }
+            $legacyState = Get-DataProperty $output 'legacyVolume' $null
+            if ($null -eq $legacyState) {
+                $legacyState = [pscustomobject][ordered]@{
+                    status = [string](Get-DataProperty $output 'status' 'not-built')
+                    lastBuiltAt = Get-DataProperty $output 'lastBuiltAt' $null
+                    outputPdf = Get-DataProperty $output 'outputPdf' $null
+                    builtFingerprint = [string](Get-DataProperty $output 'builtFingerprint' '')
+                    staleReasons = @(Get-Array (Get-DataProperty $output 'staleReasons' @()))
+                    message = [string](Get-DataProperty $output 'message' '')
+                }
+            }
+            $rebuiltVolumes[(Get-VolumeStateKey $legacyVolume $category)] = $legacyState
+        }
+        Set-NoteProperty $Structure 'volumes' $rebuiltVolumes
+    }
+}
+
+function Sync-StructureV3FromLegacy($Structure, [string]$Language = '') {
+    if ($null -eq $Structure) { return $Structure }
+    if ([string]::IsNullOrWhiteSpace($Language)) { $Language = [string](Get-DataProperty $Structure 'language' 'ja') }
+    if ($Language -notin @('ja','en')) { $Language = 'ja' }
+    $oldPackMap = @{}; foreach ($x in @(Get-Array (Get-DataProperty $Structure 'packs' @()))) { $oldPackMap[[string](Get-DataProperty $x 'packId' '')] = $x }
+    $oldSourceMap = @{}; foreach ($x in @(Get-Array (Get-DataProperty $Structure 'sources' @()))) { $oldSourceMap[[string](Get-DataProperty $x 'sourceId' '')] = $x }
+    $oldUnitMap = @{}; foreach ($x in @(Get-Array (Get-DataProperty $Structure 'units' @()))) { $oldUnitMap[[string](Get-DataProperty $x 'unitId' '')] = $x }
+    $oldItemMap = @{}; foreach ($x in @(Get-Array (Get-DataProperty $Structure 'items' @()))) { $oldItemMap[[string](Get-DataProperty $x 'itemId' '')] = $x }
+    $oldArtifactMap = @{}; foreach ($x in @(Get-Array (Get-DataProperty $Structure 'artifacts' @()))) { $oldArtifactMap[[string](Get-DataProperty $x 'artifactId' '')] = $x }
+    $oldOutputs = Get-DataProperty $Structure 'outputs' ([ordered]@{})
+    $packs = @()
+    foreach ($category in @('ecm','bod','dmm')) {
+        $packId = Get-BuiltinPackId $category
+        $existing = if ($oldPackMap.ContainsKey($packId)) { $oldPackMap[$packId] } else { $null }
+        $packs += New-BuiltinPack $category $Language $existing
+    }
+    foreach ($oldPack in @(Get-Array (Get-DataProperty $Structure 'packs' @()))) {
+        if ([string]::IsNullOrWhiteSpace((Get-CategoryFromBuiltinPackId ([string](Get-DataProperty $oldPack 'packId' ''))))) { $packs += $oldPack }
+    }
+    $sources = @(); $sourceById = @{}
+    foreach ($wb in @(Get-Array (Get-DataProperty $Structure 'workbooks' @()))) {
+        $sourceId = [string](Get-DataProperty $wb 'workbookId' '')
+        if ([string]::IsNullOrWhiteSpace($sourceId)) { continue }
+        $category = Normalize-WorkbookCategory ([string](Get-DataProperty $wb 'category' '')) ([string](Get-DataProperty $wb 'fileName' ''))
+        if ([string]::IsNullOrWhiteSpace($category)) { $category = 'ecm' }
+        $old = if ($oldSourceMap.ContainsKey($sourceId)) { $oldSourceMap[$sourceId] } else { $null }
+        $sourceType = ([string](Get-DataProperty $wb 'sourceType' (Get-DataProperty $old 'sourceType' ''))).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($sourceType)) {
+            $extension = [IO.Path]::GetExtension([string](Get-DataProperty $wb 'relativePath' '')).ToLowerInvariant()
+            $sourceType = $(if ($extension -eq '.pdf') { 'pdf' } elseif ($extension -eq '.docx') { 'word' } else { 'excel' })
+        }
+        $defaultAdapterId = $(if ($sourceType -eq 'pdf') { 'pdfbox-import-v1' } elseif ($sourceType -eq 'word') { 'word-com-v1' } else { 'excel-com-v1' })
+        Set-NoteProperty $wb 'packId' (Get-BuiltinPackId $category)
+        Set-NoteProperty $wb 'sourceType' $sourceType
+        Set-NoteProperty $wb 'adapterId' ([string](Get-DataProperty $old 'adapterId' (Get-DataProperty $wb 'adapterId' $defaultAdapterId)))
+        Set-NoteProperty $wb 'ownerDepartment' ([string](Get-DataProperty $old 'ownerDepartment' (Get-DataProperty $wb 'ownerDepartment' '')))
+        Set-NoteProperty $wb 'required' ([bool](Get-DataProperty $old 'required' (Get-DataProperty $wb 'required' $true)))
+        Set-NoteProperty $wb 'defaultTargetId' ([string](Get-DataProperty $old 'defaultTargetId' (Get-DataProperty $wb 'defaultTargetId' 'unassigned')))
+        $source = [pscustomobject][ordered]@{
+            sourceId = $sourceId; packId = Get-BuiltinPackId $category
+            relativePath = [string](Get-DataProperty $wb 'relativePath' (Get-DataProperty $wb 'fileName' ''))
+            sourceType = $sourceType; adapterId = [string](Get-DataProperty $wb 'adapterId' $defaultAdapterId)
+            displayName = [string](Get-DataProperty $wb 'displayName' (Get-DataProperty $wb 'fileName' $sourceId))
+            ownerDepartment = [string](Get-DataProperty $wb 'ownerDepartment' '')
+            required = [bool](Get-DataProperty $wb 'required' $true)
+            defaultTargetId = [string](Get-DataProperty $wb 'defaultTargetId' 'unassigned')
+            status = [string](Get-DataProperty $wb 'status' 'new')
+            currentSourceHash = [string](Get-DataProperty $wb 'currentExcelHash' '')
+            currentSnapshotId = [string](Get-DataProperty $wb 'currentSnapshotId' '')
+            lastRenderedSnapshotId = [string](Get-DataProperty $wb 'lastRenderedSnapshotId' '')
+            lastRenderedVersionId = [string](Get-DataProperty $wb 'lastRenderedVersionId' '')
+            lastRenderedAt = Get-DataProperty $wb 'lastRenderedAt' $null
+            sourceMetadata = [ordered]@{ size = Get-DataProperty $wb 'currentExcelSize' 0; modifiedAtUtcTicks = [string](Get-DataProperty $wb 'currentExcelLastWriteUtcTicks' '') }
+            legacyWorkbook = $wb
+        }
+        $sources += $source; $sourceById[$sourceId] = $source
+    }
+    $units = @(); $unitAdded = @{}; $items = @(); $artifactMap = [ordered]@{}
+    foreach ($page in @(Get-Array (Get-DataProperty $Structure 'pages' @()))) {
+        $sourceId = [string](Get-DataProperty $page 'workbookId' ''); $sheetName = [string](Get-DataProperty $page 'sheetName' ''); $itemId = Resolve-PageId $page
+        if ([string]::IsNullOrWhiteSpace($sourceId) -or [string]::IsNullOrWhiteSpace($itemId)) { continue }
+        $unitId = New-WorksheetUnitId $sourceId $sheetName
+        $source = if ($sourceById.ContainsKey($sourceId)) { $sourceById[$sourceId] } else { $null }
+        $packId = if ($null -ne $source) { [string]$source.packId } else { Get-BuiltinPackId 'ecm' }
+        $sourceType = if ($null -ne $source) { [string](Get-DataProperty $source 'sourceType' 'excel') } else { 'excel' }
+        $unitKind = if ($sourceType -eq 'pdf') { 'pdf-page' } elseif ($sourceType -eq 'word') { 'document-page' } else { 'worksheet' }
+        $adapterId = if ($sourceType -eq 'pdf') { 'pdfbox-import-v1' } elseif ($sourceType -eq 'word') { 'word-com-v1' } else { 'excel-com-v1' }
+        $versionId = if ($null -ne $source) { [string]$source.lastRenderedVersionId } else { '' }
+        $snapshotId = if ($null -ne $source) { [string]$source.lastRenderedSnapshotId } else { '' }
+        $relativePdf = [string](Get-DataProperty $page 'contentPdf' ''); $artifactId = ''
+        if (-not [string]::IsNullOrWhiteSpace($relativePdf)) {
+            $artifactId = New-ArtifactId $sourceId $unitId $snapshotId $versionId $relativePdf
+            if (-not $artifactMap.Contains($artifactId)) {
+                $oldArtifact = if ($oldArtifactMap.ContainsKey($artifactId)) { $oldArtifactMap[$artifactId] } else { $null }
+                $artifactMap[$artifactId] = [pscustomobject][ordered]@{
+                    artifactId = $artifactId; sourceId = $sourceId; unitId = $unitId; snapshotId = $snapshotId
+                    adapterId = $adapterId; adapterVersion = 1; relativePdfPath = $relativePdf
+                    sha256 = [string](Get-DataProperty $oldArtifact 'sha256' ''); pageCount = Get-IntDataProperty $oldArtifact 'pageCount' 0
+                    createdAt = Get-DataProperty $oldArtifact 'createdAt' (Get-DataProperty $source 'lastRenderedAt' $null)
+                }
+            }
+        }
+        $oldUnit = if ($oldUnitMap.ContainsKey($unitId)) { $oldUnitMap[$unitId] } else { $null }
+        $artifactPageCount = if ($artifactMap.Contains($artifactId)) { Get-IntDataProperty $artifactMap[$artifactId] 'pageCount' 0 } else { 0 }
+        if (-not $unitAdded.ContainsKey($unitId)) {
+            $units += [pscustomobject][ordered]@{
+                unitId = $unitId; sourceId = $sourceId; unitKind = $unitKind; sourceKey = $(if ($sourceType -in @('pdf','word')) { "page:$([int](Get-DataProperty $page 'sheetIndex' 0))" } else { "worksheet:$sheetName" })
+                title = [string](Get-DataProperty $page 'title' $sheetName); sourceIndex = Get-IntDataProperty $page 'sheetIndex' 0
+                status = [string](Get-DataProperty $page 'status' 'not-rendered'); renderVersionId = $versionId; artifactId = $artifactId
+                physicalPageCount = Get-IntDataProperty $oldUnit 'physicalPageCount' $artifactPageCount
+            }
+            $unitAdded[$unitId] = $true
+        }
+        $oldItem = if ($oldItemMap.ContainsKey($itemId)) { $oldItemMap[$itemId] } else { $null }
+        $item = [pscustomobject][ordered]@{
+            itemId = $itemId; packId = $packId; sourceId = $sourceId; unitId = $unitId
+            targetId = Get-TargetIdFromLegacyVolume ([string](Get-DataProperty $page 'volume' 'none'))
+            sectionId = [string](Get-DataProperty $oldItem 'sectionId' 'body'); order = Get-DataProperty $page 'order' 0
+            enabled = [bool](Get-DataProperty $page 'enabled' $true); title = [string](Get-DataProperty $page 'title' $sheetName); sourceTitle = $sheetName
+            numberingMode = [string](Get-DataProperty $page 'numberingMode' 'visible'); numberingManual = [bool](Get-DataProperty $page 'numberingManual' $false)
+            artifactId = $artifactId; pageRange = Get-DataProperty $page 'pageRange' (Get-DataProperty $oldItem 'pageRange' $null); legacyContentPdf = $relativePdf; legacyPage = $page
+        }
+        $items += $item
+    }
+    $outputs = [ordered]@{}; $legacyVolumes = Get-DataProperty $Structure 'volumes' ([ordered]@{})
+    foreach ($category in @('ecm','bod','dmm')) {
+        $packId = Get-BuiltinPackId $category
+        foreach ($legacyVolume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
+            $targetId = Get-TargetIdFromLegacyVolume $legacyVolume; $outputKey = "$packId|$targetId"
+            $legacyState = Get-DataProperty $legacyVolumes (Get-VolumeStateKey $legacyVolume $category) $null
+            if ($null -eq $legacyState) { $legacyState = New-EmptyVolumeState }
+            $oldOutput = Get-DataProperty $oldOutputs $outputKey $null
+            $outputs[$outputKey] = [pscustomobject][ordered]@{
+                packId = $packId; targetId = $targetId; status = [string](Get-DataProperty $legacyState 'status' 'not-built')
+                lastBuiltAt = Get-DataProperty $legacyState 'lastBuiltAt' $null; outputPdf = Get-DataProperty $legacyState 'outputPdf' $null
+                builtFingerprint = [string](Get-DataProperty $legacyState 'builtFingerprint' ''); staleReasons = @(Get-Array (Get-DataProperty $legacyState 'staleReasons' @()))
+                message = [string](Get-DataProperty $legacyState 'message' ''); buildId = [string](Get-DataProperty $oldOutput 'buildId' ''); legacyVolume = $legacyState
+            }
+        }
+    }
+    foreach ($oldKey in @(Get-ConfigKeyNames $oldOutputs)) { if (-not $outputs.Contains($oldKey)) { $outputs[$oldKey] = Get-DataProperty $oldOutputs $oldKey $null } }
+    Set-NoteProperty $Structure 'schemaVersion' 3; Set-NoteProperty $Structure 'language' $Language
+    Set-NoteProperty $Structure 'packs' @($packs); Set-NoteProperty $Structure 'sources' @($sources); Set-NoteProperty $Structure 'units' @($units)
+    Set-NoteProperty $Structure 'items' @($items); Set-NoteProperty $Structure 'artifacts' @($artifactMap.Values); Set-NoteProperty $Structure 'outputs' $outputs
+    if (-not (Test-ConfigHasKey $Structure 'migrationIssues')) { Set-NoteProperty $Structure 'migrationIssues' @() }
+    Set-NoteProperty $Structure 'compatibility' ([ordered]@{ schemaVersion = 2; mode = 'legacy-mirror'; updatedAt = New-NowIso })
+    return $Structure
+}
+
+function ConvertTo-StructureV3($Structure, [string]$Language, [string]$Workspace = '') {
+    $Structure = Normalize-StructureCollections $Structure; [void](Repair-StructurePages $Structure); $issues = @()
+    foreach ($wb in @(Get-Array $Structure.workbooks)) {
+        $category = Normalize-WorkbookCategory ([string](Get-DataProperty $wb 'category' '')) ([string](Get-DataProperty $wb 'fileName' ''))
+        if ([string]::IsNullOrWhiteSpace($category)) {
+            $issues += [pscustomobject][ordered]@{ code = 'category-unresolved'; sourceId = [string](Get-DataProperty $wb 'workbookId' ''); relativePath = [string](Get-DataProperty $wb 'relativePath' ''); message = '既存カテゴリを判定できませんでした。ECMとして互換移行した後、資料パックを確認してください。' }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Workspace)) {
+        foreach ($page in @(Get-Array $Structure.pages)) {
+            $relativePdf = [string](Get-DataProperty $page 'contentPdf' ''); if ([string]::IsNullOrWhiteSpace($relativePdf)) { continue }
+            try {
+                $root = [IO.Path]::GetFullPath($Workspace); if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+                $full = [IO.Path]::GetFullPath((Join-Path $Workspace $relativePdf))
+                if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $full)) { throw 'missing' }
+            } catch { $issues += [pscustomobject][ordered]@{ code = 'content-pdf-missing'; itemId = Resolve-PageId $page; relativePath = $relativePdf; message = '移行時に変換PDFを確認できませんでした。再度PDFを作成してください。' } }
+        }
+    }
+    Set-NoteProperty $Structure 'migrationIssues' @($issues); Sync-StructureV3FromLegacy $Structure $Language | Out-Null
+    return $Structure
+}
+
+function ConvertTo-V4StructureCompatibilityView($Structure) {
+    if ($null -eq $Structure) { return $null }
+    Update-LegacyCompatibilityViewFromV3 $Structure
+    return [pscustomobject][ordered]@{
+        schemaVersion = 2; language = [string](Get-DataProperty $Structure 'language' '')
+        workbooks = @(Get-Array (Get-DataProperty $Structure 'workbooks' @())); pages = @(Get-Array (Get-DataProperty $Structure 'pages' @()))
+        volumes = Get-DataProperty $Structure 'volumes' ([ordered]@{}); updatedAt = Get-DataProperty $Structure 'updatedAt' $null
+    }
+}
+
+function Get-RequiredSourceRenderProfileVersion($Workbook) {
+    $sourceType = [string](Get-DataProperty $Workbook 'sourceType' 'excel')
+    if ($sourceType -eq 'pdf') { return $Script:PdfImportProfileVersion }
+    if ($sourceType -eq 'word') { return $Script:WordRenderProfileVersion }
+    return $Script:ExcelPrintProfileVersion
+}
+
+function Get-SourceUpdatedStatus($Workbook) {
+    if ([string](Get-DataProperty $Workbook 'sourceType' 'excel') -ne 'excel') { return 'source-updated' }
+    return 'excel-updated'
+}
+
 function Test-WorkbookRenderIsCurrent($Workbook) {
     if ($null -eq $Workbook) { return $false }
     $status = [string](Get-DataProperty $Workbook 'status' '')
-    if ($status -in @('new','excel-updated','missing','render-error','rendering','stale','not-rendered')) { return $false }
+    if ($status -in @('new','excel-updated','source-updated','missing','render-error','rendering','stale','not-rendered')) { return $false }
     $lastRenderedHash = [string](Get-DataProperty $Workbook 'lastRenderedExcelHash' '')
     if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { return $false }
     $currentHash = [string](Get-DataProperty $Workbook 'currentExcelHash' '')
     if ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and $currentHash -ne $lastRenderedHash) { return $false }
     $profileVersion = Get-IntDataProperty $Workbook 'renderProfileVersion' 0
-    if ($profileVersion -lt $Script:ExcelPrintProfileVersion) { return $false }
+    if ($profileVersion -lt (Get-RequiredSourceRenderProfileVersion $Workbook)) { return $false }
     return $true
 }
 
@@ -1110,9 +1589,10 @@ function Mark-WorkbookContentStaleForProfile($Structure, $Workbook) {
     $lastRenderedHash = [string](Get-DataProperty $Workbook 'lastRenderedExcelHash' '')
     if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { return $changed }
     $profileVersion = Get-IntDataProperty $Workbook 'renderProfileVersion' 0
-    if ($profileVersion -ge $Script:ExcelPrintProfileVersion) { return $changed }
-    if ([string](Get-DataProperty $Workbook 'status' '') -ne 'excel-updated') {
-        Set-NoteProperty $Workbook 'status' 'excel-updated'
+    if ($profileVersion -ge (Get-RequiredSourceRenderProfileVersion $Workbook)) { return $changed }
+    $updatedStatus = Get-SourceUpdatedStatus $Workbook
+    if ([string](Get-DataProperty $Workbook 'status' '') -ne $updatedStatus) {
+        Set-NoteProperty $Workbook 'status' $updatedStatus
         $changed = $true
     }
     foreach ($p in @(Get-Array $Structure.pages | Where-Object { [string]$_.workbookId -eq [string]$Workbook.workbookId })) {
@@ -1181,15 +1661,67 @@ function Repair-StructurePages($Structure) {
     return $changed
 }
 
+function Test-UniqueStructureRecordIds($Records, [string]$IdProperty) {
+    $seen = @{}
+    foreach ($record in @(Get-Array $Records)) {
+        $id = [string](Get-DataProperty $record $IdProperty '')
+        if ([string]::IsNullOrWhiteSpace($id) -or $seen.ContainsKey($id)) { return $false }
+        $seen[$id] = $true
+    }
+    return $true
+}
+
+function Test-DirectPdfRelativePath([string]$RelativePath) {
+    Test-RelativePath $RelativePath | Out-Null
+    if ($RelativePath -match '[\\/]') { throw '提出フォルダ直下のPDFだけ登録できます。子フォルダ内のファイルは対象外です。' }
+    $ext = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    if ($ext -ne '.pdf') { throw '拡張子が .pdf のPDFだけ登録できます。' }
+    return $true
+}
+
+function Test-StructureV3References($Structure) {
+    $packs = @(Get-Array (Get-DataProperty $Structure 'packs' @()))
+    $sources = @(Get-Array (Get-DataProperty $Structure 'sources' @()))
+    $units = @(Get-Array (Get-DataProperty $Structure 'units' @()))
+    $items = @(Get-Array (Get-DataProperty $Structure 'items' @()))
+    $artifacts = @(Get-Array (Get-DataProperty $Structure 'artifacts' @()))
+    if (-not (Test-UniqueStructureRecordIds $packs 'packId') -or
+        -not (Test-UniqueStructureRecordIds $sources 'sourceId') -or
+        -not (Test-UniqueStructureRecordIds $units 'unitId') -or
+        -not (Test-UniqueStructureRecordIds $items 'itemId') -or
+        -not (Test-UniqueStructureRecordIds $artifacts 'artifactId')) { return $false }
+    $packIds = @{}; foreach ($x in $packs) { $packIds[[string]$x.packId] = $true }
+    $sourceIds = @{}; foreach ($x in $sources) { $sourceIds[[string]$x.sourceId] = $true; if (-not $packIds.ContainsKey([string]$x.packId)) { return $false } }
+    $unitIds = @{}; foreach ($x in $units) { $unitIds[[string]$x.unitId] = $true; if (-not $sourceIds.ContainsKey([string]$x.sourceId)) { return $false } }
+    $artifactIds = @{}; foreach ($x in $artifacts) { $artifactIds[[string]$x.artifactId] = $true; if (-not $sourceIds.ContainsKey([string]$x.sourceId) -or -not $unitIds.ContainsKey([string]$x.unitId)) { return $false } }
+    foreach ($x in $items) {
+        if (-not $packIds.ContainsKey([string]$x.packId) -or -not $sourceIds.ContainsKey([string]$x.sourceId) -or -not $unitIds.ContainsKey([string]$x.unitId)) { return $false }
+        $artifactId = [string](Get-DataProperty $x 'artifactId' '')
+        if (-not [string]::IsNullOrWhiteSpace($artifactId) -and -not $artifactIds.ContainsKey($artifactId)) { return $false }
+    }
+    $outputs = Get-DataProperty $Structure 'outputs' ([ordered]@{})
+    foreach ($key in @(Get-ConfigKeyNames $outputs)) {
+        $output = Get-DataProperty $outputs $key $null
+        if ($null -eq $output -or -not $packIds.ContainsKey([string](Get-DataProperty $output 'packId' '')) -or [string]::IsNullOrWhiteSpace([string](Get-DataProperty $output 'targetId' ''))) { return $false }
+    }
+    return $true
+}
+
 function Test-StructureDocument($Structure, [string]$Language) {
     if ($null -eq $Structure) { return $false }
     try {
         $version = [int](Get-DataProperty $Structure 'schemaVersion' 0)
-        if ($version -lt 1 -or $version -gt 2) { return $false }
+        if ($version -lt 1 -or $version -gt 3) { return $false }
         $storedLanguage = [string](Get-DataProperty $Structure 'language' '')
         if (-not [string]::IsNullOrWhiteSpace($storedLanguage) -and $storedLanguage -ne $Language) { return $false }
-        if (-not (Test-ConfigHasKey $Structure 'workbooks') -or
-            -not (Test-ConfigHasKey $Structure 'pages')) { return $false }
+        if ($version -le 2) {
+            if (-not (Test-ConfigHasKey $Structure 'workbooks') -or -not (Test-ConfigHasKey $Structure 'pages')) { return $false }
+        } else {
+            foreach ($name in @('packs','sources','units','items','artifacts','outputs')) {
+                if (-not (Test-ConfigHasKey $Structure $name)) { return $false }
+            }
+            if (-not (Test-StructureV3References $Structure)) { return $false }
+        }
         return $true
     } catch {
         return $false
@@ -1227,6 +1759,7 @@ function Read-StructureUnlocked([string]$Language, [string]$DataDir = '') {
 
 function Write-StructureUnlocked([string]$Language, $Structure, [string]$DataDir = '') {
     $Structure = Normalize-StructureCollections $Structure
+    if ([int](Get-DataProperty $Structure 'schemaVersion' 0) -eq 3) { Sync-StructureV3FromLegacy $Structure $Language | Out-Null }
     if (-not (Test-StructureDocument $Structure $Language)) { throw '不完全な登録情報の保存を拒否しました。' }
     Set-NoteProperty $Structure 'updatedAt' (New-NowIso)
     $workspace = Get-WorkspacePath $Language $DataDir
@@ -1438,6 +1971,142 @@ function Get-ExcelFilesInSubmission {
     return $result
 }
 
+function Get-PdfFilesInSubmission {
+    $paths = Get-Paths
+    if ([string]::IsNullOrWhiteSpace([string]$paths.submissionDir) -or -not (Test-Path -LiteralPath ([string]$paths.submissionDir))) { return @() }
+    $files = Get-ChildItem -LiteralPath ([string]$paths.submissionDir) -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension.ToLowerInvariant() -eq '.pdf' } |
+        Sort-Object Name
+    $result = @()
+    foreach ($entry in $files) {
+        try { $f = Get-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop; $f.Refresh() } catch { $f = $entry }
+        $rel = Get-RelativePathCompat ([string]$paths.submissionDir) $f.FullName
+        if ($rel -match '[\\/]') { continue }
+        $modifiedSnapshot = Get-FileLastWriteSnapshot $f.FullName
+        $result += [ordered]@{
+            fileName = $f.Name; relativePath = $rel; size = $f.Length
+            modifiedAtDisplay = [string]$modifiedSnapshot.display
+            modifiedAt = ([DateTime]$modifiedSnapshot.local).ToString('yyyy-MM-ddTHH:mm:sszzz')
+            modifiedAtUtc = ([DateTime]$modifiedSnapshot.utc).ToString('o')
+            modifiedAtUnixMs = [int64]$modifiedSnapshot.unixMs
+            modifiedAtUtcTicks = [string]([DateTime]$modifiedSnapshot.utc).Ticks
+            detectedLanguage = (Get-LanguageFromFileName $f.Name)
+        }
+    }
+    return $result
+}
+
+function Get-WordFilesInSubmission {
+    $paths = Get-Paths
+    if ([string]::IsNullOrWhiteSpace([string]$paths.submissionDir) -or -not (Test-Path -LiteralPath ([string]$paths.submissionDir))) { return @() }
+    $files = Get-ChildItem -LiteralPath ([string]$paths.submissionDir) -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension.ToLowerInvariant() -eq '.docx' -and $_.Name -notlike '~$*' } |
+        Sort-Object Name
+    $result = @()
+    foreach ($entry in $files) {
+        try { $f = Get-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop; $f.Refresh() } catch { $f = $entry }
+        $rel = Get-RelativePathCompat ([string]$paths.submissionDir) $f.FullName
+        if ($rel -match '[\\/]') { continue }
+        $modifiedSnapshot = Get-FileLastWriteSnapshot $f.FullName
+        $result += [ordered]@{
+            fileName = $f.Name; relativePath = $rel; size = $f.Length
+            modifiedAtDisplay = [string]$modifiedSnapshot.display
+            modifiedAt = ([DateTime]$modifiedSnapshot.local).ToString('yyyy-MM-ddTHH:mm:sszzz')
+            modifiedAtUtc = ([DateTime]$modifiedSnapshot.utc).ToString('o')
+            modifiedAtUnixMs = [int64]$modifiedSnapshot.unixMs
+            modifiedAtUtcTicks = [string]([DateTime]$modifiedSnapshot.utc).Ticks
+            detectedLanguage = (Get-LanguageFromFileName $f.Name)
+        }
+    }
+    return $result
+}
+
+function Test-PdfMagic([string]$PdfPath) {
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($PdfPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $bytes = New-Object byte[] 5
+        if ($stream.Read($bytes, 0, 5) -ne 5) { return $false }
+        return ([Text.Encoding]::ASCII.GetString($bytes) -eq '%PDF-')
+    } catch { return $false } finally { if ($stream) { $stream.Dispose() } }
+}
+
+function Invoke-PdfSourceSplit([string]$PdfPath, [string]$OutputDir) {
+    if (-not (Test-Path -LiteralPath $PdfPath)) { throw "PDF原稿が見つかりません: $PdfPath" }
+    if (-not (Test-PdfMagic $PdfPath)) { throw 'PDFのファイル形式を確認できません。拡張子だけがPDFになっていないか確認してください。' }
+    $tool = Get-PdfBatchToolInfo
+    if ($null -eq $tool) { throw 'PDF原稿の取り込みに必要なPDFBoxまたはJava Runtimeが見つかりません。' }
+    if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+    $prefix = Join-Path $OutputDir 'page'
+    $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
+    $run = Invoke-NativeCapture ([string]$tool.javaExe) @('-jar', $pdfboxJar, 'PDFSplit', '-split', '1', '-outputPrefix', $prefix, $PdfPath)
+    $message = [string]$run.text
+    if ([int]$run.exitCode -ne 0) {
+        if ($message -match 'password|encrypted|decrypt|InvalidPassword') { throw 'パスワード保護されたPDFは登録できません。保護を解除したPDFを使用してください。' }
+        throw ('PDFを安全に読み込めませんでした。破損していないか確認してください。' + $(if ($message) { " 詳細: $message" } else { '' }))
+    }
+    $files = @(Get-ChildItem -LiteralPath $OutputDir -File -Filter 'page*.pdf' -ErrorAction SilentlyContinue | Sort-Object {
+        $m = [regex]::Match($_.BaseName, '(\d+)$'); if ($m.Success) { [int]$m.Groups[1].Value } else { [int]::MaxValue }
+    }, Name)
+    if ($files.Count -eq 0) { throw 'PDFに取り込み可能なページがありません。' }
+    if ($files.Count -gt 2000) { throw '2000ページを超えるPDFは登録できません。分割してから登録してください。' }
+    $pages = @(); $number = 0
+    foreach ($file in $files) {
+        $number++
+        if ($file.Length -le 0 -or -not (Test-PdfMagic $file.FullName)) { throw "PDFの $number ページ目を取り込めませんでした。" }
+        $pages += [pscustomobject][ordered]@{ pageNumber = $number; sheetName = "Page $number"; sheetIndex = $number; detectedTitle = "Page $number"; pdf = $file.FullName; pageCount = 1; warnings = @() }
+    }
+    return [pscustomobject][ordered]@{ ok = $true; pageCount = $pages.Count; pages = @($pages); message = $message }
+}
+
+function Inspect-PdfSourceFile([string]$PdfPath) {
+    $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('reportbinder-pdf-inspect-' + (New-RbId))
+    try {
+        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+        $split = Invoke-PdfSourceSplit $PdfPath $tmpDir
+        return [pscustomobject][ordered]@{
+            pageCount = [int]$split.pageCount
+            units = @($split.pages | ForEach-Object { [pscustomobject][ordered]@{ unitKind = 'pdf-page'; sourceKey = "page:$([int]$_.pageNumber)"; title = "Page $([int]$_.pageNumber)"; sourceIndex = [int]$_.pageNumber } })
+            warnings = @()
+        }
+    } finally { if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue } }
+}
+
+function Inspect-WordSourceFile([string]$DocxPath) {
+    if (-not (Test-Path -LiteralPath $DocxPath -PathType Leaf)) { throw "Word原稿が見つかりません: $DocxPath" }
+    $item = Get-Item -LiteralPath $DocxPath
+    if ($item.Length -le 0) { throw 'Word原稿が空です。' }
+    if ($item.Length -gt 536870912) { throw '512MBを超えるWord原稿は登録できません。分割してから登録してください。' }
+    $stream = $null; $zip = $null
+    try {
+        $stream = [IO.File]::Open($DocxPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $header = New-Object byte[] 8
+        $read = $stream.Read($header, 0, $header.Length)
+        $stream.Dispose(); $stream = $null
+        if ($read -ge 8 -and $header[0] -eq 0xD0 -and $header[1] -eq 0xCF -and $header[2] -eq 0x11 -and $header[3] -eq 0xE0) {
+            throw 'パスワード保護または暗号化されたWord原稿は登録できません。保護を解除したDOCXを使用してください。'
+        }
+        if ($read -lt 4 -or $header[0] -ne 0x50 -or $header[1] -ne 0x4B) { throw 'Word原稿のファイル形式を確認できません。拡張子だけがDOCXになっていないか確認してください。' }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue | Out-Null
+        $zip = [IO.Compression.ZipFile]::OpenRead($DocxPath)
+        $names = @($zip.Entries | ForEach-Object { ([string]$_.FullName -replace '\\','/').ToLowerInvariant() })
+        if ($names -notcontains '[content_types].xml' -or $names -notcontains 'word/document.xml') { throw 'Word原稿の内部構造が壊れています。Wordで開いて別名保存してから再登録してください。' }
+        if (@($names | Where-Object { $_ -eq 'word/vbaproject.bin' }).Count -gt 0) { throw 'マクロを含むWord原稿は登録できません。.docx形式で保存してください。' }
+        $title = [IO.Path]::GetFileNameWithoutExtension($item.Name)
+        return [pscustomobject][ordered]@{
+            pageCount = 0
+            units = @([pscustomobject][ordered]@{ unitKind = 'document'; sourceKey = 'document:root'; title = $title; sourceIndex = 1 })
+            warnings = @()
+        }
+    } catch {
+        if ($_.Exception.Message -match 'Word原稿|DOCX|パスワード|マクロ') { throw }
+        throw ('Word原稿を安全に読み込めませんでした。破損していないか確認してください。 詳細: ' + $_.Exception.Message)
+    } finally {
+        if ($zip) { $zip.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
 function New-WorkbookObject([string]$RelativePath, [string]$Language, [string]$Category = '') {
     $paths = Get-Paths
     $full = Join-Safe ([string]$paths.submissionDir) $RelativePath
@@ -1568,6 +2237,384 @@ function Inspect-ExcelWorkbook([string]$FullPath) {
     }
     return $sheets
 }
+
+function Get-SourceAdapterDescriptor([string]$SourceType) {
+    $type = ([string]$SourceType).Trim().ToLowerInvariant()
+    if ($type -eq 'excel') {
+        return [pscustomobject][ordered]@{
+            contractVersion = $Script:SourceAdapterContractVersion
+            sourceType = 'excel'
+            adapterId = 'excel-com-v1'
+            adapterVersion = 1
+            extensions = @('.xlsx')
+            unitKind = 'worksheet'
+            candidateScope = 'submission-root'
+            supportsInspection = $true
+            supportsRendering = $true
+            supportsStructuralDiff = $true
+            supportsVisualDiff = $true
+        }
+    }
+    if ($type -eq 'pdf') {
+        return [pscustomobject][ordered]@{
+            contractVersion = $Script:SourceAdapterContractVersion
+            sourceType = 'pdf'
+            adapterId = 'pdfbox-import-v1'
+            adapterVersion = 1
+            extensions = @('.pdf')
+            unitKind = 'pdf-page'
+            candidateScope = 'submission-root'
+            supportsInspection = $true
+            supportsRendering = $true
+            supportsStructuralDiff = $true
+            supportsVisualDiff = $true
+        }
+    }
+    if ($type -eq 'word') {
+        return [pscustomobject][ordered]@{
+            contractVersion = $Script:SourceAdapterContractVersion
+            sourceType = 'word'
+            adapterId = 'word-com-v1'
+            adapterVersion = 1
+            extensions = @('.docx')
+            unitKind = 'document'
+            candidateScope = 'submission-root'
+            supportsInspection = $true
+            supportsRendering = $true
+            supportsStructuralDiff = $true
+            supportsVisualDiff = $true
+        }
+    }
+    throw [System.ArgumentException]::new("未対応の原稿形式です: $SourceType")
+}
+
+function Resolve-SourceTypeFromPath([string]$Path, [string]$RequestedType = '') {
+    $requested = ([string]$RequestedType).Trim().ToLowerInvariant()
+    if (-not [string]::IsNullOrWhiteSpace($requested)) {
+        [void](Get-SourceAdapterDescriptor $requested)
+        return $requested
+    }
+    $extension = [IO.Path]::GetExtension([string]$Path).ToLowerInvariant()
+    if ($extension -eq '.xlsx') { return 'excel' }
+    if ($extension -eq '.pdf') { return 'pdf' }
+    if ($extension -eq '.docx') { return 'word' }
+    throw [System.ArgumentException]::new("拡張子に対応する原稿アダプターがありません: $extension")
+}
+
+function Test-SourceCandidate($Context) {
+    if ($null -eq $Context) { throw [System.ArgumentNullException]::new('Context') }
+    $relativePath = [string](Get-DataProperty $Context 'relativePath' '')
+    $sourceType = Resolve-SourceTypeFromPath $relativePath ([string](Get-DataProperty $Context 'sourceType' ''))
+    $adapter = Get-SourceAdapterDescriptor $sourceType
+    if ($sourceType -eq 'excel') { Test-DirectExcelRelativePath $relativePath | Out-Null }
+    elseif ($sourceType -eq 'pdf') { Test-DirectPdfRelativePath $relativePath | Out-Null }
+    elseif ($sourceType -eq 'word') { Test-DirectWordRelativePath $relativePath | Out-Null }
+    return [pscustomobject][ordered]@{ ok = $true; sourceType = $sourceType; adapterId = [string]$adapter.adapterId; relativePath = $relativePath }
+}
+
+function Get-SourceCandidates([string[]]$SourceTypes = @('excel')) {
+    $requested = @($SourceTypes | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($requested.Count -eq 0) { $requested = @('excel') }
+    $result = @()
+    foreach ($sourceType in $requested) {
+        $adapter = Get-SourceAdapterDescriptor $sourceType
+        if ($sourceType -eq 'excel') {
+            foreach ($candidate in @(Get-ExcelFilesInSubmission)) {
+                Set-NoteProperty $candidate 'sourceType' $sourceType
+                Set-NoteProperty $candidate 'adapterId' ([string]$adapter.adapterId)
+                $result += $candidate
+            }
+        } elseif ($sourceType -eq 'pdf') {
+            foreach ($candidate in @(Get-PdfFilesInSubmission)) {
+                Set-NoteProperty $candidate 'sourceType' $sourceType
+                Set-NoteProperty $candidate 'adapterId' ([string]$adapter.adapterId)
+                $result += $candidate
+            }
+        } elseif ($sourceType -eq 'word') {
+            foreach ($candidate in @(Get-WordFilesInSubmission)) {
+                Set-NoteProperty $candidate 'sourceType' $sourceType
+                Set-NoteProperty $candidate 'adapterId' ([string]$adapter.adapterId)
+                $result += $candidate
+            }
+        }
+    }
+    return @($result | Sort-Object relativePath, sourceType)
+}
+
+function Inspect-Source($Context) {
+    $validated = Test-SourceCandidate $Context
+    $paths = Get-Paths
+    $fullPath = [string](Get-DataProperty $Context 'fullPath' '')
+    if ([string]::IsNullOrWhiteSpace($fullPath)) { $fullPath = Join-Safe ([string]$paths.submissionDir) ([string]$validated.relativePath) }
+    if (-not (Test-Path -LiteralPath $fullPath)) { throw "原稿ファイルが見つかりません: $($validated.relativePath)" }
+    if ([string]$validated.sourceType -eq 'excel') {
+        $units = @()
+        foreach ($sheet in @(Inspect-ExcelWorkbook $fullPath)) {
+            $units += [pscustomobject][ordered]@{
+                unitKind = 'worksheet'
+                sourceKey = "worksheet:$([string]$sheet.sheetName)"
+                title = [string]$sheet.detectedTitle
+                sourceIndex = [int]$sheet.sheetIndex
+                legacySheet = $sheet
+            }
+        }
+        return [pscustomobject][ordered]@{
+            sourceType = 'excel'; adapterId = [string]$validated.adapterId; relativePath = [string]$validated.relativePath
+            units = @($units); warnings = @()
+        }
+    }
+    if ([string]$validated.sourceType -eq 'pdf') {
+        $inspection = Inspect-PdfSourceFile $fullPath
+        return [pscustomobject][ordered]@{
+            sourceType = 'pdf'; adapterId = [string]$validated.adapterId; relativePath = [string]$validated.relativePath
+            units = @($inspection.units); pageCount = [int]$inspection.pageCount; warnings = @($inspection.warnings)
+        }
+    }
+    if ([string]$validated.sourceType -eq 'word') {
+        $inspection = Inspect-WordSourceFile $fullPath
+        return [pscustomobject][ordered]@{
+            sourceType = 'word'; adapterId = [string]$validated.adapterId; relativePath = [string]$validated.relativePath
+            units = @($inspection.units); pageCount = 0; warnings = @($inspection.warnings)
+        }
+    }
+    throw [System.ArgumentException]::new("検査に対応していない原稿形式です: $($validated.sourceType)")
+}
+
+function Get-RegisteredSourceAdapterContext([string]$Language, [string]$SourceId) {
+    if ([string]::IsNullOrWhiteSpace($SourceId)) { throw [System.ArgumentException]::new('sourceId が必要です。') }
+    $structure = Get-Structure $Language
+    $source = @(Get-Array $structure.sources | Where-Object { [string]$_.sourceId -eq $SourceId } | Select-Object -First 1)
+    if ($source.Count -gt 0) {
+        $sourceType = Resolve-SourceTypeFromPath ([string]$source[0].relativePath) ([string]$source[0].sourceType)
+        return [pscustomobject][ordered]@{ source = $source[0]; sourceId = $SourceId; sourceType = $sourceType; adapter = Get-SourceAdapterDescriptor $sourceType }
+    }
+    $workbook = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $SourceId } | Select-Object -First 1)
+    if ($workbook.Count -eq 0) { throw "登録済み原稿が見つかりません: $SourceId" }
+    $sourceType = Resolve-SourceTypeFromPath ([string]$workbook[0].relativePath) 'excel'
+    return [pscustomobject][ordered]@{ source = $workbook[0]; sourceId = $SourceId; sourceType = $sourceType; adapter = Get-SourceAdapterDescriptor $sourceType }
+}
+
+function Register-Source([string]$Language, [string]$RelativePath, [string]$PackId = '', [string]$SourceType = '') {
+    $validated = Test-SourceCandidate ([pscustomobject]@{ relativePath = $RelativePath; sourceType = $SourceType })
+    $category = Get-CategoryFromBuiltinPackId $PackId
+    if ([string]::IsNullOrWhiteSpace($category)) { $category = Normalize-WorkbookCategory $PackId $RelativePath }
+    $category = Require-WorkbookCategory $category
+    if ([string]$validated.sourceType -eq 'excel') {
+        $result = Register-Workbook $Language $RelativePath $category
+        $workbook = Get-DataProperty $result 'workbook' $null
+        $source = [pscustomobject][ordered]@{
+            sourceId = [string](Get-DataProperty $workbook 'workbookId' '')
+            packId = Get-BuiltinPackId $category
+            relativePath = [string](Get-DataProperty $workbook 'relativePath' $RelativePath)
+            sourceType = 'excel'
+            adapterId = [string]$validated.adapterId
+            displayName = [string](Get-DataProperty $workbook 'displayName' '')
+            status = [string](Get-DataProperty $workbook 'status' 'new')
+        }
+        Set-NoteProperty $result 'source' $source
+        Set-NoteProperty $result 'units' @()
+        return $result
+    }
+    if ([string]$validated.sourceType -eq 'word') {
+        $result = Register-WordSource $Language $RelativePath $category
+        $workbook = Get-DataProperty $result 'workbook' $null
+        $source = [pscustomobject][ordered]@{
+            sourceId = [string](Get-DataProperty $workbook 'workbookId' '')
+            packId = Get-BuiltinPackId $category
+            relativePath = [string](Get-DataProperty $workbook 'relativePath' $RelativePath)
+            sourceType = 'word'; adapterId = [string]$validated.adapterId
+            displayName = [string](Get-DataProperty $workbook 'displayName' '')
+            status = [string](Get-DataProperty $workbook 'status' 'new')
+        }
+        Set-NoteProperty $result 'source' $source
+        if (-not (Test-ConfigHasKey $result 'units')) { Set-NoteProperty $result 'units' @() }
+        return $result
+    }
+    if ([string]$validated.sourceType -eq 'pdf') {
+        $result = Register-PdfSource $Language $RelativePath $category
+        $workbook = Get-DataProperty $result 'workbook' $null
+        $source = [pscustomobject][ordered]@{
+            sourceId = [string](Get-DataProperty $workbook 'workbookId' '')
+            packId = Get-BuiltinPackId $category
+            relativePath = [string](Get-DataProperty $workbook 'relativePath' $RelativePath)
+            sourceType = 'pdf'; adapterId = [string]$validated.adapterId
+            displayName = [string](Get-DataProperty $workbook 'displayName' '')
+            status = [string](Get-DataProperty $workbook 'status' 'new')
+        }
+        Set-NoteProperty $result 'source' $source
+        if (-not (Test-ConfigHasKey $result 'units')) { Set-NoteProperty $result 'units' @() }
+        return $result
+    }
+    throw [System.ArgumentException]::new("登録に対応していない原稿形式です: $($validated.sourceType)")
+}
+
+function Register-SourcesBatch([string]$Language, $RelativePaths, [string]$PackId = '', [string]$SourceType = '') {
+    $registered = @(); $errors = @(); $seen = @{}
+    foreach ($raw in @(Get-Array $RelativePaths)) {
+        $relativePath = [string]$raw
+        if ([string]::IsNullOrWhiteSpace($relativePath)) { continue }
+        $key = ($relativePath -replace '\\','/').ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        try {
+            $resolvedType = Resolve-SourceTypeFromPath $relativePath $SourceType
+            $result = Register-Source $Language $relativePath $PackId $resolvedType
+            $source = $result.source; $workbook = $result.workbook
+            $registered += [pscustomobject][ordered]@{
+                relativePath = $relativePath; sourceId = [string]$source.sourceId; sourceType = [string]$source.sourceType; adapterId = [string]$source.adapterId
+                workbookId = [string]$workbook.workbookId; fileName = [string]$workbook.fileName; displayName = [string]$workbook.displayName
+                status = [string]$workbook.status; category = [string]$workbook.category; packId = [string]$source.packId
+            }
+        } catch { $errors += [pscustomobject][ordered]@{ relativePath = $relativePath; error = $_.Exception.Message; detail = [string]$_ } }
+    }
+    return [pscustomobject][ordered]@{
+        requestedCount = @(Get-Array $RelativePaths).Count; registered = @($registered); errors = @($errors)
+        registeredCount = $registered.Count; errorCount = $errors.Count
+    }
+}
+
+function New-PdfSourceObject([string]$RelativePath, [string]$Language, [string]$Category = '', [int]$PageCount = 0) {
+    $paths = Get-Paths
+    $full = Join-Safe ([string]$paths.submissionDir) $RelativePath
+    if (-not (Test-Path -LiteralPath $full)) { throw "提出ファイルが見つかりません: $RelativePath" }
+    $item = Get-Item -LiteralPath $full
+    $hash = New-StableHash $full
+    $categoryNormalized = Normalize-WorkbookCategory $Category $item.Name
+    $baseId = New-Slug $item.Name
+    $id = $(if (-not [string]::IsNullOrWhiteSpace($categoryNormalized)) { "$categoryNormalized-pdf-$baseId" } else { "pdf-$baseId" })
+    return [ordered]@{
+        workbookId = $id; language = $Language; fileName = $item.Name; relativePath = $RelativePath; displayName = $item.Name
+        category = $categoryNormalized; sourceType = 'pdf'; adapterId = 'pdfbox-import-v1'; sourcePageCount = $PageCount
+        currentExcelModifiedAt = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz')
+        currentExcelLastWriteUtcTicks = [string]$item.LastWriteTimeUtc.Ticks; currentExcelSize = $item.Length; currentExcelHash = $hash
+        lastRenderedVersionId = $null; lastRenderedExcelHash = $null; lastRenderedAt = $null; lastRenderedSheets = @(); lastRenderedSheetFingerprint = ''
+        status = 'new'; warnings = @(); lastError = ''; lastErrorUser = ''; lastErrorAt = $null; lastRenderAttemptHash = ''; lastRenderLog = ''
+        renderProfileVersion = 0; registeredAt = New-NowIso
+    }
+}
+
+function New-WordSourceObject([string]$RelativePath, [string]$Language, [string]$Category = '') {
+    $paths = Get-Paths
+    $full = Join-Safe ([string]$paths.submissionDir) $RelativePath
+    if (-not (Test-Path -LiteralPath $full)) { throw "提出ファイルが見つかりません: $RelativePath" }
+    $item = Get-Item -LiteralPath $full
+    $hash = New-StableHash $full
+    $categoryNormalized = Normalize-WorkbookCategory $Category $item.Name
+    $baseId = New-Slug $item.Name
+    $id = $(if (-not [string]::IsNullOrWhiteSpace($categoryNormalized)) { "$categoryNormalized-word-$baseId" } else { "word-$baseId" })
+    return [ordered]@{
+        workbookId = $id; language = $Language; fileName = $item.Name; relativePath = $RelativePath; displayName = $item.Name
+        category = $categoryNormalized; sourceType = 'word'; adapterId = 'word-com-v1'; sourcePageCount = 0
+        currentExcelModifiedAt = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz')
+        currentExcelLastWriteUtcTicks = [string]$item.LastWriteTimeUtc.Ticks; currentExcelSize = $item.Length; currentExcelHash = $hash
+        lastRenderedVersionId = $null; lastRenderedExcelHash = $null; lastRenderedAt = $null; lastRenderedSheets = @(); lastRenderedSheetFingerprint = ''
+        status = 'new'; warnings = @(); lastError = ''; lastErrorUser = ''; lastErrorAt = $null; lastRenderAttemptHash = ''; lastRenderLog = ''
+        renderProfileVersion = 0; registeredAt = New-NowIso
+    }
+}
+
+function Render-Source([string]$Language, [string]$SourceId, $SharedHost = $null, [bool]$KeepHostOpen = $false, [scriptblock]$ProgressCallback = $null,
+                       [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '') {
+    $context = Get-RegisteredSourceAdapterContext $Language $SourceId
+    if ([string]$context.sourceType -eq 'excel') {
+        $result = Render-Workbook $Language $SourceId $SharedHost $KeepHostOpen $ProgressCallback $SourceOverridePath $SourceSnapshotId $ExpectedSourceHash
+        Set-NoteProperty $result 'sourceId' $SourceId
+        Set-NoteProperty $result 'sourceType' 'excel'
+        Set-NoteProperty $result 'adapterId' ([string]$context.adapter.adapterId)
+        return $result
+    }
+    if ([string]$context.sourceType -eq 'pdf') {
+        $result = Render-PdfSource $Language $SourceId $ProgressCallback $SourceOverridePath $SourceSnapshotId $ExpectedSourceHash
+        # A batch job collects this value after every source and performs analysis only
+        # after the shared rendering lock has been released. Direct calls do the same here.
+        if (-not $KeepHostOpen) {
+            $pending = $Script:PendingAnalysis
+            $Script:PendingAnalysis = $null
+            if ($null -ne $pending) {
+                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+                catch { Write-Warning ('PDF原稿の画像解析に失敗しました: ' + $_.Exception.Message) }
+            }
+        }
+        return $result
+    }
+    if ([string]$context.sourceType -eq 'word') {
+        $result = Render-WordSource $Language $SourceId $ProgressCallback $SourceOverridePath $SourceSnapshotId $ExpectedSourceHash
+        if (-not $KeepHostOpen) {
+            $pending = $Script:PendingAnalysis
+            $Script:PendingAnalysis = $null
+            if ($null -ne $pending) {
+                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+                catch { Write-Warning ('Word原稿の画像解析に失敗しました: ' + $_.Exception.Message) }
+            }
+        }
+        return $result
+    }
+    throw [System.ArgumentException]::new("変換に対応していない原稿形式です: $($context.sourceType)")
+}
+
+function Get-SourceChangeSummary([string]$Language, [string]$SourceId, $Source = $null) {
+    $context = Get-RegisteredSourceAdapterContext $Language $SourceId
+    if ([string]$context.sourceType -eq 'excel') {
+        $summary = Get-WorkbookChangeSummary $Language $SourceId $Source
+        if ($null -eq $summary) { return $null }
+        Set-NoteProperty $summary 'sourceId' $SourceId
+        Set-NoteProperty $summary 'sourceType' 'excel'
+        Set-NoteProperty $summary 'adapterId' ([string]$context.adapter.adapterId)
+        return $summary
+    }
+    if ([string]$context.sourceType -eq 'pdf') {
+        $summary = Get-WorkbookChangeSummary $Language $SourceId $Source
+        if ($null -eq $summary) { return $null }
+        Set-NoteProperty $summary 'sourceId' $SourceId; Set-NoteProperty $summary 'sourceType' 'pdf'; Set-NoteProperty $summary 'adapterId' ([string]$context.adapter.adapterId)
+        return $summary
+    }
+    if ([string]$context.sourceType -eq 'word') {
+        $summary = Get-WorkbookChangeSummary $Language $SourceId $Source
+        if ($null -eq $summary) { return $null }
+        Set-NoteProperty $summary 'sourceId' $SourceId; Set-NoteProperty $summary 'sourceType' 'word'; Set-NoteProperty $summary 'adapterId' ([string]$context.adapter.adapterId)
+        return $summary
+    }
+    throw [System.ArgumentException]::new("差分要約に対応していない原稿形式です: $($context.sourceType)")
+}
+
+function Update-SourceMetadata([string]$Language, [string]$SourceId, $Patch) {
+    $id = ([string]$SourceId).Trim()
+    if ([string]::IsNullOrWhiteSpace($id)) { throw '原稿IDが指定されていません。' }
+    $hasOwner = Test-ConfigHasKey $Patch 'ownerDepartment'
+    $hasRequired = Test-ConfigHasKey $Patch 'required'
+    $hasDefaultTarget = Test-ConfigHasKey $Patch 'defaultTargetId'
+    if (-not ($hasOwner -or $hasRequired -or $hasDefaultTarget)) { throw '更新する原稿設定が指定されていません。' }
+    $owner = if ($hasOwner) { ([string](Get-DataProperty $Patch 'ownerDepartment' '')).Trim() } else { '' }
+    if ($owner.Length -gt 120) { throw '担当部署は120文字以内で入力してください。' }
+    $defaultTarget = if ($hasDefaultTarget) { ([string](Get-DataProperty $Patch 'defaultTargetId' '')).Trim().ToLowerInvariant() } else { '' }
+    if ($hasDefaultTarget -and $defaultTarget -notin @('unassigned','main','appendix')) { throw '既定の振り分け先が不正です。' }
+    return Update-StructureLocked $Language {
+        param($structure)
+        $source = @(Get-Array (Get-DataProperty $structure 'sources' @()) | Where-Object { [string](Get-DataProperty $_ 'sourceId' '') -eq $id } | Select-Object -First 1)
+        if ($source.Count -eq 0) { throw '指定された原稿が見つかりません。' }
+        $current = $source[0]
+        $workbook = @(Get-Array (Get-DataProperty $structure 'workbooks' @()) | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $id } | Select-Object -First 1)
+        if ($hasOwner) {
+            Set-NoteProperty $current 'ownerDepartment' $owner
+            if ($workbook.Count -gt 0) { Set-NoteProperty $workbook[0] 'ownerDepartment' $owner }
+        }
+        if ($hasRequired) {
+            $required = [bool](Get-DataProperty $Patch 'required' $false)
+            Set-NoteProperty $current 'required' $required
+            if ($workbook.Count -gt 0) { Set-NoteProperty $workbook[0] 'required' $required }
+        }
+        if ($hasDefaultTarget) {
+            Set-NoteProperty $current 'defaultTargetId' $defaultTarget
+            if ($workbook.Count -gt 0) { Set-NoteProperty $workbook[0] 'defaultTargetId' $defaultTarget }
+        }
+        return [pscustomobject][ordered]@{
+            sourceId = $id
+            ownerDepartment = [string](Get-DataProperty $current 'ownerDepartment' '')
+            required = [bool](Get-DataProperty $current 'required' $true)
+            defaultTargetId = [string](Get-DataProperty $current 'defaultTargetId' 'unassigned')
+        }
+    }
+}
 function Add-NotePropertyIfMissing($Object, [string]$Name, $Value) {
     if ($null -eq $Object) { return }
     if ($Object -is [System.Collections.IDictionary]) {
@@ -1638,43 +2685,55 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
         $structure = Read-StructureUnlocked $Language $DataDir
         $version = 1
         try { $version=[int](Get-DataProperty $structure 'schemaVersion' 1) } catch { $version=1 }
-        if ($version -gt 2) { throw "この管理データは新しいschemaVersion=$versionです。対応するReportBinderを使用してください。" }
-        if ($version -eq 2) {
+        if ($version -gt 3) { throw "この管理データは新しいschemaVersion=$versionです。対応するReportBinderを使用してください。" }
+        if ($version -eq 3) {
             $lastGood = Join-Path $workspace 'structure.json.last-good'
             if (-not (Test-Path -LiteralPath $lastGood)) { Write-JsonFile $lastGood $structure }
             return [ordered]@{ created=$false; migrated=$false }
         }
-        $backup = Join-Path $workspace 'structure.json.v1.bak'
-        if (-not (Test-Path -LiteralPath $backup)) {
-            Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
-            if ((Get-Item $backup).Length -ne (Get-Item $path).Length -or (New-StableHash $backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakの検証に失敗しました。' }
-        }
-        $structure = Normalize-StructureCollections $structure
-        [void](Repair-StructurePages $structure)
-        $oldVolumes = Get-DataProperty $structure 'volumes' $null
-        $newVolumes = [ordered]@{}
-        foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
-            foreach ($cat in @('ecm','bod','dmm')) {
-                $fresh = New-EmptyVolumeState
-                if ($cat -eq 'ecm' -and $null -ne $oldVolumes) {
-                    $old = Get-DataProperty $oldVolumes $volume $null
-                    if ($null -eq $old) { $old = Get-DataProperty $oldVolumes (Get-VolumeStateKey $volume $cat) $null }
-                    if ($null -ne $old) {
-                        foreach ($name in @('status','lastBuiltAt','outputPdf','message','builtFingerprint','staleReasons')) {
-                            $value=Get-DataProperty $old $name $null
-                            if ($null -ne $value) { Set-NoteProperty $fresh $name $value }
-                        }
+        $backups = @()
+        if ($version -eq 1) {
+            $v1Backup = Join-Path $workspace 'structure.json.v1.bak'
+            if (-not (Test-Path -LiteralPath $v1Backup)) {
+                Copy-Item -LiteralPath $path -Destination $v1Backup -ErrorAction Stop
+                if ((Get-Item $v1Backup).Length -ne (Get-Item $path).Length -or (New-StableHash $v1Backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakの検証に失敗しました。' }
+            }
+            $backups += $v1Backup
+            $structure = Normalize-StructureCollections $structure; [void](Repair-StructurePages $structure)
+            $oldVolumes = Get-DataProperty $structure 'volumes' $null; $newVolumes = [ordered]@{}
+            foreach ($volume in @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })) {
+                foreach ($cat in @('ecm','bod','dmm')) {
+                    $fresh = New-EmptyVolumeState
+                    if ($cat -eq 'ecm' -and $null -ne $oldVolumes) {
+                        $old = Get-DataProperty $oldVolumes $volume $null
+                        if ($null -eq $old) { $old = Get-DataProperty $oldVolumes (Get-VolumeStateKey $volume $cat) $null }
+                        if ($null -ne $old) { foreach ($name in @('status','lastBuiltAt','outputPdf','message','builtFingerprint','staleReasons')) { $value=Get-DataProperty $old $name $null; if ($null -ne $value) { Set-NoteProperty $fresh $name $value } } }
                     }
+                    $newVolumes[(Get-VolumeStateKey $volume $cat)] = $fresh
                 }
-                $newVolumes[(Get-VolumeStateKey $volume $cat)] = $fresh
+            }
+            Set-NoteProperty $structure 'volumes' $newVolumes; Set-NoteProperty $structure 'schemaVersion' 2
+            foreach ($cat in @('ecm','bod','dmm')) { foreach ($volume in @(Get-VolumeList $Language)) { [void](Renumber-VolumeOrder $structure $volume $cat) } }
+        }
+        $v2Backup = Join-Path $workspace 'structure.json.v2.bak'
+        if (-not (Test-Path -LiteralPath $v2Backup)) {
+            if ($version -eq 2) {
+                Copy-Item -LiteralPath $path -Destination $v2Backup -ErrorAction Stop
+                if ((Get-Item $v2Backup).Length -ne (Get-Item $path).Length -or (New-StableHash $v2Backup) -ne (New-StableHash $path)) { throw 'structure.json.v2.bakの検証に失敗しました。' }
+            } else {
+                Write-JsonFile $v2Backup $structure
+                $verifiedV2 = Read-JsonFile $v2Backup $null
+                if (-not (Test-StructureDocument $verifiedV2 $Language) -or [int](Get-DataProperty $verifiedV2 'schemaVersion' 0) -ne 2) { throw 'structure.json.v2.bakの検証に失敗しました。' }
             }
         }
-        Set-NoteProperty $structure 'volumes' $newVolumes
-        Set-NoteProperty $structure 'schemaVersion' 2
-        foreach ($cat in @('ecm','bod','dmm')) { foreach ($volume in @(Get-VolumeList $Language)) { [void](Renumber-VolumeOrder $structure $volume $cat) } }
+        $backups += $v2Backup
+        $structure = ConvertTo-StructureV3 $structure $Language $workspace
         Write-StructureUnlocked $Language $structure $DataDir
-        Write-JsonFile (Join-Path $workspace 'schema-version.json') ([ordered]@{ schemaVersion=2; migratedAt=(New-NowIso); backup=$backup })
-        return [ordered]@{ created=$false; migrated=$true; backup=$backup }
+        $savedV3 = Read-JsonFile $path $null
+        if (-not (Test-StructureDocument $savedV3 $Language) -or [int](Get-DataProperty $savedV3 'schemaVersion' 0) -ne 3) { throw 'schemaVersion 3の保存後検証に失敗しました。' }
+        Write-JsonFile (Join-Path $workspace 'structure.json.last-good') $savedV3
+        Write-JsonFile (Join-Path $workspace 'schema-version.json') ([ordered]@{ schemaVersion=3; migratedAt=(New-NowIso); backups=@($backups) })
+        return [ordered]@{ created=$false; migrated=$true; backup=$v2Backup; backups=@($backups); migrationIssues=@(Get-Array $structure.migrationIssues) }
     }
 }
 
@@ -1699,6 +2758,11 @@ function Apply-DefaultNumberingPerVolume([string]$Language, $Structure, [string]
 function ConvertTo-UserRenderError([string]$Message) {
     $text = [string]$Message
     $rawTail = if ($text.Length -gt 250) { ' (元のエラー: ' + $text.Substring(0, 250) + '…)' } else { ' (元のエラー: ' + $text + ')' }
+    if ($text -match 'WORD_TIMEOUT') { return 'Word原稿のPDF変換が時間内に完了しませんでした。Wordの確認画面が開いていないか、文書が破損していないか確認してください。前回成功した変換PDFは保持されています。' }
+    if ($text -match 'WORD_NOT_AVAILABLE|ActiveX component can.t create object|Class not registered') { return 'Microsoft Wordを起動できませんでした。このPCにデスクトップ版Wordがインストールされ、通常起動できることを確認してください。' }
+    if ($text -match 'WORD_OPEN_FAILED') { return 'Wordが原稿を開けませんでした。パスワード保護、秘密度ラベル、破損、変換確認が必要な文書ではないか確認してください。' }
+    if ($text -match 'WORD_EXPORT_FAILED|WORD_PDF_MISSING|WORD_PDF_EMPTY|WORD_PDF_INVALID') { return 'Word原稿からPDFを作成できませんでした。印刷レイアウト、プリンター設定、文書の保護状態を確認してください。' }
+    if ($text -match 'Word原稿|DOCX|word-com|WORD_WORKER') { return ('Word原稿をPDF変換できませんでした。' + $rawTail) }
     if ($text -match 'Open プロパティを取得できません|Unable to get the Open property') { return 'Excelがこのファイルを開けませんでした。ファイルが保護ビュー対象（インターネット由来）・暗号化（秘密度ラベル/IRM）・破損のいずれかの可能性があります。ファイルを右クリック→プロパティ→「許可する」にチェック後、もう一度PDF作成してください。' }
     if ($text -match 'このオブジェクトにプロパティ|stateSavedAt|プロパティ.*見つかりません|property.*not found|does not contain a property') { return 'PDF作成の進捗状態を更新できませんでした。ReportBinderを更新してから、もう一度PDF作成してください。' }
     if ($text -match 'PDF化対象のシート|PDF化対象の表示シート') { return 'PDF化対象の表示シートがありません。Excelで少なくとも1つのワークシートを表示してください。' }
@@ -1889,7 +2953,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
     if ($removed.Count -gt 0) {
         $affected = @($removed | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
         if ($affected.Count -gt 0) {
-            Mark-VolumeNeedsRebuild $Structure $Language $cat $affected 'render' 'Excelのシート構成が変更されました'
+            Mark-VolumeNeedsRebuild $Structure $Language $cat $affected 'render' '原稿のページ構成が変更されました'
         }
     }
     Apply-DefaultNumberingPerVolume $Language $Structure $cat
@@ -2519,36 +3583,373 @@ function Register-Workbook([string]$Language, [string]$RelativePath, [string]$Ca
 }
 
 function Register-WorkbooksBatch([string]$Language, $RelativePaths, [string]$Category = '') {
-    $registered = @()
-    $errors = @()
-    $seen = @{}
-    foreach ($raw in (Get-Array $RelativePaths)) {
-        $rel = [string]$raw
-        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
-        $key = ($rel -replace '\\', '/').ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
-        try {
-            $r = Register-Workbook $Language $rel $Category
-            $wb = $r.workbook
-            $registered += [ordered]@{
-                relativePath = $rel
-                workbookId = [string]$wb.workbookId
-                fileName = [string]$wb.fileName
-                displayName = [string]$wb.displayName
-                status = [string]$wb.status
-                category = [string]$wb.category
+    $categoryNormalized = Require-WorkbookCategory $Category
+    return Register-SourcesBatch $Language $RelativePaths (Get-BuiltinPackId $categoryNormalized) 'excel'
+}
+
+function Register-PdfSource([string]$Language, [string]$RelativePath, [string]$Category = '') {
+    Test-DirectPdfRelativePath $RelativePath | Out-Null
+    $cat = Require-WorkbookCategory $Category
+    $paths = Get-Paths
+    $full = Join-Safe ([string]$paths.submissionDir) $RelativePath
+    if (-not (Test-Path -LiteralPath $full)) { throw "提出ファイルが見つかりません: $RelativePath" }
+    $inspection = Inspect-PdfSourceFile $full
+    $candidate = New-PdfSourceObject $RelativePath $Language $cat ([int]$inspection.pageCount)
+    return Update-StructureLocked $Language {
+        param($structure)
+        $normalized = ([string]$RelativePath -replace '\\','/').ToLowerInvariant()
+        $existing = @(Get-Array $structure.workbooks | Where-Object {
+            ([string]$_.workbookId -eq [string]$candidate.workbookId) -or ((([string]$_.relativePath -replace '\\','/').ToLowerInvariant() -eq $normalized) -and (Test-WorkbookCategory $_ $cat))
+        } | Select-Object -First 1)
+        if ($existing.Count -gt 0) {
+            $old = $existing[0]
+            Set-NoteProperty $candidate 'workbookId' ([string]$old.workbookId)
+            foreach ($name in @('lastRenderedVersionId','lastRenderedSnapshotId','lastRenderedExcelHash','lastRenderedAt','lastRenderedSheets','lastRenderedSheetFingerprint','lastRenderLog','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash','ownerDepartment','required','defaultTargetId')) {
+                Set-NoteProperty $candidate $name (Get-DataProperty $old $name $null)
             }
-        } catch {
-            $errors += [ordered]@{ relativePath = $rel; error = $_.Exception.Message; detail = [string]$_ }
+            if (-not [string]::IsNullOrWhiteSpace([string]$candidate.lastRenderedExcelHash)) {
+                Set-NoteProperty $candidate 'status' $(if ($candidate.currentExcelHash -ne $candidate.lastRenderedExcelHash) { 'source-updated' } else { [string]$old.status })
+            }
+        }
+        $structure.workbooks = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -ne [string]$candidate.workbookId }) + @($candidate)
+        return [ordered]@{ workbook = $candidate; units = @($inspection.units); registered = $true; inspected = $true; sourceType = 'pdf' }
+    }
+}
+
+function Register-WordSource([string]$Language, [string]$RelativePath, [string]$Category = '') {
+    Test-DirectWordRelativePath $RelativePath | Out-Null
+    $cat = Require-WorkbookCategory $Category
+    $paths = Get-Paths
+    $full = Join-Safe ([string]$paths.submissionDir) $RelativePath
+    if (-not (Test-Path -LiteralPath $full)) { throw "提出ファイルが見つかりません: $RelativePath" }
+    $inspection = Inspect-WordSourceFile $full
+    $candidate = New-WordSourceObject $RelativePath $Language $cat
+    return Update-StructureLocked $Language {
+        param($structure)
+        $normalized = ([string]$RelativePath -replace '\\','/').ToLowerInvariant()
+        $existing = @(Get-Array $structure.workbooks | Where-Object {
+            ([string]$_.workbookId -eq [string]$candidate.workbookId) -or ((([string]$_.relativePath -replace '\\','/').ToLowerInvariant() -eq $normalized) -and (Test-WorkbookCategory $_ $cat))
+        } | Select-Object -First 1)
+        if ($existing.Count -gt 0) {
+            $old = $existing[0]
+            Set-NoteProperty $candidate 'workbookId' ([string]$old.workbookId)
+            foreach ($name in @('lastRenderedVersionId','lastRenderedSnapshotId','lastRenderedExcelHash','lastRenderedAt','lastRenderedSheets','lastRenderedSheetFingerprint','lastRenderLog','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash','ownerDepartment','required','defaultTargetId','sourcePageCount')) {
+                Set-NoteProperty $candidate $name (Get-DataProperty $old $name $null)
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$candidate.lastRenderedExcelHash)) {
+                Set-NoteProperty $candidate 'status' $(if ($candidate.currentExcelHash -ne $candidate.lastRenderedExcelHash) { 'source-updated' } else { [string]$old.status })
+            }
+        }
+        $structure.workbooks = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -ne [string]$candidate.workbookId }) + @($candidate)
+        return [ordered]@{ workbook = $candidate; units = @($inspection.units); registered = $true; inspected = $true; sourceType = 'word' }
+    }
+}
+
+function Stop-ReportBinderProcessTree([int]$ProcessId) {
+    if ($ProcessId -le 0) { return }
+    try {
+        $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue)
+        foreach ($child in $children) { Stop-ReportBinderProcessTree ([int]$child.ProcessId) }
+    } catch { }
+    try { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+}
+
+function ConvertTo-PathBase64([string]$Path) {
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Path)))
+}
+
+function Invoke-WordDocumentToPdf([string]$InputPath, [string]$OutputPath, [int]$TimeoutSeconds = 0) {
+    if ($TimeoutSeconds -le 0) { $TimeoutSeconds = $Script:WordRenderTimeoutSeconds }
+    $worker = Join-Path $Script:AppRoot 'tools\word-render-worker.ps1'
+    if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) { throw 'Word変換ワーカーが見つかりません。' }
+    $runId = New-RbId
+    $runDir = Split-Path -Parent $OutputPath
+    if (-not (Test-Path -LiteralPath $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+    $resultPath = Join-Path $runDir "word-result-$runId.json"
+    $stdoutPath = Join-Path $runDir "word-out-$runId.log"
+    $stderrPath = Join-Path $runDir "word-err-$runId.log"
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+    $workerEscaped = $worker.Replace("'", "''")
+    $command = "& '$workerEscaped' -InputPathB64 '$(ConvertTo-PathBase64 $InputPath)' -OutputPathB64 '$(ConvertTo-PathBase64 $OutputPath)' -ResultPathB64 '$(ConvertTo-PathBase64 $resultPath)'"
+    $proc = $null
+    try {
+        $proc = Start-HiddenPowerShellChild $psExe $command $stdoutPath $stderrPath
+        if ($null -eq $proc) { throw 'WORD_WORKER_START_FAILED' }
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-ReportBinderProcessTree ([int]$proc.Id)
+            throw "WORD_TIMEOUT:$TimeoutSeconds"
+        }
+        try { $proc.WaitForExit() } catch { }
+        $result = Read-JsonFile $resultPath $null
+        if ($null -eq $result) {
+            $details = @()
+            if (Test-Path -LiteralPath $stderrPath) { $details += (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue) }
+            if (Test-Path -LiteralPath $stdoutPath) { $details += (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) }
+            throw ('WORD_WORKER_NO_RESULT:' + ([string]::Join(' ', @($details))).Trim())
+        }
+        if (-not [bool](Get-DataProperty $result 'ok' $false)) {
+            throw ("$([string](Get-DataProperty $result 'errorCode' 'WORD_WORKER_FAILED')):$([string](Get-DataProperty $result 'stage' '')):$([string](Get-DataProperty $result 'message' ''))")
+        }
+        if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf) -or (Get-Item -LiteralPath $OutputPath).Length -le 0 -or -not (Test-PdfMagic $OutputPath)) { throw 'WORD_PDF_INVALID' }
+        return $result
+    } finally {
+        foreach ($path in @($resultPath,$stdoutPath,$stderrPath)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } }
+    }
+}
+
+function Render-WordSource([string]$Language, [string]$SourceId, [scriptblock]$ProgressCallback = $null,
+                           [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '') {
+    return Invoke-WithRenderLock $Language $SourceId {
+        $workspace = Get-WorkspacePath $Language
+        $paths = Get-Paths
+        $structure = Get-Structure $Language
+        $found = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $SourceId } | Select-Object -First 1)
+        if ($found.Count -eq 0) { throw "登録済みWord原稿が見つかりません: $SourceId" }
+        $source = $found[0]
+        if ([string](Get-DataProperty $source 'sourceType' '') -ne 'word') { throw 'Word原稿ではないためWordアダプターで処理できません。' }
+        $livePath = Join-Safe ([string]$paths.submissionDir) ([string]$source.relativePath)
+        if (-not (Test-Path -LiteralPath $livePath)) { throw "Word原稿が見つかりません: $($source.relativePath)" }
+        $inputPath = $SourceOverridePath
+        $ephemeralCaptureId = ''
+        if ([string]::IsNullOrWhiteSpace($inputPath) -and (Test-InputHistoryEnabled)) {
+            if ([string]::IsNullOrWhiteSpace($SourceSnapshotId)) {
+                $captured = Capture-DetectedSnapshot $Language $SourceId 'render'
+                if ([bool]$captured.ok) { $SourceSnapshotId = [string]$captured.snapshotId }
+            }
+            $inputInfo = Capture-RenderInput $Language $SourceId $SourceSnapshotId ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$inputInfo.path)) {
+                $inputPath = [string]$inputInfo.path; $SourceSnapshotId = [string]$inputInfo.snapshotId
+                if ([bool]$inputInfo.ephemeral) { $ephemeralCaptureId = [string]$inputInfo.captureId }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($inputPath)) { $inputPath = $livePath }
+        [void](Inspect-WordSourceFile $inputPath)
+        $sourceHash = Normalize-FileHash (New-Sha256 $inputPath)
+        $expectedHash = Normalize-FileHash $ExpectedSourceHash
+        if (-not [string]::IsNullOrWhiteSpace($expectedHash) -and $sourceHash -ne $expectedHash) { throw '指定したWord原稿の版と実ファイルが一致しません。更新確認後に再度変換してください。' }
+        $versionId = New-RbVersionId
+        $contentDir = Get-ContentPdfVersionDir $workspace $SourceId $versionId
+        $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('reportbinder-word-' + (New-RbId))
+        $success = $false
+        try {
+            New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
+            New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+            $workDocx = Join-Path $tmpDir 'source.docx'
+            Copy-FileSharedRead $inputPath $workDocx
+            $wholePdf = Join-Path $tmpDir 'document.pdf'
+            if ($ProgressCallback) { & $ProgressCallback 'word' $SourceId '' }
+            $wordResult = Invoke-WordDocumentToPdf $workDocx $wholePdf $Script:WordRenderTimeoutSeconds
+            if ($ProgressCallback) { & $ProgressCallback 'split' $SourceId '' }
+            $split = Invoke-PdfSourceSplit $wholePdf $contentDir
+            $rendered = @(); $inspection = @()
+            foreach ($pageInfo in @($split.pages)) {
+                $number = [int]$pageInfo.pageNumber; $name = "Page $number"
+                $title = "$([IO.Path]::GetFileNameWithoutExtension([string]$source.fileName)) / $name"
+                $inspection += [pscustomobject][ordered]@{ sheetName = $name; sheetIndex = $number; detectedTitle = $title }
+                $rendered += [pscustomobject][ordered]@{ sheetName = $name; pdf = [string]$pageInfo.pdf; pageCount = 1; warnings = @() }
+            }
+            $pageSync = Update-StructureLocked $Language {
+                param($st)
+                $latest = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $SourceId } | Select-Object -First 1)
+                if ($latest.Count -eq 0) { throw "登録済みWord原稿が見つかりません: $SourceId" }
+                $w = $latest[0]; $sync = Update-WorkbookPagesFromInspection $Language $st $w $inspection; $pages = @(Get-Array $st.pages)
+                foreach ($r in $rendered) {
+                    $page = @($pages | Where-Object { [string]$_.workbookId -eq $SourceId -and [string]$_.sheetName -eq [string]$r.sheetName } | Select-Object -First 1)
+                    if ($page.Count -gt 0) {
+                        Set-NoteProperty $page[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf))
+                        Set-NoteProperty $page[0] 'status' 'rendered'; Set-NoteProperty $page[0] 'warnings' @(); Set-NoteProperty $page[0] 'updatedAt' (New-NowIso)
+                    }
+                }
+                Set-NoteProperty $w 'sourceType' 'word'; Set-NoteProperty $w 'adapterId' 'word-com-v1'; Set-NoteProperty $w 'sourcePageCount' ([int]$split.pageCount)
+                Set-NoteProperty $w 'lastRenderedVersionId' $versionId; Set-NoteProperty $w 'lastRenderedSnapshotId' $SourceSnapshotId
+                Set-NoteProperty $w 'lastRenderedExcelHash' $sourceHash; Set-NoteProperty $w 'lastRenderedAt' (New-NowIso)
+                Set-NoteProperty $w 'renderProfileVersion' $Script:WordRenderProfileVersion; Set-WorkbookRenderedSheetSnapshot $w (Get-DataProperty $sync 'sheetNames' @())
+                Set-NoteProperty $w 'lastError' ''; Set-NoteProperty $w 'lastErrorUser' ''; Set-NoteProperty $w 'lastErrorAt' $null; Set-NoteProperty $w 'lastRenderAttemptHash' $sourceHash
+                $currentHash = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
+                if ([string]::IsNullOrWhiteSpace($currentHash) -or $currentHash -eq $sourceHash) { Set-NoteProperty $w 'status' 'rendered-unchecked' }
+                else { Set-NoteProperty $w 'status' 'source-updated'; foreach ($p in @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $SourceId })) { Set-NoteProperty $p 'status' 'stale' } }
+                $cat = Require-WorkbookCategory ([string]$w.category)
+                $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $SourceId } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+                Mark-VolumeNeedsRebuild $st $Language $cat $vols 'render' 'Word原稿を1件PDF変換しました'
+                return $sync
+            }
+            $wordVersion = [string](Get-DataProperty $wordResult 'wordVersion' '')
+            $Script:CurrentRenderEnvFingerprint = Get-Sha256Text "word-com|$wordVersion|$($Script:WordRenderProfileVersion)"
+            $Script:CurrentRenderEnvInfo = [ordered]@{ adapterId = 'word-com-v1'; wordVersion = $wordVersion; profileVersion = $Script:WordRenderProfileVersion }
+            $Script:PendingAnalysis = [ordered]@{ language = $Language; workbookId = $SourceId; snapshotId = [string]$SourceSnapshotId; versionId = $versionId; rendered = $rendered }
+            Remove-WorkbookContentPdfs $workspace $SourceId $versionId
+            $success = $true
+            return [ordered]@{ workbookId = $SourceId; sourceId = $SourceId; sourceType = 'word'; adapterId = 'word-com-v1'; versionId = $versionId; rendered = @($rendered); warnings = @(); steps = @('Wordを一時コピーからPDF変換','PDFをページ単位で取り込み'); sheetSync = $pageSync }
+        } finally {
+            if (-not $success -and (Test-Path -LiteralPath $contentDir)) { Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
+            if (-not [string]::IsNullOrWhiteSpace($ephemeralCaptureId)) { Remove-EphemeralCopy $Language $ephemeralCaptureId }
         }
     }
-    return [ordered]@{
-        requestedCount = @(Get-Array $RelativePaths).Count
-        registered = @($registered)
-        errors = @($errors)
-        registeredCount = @($registered).Count
-        errorCount = @($errors).Count
+}
+
+function Render-PdfSource([string]$Language, [string]$SourceId, [scriptblock]$ProgressCallback = $null,
+                          [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '') {
+    return Invoke-WithRenderLock $Language $SourceId {
+        $workspace = Get-WorkspacePath $Language
+        $paths = Get-Paths
+        $structure = Get-Structure $Language
+        $found = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $SourceId } | Select-Object -First 1)
+        if ($found.Count -eq 0) { throw "登録済みPDF原稿が見つかりません: $SourceId" }
+        $source = $found[0]
+        if ([string](Get-DataProperty $source 'sourceType' '') -ne 'pdf') { throw 'PDF原稿ではないためPDFアダプターで処理できません。' }
+        $livePath = Join-Safe ([string]$paths.submissionDir) ([string]$source.relativePath)
+        if (-not (Test-Path -LiteralPath $livePath)) { throw "PDF原稿が見つかりません: $($source.relativePath)" }
+        $inputPath = $SourceOverridePath
+        $ephemeralCaptureId = ''
+        if ([string]::IsNullOrWhiteSpace($inputPath) -and (Test-InputHistoryEnabled)) {
+            if ([string]::IsNullOrWhiteSpace($SourceSnapshotId)) {
+                $captured = Capture-DetectedSnapshot $Language $SourceId 'render'
+                if ([bool]$captured.ok) { $SourceSnapshotId = [string]$captured.snapshotId }
+            }
+            $inputInfo = Capture-RenderInput $Language $SourceId $SourceSnapshotId ''
+            if (-not [string]::IsNullOrWhiteSpace([string]$inputInfo.path)) {
+                $inputPath = [string]$inputInfo.path
+                $SourceSnapshotId = [string]$inputInfo.snapshotId
+                if ([bool]$inputInfo.ephemeral) { $ephemeralCaptureId = [string]$inputInfo.captureId }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($inputPath)) { $inputPath = $livePath }
+        $sourceHash = Normalize-FileHash (New-Sha256 $inputPath)
+        $expectedHash = Normalize-FileHash $ExpectedSourceHash
+        if (-not [string]::IsNullOrWhiteSpace($expectedHash) -and $sourceHash -ne $expectedHash) { throw '指定したPDF原稿の版と実ファイルが一致しません。更新確認後に再度取り込んでください。' }
+        $versionId = New-RbVersionId
+        $contentDir = Get-ContentPdfVersionDir $workspace $SourceId $versionId
+        $success = $false
+        try {
+            New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
+            if ($ProgressCallback) { & $ProgressCallback 'split' $SourceId '' }
+            $split = Invoke-PdfSourceSplit $inputPath $contentDir
+            $rendered = @(); $inspection = @()
+            foreach ($pageInfo in @($split.pages)) {
+                $number = [int]$pageInfo.pageNumber
+                $name = "Page $number"
+                $title = "$([IO.Path]::GetFileNameWithoutExtension([string]$source.fileName)) / $name"
+                $inspection += [pscustomobject][ordered]@{ sheetName = $name; sheetIndex = $number; detectedTitle = $title }
+                $rendered += [pscustomobject][ordered]@{ sheetName = $name; pdf = [string]$pageInfo.pdf; pageCount = 1; warnings = @() }
+            }
+            $pageSync = Update-StructureLocked $Language {
+                param($st)
+                $latest = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $SourceId } | Select-Object -First 1)
+                if ($latest.Count -eq 0) { throw "登録済みPDF原稿が見つかりません: $SourceId" }
+                $w = $latest[0]
+                $sync = Update-WorkbookPagesFromInspection $Language $st $w $inspection
+                $pages = @(Get-Array $st.pages)
+                foreach ($r in $rendered) {
+                    $page = @($pages | Where-Object { [string]$_.workbookId -eq $SourceId -and [string]$_.sheetName -eq [string]$r.sheetName } | Select-Object -First 1)
+                    if ($page.Count -gt 0) {
+                        Set-NoteProperty $page[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf))
+                        Set-NoteProperty $page[0] 'status' 'rendered'; Set-NoteProperty $page[0] 'warnings' @(); Set-NoteProperty $page[0] 'updatedAt' (New-NowIso)
+                    }
+                }
+                Set-NoteProperty $w 'sourceType' 'pdf'; Set-NoteProperty $w 'adapterId' 'pdfbox-import-v1'; Set-NoteProperty $w 'sourcePageCount' ([int]$split.pageCount)
+                Set-NoteProperty $w 'lastRenderedVersionId' $versionId; Set-NoteProperty $w 'lastRenderedSnapshotId' $SourceSnapshotId
+                Set-NoteProperty $w 'lastRenderedExcelHash' $sourceHash; Set-NoteProperty $w 'lastRenderedAt' (New-NowIso)
+                Set-NoteProperty $w 'renderProfileVersion' $Script:PdfImportProfileVersion; Set-WorkbookRenderedSheetSnapshot $w (Get-DataProperty $sync 'sheetNames' @())
+                Set-NoteProperty $w 'lastError' ''; Set-NoteProperty $w 'lastErrorUser' ''; Set-NoteProperty $w 'lastErrorAt' $null; Set-NoteProperty $w 'lastRenderAttemptHash' $sourceHash
+                $currentHash = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
+                if ([string]::IsNullOrWhiteSpace($currentHash) -or $currentHash -eq $sourceHash) { Set-NoteProperty $w 'status' 'rendered-unchecked' }
+                else { Set-NoteProperty $w 'status' 'source-updated'; foreach ($p in @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $SourceId })) { Set-NoteProperty $p 'status' 'stale' } }
+                $cat = Require-WorkbookCategory ([string]$w.category)
+                $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $SourceId } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+                Mark-VolumeNeedsRebuild $st $Language $cat $vols 'render' 'PDF原稿を1件取り込みました'
+                return $sync
+            }
+            $Script:CurrentRenderEnvFingerprint = Get-Sha256Text "pdfbox-import|$($Script:PdfImportProfileVersion)"
+            $Script:CurrentRenderEnvInfo = [ordered]@{ adapterId = 'pdfbox-import-v1'; profileVersion = $Script:PdfImportProfileVersion }
+            $Script:PendingAnalysis = [ordered]@{ language = $Language; workbookId = $SourceId; snapshotId = [string]$SourceSnapshotId; versionId = $versionId; rendered = $rendered }
+            Remove-WorkbookContentPdfs $workspace $SourceId $versionId
+            $success = $true
+            return [ordered]@{ workbookId = $SourceId; sourceId = $SourceId; sourceType = 'pdf'; adapterId = 'pdfbox-import-v1'; versionId = $versionId; rendered = @($rendered); warnings = @(); steps = @('PDFをページ単位で取り込み'); sheetSync = $pageSync }
+        } finally {
+            if (-not $success -and (Test-Path -LiteralPath $contentDir)) { Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue }
+            if (-not [string]::IsNullOrWhiteSpace($ephemeralCaptureId)) { Remove-EphemeralCopy $Language $ephemeralCaptureId }
+        }
+    }
+}
+
+function Render-PdfSnapshotForComparison([string]$Language, [string]$SourceId, [string]$SnapshotId) {
+    $state = Get-SnapshotSourceState $Language $SourceId $SnapshotId
+    if (-not [bool]$state.sourceRetained) { return [ordered]@{ ok = $false; reason = 'source-missing' } }
+    return Invoke-WithRenderLock $Language $SourceId {
+        $versionId = New-RbVersionId
+        $workspace = Get-WorkspacePath $Language
+        $contentDir = Get-ContentPdfVersionDir $workspace $SourceId $versionId
+        $jobId = New-RbId; $snapshotLease = ''; $contentLease = ''; $success = $false
+        try {
+            New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
+            $snapshotLease = New-SnapshotLease $Language $SourceId $SnapshotId 'compare' $jobId 120 $versionId
+            $contentLease = New-ContentPdfLease $workspace $SourceId $versionId 'compare' $jobId 120
+            if ([string]::IsNullOrWhiteSpace($snapshotLease) -or [string]::IsNullOrWhiteSpace($contentLease)) { throw '比較資産の保護leaseを作成できませんでした。' }
+            $split = Invoke-PdfSourceSplit ([string]$state.sourcePath) $contentDir
+            $sheets = @()
+            foreach ($pageInfo in @($split.pages)) {
+                $name = "Page $([int]$pageInfo.pageNumber)"
+                $sheets += @{ sheetName = $name; pdf = [string]$pageInfo.pdf; rasterDirectory = (Get-RenderRasterSheetDir $Language $SourceId $SnapshotId $versionId $name) }
+            }
+            $Script:CurrentRenderEnvFingerprint = Get-Sha256Text "pdfbox-import|$($Script:PdfImportProfileVersion)"
+            $analysis = Invoke-PdfPageAnalyzer $sheets
+            if ($null -eq $analysis -or -not [bool]$analysis.ok) { return [ordered]@{ ok = $false; reason = 'analyze-failed' } }
+            Write-RenderRecord $Language $SourceId $SnapshotId $versionId 'comparison' $true ([pscustomobject]$analysis.result)
+            $availability = Get-HistoryRenderVersionAvailability $Language $SourceId $SnapshotId $versionId
+            if (-not [bool]$availability.ready) { return [ordered]@{ ok = $false; reason = 'retention-verify-failed'; message = [string]$availability.reason } }
+            $success = $true
+            return [ordered]@{ ok = $true; versionId = $versionId; envFingerprint = [string]$Script:CurrentRenderEnvFingerprint }
+        } catch { return [ordered]@{ ok = $false; reason = 'error'; message = $_.Exception.Message } }
+        finally {
+            Remove-SnapshotLease $Language $SourceId $SnapshotId $snapshotLease
+            Remove-ContentPdfLease $workspace $SourceId $versionId $contentLease
+            if (-not $success -and (Test-Path -LiteralPath $contentDir)) { Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Render-WordSnapshotForComparison([string]$Language, [string]$SourceId, [string]$SnapshotId) {
+    $state = Get-SnapshotSourceState $Language $SourceId $SnapshotId
+    if (-not [bool]$state.sourceRetained) { return [ordered]@{ ok = $false; reason = 'source-missing' } }
+    return Invoke-WithRenderLock $Language $SourceId {
+        $versionId = New-RbVersionId
+        $workspace = Get-WorkspacePath $Language
+        $contentDir = Get-ContentPdfVersionDir $workspace $SourceId $versionId
+        $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('reportbinder-word-compare-' + (New-RbId))
+        $jobId = New-RbId; $snapshotLease = ''; $contentLease = ''; $success = $false
+        try {
+            New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
+            New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+            $snapshotLease = New-SnapshotLease $Language $SourceId $SnapshotId 'compare' $jobId 180 $versionId
+            $contentLease = New-ContentPdfLease $workspace $SourceId $versionId 'compare' $jobId 180
+            if ([string]::IsNullOrWhiteSpace($snapshotLease) -or [string]::IsNullOrWhiteSpace($contentLease)) { throw '比較資産の保護leaseを作成できませんでした。' }
+            $workDocx = Join-Path $tmpDir 'source.docx'; Copy-FileSharedRead ([string]$state.sourcePath) $workDocx
+            $wholePdf = Join-Path $tmpDir 'document.pdf'
+            $wordResult = Invoke-WordDocumentToPdf $workDocx $wholePdf $Script:WordRenderTimeoutSeconds
+            $split = Invoke-PdfSourceSplit $wholePdf $contentDir
+            $sheets = @()
+            foreach ($pageInfo in @($split.pages)) {
+                $name = "Page $([int]$pageInfo.pageNumber)"
+                $sheets += @{ sheetName = $name; pdf = [string]$pageInfo.pdf; rasterDirectory = (Get-RenderRasterSheetDir $Language $SourceId $SnapshotId $versionId $name) }
+            }
+            $wordVersion = [string](Get-DataProperty $wordResult 'wordVersion' '')
+            $Script:CurrentRenderEnvFingerprint = Get-Sha256Text "word-com|$wordVersion|$($Script:WordRenderProfileVersion)"
+            $analysis = Invoke-PdfPageAnalyzer $sheets
+            if ($null -eq $analysis -or -not [bool]$analysis.ok) { return [ordered]@{ ok = $false; reason = 'analyze-failed' } }
+            Write-RenderRecord $Language $SourceId $SnapshotId $versionId 'comparison' $true ([pscustomobject]$analysis.result)
+            $availability = Get-HistoryRenderVersionAvailability $Language $SourceId $SnapshotId $versionId
+            if (-not [bool]$availability.ready) { return [ordered]@{ ok = $false; reason = 'retention-verify-failed'; message = [string]$availability.reason } }
+            $success = $true
+            return [ordered]@{ ok = $true; versionId = $versionId; envFingerprint = [string]$Script:CurrentRenderEnvFingerprint }
+        } catch { return [ordered]@{ ok = $false; reason = 'error'; message = $_.Exception.Message } }
+        finally {
+            Remove-SnapshotLease $Language $SourceId $SnapshotId $snapshotLease
+            Remove-ContentPdfLease $workspace $SourceId $versionId $contentLease
+            if (Test-Path -LiteralPath $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
+            if (-not $success -and (Test-Path -LiteralPath $contentDir)) { Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
 }
 
@@ -2577,7 +3978,7 @@ function Set-WorkbookRenderError([string]$Language, [string]$WorkbookId, [string
                     Set-NoteProperty $wb[0] 'status' 'render-error'
                     foreach ($p in @(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.status -ne 'confirmed' })) { Set-NoteProperty $p 'status' 'render-error'; Set-NoteProperty $p 'warnings' @($userMessage); Set-NoteProperty $p 'updatedAt' (New-NowIso) }
                 } else {
-                    Set-NoteProperty $wb[0] 'status' 'excel-updated'
+                    Set-NoteProperty $wb[0] 'status' (Get-SourceUpdatedStatus $wb[0])
                     # ページの status は上書きしない(新しい版の状態を壊さないため)
                 }
                 # 失敗情報は状態と切り離して必ず残す
@@ -3103,7 +4504,7 @@ function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null,
                 if (-not $wasMissing) {
                     $cat = Require-WorkbookCategory ([string]$w.category)
                     $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
-                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'excel-updated' '元Excelが見つかりません'
+                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'source-updated' '元原稿が見つかりません'
                 }
                 return (-not $wasMissing)
             }
@@ -3128,20 +4529,21 @@ function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null,
             $previousHash = [string](Get-DataProperty $w 'currentExcelHash' '')
             $previousStatus = [string](Get-DataProperty $w 'status' '')
             $lastRendered = [string](Get-DataProperty $w 'lastRenderedExcelHash' '')
+            $updatedStatus = Get-SourceUpdatedStatus $w
             Set-NoteProperty $w 'currentExcelModifiedAt' $modified
             Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
             Set-NoteProperty $w 'currentExcelSize' $size
             if (-not [string]::IsNullOrWhiteSpace($hash)) { Set-NoteProperty $w 'currentExcelHash' $hash }
-            $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt $Script:ExcelPrintProfileVersion)
+            $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $w))
             $stale = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and (([string]::IsNullOrWhiteSpace($hash)) -or $hash -ne $lastRendered -or $profileOld)
             if ($stale) {
-                Set-NoteProperty $w 'status' 'excel-updated'
+                Set-NoteProperty $w 'status' $updatedStatus
                 foreach ($page in @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id -and -not [string]::IsNullOrWhiteSpace([string]$_.contentPdf) })) { Set-NoteProperty $page 'status' 'stale' }
-                $newlyDetected = ($previousStatus -ne 'excel-updated') -or ($previousHash -ne $hash)
+                $newlyDetected = ($previousStatus -ne $updatedStatus) -or ($previousHash -ne $hash)
                 if ($newlyDetected) {
                     $cat = Require-WorkbookCategory ([string]$w.category)
                     $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
-                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'excel-updated' '元Excelが1件更新されました'
+                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'source-updated' '元原稿が1件更新されました'
                 }
                 return $newlyDetected
             }
@@ -3171,14 +4573,14 @@ function Get-AutoRenderWorkbookIds([string]$Language, [string[]]$PreferredIds, [
         $currentHash = [string]$wb.currentExcelHash
         $lastRenderedHash = [string]$wb.lastRenderedExcelHash
         $lastAttemptHash = [string]$wb.lastRenderAttemptHash
-        $renderProfileOutdated = ((-not [string]::IsNullOrWhiteSpace($lastRenderedHash)) -and ((Get-IntDataProperty $wb 'renderProfileVersion' 0) -lt $Script:ExcelPrintProfileVersion))
+        $renderProfileOutdated = ((-not [string]::IsNullOrWhiteSpace($lastRenderedHash)) -and ((Get-IntDataProperty $wb 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $wb)))
         if ($status -eq 'render-error') {
             # The PDF button is an explicit retry. A previous render-error must not make
             # the button look idle just because the same file hash already failed once.
             $needs = $true
         } else {
             if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { $needs = $true }
-            if ($status -in @('new','excel-updated')) { $needs = $true }
+            if ($status -in @('new','excel-updated','source-updated')) { $needs = $true }
             if ($renderProfileOutdated) { $needs = $true }
             if ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and ($currentHash -ne $lastRenderedHash)) { $needs = $true }
             if ($usePreferred) { $needs = $true }
@@ -3200,7 +4602,7 @@ function Invoke-AutoRender([string]$Language, [string[]]$WorkbookIds) {
         $results = @()
         foreach ($id in $ids) {
             try {
-                $r = Render-Workbook $Language $id
+                $r = Render-Source $Language $id
                 $r['ok'] = $true
                 $results += $r
             } catch {
@@ -3449,8 +4851,8 @@ function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyU
     $stdoutPath = Join-Path $jobDir "$jobId.out.log"
     $stderrPath = Join-Path $jobDir "$jobId.err.log"
     $initialTotal = if ($OnlyUpdated -and $ids.Count -eq 0) { $registeredCount } else { $ids.Count }
-    $initialMessage = 'PDF作成が必要なExcelはありません。'
-    if ($registeredCount -eq 0) { $initialMessage = '登録済みExcelがありません。' }
+    $initialMessage = '変換PDFの作成が必要な原稿はありません。'
+    if ($registeredCount -eq 0) { $initialMessage = '登録済み原稿がありません。' }
     elseif ($OnlyUpdated -and $ids.Count -eq 0) { $initialMessage = 'PDF作成対象を確認しています。' }
     elseif ($ids.Count -gt 0) { $initialMessage = 'PDF作成を開始します。' }
     $initial = [pscustomobject][ordered]@{
@@ -3464,7 +4866,7 @@ function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyU
     Write-JsonFile $inputPath ([ordered]@{ jobId = $jobId; mode = $Language; workbookIds = @($ids); onlyUpdated = $OnlyUpdated; category = $categoryNormalized; snapshotPins = $pinsOut; statusPath = $statusPath; stdoutPath = $stdoutPath; stderrPath = $stderrPath })
     if ($registeredCount -eq 0 -or ($ids.Count -eq 0 -and -not $OnlyUpdated)) {
         $initial.status = 'completed'; $initial.percent = 100
-        if ($registeredCount -eq 0) { $initial.message = '登録済みExcelがありません。' } else { $initial.message = 'PDF作成が必要なExcelはありません。' }
+        if ($registeredCount -eq 0) { $initial.message = '登録済み原稿がありません。' } else { $initial.message = '変換PDFの作成が必要な原稿はありません。' }
         Write-RenderJobStatus $statusPath $initial
         return ([pscustomobject]$initial)
     }
@@ -3491,7 +4893,7 @@ function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyU
             Set-NoteProperty $statusToUpdate 'processId' ([int]$proc.Id)
             Set-NoteProperty $statusToUpdate 'status' 'launching'
             Set-NoteProperty $statusToUpdate 'percent' ([Math]::Max(2, (Get-IntDataProperty $statusToUpdate 'percent' 0)))
-            Set-NoteProperty $statusToUpdate 'message' 'PDF作成プロセスを起動しました。Excelを準備しています。'
+            Set-NoteProperty $statusToUpdate 'message' 'PDF作成プロセスを起動しました。原稿を準備しています。'
             Write-RenderJobStatus $statusPath $statusToUpdate
         }
     } catch {
@@ -3525,7 +4927,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
     } catch { }
     if ($processId -le 0) { try { $processId = [System.Diagnostics.Process]::GetCurrentProcess().Id } catch { $processId = 0 } }
     $total = $ids.Count
-    $statusMessage = 'Excelを準備しています。'
+    $statusMessage = '原稿を準備しています。'
     if ($onlyUpdated -and -not $explicitIds) { $statusMessage = 'PDF作成対象を確認しています。' }
     $status = [pscustomobject][ordered]@{ ok = $true; jobId = $jobId; status = 'running'; total = $total; completed = 0; failed = 0; percent = 3; message = $statusMessage; currentWorkbookId = ''; currentWorkbookName = ''; currentSheet = ''; processId = $processId; stdoutPath = $stdoutPath; stderrPath = $stderrPath; results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = '' }
     Write-RenderJobStatus $statusPath $status
@@ -3534,7 +4936,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
     try {
         if ($onlyUpdated -and -not $explicitIds) {
             $status.status = 'scanning'
-            $status.message = 'PDF作成が必要なExcelを確認しています。'
+            $status.message = '変換PDFの作成が必要な原稿を確認しています。'
             $status.percent = 5
             Write-RenderJobStatus $statusPath $status
             [void](Scan-Updates $language {
@@ -3558,7 +4960,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
             $status.percent = if ($total -gt 0) { [Math]::Max([int]$status.percent, 15) } else { 100 }
             if ($total -eq 0) {
                 $status.status = 'completed'
-                $status.message = 'PDF作成が必要なExcelはありません。'
+                $status.message = '変換PDFの作成が必要な原稿はありません。'
                 Write-RenderJobStatus $statusPath $status
                 return
             }
@@ -3567,11 +4969,20 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
         } elseif ($total -eq 0) {
             $status.status = 'completed'
             $status.percent = 100
-            $status.message = 'PDF作成が必要なExcelはありません。'
+            $status.message = '変換PDFの作成が必要な原稿はありません。'
             Write-RenderJobStatus $statusPath $status
             return
         }
-        if ($total -gt 0) {
+        $renderStructure = if ($total -gt 0) { Get-Structure $language } else { $null }
+        $excelIds = @()
+        if ($null -ne $renderStructure) {
+            $excelIds = @($ids | Where-Object {
+                $id = $_
+                $source = @(Get-Array $renderStructure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$id } | Select-Object -First 1)
+                $source.Count -gt 0 -and [string](Get-DataProperty $source[0] 'sourceType' 'excel') -eq 'excel'
+            })
+        }
+        if ($excelIds.Count -gt 0) {
             Reset-RenderEnvironmentForJob   # V5-§6.4: ジョブ開始ごとに環境を取り直す
             $status.message = 'Excelを起動しています。'
             $status.percent = [Math]::Max([int]$status.percent, 8)
@@ -3580,12 +4991,24 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
             $status.message = 'Excelの起動が完了しました。PDF化を開始します。'
             $status.percent = [Math]::Max([int]$status.percent, 10)
             Write-RenderJobStatus $statusPath $status
+        } elseif ($total -gt 0) {
+            $hasWord = @($ids | Where-Object {
+                $id = $_
+                $source = @(Get-Array $renderStructure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$id } | Select-Object -First 1)
+                $source.Count -gt 0 -and [string](Get-DataProperty $source[0] 'sourceType' 'excel') -eq 'word'
+            }).Count -gt 0
+            $status.message = $(if ($hasWord) { 'Word原稿をPDF変換しています。' } else { 'PDF原稿をページ単位で取り込んでいます。' })
+            $status.percent = [Math]::Max([int]$status.percent, 10)
+            Write-RenderJobStatus $statusPath $status
         }
         $index = 0
         $deferredAnalyses = @()
         foreach ($id in $ids) {
             $index++
             $name = Get-WorkbookDisplayForStatus $language $id
+            $jobSource = if ($null -ne $renderStructure) { @(Get-Array $renderStructure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$id } | Select-Object -First 1) } else { @() }
+            $jobSourceType = if ($jobSource.Count -gt 0) { [string](Get-DataProperty $jobSource[0] 'sourceType' 'excel') } else { 'excel' }
+            $unitLabel = if ($jobSourceType -in @('pdf','word')) { 'ページ' } else { 'シート' }
             $status.currentWorkbookId = $id
             $status.currentWorkbookName = $name
             $status.currentSheet = ''
@@ -3597,11 +5020,12 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
                 $status.currentWorkbookId = [string]$workbookId
                 $status.currentWorkbookName = $name
                 $status.currentSheet = [string]$sheetName
-                if ($stage -eq 'open') { $status.message = "$index / $total 件目: $name を開いています。" }
-                elseif ($stage -eq 'sheet-setup') { $status.message = "$index / $total 件目: $name / シート $sheetName の印刷設定を調整しています。" }
+                if ($stage -eq 'word') { $status.message = "$index / $total 件目: $name をWordでPDF変換しています。" }
+                elseif ($stage -eq 'open') { $status.message = "$index / $total 件目: $name を開いています。" }
+                elseif ($stage -eq 'sheet-setup') { $status.message = "$index / $total 件目: $name / $unitLabel $sheetName の印刷設定を調整しています。" }
                 elseif ($stage -eq 'batch') { $status.message = "$index / $total 件目: $name の複数シートをまとめてPDF化しています。" }
-                elseif ($stage -eq 'split') { $status.message = "$index / $total 件目: $name のPDFをシート別に分けています。" }
-                elseif ($stage -eq 'sheet') { $status.message = "$index / $total 件目: $name / シート $sheetName をPDF化しています。" }
+                elseif ($stage -eq 'split') { $status.message = "$index / $total 件目: $name のPDFを$unitLabel 単位に分けています。" }
+                elseif ($stage -eq 'sheet') { $status.message = "$index / $total 件目: $name / $unitLabel $sheetName をPDF化しています。" }
                 else { $status.message = "$index / $total 件目: $name を準備しています。" }
                 $status.percent = [int][Math]::Floor((($index - 1 + 0.35) / [Math]::Max(1, $total)) * 100)
                 Write-RenderJobStatus $statusPath $status
@@ -3611,7 +5035,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
                 $pin = Get-DataProperty (Get-DataProperty $job 'snapshotPins' $null) $id $null
                 $pinSnapshot = [string](Get-DataProperty $pin 'snapshotId' '')
                 $pinHash = [string](Get-DataProperty $pin 'expectedHash' '')
-                $r = Render-Workbook $language $id $excel $true $callback '' $pinSnapshot $pinHash
+                $r = Render-Source $language $id $excel $true $callback '' $pinSnapshot $pinHash
                 $deferredAnalyses += $Script:PendingAnalysis
                 $Script:PendingAnalysis = $null
                 $r['ok'] = $true
@@ -3754,6 +5178,14 @@ function Update-Page([string]$Language, $Body) {
         }
         if ($null -ne $Body.numberingManual) { Set-NoteProperty $p 'numberingManual' ([bool]$Body.numberingManual); $structural = $true }
         if ($null -ne $Body.resetNumbering -and [bool]$Body.resetNumbering) { Set-NoteProperty $p 'numberingManual' $false; $structural = $true }
+        if ($null -ne (Get-DataProperty $Body 'pageRange' $null)) {
+            Set-NoteProperty $p 'pageRange' (ConvertTo-NormalizedPageRange (Get-DataProperty $Body 'pageRange' $null))
+            $structural = $true
+        }
+        if ($null -ne (Get-DataProperty $Body 'clearPageRange' $null) -and [bool](Get-DataProperty $Body 'clearPageRange' $false)) {
+            Set-NoteProperty $p 'pageRange' $null
+            $structural = $true
+        }
         if ($null -ne $Body.enabled) {
             if ([bool]$Body.enabled) {
                 if ([string](Get-DataProperty $p 'volume' 'none') -eq 'none') {
@@ -3874,20 +5306,118 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     $cat=Require-WorkbookCategory $Category
     if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $Volume){throw [ArgumentException]::new("不正な成果物です: $Volume")}
     $workspace=Get-WorkspacePath $Language;$wbMap=@{};$targets=@(Get-Array $Structure.workbooks|Where-Object{Test-WorkbookCategory $_ $cat});foreach($wb in $targets){$wbMap[[string]$wb.workbookId]=$wb}
+    $sourceMap=@{};foreach($source in @(Get-Array (Get-DataProperty $Structure 'sources' @()))){$sourceMap[[string](Get-DataProperty $source 'sourceId' '')]=$source}
+    $itemMap=@{};foreach($item in @(Get-Array (Get-DataProperty $Structure 'items' @()))){$itemMap[[string](Get-DataProperty $item 'itemId' '')]=$item}
+    $unitMap=@{};foreach($unit in @(Get-Array (Get-DataProperty $Structure 'units' @()))){$unitMap[[string](Get-DataProperty $unit 'unitId' '')]=$unit}
+    $artifactMap=@{};foreach($artifact in @(Get-Array (Get-DataProperty $Structure 'artifacts' @()))){$artifactMap[[string](Get-DataProperty $artifact 'artifactId' '')]=$artifact}
+    $packId=Get-BuiltinPackId $cat;$pack=@(Get-Array (Get-DataProperty $Structure 'packs' @())|Where-Object{[string](Get-DataProperty $_ 'packId' '') -eq $packId}|Select-Object -First 1)
+    $packObject=if($pack.Count -gt 0){$pack[0]}else{New-BuiltinPack $cat $Language}
+    $settings=Get-ResolvedPackSettings $packObject $Language;$targetName=Get-TargetDisplayName $Language $Volume;$projectId=Get-ProjectIdFromWorkbooks $targets;$namedProjectId=Get-CategoryProjectId $projectId $cat
+    $outputFileName=Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId ([string](Get-DataProperty $packObject 'displayName' $cat.ToUpperInvariant())) $targetName
+    $document=[ordered]@{title=[string]$settings.documentTitle;subtitle=[string]$settings.documentSubtitle;targetName=$targetName;includeCover=[bool]$settings.includeCover;includeToc=[bool]$settings.includeToc;includeSectionDividers=[bool]$settings.includeSectionDividers;outputFileNamePattern=[string]$settings.outputFileNamePattern;outputFileName=$outputFileName}
     $pages=@(Get-Array $Structure.pages|Where-Object{$_.enabled -eq $true -and [string]$_.volume -eq $Volume -and $wbMap.ContainsKey([string]$_.workbookId)}|Sort-Object {[double]$_.order},{Resolve-PageId $_})
     $blockers=@();$manifest=@();$fpPages=@()
     if($pages.Count -eq 0){$blockers+= [ordered]@{code='no-pages';pageTitle='';workbookName='';message='対象ページがありません。ページ構成を確認してください。'}}
-    foreach($p in $pages){$wb=$wbMap[[string]$p.workbookId];$title=[string]$p.title;$wbName=[string]$wb.fileName;$rel=[string]$p.contentPdf;$full='';$size=0L;$ticks=0L
+    foreach($p in $pages){$pageId=Resolve-PageId $p;$wb=$wbMap[[string]$p.workbookId];$title=[string]$p.title;if([string]::IsNullOrWhiteSpace($title)){$title=[string]$p.sheetName};$wbName=[string]$wb.fileName;$rel=[string]$p.contentPdf;$full='';$size=0L;$ticks=0L;$sourcePageCount=1
         if(-not $rel){$blockers+=[ordered]@{code='content-missing';pageTitle=$title;workbookName=$wbName;message='PDF未作成のページがあります。先にPDF作成してください。'}}
-        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path $full)){throw 'missing'};$it=Get-Item $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
-        if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers+=[ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='元Excelが更新されています。先にPDF作成してください。'}}
-        elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers+=[ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='Excelのシート構成が変わっています。先にPDF作成してください。'}}
+        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path $full)){throw 'missing'};$it=Get-Item $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;$sourcePageCount=Get-PdfPageCount $full}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
+        if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers+=[ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='元原稿が更新されています。先に変換PDFを作成してください。'}}
+        elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers+=[ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='原稿のページ構成が変わっています。先に変換PDFを作成してください。'}}
         elseif(-not(Test-PageContentMatchesWorkbookVersion $p $wb)){$blockers+=[ordered]@{code='old-content';pageTitle=$title;workbookName=$wbName;message='古いPDF参照が残っています。先にPDF作成してください。'}}
-        $normalized=($rel -replace '\\','/').ToLowerInvariant();$fpPages+=[ordered]@{pageId=(Resolve-PageId $p);order=[double]$p.order;enabled=[bool]$p.enabled;volume=[string]$p.volume;numberingMode=[string]$p.numberingMode;contentPdf=$normalized;contentPdfSize=$size;contentPdfLastWriteUtcTicks=$ticks;lastRenderedVersionId=[string]$wb.lastRenderedVersionId}
-        if($full){$manifest+=[ordered]@{pageId=(Resolve-PageId $p);title=$title;sourcePdf=$full;numberingMode=[string]$p.numberingMode;punchShiftPt=(Convert-CmToPt 0.2)}}
+        $item=if($itemMap.ContainsKey($pageId)){$itemMap[$pageId]}else{$null};$unitId=[string](Get-DataProperty $item 'unitId' (New-WorksheetUnitId ([string]$p.workbookId) ([string]$p.sheetName)));$unit=if($unitMap.ContainsKey($unitId)){$unitMap[$unitId]}else{$null};$artifactId=[string](Get-DataProperty $item 'artifactId' '');$artifact=if($artifactMap.ContainsKey($artifactId)){$artifactMap[$artifactId]}else{$null};$source=if($sourceMap.ContainsKey([string]$p.workbookId)){$sourceMap[[string]$p.workbookId]}else{$null};$recordedPageCount=Get-IntDataProperty $artifact 'pageCount' (Get-IntDataProperty $unit 'physicalPageCount' 0);if($recordedPageCount -gt 0){$sourcePageCount=$recordedPageCount}
+        $rangeValue=Get-DataProperty $p 'pageRange' (Get-DataProperty $item 'pageRange' $null);$range=$null;try{$range=ConvertTo-NormalizedPageRange $rangeValue}catch{$blockers+=[ordered]@{code='invalid-page-range';pageTitle=$title;workbookName=$wbName;message=$_.Exception.Message}}
+        $rangeStart=if($null -ne $range){[int]$range.start}else{1};$rangeEnd=if($null -ne $range){[int]$range.end}else{$sourcePageCount}
+        if($rangeStart -gt $sourcePageCount -or $rangeEnd -gt $sourcePageCount){$blockers+=[ordered]@{code='page-range-out-of-bounds';pageTitle=$title;workbookName=$wbName;message="ページ範囲 $rangeStart-$rangeEnd は変換PDF（$sourcePageCount ページ）の範囲外です。"}}
+        $sourceType=[string](Get-DataProperty $source 'sourceType' (Get-DataProperty $wb 'sourceType' 'excel'));$sourceKey=[string](Get-DataProperty $unit 'sourceKey' ([string]$p.sheetName));$sectionId="source:$([string]$p.workbookId)";$sectionTitle=[string](Get-DataProperty $source 'displayName' (Get-DataProperty $wb 'displayName' $wbName));$bookmarkTitle=if([string]::IsNullOrWhiteSpace($sectionTitle)){$title}else{"$sectionTitle / $title"}
+        $normalized=($rel -replace '\\','/').ToLowerInvariant();$fpPages+=[ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);order=[double]$p.order;enabled=[bool]$p.enabled;volume=[string]$p.volume;title=$title;pageRange=$range;numberingMode=[string]$p.numberingMode;contentPdf=$normalized;contentPdfSize=$size;contentPdfLastWriteUtcTicks=$ticks;lastRenderedVersionId=[string]$wb.lastRenderedVersionId}
+        if($full){$manifest+=[ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);sourceId=[string]$p.workbookId;unitId=$unitId;artifactId=[string](Get-DataProperty $artifact 'artifactId' $artifactId);sourceType=$sourceType;sourceKey=$sourceKey;title=$title;bookmarkTitle=$bookmarkTitle;sectionId=$sectionId;sectionTitle=$sectionTitle;sourcePdf=$full;sourcePageStart=$rangeStart;sourcePageEnd=$rangeEnd;sourcePageCount=$sourcePageCount;numberingMode=[string]$p.numberingMode;punchShiftPt=(Convert-CmToPt 0.2)}}
     }
-    $input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;category=$cat;volume=$Volume;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
-    return [ordered]@{language=$Language;category=$cat;volume=$Volume;pages=$pages;manifestPages=$manifest;blockers=@($blockers);pageCount=$pages.Count;projectId=(Get-ProjectIdFromWorkbooks $targets);fingerprint=$fingerprint;fingerprintInput=$input}
+    $physicalPages=@();$outputPageNumber=0
+    if($manifest.Count -gt 0 -and $document.includeCover){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;kind='cover';title=[string]$document.title}}
+    $tocCount=if($manifest.Count -gt 0 -and $document.includeToc){[Math]::Max(1,[Math]::Ceiling($manifest.Count/34.0))}else{0};for($i=1;$i -le $tocCount;$i++){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;kind='toc';title='目次';tocPageNumber=$i}}
+    $previousSection=''
+    foreach($entry in $manifest){if($document.includeSectionDividers -and [string]$entry.sectionId -ne $previousSection){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;kind='section-divider';sectionId=[string]$entry.sectionId;title=[string]$entry.sectionTitle}};$previousSection=[string]$entry.sectionId
+        for($sourcePage=[int]$entry.sourcePageStart;$sourcePage -le [int]$entry.sourcePageEnd;$sourcePage++){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;kind='content';itemId=[string]$entry.itemId;pageId=[string]$entry.pageId;sourceId=[string]$entry.sourceId;unitId=[string]$entry.unitId;artifactId=[string]$entry.artifactId;sourceType=[string]$entry.sourceType;sourceKey=[string]$entry.sourceKey;sourcePdfPageNumber=$sourcePage;title=[string]$entry.title;sectionId=[string]$entry.sectionId;numberingMode=[string]$entry.numberingMode}}
+    }
+    $input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;category=$cat;volume=$Volume;document=$document;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
+    return [ordered]@{language=$Language;category=$cat;volume=$Volume;pages=$pages;manifestPages=$manifest;physicalPages=$physicalPages;document=$document;blockers=@($blockers);itemCount=$pages.Count;pageCount=$outputPageNumber;projectId=$projectId;outputFileName=$outputFileName;fingerprint=$fingerprint;fingerprintInput=$input}
+}
+
+function Get-OfficeApplicationDiagnostic([string]$ProgId, [string]$DisplayName) {
+    $curVer = ''; $registered = $false
+    try {
+        $key = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey("$ProgId\CurVer")
+        if ($null -ne $key) { try { $curVer = [string]$key.GetValue(''); $registered = -not [string]::IsNullOrWhiteSpace($curVer) } finally { $key.Dispose() } }
+    } catch { }
+    $app = $null; $version = ''; $build = ''; $errorCode = ''; $errorMessage = ''
+    if ($registered) {
+        try {
+            $app = New-Object -ComObject $ProgId
+            try { $app.Visible = $false } catch { }
+            try { $app.DisplayAlerts = $false } catch { }
+            try { $version = [string]$app.Version } catch { }
+            try { $build = [string]$app.Build } catch { }
+        } catch {
+            $errorMessage = [string]$_.Exception.Message
+            if ($errorMessage -match '80070520|0x80070520') { $errorCode = 'windows-session-unavailable' }
+            elseif ($errorMessage -match '80040154|0x80040154') { $errorCode = 'class-not-registered' }
+            else { $errorCode = 'com-start-failed' }
+        } finally {
+            if ($null -ne $app) {
+                try { $app.Quit() } catch { }
+                try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($app) } catch { }
+            }
+        }
+    } else { $errorCode = 'not-installed' }
+    $major = 0; if ($version -match '^(?<major>\d+)') { $major = [int]$matches.major }
+    $compatible = ($registered -and -not [string]::IsNullOrWhiteSpace($version) -and $major -ge 16)
+    $available = ($compatible -and [string]::IsNullOrWhiteSpace($errorCode))
+    $status = if ($available) { 'ready' } elseif (-not $registered) { 'not-installed' } elseif ($version -and -not $compatible) { 'unsupported' } else { 'unavailable' }
+    $action = switch ($status) {
+        'ready' { '' }
+        'not-installed' { "$DisplayName デスクトップ版をインストールしてください。PDF原稿だけの処理は継続できます。" }
+        'unsupported' { "$DisplayName 16.x以降へ更新してください。" }
+        default { "$DisplayName は登録済みですが起動できません。Windowsへサインインし直し、デスクトップからReportBinderを起動してください。" }
+    }
+    return [ordered]@{ appId=$ProgId; displayName=$DisplayName; registered=[bool]$registered; registeredVersion=$curVer; available=[bool]$available; compatible=[bool]$compatible; version=$version; build=$build; status=$status; errorCode=$errorCode; errorMessage=$errorMessage; userAction=$action }
+}
+
+function Get-PathFreeBytes([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    try {
+        $full = [IO.Path]::GetFullPath($Path); $root = [IO.Path]::GetPathRoot($full)
+        if ([string]::IsNullOrWhiteSpace($root)) { return $null }
+        return [int64]([IO.DriveInfo]::new($root).AvailableFreeSpace)
+    } catch { return $null }
+}
+
+function Get-SystemDiagnostics([string]$Language) {
+    $excel = Get-OfficeApplicationDiagnostic 'Excel.Application' 'Microsoft Excel'
+    $word = Get-OfficeApplicationDiagnostic 'Word.Application' 'Microsoft Word'
+    $composer = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
+    $pdfbox = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
+    $pdfjsMain = Join-Path $Script:WebRoot 'pdfjs\pdf.min.mjs'
+    $pdfjsWorker = Join-Path $Script:WebRoot 'pdfjs\pdf.worker.min.mjs'
+    $javaPath = ''; $javaVersion = ''; $javaReady = $false
+    try { $javaPath = Resolve-JavaExe; $javaVersion = ([string](Invoke-NativeCapture $javaPath @('-version')).text -replace '\s+', ' ').Trim(); $javaReady = -not [string]::IsNullOrWhiteSpace($javaVersion) } catch { $javaVersion = $_.Exception.Message }
+    $coreReady = ($javaReady -and (Test-Path -LiteralPath $composer) -and (Test-Path -LiteralPath $pdfbox) -and (Test-Path -LiteralPath $pdfjsMain) -and (Test-Path -LiteralPath $pdfjsWorker))
+    $paths = Get-Paths
+    $officeReady = ([bool]$excel.available -and [bool]$word.available)
+    $overall = if (-not $coreReady) { 'blocked' } elseif ($officeReady) { 'ready' } else { 'limited' }
+    $summary = if ($overall -eq 'ready') { 'Excel・Word・PDF原稿を処理できます。' } elseif ($overall -eq 'limited') { 'PDF原稿は処理できます。Office原稿には対応が必要です。' } else { '実行依存ファイルが不足しているため、管理者による修復が必要です。' }
+    return [ordered]@{
+        capturedAt = New-NowIso; language=$Language; status=$overall; summary=$summary
+        office = [ordered]@{ minimumSupportedMajor=16; excel=$excel; word=$word }
+        runtime = [ordered]@{
+            java=[ordered]@{ready=[bool]$javaReady;path=$javaPath;version=$javaVersion}
+            pdfbox=[ordered]@{ready=[bool]((Test-Path -LiteralPath $composer) -and (Test-Path -LiteralPath $pdfbox));composerBytes=$(if(Test-Path -LiteralPath $composer){(Get-Item -LiteralPath $composer).Length}else{0});libraryBytes=$(if(Test-Path -LiteralPath $pdfbox){(Get-Item -LiteralPath $pdfbox).Length}else{0})}
+            pdfjs=[ordered]@{ready=[bool]((Test-Path -LiteralPath $pdfjsMain) -and (Test-Path -LiteralPath $pdfjsWorker))}
+        }
+        storage = [ordered]@{
+            configured=[bool](-not [string]::IsNullOrWhiteSpace([string]$paths.submissionDir)); submissionDir=[string]$paths.submissionDir; dataDir=[string]$paths.dataDir; outputDir=[string]$paths.outputDir
+            dataFreeBytes=Get-PathFreeBytes ([string]$paths.dataDir); outputFreeBytes=Get-PathFreeBytes ([string]$paths.outputDir)
+        }
+    }
 }
 
 function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty $Snapshot 'fingerprint' '') }
@@ -3911,12 +5441,13 @@ function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Categor
         $composerJar=Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar';$pdfboxJar=Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar';if(-not(Test-Path $composerJar)){throw 'ReportPdfComposer.jar がありません。'};if(-not(Test-Path $pdfboxJar)){throw 'pdfbox-app.jar がありません。'}
         $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
         if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
-        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=Get-OutputFileName $Volume $projectId $cat;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
+        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=[string]$snapshotBefore.outputFileName;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
         if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の最終PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
-        $manifest=[ordered]@{schemaVersion=2;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
+        $manifest=[ordered]@{schemaVersion=3;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;document=$snapshotBefore.document;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};physicalPages=$snapshotBefore.physicalPages;pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
         $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath);$exit=[int]$run.exitCode;$text=[string]$run.text;if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '最終PDFを作成できませんでした。'}
-        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'excel-updated' '元Excelが更新されたため、PDFを再作成後に最終PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
+        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'source-updated' '元原稿が更新されたため、変換PDFを再作成後に最終PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
         if($commit.changed){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'PDF作成中にページ構成またはPDF入力が変更されました。最新の状態で再度出力してください。'}
+        $manifest.outputPdf=$outPath;Write-JsonFile $manifestPath $manifest
         return [ordered]@{volume=$Volume;category=$cat;outputPdf=$outPath;inputFingerprint=$fpBefore;message=$text;readiness=$commit.readiness}
     }
 }
@@ -3971,12 +5502,12 @@ function Get-StatePayload([string]$Language) {
     $workbooks = @(Get-Array $structure.workbooks)
     $pages = @(Get-Array $structure.pages)
     $summary = [ordered]@{
-        excelUpdated = @($workbooks | Where-Object { [string]$_.status -eq 'excel-updated' }).Count
+        excelUpdated = @($workbooks | Where-Object { [string]$_.status -in @('excel-updated','source-updated') }).Count
         uncheckedPages = @($pages | Where-Object { [string]$_.status -in @('rendered','stale','not-rendered') }).Count
         confirmedPages = @($pages | Where-Object { [string]$_.status -eq 'confirmed' }).Count
         renderErrors = @($workbooks | Where-Object { [string]$_.status -eq 'render-error' }).Count
         pdfReadyWorkbooks = @($workbooks | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.lastRenderedExcelHash) -and [string]$_.status -ne 'render-error' }).Count
-        pdfPendingWorkbooks = @($workbooks | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.lastRenderedExcelHash) -or [string]$_.status -in @('new','excel-updated','render-error') }).Count
+        pdfPendingWorkbooks = @($workbooks | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.lastRenderedExcelHash) -or [string]$_.status -in @('new','excel-updated','source-updated','render-error') }).Count
         pdfReadyPages = @($pages | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.contentPdf) }).Count
         totalWorkbooks = $workbooks.Count
         totalPages = $pages.Count
@@ -4008,6 +5539,8 @@ function Get-StatePayload([string]$Language) {
     $pdfjsModule = ((Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.min.mjs')) -and (Test-Path -LiteralPath (Join-Path $pdfjsDir 'pdf.worker.min.mjs')))
     $pdfjsMode = 'none'
     if ($pdfjsModule) { $pdfjsMode = 'module' } elseif ($pdfjsClassic) { $pdfjsMode = 'classic' }
+    $packTemplates = @(Get-PackTemplateCatalog $Language)
+    $publicPacks = @(Get-PublicPackList $structure $Language)
     return [ordered]@{
         ok = $true
         mode = $Mode
@@ -4015,7 +5548,9 @@ function Get-StatePayload([string]$Language) {
         token = $Script:Token
         configured = $configured
         paths = $paths
-        structure = $structure
+        packTemplates = $packTemplates
+        packs = $publicPacks
+        structure = ConvertTo-V4StructureCompatibilityView $structure
         structureLoadError = $structureLoadError
         finalReadiness = $(if ($configured -and -not $structureLoadError) { Get-AllFinalReadiness $structure $Language $false } else { [ordered]@{} })
         summary = $summary
@@ -4023,11 +5558,69 @@ function Get-StatePayload([string]$Language) {
         pdfjsPresent = ($pdfjsClassic -or $pdfjsModule)
         pdfjsMode = $pdfjsMode
         excelPrintProfileVersion = $Script:ExcelPrintProfileVersion
+        pdfImportProfileVersion = $Script:PdfImportProfileVersion
+        wordRenderProfileVersion = $Script:WordRenderProfileVersion
         inputHistoryEnabled = $inputHistoryOn
         changeSummaries = $changeSummaries
         auto = $autoSummary
         autoRenderInProgress = $Script:AutoRenderInProgress
         shutdownOnTabClose = $false
+    }
+}
+
+function Get-V2StatePayload([string]$Language) {
+    $legacy = Get-StatePayload $Language
+    $configured = [bool](Get-DataProperty $legacy 'configured' $false)
+    $structureLoadError = [string](Get-DataProperty $legacy 'structureLoadError' '')
+    $structure = if ($configured -and [string]::IsNullOrWhiteSpace($structureLoadError)) { Get-Structure $Language } else { New-EmptyStructure $Language }
+    $sources = @()
+    foreach ($source in @(Get-Array (Get-DataProperty $structure 'sources' @()))) {
+        $sources += [pscustomobject][ordered]@{
+            sourceId = [string](Get-DataProperty $source 'sourceId' '')
+            packId = [string](Get-DataProperty $source 'packId' '')
+            relativePath = [string](Get-DataProperty $source 'relativePath' '')
+            sourceType = [string](Get-DataProperty $source 'sourceType' '')
+            adapterId = [string](Get-DataProperty $source 'adapterId' '')
+            displayName = [string](Get-DataProperty $source 'displayName' '')
+            ownerDepartment = [string](Get-DataProperty $source 'ownerDepartment' '')
+            required = [bool](Get-DataProperty $source 'required' $true)
+            defaultTargetId = [string](Get-DataProperty $source 'defaultTargetId' 'unassigned')
+            status = [string](Get-DataProperty $source 'status' '')
+            currentSnapshotId = [string](Get-DataProperty $source 'currentSnapshotId' '')
+            lastRenderedSnapshotId = [string](Get-DataProperty $source 'lastRenderedSnapshotId' '')
+            lastRenderedVersionId = [string](Get-DataProperty $source 'lastRenderedVersionId' '')
+            lastRenderedAt = Get-DataProperty $source 'lastRenderedAt' $null
+        }
+    }
+    return [ordered]@{
+        ok = $true
+        apiVersion = 2
+        domainSchemaVersion = 3
+        mode = Get-DataProperty $legacy 'mode' $Mode
+        language = $Language
+        token = Get-DataProperty $legacy 'token' $Script:Token
+        configured = $configured
+        paths = Get-DataProperty $legacy 'paths' $null
+        structureLoadError = $structureLoadError
+        packTemplates = @(Get-PackTemplateCatalog $Language)
+        packs = @(Get-PublicPackList $structure $Language)
+        structure = [ordered]@{
+            schemaVersion = 3
+            language = $Language
+            packs = @(Get-PublicPackList $structure $Language)
+            sources = @($sources)
+            units = @(Get-Array (Get-DataProperty $structure 'units' @()))
+            items = @(Get-Array (Get-DataProperty $structure 'items' @()))
+            artifacts = @(Get-Array (Get-DataProperty $structure 'artifacts' @()))
+            outputs = Get-DataProperty $structure 'outputs' ([ordered]@{})
+            migrationIssues = @(Get-Array (Get-DataProperty $structure 'migrationIssues' @()))
+            updatedAt = Get-DataProperty $structure 'updatedAt' $null
+        }
+        finalReadiness = Get-DataProperty $legacy 'finalReadiness' ([ordered]@{})
+        summary = Get-DataProperty $legacy 'summary' ([ordered]@{})
+        recentErrors = @(Get-Array (Get-DataProperty $legacy 'recentErrors' @()))
+        inputHistoryEnabled = [bool](Get-DataProperty $legacy 'inputHistoryEnabled' $false)
+        changeSummaries = Get-DataProperty $legacy 'changeSummaries' ([ordered]@{})
     }
 }
 
@@ -4421,6 +6014,62 @@ function Handle-Api($Context) {
             $result = Invoke-AutoRender $language $ids
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result }); return
         }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/state') {
+            Write-JsonResponse $Context 200 (Get-V2StatePayload $language); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/diagnostics/run') {
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; diagnostics=(Get-SystemDiagnostics $language) }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/pack-templates') {
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; packTemplates = @(Get-PackTemplateCatalog $language) }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/packs') {
+            $packPaths = Get-Paths
+            $packDataDir = [string](Get-DataProperty $packPaths 'dataDir' '')
+            $structure = if (-not [string]::IsNullOrWhiteSpace($packDataDir) -and (Test-Path -LiteralPath $packDataDir)) { Get-Structure $language } else { New-EmptyStructure $language }
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; packs = @(Get-PublicPackList $structure $language) }); return
+        }
+        if ($method -eq 'PATCH' -and $path -match '^/api/v2/packs/([^/]+)$') {
+            $body = Read-BodyJson $Context.Request
+            $packId = [Uri]::UnescapeDataString([string]$matches[1])
+            $result = Update-PackSettings $language $packId $body
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; result = $result; state = (Get-StatePayload $language) }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/source-candidates') {
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; scannedAt = (New-NowIso); candidates = @(Get-SourceCandidates @('excel','word','pdf')) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/sources/register-batch') {
+            $body = Read-BodyJson $Context.Request
+            $relativePaths = @(Get-Array (Get-DataProperty $body 'relativePaths' @()) | ForEach-Object { [string]$_ })
+            if ($relativePaths.Count -eq 0) { throw '登録する原稿が選択されていません。' }
+            $packId = [string](Get-DataProperty $body 'packId' '')
+            if ([string]::IsNullOrWhiteSpace($packId)) { $packId = Get-BuiltinPackId (Require-WorkbookCategory ([string](Get-DataProperty $body 'category' ''))) }
+            $result = Register-SourcesBatch $language $relativePaths $packId ([string](Get-DataProperty $body 'sourceType' ''))
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; result = $result; state = (Get-V2StatePayload $language) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/sources/unregister') {
+            $body = Read-BodyJson $Context.Request
+            $sourceId = [string](Get-DataProperty $body 'sourceId' '')
+            if ([string]::IsNullOrWhiteSpace($sourceId)) { throw 'sourceId が必要です。' }
+            $result = Unregister-Workbook $language $sourceId
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; result = $result; state = (Get-V2StatePayload $language) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/sources/scan-updates') {
+            $result = Scan-Updates $language
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; result = $result; state = (Get-V2StatePayload $language) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/sources/render/start') {
+            $body = Read-BodyJson $Context.Request
+            $sourceIds = @(Get-Array (Get-DataProperty $body 'sourceIds' @()) | ForEach-Object { [string]$_ })
+            $result = Start-RenderJob $language $sourceIds ([bool](Get-DataProperty $body 'onlyUpdated' $false)) ([string](Get-DataProperty $body 'category' ''))
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; jobId = [string]$result.jobId; job = $result }); return
+        }
+        if ($method -eq 'PATCH' -and $path -match '^/api/v2/sources/([^/]+)$') {
+            $body = Read-BodyJson $Context.Request
+            $sourceId = [Uri]::UnescapeDataString([string]$matches[1])
+            $updated = Update-SourceMetadata $language $sourceId $body
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; source = $updated; state = (Get-StatePayload $language) }); return
+        }
         if ($method -eq 'GET' -and $path -eq '/api/state') {
             Write-JsonResponse $Context 200 (Get-StatePayload $language); return
         }
@@ -4431,7 +6080,7 @@ function Handle-Api($Context) {
             Write-JsonResponse $Context 200 ([ordered]@{ok=$true;category=$cat;volumes=$vols});return
         }
         if ($method -eq 'GET' -and $path -eq '/api/submission-files') {
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; scannedAt = (New-NowIso); files = (Get-ExcelFilesInSubmission) }); return
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; scannedAt = (New-NowIso); files = (Get-SourceCandidates @('excel','word','pdf')) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/submission/select-and-start') {
             $body = Read-BodyJson $Context.Request
@@ -4450,7 +6099,7 @@ function Handle-Api($Context) {
             $config.lastOutputDir = [string]$newPaths.outputDir
             $config.lastMode = $Mode
             Save-AppConfig $config
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; migration = $migration; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = (Get-ExcelFilesInSubmission) }); return
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; migration = $migration; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = (Get-SourceCandidates @('excel','word','pdf')) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/dialog/folder') {
             $body = Read-BodyJson $Context.Request
@@ -4495,13 +6144,15 @@ function Handle-Api($Context) {
             $rels = @()
             if ($body.relativePaths) { $rels = @(Get-Array $body.relativePaths | ForEach-Object { [string]$_ }) }
             elseif ($body.relativePath) { $rels = @([string]$body.relativePath) }
-            if ($rels.Count -eq 0) { throw '登録するExcelが選択されていません。' }
-            $result = Register-WorkbooksBatch $language $rels ([string]$body.category)
+            if ($rels.Count -eq 0) { throw '登録する原稿が選択されていません。' }
+            $cat = Require-WorkbookCategory ([string]$body.category)
+            $result = Register-SourcesBatch $language $rels (Get-BuiltinPackId $cat) ''
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result; state = (Get-StatePayload $language) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/workbooks/register') {
             $body = Read-BodyJson $Context.Request
-            $result = Register-Workbook $language ([string]$body.relativePath) ([string]$body.category)
+            $cat = Require-WorkbookCategory ([string]$body.category)
+            $result = Register-Source $language ([string]$body.relativePath) (Get-BuiltinPackId $cat) ([string](Get-DataProperty $body 'sourceType' ''))
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = $result; state = (Get-StatePayload $language) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/workbooks/unregister') {
@@ -4539,12 +6190,12 @@ function Handle-Api($Context) {
             $structure = Get-Structure $language
             $ids = @()
             if ($body.workbookIds) { $ids = @(Get-Array $body.workbookIds | ForEach-Object { [string]$_ }) }
-            elseif ($body.onlyUpdated -eq $true) { $ids = @(Get-Array $structure.workbooks | Where-Object { [string]$_.status -in @('new','excel-updated','render-error') -or [string]$_.currentExcelHash -ne [string]$_.lastRenderedExcelHash } | ForEach-Object { [string]$_.workbookId }) }
+            elseif ($body.onlyUpdated -eq $true) { $ids = @(Get-Array $structure.workbooks | Where-Object { [string]$_.status -in @('new','excel-updated','source-updated','render-error') -or [string]$_.currentExcelHash -ne [string]$_.lastRenderedExcelHash } | ForEach-Object { [string]$_.workbookId }) }
             else { $ids = @(Get-Array $structure.workbooks | ForEach-Object { [string]$_.workbookId }) }
             $results = @()
             foreach ($id in $ids) {
                 try {
-                    $r = Render-Workbook $language $id
+                    $r = Render-Source $language $id
                     $r['ok'] = $true
                     $results += $r
                 } catch {
@@ -5148,7 +6799,10 @@ function Get-SnapshotSourceState([string]$Language, [string]$WorkbookId, [string
     # V5-IV-5: 現物の有無は immutable な manifest には書かない。
     $dir = Get-SnapshotDir $Language $WorkbookId $SnapshotId
     $statePath = Join-Path $dir 'source-state.json'
-    $sourcePath = Join-Path $dir 'source.xlsx'
+    $manifest = Get-SnapshotManifest $Language $WorkbookId $SnapshotId
+    $extension = [IO.Path]::GetExtension([string](Get-DataProperty $manifest 'relativePath' '')).ToLowerInvariant()
+    if ($extension -notin @('.xlsx','.pdf')) { $extension = $(if (Test-Path -LiteralPath (Join-Path $dir 'source.pdf')) { '.pdf' } else { '.xlsx' }) }
+    $sourcePath = Join-Path $dir ("source$extension")
     $exists = Test-Path -LiteralPath $sourcePath
     $state = $null
     if (Test-Path -LiteralPath $statePath) { try { $state = Read-JsonFile $statePath $null } catch { } }
@@ -5339,12 +6993,14 @@ function Save-SnapshotSourceFile([string]$Language, [string]$WorkbookId, [string
     if (-not (Test-SourceRetentionEnabled)) { return [ordered]@{ ok = $false; reason = 'retention-not-approved' } }
     $dir = Get-SnapshotDir $Language $WorkbookId $SnapshotId
     if (-not (Test-Path -LiteralPath $dir)) { return [ordered]@{ ok = $false; reason = 'snapshot-missing' } }
-    $dest = Join-Path $dir 'source.xlsx'
+    $extension = [IO.Path]::GetExtension($SourcePath).ToLowerInvariant()
+    if ($extension -notin @('.xlsx','.pdf')) { $extension = '.xlsx' }
+    $dest = Join-Path $dir ("source$extension")
     if (Test-Path -LiteralPath $dest) { return [ordered]@{ ok = $true; path = $dest; reused = $true } }
 
     $tmpDir = Join-Path (Get-WorkspacePath $Language) ('state\tmp\' + (New-RbId))
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-    $tmp = Join-Path $tmpDir 'source.xlsx'
+    $tmp = Join-Path $tmpDir ("source$extension")
     try {
         $before = Get-Item -LiteralPath $SourcePath -ErrorAction Stop
         $copied = $false; $lastError = ''
@@ -5435,7 +7091,7 @@ function Capture-DetectedSnapshot([string]$Language, [string]$WorkbookId, [strin
         Set-NoteProperty $t 'currentSnapshotId' $snapshotId
         Set-NoteProperty $t 'lastDetectedAt' (New-NowIso)
         $rendered = Normalize-FileHash ([string](Get-DataProperty $t 'lastRenderedExcelHash' ''))
-        if ($rendered -and $rendered -ne $capturedHash -and [string]$t.status -ne 'render-error') { Set-NoteProperty $t 'status' 'excel-updated' }
+        if ($rendered -and $rendered -ne $capturedHash -and [string]$t.status -ne 'render-error') { Set-NoteProperty $t 'status' (Get-SourceUpdatedStatus $t) }
         return [ordered]@{ committed = $true }
     }
     return [ordered]@{ ok = $true; snapshotId = $snapshotId; isNew = [bool]$meta.isNew; committed = [bool]$committed.committed; reason = [string]$committed.reason }
@@ -5502,7 +7158,9 @@ function Capture-RenderInput([string]$Language, [string]$WorkbookId, [string]$Sn
     $captureId = $(if ([string]::IsNullOrWhiteSpace($JobId)) { New-RbId } else { $JobId })
     $dir = Join-Path (Get-EphemeralJobRoot $Language) $captureId
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $tmp = Join-Path $dir 'source.xlsx'
+    $extension = [IO.Path]::GetExtension($livePath).ToLowerInvariant()
+    if ($extension -notin @('.xlsx','.pdf')) { $extension = '.xlsx' }
+    $tmp = Join-Path $dir ("source$extension")
     if (-not (Test-Path -LiteralPath $tmp)) {
         Copy-FileSharedRead $livePath $tmp
         try { Unblock-File -LiteralPath $tmp -ErrorAction SilentlyContinue } catch { }
@@ -6504,6 +8162,15 @@ function Set-LatestComparisonAssets([string]$Language, [string]$WorkbookId, $Com
 function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
     # structure.json等は変更しないが、画像ハッシュと同一世代のcontent PDFは保持する。
     # これにより再レンダリング比較でも、判定対象と画面表示対象が必ず一致する。
+    try {
+        $structure = Get-Structure $Language
+        $source = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
+        if ($source.Count -gt 0) {
+            $sourceType = [string](Get-DataProperty $source[0] 'sourceType' 'excel')
+            if ($sourceType -eq 'pdf') { return Render-PdfSnapshotForComparison $Language $WorkbookId $SnapshotId }
+            if ($sourceType -eq 'word') { return Render-WordSnapshotForComparison $Language $WorkbookId $SnapshotId }
+        }
+    } catch { }
     $state = Get-SnapshotSourceState $Language $WorkbookId $SnapshotId
     if (-not [bool]$state.sourceRetained) { return [ordered]@{ ok = $false; reason = 'source-missing' } }
     return Invoke-WithRenderLock $Language $WorkbookId {
@@ -6595,14 +8262,165 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
     }
 }
 
+function Get-ComparisonSourceType([string]$Language, [string]$WorkbookId) {
+    try {
+        $context = Get-RegisteredSourceAdapterContext $Language $WorkbookId
+        $sourceType = ([string](Get-DataProperty $context 'sourceType' 'excel')).Trim().ToLowerInvariant()
+        if ($sourceType -in @('excel','word','pdf')) { return $sourceType }
+    } catch { }
+    return 'excel'
+}
+
+function Test-ComparisonSheetEquivalent($Before, $After) {
+    if ($null -eq $Before -or $null -eq $After) { return $false }
+    if ([string](Get-DataProperty $Before 'status' '') -ne 'ok' -or [string](Get-DataProperty $After 'status' '') -ne 'ok') { return $false }
+    $beforeHash = Normalize-FileHash ([string](Get-DataProperty $Before 'sheetVisualHash' ''))
+    $afterHash = Normalize-FileHash ([string](Get-DataProperty $After 'sheetVisualHash' ''))
+    return ((-not [string]::IsNullOrWhiteSpace($beforeHash) -and $beforeHash -eq $afterHash) -or (Test-SheetVisualEquivalent $Before $After))
+}
+
+function New-ComparisonUnitMapping($Before, $After, [string]$Kind, [double]$Confidence, [string]$Method, [string]$Message = '') {
+    $beforeName = $(if ($null -ne $Before) { [string](Get-DataProperty $Before 'sheetName' '') } else { '' })
+    $afterName = $(if ($null -ne $After) { [string](Get-DataProperty $After 'sheetName' '') } else { '' })
+    return [pscustomobject][ordered]@{
+        beforeSheetName = $beforeName
+        afterSheetName = $afterName
+        displayName = $(if (-not [string]::IsNullOrWhiteSpace($afterName)) { $afterName } else { $beforeName })
+        kind = $Kind
+        matchConfidence = [Math]::Max(0, [Math]::Min(1, $Confidence))
+        matchMethod = $Method
+        message = $Message
+    }
+}
+
+function Get-ComparisonSheetSequenceNumber($Sheet) {
+    $name = [string](Get-DataProperty $Sheet 'sheetName' '')
+    if ($name -match '(?<number>\d+)\s*$') { return [int]$matches['number'] }
+    return Get-SheetOrderNumber $name
+}
+
+function Get-ComparisonUnitMappings($BaselineSheets, $CurrentSheets, [string]$SourceType = 'excel') {
+    $before = @(Get-Array $BaselineSheets)
+    $after = @(Get-Array $CurrentSheets)
+    if ($SourceType -eq 'excel') {
+        $beforeMap = @{}
+        foreach ($sheet in $before) {
+            $name = [string](Get-DataProperty $sheet 'sheetName' '')
+            if (-not [string]::IsNullOrWhiteSpace($name)) { $beforeMap[$name] = $sheet }
+        }
+        $seen = @{}; $result = @()
+        foreach ($sheet in $after) {
+            $name = [string](Get-DataProperty $sheet 'sheetName' '')
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $seen[$name] = $true
+            if (-not $beforeMap.ContainsKey($name)) { $result += New-ComparisonUnitMapping $null $sheet 'added' 1 'name-unmatched'; continue }
+            $old = $beforeMap[$name]
+            if ([string](Get-DataProperty $old 'status' '') -ne 'ok' -or [string](Get-DataProperty $sheet 'status' '') -ne 'ok') {
+                $result += New-ComparisonUnitMapping $old $sheet 'unknown' 0 'analysis-unavailable' '比較用画像を解析できないため判定不能です。'
+            } elseif (Test-ComparisonSheetEquivalent $old $sheet) {
+                $result += New-ComparisonUnitMapping $old $sheet 'unchanged' 1 'stable-name-and-hash'
+            } else {
+                $result += New-ComparisonUnitMapping $old $sheet 'modified' 1 'stable-name'
+            }
+        }
+        foreach ($name in @($beforeMap.Keys)) {
+            if (-not $seen.ContainsKey([string]$name)) { $result += New-ComparisonUnitMapping $beforeMap[$name] $null 'removed' 1 'name-unmatched' }
+        }
+        return @($result)
+    }
+
+    # Word/PDFは物理ページ名が位置に依存する。完全一致ページの最長共通部分列を
+    # アンカーにし、途中への挿入・削除で後続ページを誤って「変更」にしない。
+    $before = @($before | Sort-Object @{Expression={Get-ComparisonSheetSequenceNumber $_};Ascending=$true})
+    $after = @($after | Sort-Object @{Expression={Get-ComparisonSheetSequenceNumber $_};Ascending=$true})
+    $m = $before.Count; $n = $after.Count
+    if ($m -eq 0) { return @($after | ForEach-Object { New-ComparisonUnitMapping $null $_ 'added' 1 'sequence-inserted' }) }
+    if ($n -eq 0) { return @($before | ForEach-Object { New-ComparisonUnitMapping $_ $null 'removed' 1 'sequence-removed' }) }
+    $equivalent = New-Object 'bool[,]' $m,$n
+    $hashCountsBefore = @{}; $hashCountsAfter = @{}
+    foreach ($sheet in $before) { $h = Normalize-FileHash ([string](Get-DataProperty $sheet 'sheetVisualHash' '')); if ($h) { $hashCountsBefore[$h] = 1 + [int](Get-DataProperty $hashCountsBefore $h 0) } }
+    foreach ($sheet in $after) { $h = Normalize-FileHash ([string](Get-DataProperty $sheet 'sheetVisualHash' '')); if ($h) { $hashCountsAfter[$h] = 1 + [int](Get-DataProperty $hashCountsAfter $h 0) } }
+    for ($i = 0; $i -lt $m; $i++) { for ($j = 0; $j -lt $n; $j++) { $equivalent[$i,$j] = Test-ComparisonSheetEquivalent ($before[$i]) ($after[$j]) } }
+    $lcs = New-Object 'int[,]' ($m + 1),($n + 1)
+    for ($i = $m - 1; $i -ge 0; $i--) {
+        for ($j = $n - 1; $j -ge 0; $j--) {
+            $nextI = $i + 1; $nextJ = $j + 1
+            if ($equivalent[$i,$j]) { $lcs[$i,$j] = 1 + $lcs[$nextI,$nextJ] }
+            else {
+                $skipBefore = [int]$lcs[$nextI,$j]; $skipAfter = [int]$lcs[$i,$nextJ]
+                $lcs[$i,$j] = [Math]::Max($skipBefore, $skipAfter)
+            }
+        }
+    }
+    $anchors = @(); $i = 0; $j = 0
+    while ($i -lt $m -and $j -lt $n) {
+        $nextI = $i + 1; $nextJ = $j + 1
+        if ($equivalent[$i,$j] -and $lcs[$i,$j] -eq (1 + $lcs[$nextI,$nextJ])) { $anchors += [pscustomobject]@{ before=$i; after=$j }; $i++; $j++ }
+        else {
+            $skipBefore = [int]$lcs[$nextI,$j]; $skipAfter = [int]$lcs[$i,$nextJ]
+            if ($skipBefore -ge $skipAfter) { $i++ } else { $j++ }
+        }
+    }
+    $anchors += [pscustomobject]@{ before=$m; after=$n }
+    $result = @(); $beforeStart = 0; $afterStart = 0
+    foreach ($anchor in $anchors) {
+        $beforeEnd = [int]$anchor.before; $afterEnd = [int]$anchor.after
+        $beforeGap = $beforeEnd - $beforeStart; $afterGap = $afterEnd - $afterStart
+        if ($beforeGap -eq 0) {
+            for ($k = 0; $k -lt $afterGap; $k++) { $result += New-ComparisonUnitMapping $null ($after[$afterStart + $k]) 'added' 1 'sequence-inserted' }
+        } elseif ($afterGap -eq 0) {
+            for ($k = 0; $k -lt $beforeGap; $k++) { $result += New-ComparisonUnitMapping ($before[$beforeStart + $k]) $null 'removed' 1 'sequence-removed' }
+        } elseif ($beforeGap -eq $afterGap) {
+            for ($k = 0; $k -lt $beforeGap; $k++) {
+                $old = $before[$beforeStart + $k]; $cur = $after[$afterStart + $k]
+                if ([string](Get-DataProperty $old 'status' '') -ne 'ok' -or [string](Get-DataProperty $cur 'status' '') -ne 'ok') {
+                    $result += New-ComparisonUnitMapping $old $cur 'unknown' 0 'analysis-unavailable' '比較用画像を解析できないため判定不能です。'
+                } else {
+                    $confidence = $(if ($beforeGap -eq 1) { 0.95 } else { 0.8 })
+                    $result += New-ComparisonUnitMapping $old $cur 'modified' $confidence 'sequence-between-anchors' '前後の一致ページを基準に対応付けました。'
+                }
+            }
+        } else {
+            $pairs = [Math]::Min($beforeGap, $afterGap)
+            for ($k = 0; $k -lt $pairs; $k++) {
+                $result += New-ComparisonUnitMapping ($before[$beforeStart + $k]) ($after[$afterStart + $k]) 'unknown' 0.35 'ambiguous-sequence' 'ページの追加・削除と変更が同じ区間にあり、対応を確定できません。'
+            }
+            for ($k = $pairs; $k -lt $beforeGap; $k++) { $result += New-ComparisonUnitMapping ($before[$beforeStart + $k]) $null 'removed' 0.65 'ambiguous-sequence-unmatched' }
+            for ($k = $pairs; $k -lt $afterGap; $k++) { $result += New-ComparisonUnitMapping $null ($after[$afterStart + $k]) 'added' 0.65 'ambiguous-sequence-unmatched' }
+        }
+        if ($beforeEnd -lt $m -and $afterEnd -lt $n) {
+            $old = $before[$beforeEnd]; $cur = $after[$afterEnd]
+            $hash = Normalize-FileHash ([string](Get-DataProperty $old 'sheetVisualHash' ''))
+            $ambiguousHash = (-not [string]::IsNullOrWhiteSpace($hash) -and ([int](Get-DataProperty $hashCountsBefore $hash 0) -gt 1 -or [int](Get-DataProperty $hashCountsAfter $hash 0) -gt 1))
+            $result += New-ComparisonUnitMapping $old $cur 'unchanged' $(if ($ambiguousHash) { 0.85 } else { 1.0 }) $(if ($ambiguousHash) { 'exact-hash-sequence-duplicate' } else { 'exact-hash-sequence' })
+        }
+        $beforeStart = $beforeEnd + 1; $afterStart = $afterEnd + 1
+    }
+    return @($result)
+}
+
+function Set-ComparisonUnitMappingResult($Result, $Mappings) {
+    $list = @(Get-Array $Mappings)
+    $Result.unitMappings = @($list)
+    $Result.changedSheets = @($list | Where-Object { [string]$_.kind -eq 'modified' } | ForEach-Object { [string]$_.displayName })
+    $Result.unchangedSheets = @($list | Where-Object { [string]$_.kind -eq 'unchanged' } | ForEach-Object { [string]$_.displayName })
+    $Result.unknownSheets = @($list | Where-Object { [string]$_.kind -eq 'unknown' } | ForEach-Object { [string]$_.displayName })
+    $Result.addedSheets = @($list | Where-Object { [string]$_.kind -eq 'added' } | ForEach-Object { [string]$_.displayName })
+    $Result.removedSheets = @($list | Where-Object { [string]$_.kind -eq 'removed' } | ForEach-Object { [string]$_.displayName })
+    $confidences = @($list | ForEach-Object { [double](Get-DataProperty $_ 'matchConfidence' 1) })
+    $Result.mappingConfidence = $(if ($confidences.Count -gt 0) { [double](@($confidences | Measure-Object -Minimum)[0].Minimum) } else { 1.0 })
+}
+
 function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]$CurrentSnapshotId, [string]$CurrentVersionId) {
     # 表現は「見落としなし」ではなく「最終PDFの見た目を基準とした高精度な判定」。
     $result = [ordered]@{
-        schemaVersion = 2; status = 'unavailable'
+        schemaVersion = 3; status = 'unavailable'
         scope = 'automatic'
         baselineSnapshotId = ''; baselineVersionId = ''
         currentSnapshotId = $CurrentSnapshotId; currentVersionId = $CurrentVersionId
         comparedAt = New-NowIso; method = ''
+        sourceType = Get-ComparisonSourceType $Language $WorkbookId
+        unitMappings = @(); mappingConfidence = 1.0
         changedSheets = @(); unchangedSheets = @(); unknownSheets = @()
         addedSheets = @(); removedSheets = @(); message = ''
     }
@@ -6659,32 +8477,12 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
         return $result
     }
 
-    $baseMap = @{}
-    foreach ($s in @(Get-Array (Get-DataProperty $base 'sheets' @()))) { $baseMap[[string]$s.sheetName] = $s }
-    $curNames = @{}
-    $changed = @(); $unchanged = @(); $unknown = @(); $added = @(); $removed = @()
-    foreach ($s in @(Get-Array (Get-DataProperty $cur 'sheets' @()))) {
-        $name = [string]$s.sheetName
-        $curNames[$name] = $true
-        if ([string](Get-DataProperty $s 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if (-not $baseMap.ContainsKey($name)) { $added += $name; continue }
-        $b = $baseMap[$name]
-        if ([string](Get-DataProperty $b 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if ((Normalize-FileHash ([string](Get-DataProperty $b 'sheetVisualHash' ''))) -eq (Normalize-FileHash ([string](Get-DataProperty $s 'sheetVisualHash' ''))) -or
-            (Test-SheetVisualEquivalent $b $s)) { $unchanged += $name }
-        else { $changed += $name }
-    }
+    $mappings = Get-ComparisonUnitMappings (Get-DataProperty $base 'sheets' @()) (Get-DataProperty $cur 'sheets' @()) ([string]$result.sourceType)
     $result.status = 'complete'
     $result.baselineSnapshotId = $baseSnap
     $result.baselineVersionId = $baseVer
     $result.method = $method
-    # V5-P1: 今回版のシートだけを回すと、削除されたシートが差分に出ない。
-    foreach ($k in @($baseMap.Keys)) { if (-not $curNames.ContainsKey([string]$k)) { $removed += [string]$k } }
-    $result.changedSheets = @($changed)
-    $result.unchangedSheets = @($unchanged)
-    $result.unknownSheets = @($unknown)
-    $result.addedSheets = @($added)
-    $result.removedSheets = @($removed)
+    Set-ComparisonUnitMappingResult $result $mappings
     $dir = Join-Path (Get-RenderRecordDir $Language $WorkbookId $CurrentSnapshotId $CurrentVersionId) 'comparisons'
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $comparisonKey = (Get-Sha256Text ("{0}|{1}|{2}|{3}|automatic" -f $baseSnap, $baseVer, $CurrentSnapshotId, $CurrentVersionId)).Substring(7, 16)
@@ -6707,7 +8505,7 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
     try { Publish-LatestComparisonCaches $Language $WorkbookId $saved $cur $base } catch {
         Write-Warning ('比較情報のローカルキャッシュ作成に失敗しました: ' + $_.Exception.Message)
     }
-    Write-HistoryEvent $Language 'compare.completed' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $CurrentSnapshotId; changed = @($changed); unknown = @($unknown) })
+    Write-HistoryEvent $Language 'compare.completed' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $CurrentSnapshotId; changed = @($result.changedSheets); unknown = @($result.unknownSheets) })
     return $saved
 }
 
@@ -7130,7 +8928,7 @@ function Assert-FinalBuildSourcesUnchanged($Snapshots, [string[]]$Volumes) {
             $knownSize = [int64](Get-DataProperty $w 'currentExcelSize' -1)
             if (-not [string]::IsNullOrWhiteSpace($knownTicks) -and $knownSize -ge 0) {
                 if ([string]$item.LastWriteTimeUtc.Ticks -ne $knownTicks -or [int64]$item.Length -ne $knownSize) {
-                    throw [InvalidOperationException]::new("$name の元Excelが更新されています。先にPDF作成してください。")
+                    throw [InvalidOperationException]::new("$name の元原稿が更新されています。先に変換PDFを作成してください。")
                 }
                 continue
             }
@@ -7138,7 +8936,7 @@ function Assert-FinalBuildSourcesUnchanged($Snapshots, [string[]]$Volumes) {
             $knownHash = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
             $liveHash = Normalize-FileHash (New-StableHash $full)
             if ([string]::IsNullOrWhiteSpace($knownHash) -or $liveHash -ne $knownHash) {
-                throw [InvalidOperationException]::new("$name の元Excelが更新されています。先にPDF作成してください。")
+                throw [InvalidOperationException]::new("$name の元原稿が更新されています。先に変換PDFを作成してください。")
             }
         }
     }
@@ -7230,7 +9028,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             # 5. 出力先PDFが開かれていないかを、対象すべてまとめて確認
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
-                $outName = Get-OutputFileName $v ([string]$snapshots[$v].projectId) $Category
+                $outName = [string]$snapshots[$v].outputFileName
                 $outPath = Join-Path ([string]$paths.outputDir) $outName
                 Set-NoteProperty $t 'finalPath' $outPath
                 Set-NoteProperty $t 'existed' ([bool](Test-Path -LiteralPath $outPath))
@@ -7250,7 +9048,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
                 Set-NoteProperty $t 'tempPath' $tmp
                 $snap = $snapshots[$v]
-                $manifest = [ordered]@{ schemaVersion=2; language=$Language; category=$cat; volume=$v; projectId=[string]$snap.projectId; inputFingerprint=[string]$snap.fingerprint; outputPdf=$tmp; createdAt=New-NowIso; pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true}; pages=$snap.manifestPages }
+                $manifest = [ordered]@{ schemaVersion=3; language=$Language; category=$cat; volume=$v; projectId=[string]$snap.projectId; inputFingerprint=[string]$snap.fingerprint; outputPdf=$tmp; createdAt=New-NowIso; document=$snap.document; pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true}; physicalPages=$snap.physicalPages; pages=$snap.manifestPages }
                 $manifestPath = Join-Path ([IO.Path]::GetTempPath()) ("ReportBinder_final_{0}_{1}_{2}.json" -f $v, $cat, $txId)
                 try {
                     Write-JsonFile $manifestPath $manifest
@@ -7349,10 +9147,16 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             $built = @()
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
+                $savedManifest = Get-DataProperty $t 'manifest' $null
+                $savedManifestPath = Join-Path $workspace ("exports\manifest_{0}_{1}.json" -f $v, $cat)
+                if ($null -ne $savedManifest) {
+                    Set-NoteProperty $savedManifest 'outputPdf' ([string]$t.finalPath)
+                    Write-JsonFile $savedManifestPath $savedManifest
+                }
                 # 保存済み出力・ページ構成履歴は廃止。共有フォルダーへの複製を作らない。
                 $archive = ''
                 Write-HistoryEvent $Language 'final.built' ([ordered]@{ category = $cat; volume = $v; buildId = [string]$t.buildId; outputPdf = [string]$t.finalPath })
-                $built += [ordered]@{ volume = $v; category = $cat; outputPdf = [string]$t.finalPath; buildId = [string]$t.buildId; archivePath = $archive; inputFingerprint = [string]$journal.beforeFingerprints[$v] }
+                $built += [ordered]@{ volume = $v; category = $cat; outputPdf = [string]$t.finalPath; manifestPath = $savedManifestPath; buildId = [string]$t.buildId; archivePath = $archive; inputFingerprint = [string]$journal.beforeFingerprints[$v] }
             }
             Set-JournalPhase $Language $journal 'completed'
             if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue }
@@ -7823,7 +9627,7 @@ function Request-AutoRunNow([string]$Language, [string]$WorkbookId) {
 # V5 差分詳細・視覚比較
 # =====================================================================
 
-$Script:DiffDetailAlgorithmVersion = 20
+$Script:DiffDetailAlgorithmVersion = 21
 $Script:DiffDetailDpi = 120
 $Script:DiffDetailThreshold = 24
 $Script:DiffDetailMinimumRegionPixels = 24
@@ -7863,7 +9667,7 @@ function New-HistoricalSnapshotComparison(
     $base = Get-VisualHashes $Language $WorkbookId $BaselineSnapshotId $BaselineVersionId
     $current = Get-VisualHashes $Language $WorkbookId $CurrentSnapshotId $CurrentVersionId
     $result = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 3
         status = 'unavailable'
         scope = 'history'
         baselineSnapshotId = $BaselineSnapshotId
@@ -7873,6 +9677,9 @@ function New-HistoricalSnapshotComparison(
         comparedAt = New-NowIso
         method = 'stored-hash-history'
         confidence = 1.0
+        sourceType = Get-ComparisonSourceType $Language $WorkbookId
+        unitMappings = @()
+        mappingConfidence = 1.0
         changedSheets = @()
         unchangedSheets = @()
         unknownSheets = @()
@@ -7893,32 +9700,9 @@ function New-HistoricalSnapshotComparison(
         $result.confidence = 0.65
         $result.message = '2版のPDF作成環境が異なります。表示結果を目視で確認してください。'
     }
-    $baseMap = @{}
-    foreach ($sheet in @(Get-Array (Get-DataProperty $base 'sheets' @()))) {
-        $name = [string](Get-DataProperty $sheet 'sheetName' '')
-        if (-not [string]::IsNullOrWhiteSpace($name)) { $baseMap[$name] = $sheet }
-    }
-    $currentNames = @{}
-    $changed = @(); $unchanged = @(); $unknown = @(); $added = @(); $removed = @()
-    foreach ($sheet in @(Get-Array (Get-DataProperty $current 'sheets' @()))) {
-        $name = [string](Get-DataProperty $sheet 'sheetName' '')
-        if ([string]::IsNullOrWhiteSpace($name)) { continue }
-        $currentNames[$name] = $true
-        if ([string](Get-DataProperty $sheet 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if (-not $baseMap.ContainsKey($name)) { $added += $name; continue }
-        $before = $baseMap[$name]
-        if ([string](Get-DataProperty $before 'status' '') -ne 'ok') { $unknown += $name; continue }
-        if ((Normalize-FileHash ([string](Get-DataProperty $before 'sheetVisualHash' ''))) -eq
-            (Normalize-FileHash ([string](Get-DataProperty $sheet 'sheetVisualHash' ''))) -or
-            (Test-SheetVisualEquivalent $before $sheet)) { $unchanged += $name } else { $changed += $name }
-    }
-    foreach ($name in @($baseMap.Keys)) { if (-not $currentNames.ContainsKey([string]$name)) { $removed += [string]$name } }
+    $mappings = Get-ComparisonUnitMappings (Get-DataProperty $base 'sheets' @()) (Get-DataProperty $current 'sheets' @()) ([string]$result.sourceType)
     $result.status = 'complete'
-    $result.changedSheets = @($changed)
-    $result.unchangedSheets = @($unchanged)
-    $result.unknownSheets = @($unknown)
-    $result.addedSheets = @($added)
-    $result.removedSheets = @($removed)
+    Set-ComparisonUnitMappingResult $result $mappings
     return [pscustomobject]$result
 }
 
@@ -7965,7 +9749,7 @@ function Get-DiffDetailContext(
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
     $structure = Get-Structure $Language
     $matches = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $safeWorkbookId } | Select-Object -First 1)
-    if ($matches.Count -eq 0) { throw '登録済みExcelが見つかりません。' }
+    if ($matches.Count -eq 0) { throw '登録済み原稿が見つかりません。' }
     $workbook = $matches[0]
     $displayName = [string](Get-DataProperty $workbook 'displayName' '')
     if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = [string](Get-DataProperty $workbook 'fileName' $safeWorkbookId) }
@@ -7976,6 +9760,7 @@ function Get-DiffDetailContext(
         currentSnapshotId = ''; currentVersionId = ''; baselineSnapshotId = ''; baselineVersionId = ''
         currentVisualHashes = $null; baselineVisualHashes = $null
         currentAt = ''; baselineAt = ''; method = ''; scope = 'automatic'
+        sourceType = [string](Get-DataProperty $workbook 'sourceType' 'excel')
     }
     if (-not (Test-InputHistoryEnabled)) {
         $baseResult.message = '入力履歴が無効なため、差分詳細は利用できません。'
@@ -8019,7 +9804,7 @@ function Get-DiffDetailContext(
     $status = [string](Get-DataProperty $workbook 'status' '')
     $currentHash = Normalize-FileHash ([string](Get-DataProperty $workbook 'currentExcelHash' ''))
     $renderedHash = Normalize-FileHash ([string](Get-DataProperty $workbook 'lastRenderedExcelHash' ''))
-    if ([string]::IsNullOrWhiteSpace($renderedHash) -or $status -in @('new','excel-updated','render-error','rendering') -or
+    if ([string]::IsNullOrWhiteSpace($renderedHash) -or $status -in @('new','excel-updated','source-updated','render-error','rendering') -or
         ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and $currentHash -ne $renderedHash)) {
         $baseResult.message = '最新のPDFを作成してから差分を確認してください。'; return [pscustomobject]$baseResult
     }
@@ -8124,36 +9909,53 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
     foreach ($name in @(Get-Array (Get-DataProperty $comparison 'removedSheets' @()))) { $removedSet[[string]$name] = $true }
     foreach ($name in @(Get-Array (Get-DataProperty $comparison 'unknownSheets' @()))) { $unknownSet[[string]$name] = $true }
 
-    $items = @()
-    $seen = @{}
-    foreach ($group in @(
-        [ordered]@{ kind = 'modified'; names = @(Get-Array (Get-DataProperty $comparison 'changedSheets' @())) },
-        [ordered]@{ kind = 'added'; names = @(Get-Array (Get-DataProperty $comparison 'addedSheets' @())) },
-        [ordered]@{ kind = 'removed'; names = @(Get-Array (Get-DataProperty $comparison 'removedSheets' @())) },
-        [ordered]@{ kind = 'unknown'; names = @(Get-Array (Get-DataProperty $comparison 'unknownSheets' @())) },
-        [ordered]@{ kind = 'unchanged'; names = @(Get-Array (Get-DataProperty $comparison 'unchangedSheets' @())) }
-    )) {
-        foreach ($rawName in @($group.names)) {
-            $name = [string]$rawName
-            if ([string]::IsNullOrWhiteSpace($name) -or $seen.ContainsKey($name)) { continue }
-            if ([string]$group.kind -eq 'modified' -and ($addedSet.ContainsKey($name) -or $removedSet.ContainsKey($name) -or $unknownSet.ContainsKey($name))) { continue }
-            $seen[$name] = $true
-            $items += [pscustomobject][ordered]@{
-                sheetName = $name
-                sheetKey = Get-DiffSheetKey $name
-                kind = [string]$group.kind
-                beforePages = 0
-                afterPages = 0
-                pageCount = 0
-                unchangedPageNumbers = @()
-                regionCount = 0
-                # PDFはそのまま保持し、表示中のページだけをブラウザで描画・比較する。
-                status = 'ready'
-                message = '表示したページをブラウザで比較します。'
-                confirmed = $false
-                pages = @()
+    $items = @(); $seen = @()
+    $mappingRecords = @(Get-Array (Get-DataProperty $comparison 'unitMappings' @()))
+    if ($mappingRecords.Count -eq 0) {
+        foreach ($group in @(
+            [ordered]@{ kind = 'modified'; names = @(Get-Array (Get-DataProperty $comparison 'changedSheets' @())) },
+            [ordered]@{ kind = 'added'; names = @(Get-Array (Get-DataProperty $comparison 'addedSheets' @())) },
+            [ordered]@{ kind = 'removed'; names = @(Get-Array (Get-DataProperty $comparison 'removedSheets' @())) },
+            [ordered]@{ kind = 'unknown'; names = @(Get-Array (Get-DataProperty $comparison 'unknownSheets' @())) },
+            [ordered]@{ kind = 'unchanged'; names = @(Get-Array (Get-DataProperty $comparison 'unchangedSheets' @())) }
+        )) {
+            foreach ($rawName in @($group.names)) {
+                $name = [string]$rawName
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                $mappingRecords += [pscustomobject][ordered]@{ beforeSheetName = $(if ([string]$group.kind -ne 'added') { $name } else { '' }); afterSheetName = $(if ([string]$group.kind -ne 'removed') { $name } else { '' }); displayName = $name; kind = [string]$group.kind; matchConfidence = 1.0; matchMethod = 'legacy-name'; message = '' }
             }
         }
+    }
+    foreach ($mapping in $mappingRecords) {
+        $beforeName = [string](Get-DataProperty $mapping 'beforeSheetName' '')
+        $afterName = [string](Get-DataProperty $mapping 'afterSheetName' '')
+        $name = [string](Get-DataProperty $mapping 'displayName' $(if ($afterName) { $afterName } else { $beforeName }))
+        $kind = [string](Get-DataProperty $mapping 'kind' 'unknown')
+        $identity = "$beforeName`n$afterName`n$kind"
+        if ([string]::IsNullOrWhiteSpace($name) -or $seen -contains $identity) { continue }
+        $seen += $identity
+        $mappingMessage = [string](Get-DataProperty $mapping 'message' '')
+        $item = [pscustomobject][ordered]@{
+            sheetName = $name
+            beforeSheetName = $beforeName
+            afterSheetName = $afterName
+            sheetKey = Get-DiffSheetKey $identity
+            kind = $kind
+            matchConfidence = [double](Get-DataProperty $mapping 'matchConfidence' 1)
+            matchMethod = [string](Get-DataProperty $mapping 'matchMethod' '')
+            beforePages = 0
+            afterPages = 0
+            pageCount = 0
+            unchangedPageNumbers = @()
+            regionCount = 0
+            # PDFはそのまま保持し、表示中のページだけをブラウザで描画・比較する。
+            status = 'ready'
+            message = $(if ($mappingMessage) { $mappingMessage } elseif ($kind -eq 'unknown') { '対応を確定できないため、左右のPDFを目視確認してください。' } else { '表示したページをブラウザで比較します。' })
+            confirmed = $false
+            pages = @()
+        }
+        if ($kind -eq 'unknown') { $item.status = 'unknown' }
+        $items += $item
     }
     $currentHashes = Get-DataProperty $Context 'currentVisualHashes' $null
     $baselineHashes = Get-DataProperty $Context 'baselineVisualHashes' $null
@@ -8172,12 +9974,12 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
     foreach ($item in $items) {
         $beforeSheet = $null
         $afterSheet = $null
-        if ($baselineMap.ContainsKey([string]$item.sheetName)) {
-            $beforeSheet = $baselineMap[[string]$item.sheetName]
+        if ($baselineMap.ContainsKey([string]$item.beforeSheetName)) {
+            $beforeSheet = $baselineMap[[string]$item.beforeSheetName]
             $item.beforePages = Get-IntDataProperty $beforeSheet 'pageCount' 0
         }
-        if ($currentMap.ContainsKey([string]$item.sheetName)) {
-            $afterSheet = $currentMap[[string]$item.sheetName]
+        if ($currentMap.ContainsKey([string]$item.afterSheetName)) {
+            $afterSheet = $currentMap[[string]$item.afterSheetName]
             $item.afterPages = Get-IntDataProperty $afterSheet 'pageCount' 0
         }
         $item.pageCount = [Math]::Max([int]$item.beforePages, [int]$item.afterPages)
@@ -8209,6 +10011,8 @@ function New-DiffDetailSkeleton([string]$Language, $Context) {
         message = [string]$Context.message
         workbookId = [string]$Context.workbookId
         workbookName = [string]$Context.workbookName
+        sourceType = [string](Get-DataProperty $Context 'sourceType' 'excel')
+        unitLabel = $(if ([string](Get-DataProperty $Context 'sourceType' 'excel') -in @('word','pdf')) { 'ページ' } else { 'シート' })
         comparison = [ordered]@{
             baselineSnapshotId = [string]$Context.baselineSnapshotId
             baselineVersionId = [string]$Context.baselineVersionId
@@ -8575,7 +10379,7 @@ function Invoke-DiffDetailJobCore($Job) {
             if ($preferredIndex -ge 0) { $workIndexes += $preferredIndex }
         } else {
             for ($n = 0; $n -lt $allSheets.Count; $n++) { if ([string]$allSheets[$n].sheetKey -eq $requestedSheetKey) { $workIndexes += $n; break } }
-            if ($workIndexes.Count -eq 0) { throw '指定したシートは比較対象に含まれていません。' }
+            if ($workIndexes.Count -eq 0) { throw '指定した項目は比較対象に含まれていません。' }
         }
         $detail.sheets = @($allSheets)
         $detail.status = 'generating'
@@ -8593,11 +10397,13 @@ function Invoke-DiffDetailJobCore($Job) {
             $i = [int]$workIndexes[$position]
             $sheet = $detail.sheets[$i]
             $name = [string]$sheet.sheetName
+            $beforeName = [string](Get-DataProperty $sheet 'beforeSheetName' $name)
+            $afterName = [string](Get-DataProperty $sheet 'afterSheetName' $name)
             $kind = [string]$sheet.kind
             try {
                 $beforePdf = ''; $afterPdf = ''
-                if ($kind -ne 'added') { $beforePdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $name }
-                if ($kind -ne 'removed') { $afterPdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.currentSnapshotId) ([string]$context.currentVersionId) $name }
+                if ($kind -ne 'added') { $beforePdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $beforeName }
+                if ($kind -ne 'removed') { $afterPdf = Resolve-DiffContentPdfPath $language $workbookId ([string]$context.currentSnapshotId) ([string]$context.currentVersionId) $afterName }
                 $missing = (($kind -in @('modified','unchanged') -and ([string]::IsNullOrWhiteSpace($beforePdf) -or [string]::IsNullOrWhiteSpace($afterPdf))) -or
                     ($kind -eq 'added' -and [string]::IsNullOrWhiteSpace($afterPdf)) -or ($kind -eq 'removed' -and [string]::IsNullOrWhiteSpace($beforePdf)))
                 if ($missing) { throw '同一レンダリング世代のcontent PDFが見つかりません。' }
@@ -8612,10 +10418,10 @@ function Invoke-DiffDetailJobCore($Job) {
                     beforePdf = $beforePdf
                     afterPdf = $afterPdf
                     beforeRasterDirectory = $(if ($kind -ne 'added') {
-                        Get-RenderRasterSheetDir $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $name
+                        Get-RenderRasterSheetDir $language $workbookId ([string]$context.baselineSnapshotId) ([string]$context.baselineVersionId) $beforeName
                     } else { '' })
                     afterRasterDirectory = $(if ($kind -ne 'removed') {
-                        Get-RenderRasterSheetDir $language $workbookId ([string]$context.currentSnapshotId) ([string]$context.currentVersionId) $name
+                        Get-RenderRasterSheetDir $language $workbookId ([string]$context.currentSnapshotId) ([string]$context.currentVersionId) $afterName
                     } else { '' })
                     beforePageCount = Get-IntDataProperty $sheet 'beforePages' 0
                     afterPageCount = Get-IntDataProperty $sheet 'afterPages' 0
@@ -8650,7 +10456,7 @@ function Invoke-DiffDetailJobCore($Job) {
             $name = [string]$sheet.sheetName; $kind = [string]$sheet.kind
             $sheet.status = 'generating'; $sheet.message = ''
             $status.currentSheet = $name
-            $status.message = "差分画像を作成しています: $($position + 1) / $($workIndexes.Count) シート $name"
+            $status.message = "差分画像を作成しています: $($position + 1) / $($workIndexes.Count) 項目 $name"
             $status.percent = [int][Math]::Max(5, [Math]::Min(95, [Math]::Floor((([double]$position) / [Math]::Max(1, $workIndexes.Count)) * 90) + 5))
             Write-RenderJobStatus $statusPath $status
             try {
@@ -8707,7 +10513,7 @@ function Invoke-DiffDetailJobCore($Job) {
             $parts = @()
             if ($pendingSheets -gt 0) { $parts += "未作成 $pendingSheets 件" }
             if ($failedSheets -gt 0) { $parts += "作成失敗 $failedSheets 件" }
-            $detail.message = ('差分画像に未完了のシートがあります（' + ($parts -join '、') + '）。再試行してください。')
+            $detail.message = ('差分画像に未完了の項目があります（' + ($parts -join '、') + '）。再試行してください。')
         }
         $detail.generatedAt = New-NowIso
         Set-NoteProperty $detail 'performance' $batchTimings
@@ -8791,7 +10597,7 @@ function Serve-DiffPage($Context, [string]$Language, [string]$WorkbookId, [strin
         throw '差分詳細の比較対象が一致しません。差分詳細を再作成してください。'
     }
     $sheet = @(Get-Array $detail.sheets | Where-Object { [string]$_.sheetKey -eq $safeSheetKey } | Select-Object -First 1)
-    if ($sheet.Count -eq 0) { throw '指定したシートは比較対象に含まれていません。' }
+    if ($sheet.Count -eq 0) { throw '指定した項目は比較対象に含まれていません。' }
     $page = @(Get-Array $sheet[0].pages | Where-Object { (Get-IntDataProperty $_ 'pageNumber' 0) -eq $pageNumber } | Select-Object -First 1)
     if ($page.Count -eq 0) { throw '指定したページは比較対象に含まれていません。' }
     $property = switch ($Asset) {
@@ -8809,7 +10615,7 @@ function Serve-DiffPage($Context, [string]$Language, [string]$WorkbookId, [strin
     $root = ''
     if ($Asset -in @('before','after') -and $fileName -eq 'render.png') {
         # レンダリング時に保存した120 DPI PNGを直接返し、比較キャッシュへの重複コピーを省く。
-        $sheetName = [string](Get-DataProperty $sheet[0] 'sheetName' '')
+        $sheetName = $(if ($Asset -eq 'before') { [string](Get-DataProperty $sheet[0] 'beforeSheetName' (Get-DataProperty $sheet[0] 'sheetName' '')) } else { [string](Get-DataProperty $sheet[0] 'afterSheetName' (Get-DataProperty $sheet[0] 'sheetName' '')) })
         if ($Asset -eq 'before') {
             $rasterDir = Get-RenderRasterSheetDir $Language ([string]$diffContext.workbookId) ([string]$diffContext.baselineSnapshotId) ([string]$diffContext.baselineVersionId) $sheetName
         } else {

@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 2,
+  "benchmark": "ReportBinder mixed-source scale acceptance",
+  "tier": "large",
+  "measuredAt": "2026-08-07T06:49:07.4681216+09:00",
+  "workspaceRetainedForQa": true,
+  "environment": {
+    "status": "ready",
+    "excel": { "version": "16.0", "build": "20228", "status": "ready" },
+    "word": { "version": "16.0", "build": "16.0.20228", "status": "ready" },
+    "java": { "ready": true, "version": "OpenJDK 17.0.20 Temurin" },
+    "pdfbox": { "ready": true, "composerBytes": 24891, "libraryBytes": 12920400 },
+    "pdfjs": { "ready": true }
+  },
+  "workload": {
+    "sourceCount": 12,
+    "sourceBytes": 4589934,
+    "pdfCount": 6,
+    "pdfPagesEach": 20,
+    "wordCount": 3,
+    "wordPagesEach": 10,
+    "excelCount": 3,
+    "excelSheetsEach": 8,
+    "excelRowsEach": 45,
+    "sourceLogicalPageCount": 174,
+    "updatedSourceCount": 3
+  },
+  "result": {
+    "main": {
+      "canBuild": true,
+      "pageCount": 155,
+      "status": "built",
+      "displayState": "built",
+      "builtFingerprint": "sha256:37fb182d949dc0901aea389fbf067796fb2a1e0164a5effe746999acd6137ed8",
+      "currentFingerprint": "sha256:37fb182d949dc0901aea389fbf067796fb2a1e0164a5effe746999acd6137ed8",
+      "outputPdfName": "ReportBinder_ECM_ECM_本体_20260807.pdf",
+      "outputPdfExists": true,
+      "lastBuiltAt": "2026-08-07T06:49:03+09:00",
+      "blockers": [],
+      "staleReasons": []
+    },
+    "appendix": {
+      "canBuild": true,
+      "pageCount": 40,
+      "status": "built",
+      "displayState": "built",
+      "builtFingerprint": "sha256:a825d32835b1fedd3c73480a4bc03f14489da62065fe308c12100663c7d2f40e",
+      "currentFingerprint": "sha256:a825d32835b1fedd3c73480a4bc03f14489da62065fe308c12100663c7d2f40e",
+      "outputPdfName": "ReportBinder_ECM_ECM_補足_20260807.pdf",
+      "outputPdfExists": true,
+      "lastBuiltAt": "2026-08-07T06:49:03+09:00",
+      "blockers": [],
+      "staleReasons": []
+    },
+    "finalOutputPageCount": 195,
+    "generatedCompositionPageCount": 21,
+    "outputFiles": [
+      { "name": "ReportBinder_ECM_ECM_本体_20260807.pdf", "bytes": 60381168 },
+      { "name": "ReportBinder_ECM_ECM_補足_20260807.pdf", "bytes": 3168348 }
+    ],
+    "dataBytes": 85883355,
+    "outputBytes": 63549516,
+    "peakObservedWorkspaceBytes": 160419771,
+    "minimumObservedFreeBytes": 359090888704,
+    "workspaceToSourceRatio": 34.95
+  },
+  "acceptance": {
+    "passed": true,
+    "thresholds": {
+      "initialRenderSeconds": 300,
+      "updateDetectionSeconds": 60,
+      "updatedRenderAndAnalysisSeconds": 120,
+      "finalBuildSecondsPerRun": 60,
+      "peakWorkspaceBytes": 1073741824,
+      "minimumFreeBytes": 10737418240
+    },
+    "checks": {
+      "allSourcesRegistered": true,
+      "initialRenderSucceeded": true,
+      "exactlyThreeSourcesDetected": true,
+      "updatedRenderSucceeded": true,
+      "bothOutputsBuilt": true,
+      "initialRenderWithinBudget": true,
+      "updateDetectionWithinBudget": true,
+      "updatedRenderWithinBudget": true,
+      "initialBuildWithinBudget": true,
+      "updatedBuildWithinBudget": true,
+      "peakWorkspaceWithinBudget": true,
+      "freeSpaceWithinBudget": true
+    }
+  },
+  "phases": [
+    { "name": "fixture-generation", "durationSeconds": 15.567, "workspaceBytes": 10927830, "peakObservedWorkspaceBytes": 10927830, "freeBytes": 359355121664, "details": { "sourceCount": 12, "sourceBytes": 4589934 } },
+    { "name": "registration", "durationSeconds": 4.482, "workspaceBytes": 11107391, "peakObservedWorkspaceBytes": 11107391, "freeBytes": 359421513728, "details": { "candidateCount": 12, "registeredCount": 12 } },
+    { "name": "initial-render", "durationSeconds": 144.633, "workspaceBytes": 82282846, "peakObservedWorkspaceBytes": 82282846, "freeBytes": 359182381056, "details": { "total": 12, "completed": 12, "failed": 0 } },
+    { "name": "initial-final-build", "durationSeconds": 10.725, "workspaceBytes": 146962726, "peakObservedWorkspaceBytes": 146962726, "freeBytes": 359118274560, "details": { "logicalPages": 174, "mainLogicalPages": 140, "appendixLogicalPages": 34 } },
+    { "name": "update-detection", "durationSeconds": 32.117, "workspaceBytes": 148010639, "peakObservedWorkspaceBytes": 148010639, "freeBytes": 359115628544, "details": { "updatedSourceCount": 3, "capturedSnapshotCount": 5 } },
+    { "name": "updated-render-and-analysis", "durationSeconds": 50.862, "workspaceBytes": 159771318, "peakObservedWorkspaceBytes": 159771318, "freeBytes": 359092805632, "details": { "total": 3, "completed": 3, "failed": 0 } },
+    { "name": "updated-final-build", "durationSeconds": 9.479, "workspaceBytes": 160419771, "peakObservedWorkspaceBytes": 160419771, "freeBytes": 359090888704, "details": null }
+  ]
+}
