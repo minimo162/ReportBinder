@@ -12,7 +12,7 @@ required = [
     'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1',
-    '.github/workflows/ci.yml','.github/workflows/release.yml',
+    '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
     'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
@@ -41,7 +41,7 @@ for needed in ['Assert-PowerShellSyntax', 'Assert-VersionDocumented', 'Diff regr
                'Final composition regression', 'Operational readiness regression',
                'ZIP release smoke test', 'Assert-PackageContents']:
     if needed not in ci_selfcheck: raise SystemExit(f'CI acceptance coverage missing: {needed}')
-ci_workflow=(root/'.github/workflows/ci.yml').read_text(encoding='utf-8')
+ci_workflow=(root/'.github/workflows/thirdparty-check.yml').read_text(encoding='utf-8')
 for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -Force',
                'build.ps1', 'ci-selfcheck.ps1']:
     if needed not in ci_workflow: raise SystemExit(f'GitHub CI workflow coverage missing: {needed}')
