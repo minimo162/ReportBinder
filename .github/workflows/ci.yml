@@ -1,0 +1,54 @@
+name: ReportBinder CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: reportbinder-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-windows-powershell-51:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install verified external dependencies
+        shell: powershell
+        run: .\app\tools\install-thirdparty.ps1 -Force
+
+      - name: Rebuild ReportPdfComposer
+        shell: powershell
+        run: .\app\lib\pdfbox\build.ps1
+
+      - name: Run complete CI acceptance suite
+        shell: powershell
+        run: .\app\tools\ci-selfcheck.ps1
+
+      - name: Remove transient dependencies and build output
+        if: always()
+        shell: powershell
+        run: |
+          Remove-Item -LiteralPath .\app\thirdparty-cache -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath .\app\lib\pdfbox\classes -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath .\app\tools\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
+

@@ -1,0 +1,50 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install verified external dependencies
+        shell: powershell
+        run: .\app\tools\install-thirdparty.ps1 -Force
+
+      - name: Rebuild and validate
+        shell: powershell
+        run: |
+          .\app\lib\pdfbox\build.ps1
+          .\app\tools\ci-selfcheck.ps1 -SkipPackageSmoke
+
+      - name: Build ZIP and shared-folder releases
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path "${{ runner.temp }}\release" -Force | Out-Null
+          .\app\tools\package-release.ps1 -OutputDir "${{ runner.temp }}\release" -NoOpen
+          .\app\tools\package-release.ps1 -OutputDir "${{ runner.temp }}\release" -SharedFolderOnly -NoOpen
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReportBinder-${{ github.run_number }}
+          path: ${{ runner.temp }}\release\*
+          if-no-files-found: error
+          retention-days: 14
