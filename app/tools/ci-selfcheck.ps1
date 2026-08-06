@@ -55,7 +55,7 @@ function Assert-VersionDocumented {
 function Assert-PackageContents([string]$OutputRoot) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
     $forbiddenFragments = @(
-        'app/tools/selfcheck.py', 'app/tools/ci-selfcheck.ps1', 'app/tools/fixtures/',
+        'app/tools/selfcheck.py', 'app/tools/ci-selfcheck.ps1', 'app/tools/ci-requirements.txt', 'app/tools/fixtures/',
         'app/tools/scale-benchmark.ps1', 'docs/benchmarks/', '.github/'
     )
     $archives = @(Get-ChildItem -LiteralPath $OutputRoot -File -Filter '*.zip')

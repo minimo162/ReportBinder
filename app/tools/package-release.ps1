@@ -113,6 +113,7 @@ function Remove-ReleaseDevelopmentFiles([string]$StageRoot) {
         'app\tools\create-scale-benchmark-fixtures.py', 'app\tools\create-scale-benchmark-workbooks.mjs',
         'app\tools\scale-benchmark.ps1', 'docs\SCALE_BENCHMARK.md', 'docs\benchmarks',
         'app\tools\ci-selfcheck.ps1',
+        'app\tools\ci-requirements.txt',
         'app\tools\package-release.ps1'
     )) { Remove-PathIfExists (Join-Path $StageRoot $relativePath) }
 }
@@ -158,6 +159,7 @@ function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
         'app\tools\create-scale-benchmark-workbooks.mjs',
         'app\tools\scale-benchmark.ps1',
         'app\tools\ci-selfcheck.ps1',
+        'app\tools\ci-requirements.txt',
         'docs\SCALE_BENCHMARK.md',
         'docs\benchmarks',
         'app\tools\package-release.ps1'
@@ -215,6 +217,7 @@ function Assert-SharedFolderLayout([string]$StageRoot) {
         'app\tools\create-scale-benchmark-workbooks.mjs',
         'app\tools\scale-benchmark.ps1',
         'app\tools\ci-selfcheck.ps1',
+        'app\tools\ci-requirements.txt',
         'docs\SCALE_BENCHMARK.md',
         'docs\benchmarks'
     )

@@ -11,7 +11,7 @@ required = [
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
     'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
-    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1',
+    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
     'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
@@ -43,7 +43,7 @@ for needed in ['Assert-PowerShellSyntax', 'Assert-VersionDocumented', 'Diff regr
     if needed not in ci_selfcheck: raise SystemExit(f'CI acceptance coverage missing: {needed}')
 ci_workflow=(root/'.github/workflows/thirdparty-check.yml').read_text(encoding='utf-8')
 for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -Force',
-               'build.ps1', 'ci-selfcheck.ps1']:
+               'ci-requirements.txt', 'build.ps1', 'ci-selfcheck.ps1']:
     if needed not in ci_workflow: raise SystemExit(f'GitHub CI workflow coverage missing: {needed}')
 release_workflow=(root/'.github/workflows/release.yml').read_text(encoding='utf-8')
 for needed in ['workflow_dispatch:', 'package-release.ps1', '-SharedFolderOnly', 'actions/upload-artifact@v6']:
@@ -948,7 +948,7 @@ for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelop
 _shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
 for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
                "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'",
-               "'app\\tools\\scale-benchmark.ps1'", "'app\\tools\\ci-selfcheck.ps1'", "'docs\\benchmarks'"]:
+               "'app\\tools\\scale-benchmark.ps1'", "'app\\tools\\ci-selfcheck.ps1'", "'app\\tools\\ci-requirements.txt'", "'docs\\benchmarks'"]:
     if needed not in _shared_cleanup:
         raise SystemExit(f'shared-folder cleanup omission: {needed}')
 if "-IncludeJava $true" not in package_release:
