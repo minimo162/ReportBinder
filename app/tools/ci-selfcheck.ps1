@@ -84,6 +84,8 @@ function Assert-PackageContents([string]$OutputRoot) {
 
 function Remove-CiGeneratedFiles {
     foreach ($path in @(
+        (Join-Path $appRoot 'thirdparty-cache'),
+        (Join-Path $appRoot 'lib\pdfbox\classes'),
         (Join-Path $repoRoot 'tmp\pdfs\pr7-final-composition'),
         (Join-Path $toolsRoot '__pycache__'),
         (Join-Path $repoRoot 'tests\__pycache__')
@@ -99,6 +101,7 @@ try {
     Assert-PowerShellSyntax
     Assert-VersionDocumented
     Invoke-Checked 'Third-party verification' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'verify-thirdparty.ps1'),'-RequirePdfJs','-RequirePortableJava')
+    Remove-CiGeneratedFiles
     Invoke-Checked 'Repository selfcheck' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py')))
     Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
     Invoke-Checked 'Diff regression' $node @((Join-Path $repoRoot 'tests\diff-regression.mjs'))

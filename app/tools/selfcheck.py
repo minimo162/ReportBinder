@@ -46,7 +46,7 @@ for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -
                'build.ps1', 'ci-selfcheck.ps1']:
     if needed not in ci_workflow: raise SystemExit(f'GitHub CI workflow coverage missing: {needed}')
 release_workflow=(root/'.github/workflows/release.yml').read_text(encoding='utf-8')
-for needed in ['workflow_dispatch:', 'package-release.ps1', '-SharedFolderOnly', 'actions/upload-artifact@v4']:
+for needed in ['workflow_dispatch:', 'package-release.ps1', '-SharedFolderOnly', 'actions/upload-artifact@v6']:
     if needed not in release_workflow: raise SystemExit(f'GitHub release workflow coverage missing: {needed}')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
