@@ -251,13 +251,13 @@ if 'const byEpoch = formatLocalDateTimeMinuteFromUnixMs(file?.modifiedAtUnixMs)'
     raise SystemExit('submission file time must not be converted again in the browser')
 if html.find('id="select-render-needed-btn"') > html.find('id="render-selected-btn"'):
     raise SystemExit('PDF render button must be next to the needed-selection action')
-for needle in ['unregistered-card','registered-card','workbook-toolbar','render-target-hint']:
+for needle in ['unregistered-card','registered-card','workbook-context-bar','render-target-hint']:
     if needle not in html: raise SystemExit(f'v4.3 Excel HTML feature not found: {needle}')
 for needle in ['font-family:"BIZ UDPGothic"','grid-template-columns:minmax(460px,.82fr) minmax(650px,1.18fr)','font-size:15px','.workbook-table{width:100%;min-width:0']:
     if needle not in css: raise SystemExit(f'v4.3 readability CSS feature not found: {needle}')
 for needle in ['.workbook-table .pdf-status-col{width:320px}', '.excel-grid{grid-template-columns:minmax(340px,.65fr) minmax(720px,1.35fr)', '.excel-grid>.card+.card{margin-top:0}', '.excel-grid .file-name-cell strong{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere', '.pdf-status-stack{display:grid;gap:5px}', '@media(max-width:1320px){.excel-grid{grid-template-columns:1fr}']:
     if needle not in css: raise SystemExit(f'change column readability CSS missing: {needle}')
-for needle in ['<div class="file-meta"', '更新日時：', 'PDF作成日時：', '<th class="pdf-status-col">PDF状況</th>', '差分は作成後に確認します', '前回PDFとの差分']:
+for needle in ['<div class="file-meta"', '更新日時：', 'シートPDF作成日時：', '<th class="pdf-status-col">シートPDFの状態</th>', '差分は作成後に確認します', '前回のシートPDFとの差分']:
     if needle not in appjs: raise SystemExit(f'file identity UX feature missing: {needle}')
 if '<th class="date-col" title="Excelファイルの最終保存日時">更新日時</th>' in appjs or '<th class="date-col" title="最後にページPDFを作成した日時">PDF作成日時</th>' in appjs:
     raise SystemExit('Excel timestamps must be secondary metadata under the file name')
@@ -535,7 +535,7 @@ for needed in ['function Get-DiffDetailContext', 'function Serve-HistoryContentP
         raise SystemExit(f'browser PDF comparison server support missing: {needed}')
 for needed in ['diffDetailRequestPath', 'diffHistoryPdfParams', 'fetchDiffPdfDocument',
                'fromSnapshotId:from', 'toSnapshotId:to',
-               '選んだ2版を視覚比較', '比較元と比較先を入れ替え',
+               '選んだ2版を比較', '比較元・比較先を入れ替え',
                'renderSnapshotHistorySelectionHint', 'visualCompareReady', 'unavailableReason']:
     if needed not in appjs:
         raise SystemExit(f'historical browser PDF comparison UI missing: {needed}')
@@ -902,7 +902,7 @@ if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'
     raise SystemExit('third-party cache must be ignored by git')
 
 # V5.1: history comparison must be a first-class destination and list actions must be visible before the list.
-for needed in ['data-view-nav="history"', 'data-view-panel="history"', '<h2>履歴・比較</h2>', '任意の2時点を視覚比較', 'class="list-action-bar"']:
+for needed in ['data-view-nav="history"', 'data-view-panel="history"', '<h2>履歴・比較</h2>', '任意の2時点を視覚比較', 'class="list-action-bar contextual-action-bar"']:
     if needed not in html: raise SystemExit(f'history/list action UX missing: {needed}')
 if html.index('id="register-selected-btn"') > html.index('id="file-list"'):
     raise SystemExit('unregistered Excel actions must appear before the file list')
@@ -1020,7 +1020,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260806_v92', 'style.css?v=20260806_v61']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260806_v101', 'style.css?v=20260806_v65']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1067,7 +1067,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260806_v92' not in html:
+if 'app.js?v=20260806_v101' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1093,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260806_v92' not in html:
+if 'app.js?v=20260806_v101' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1158,8 +1158,29 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.06.37':
-    raise SystemExit('worksheet inbox release must bump the immutable runtime version')
+if str(runtime_info.get('version','')) != '2026.08.06.47':
+    raise SystemExit('workflow UX release must bump the immutable runtime version')
+for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'data-progress-view="folders"', '提出用PDF']:
+    if needed not in html:
+        raise SystemExit(f'workflow UX markup is missing: {needed}')
+for needed in ['function confirmAction', 'function isConfirmModalOpen', 'snapshot-timeline', 'data-snapshot-from', 'data-snapshot-to']:
+    if needed not in appjs:
+        raise SystemExit(f'workflow UX behavior is missing: {needed}')
+if 'confirm(' in appjs or 'data-step-view=' in html:
+    raise SystemExit('blocking browser confirms and duplicate step navigation must not return')
+for needed in ['.contextual-action-bar.has-selection', '.confirm-dialog', '.snapshot-timeline-item']:
+    if needed not in css:
+        raise SystemExit(f'workflow UX styling is missing: {needed}')
+for needed in ['id="submissionDir" type="text"', 'id="use-submission-path-btn"', '入力したパスを使用']:
+    if needed not in html:
+        raise SystemExit(f'submission folder path fallback is missing: {needed}')
+for needed in ["bind('use-submission-path-btn'", "event.key==='Enter'", "setTimeout(()=>$('submissionDir')?.focus()"]:
+    if needed not in appjs:
+        raise SystemExit(f'submission folder keyboard/fallback wiring is missing: {needed}')
+_folder_picker = server.split('function Select-FolderDialog', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['$proc.WaitForExit(60000)', '$proc.Kill()', '画面でパスを直接入力してください']:
+    if needed not in _folder_picker:
+        raise SystemExit(f'folder picker timeout recovery is missing: {needed}')
 for needed in ['choosePixelColumnMapping', 'mappedColumnX', 'refinePixelColumnMapping',
                "clearlyImproves(pixel.score,pixel.identityScore,.7)",
                "columnAlignment.split>=0", 'column-identity']:
@@ -1322,10 +1343,33 @@ _update_pages = server.split('function Update-WorkbookPagesFromInspection',1)[1]
 for needed in ['$knownBySheet', "Insert-PageInSheetOrder $Structure $page 'none'", '$removed.Count -gt 0']:
     if needed not in _update_pages:
         raise SystemExit(f'existing page assignment preservation missing: {needed}')
+_locked_render_commit = server.split('$pageSync = Update-StructureLocked $Language',1)[1].split('$timingsMs.total',1)[0]
+for needed in ['[string]$_.workbookId -eq $WorkbookId', '[string]$_.sheetName -eq [string]$r.sheetName']:
+    if needed not in _locked_render_commit:
+        raise SystemExit(f'unrestricted worksheet render commit fallback missing: {needed}')
 for needed in ['未振り分け（出力しない）', '本体または補足へ移したページだけ',
                'Excelのシート順に整える', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
+
+
+for needed in ['カードを直接ドラッグ', '本体・補足へドロップ', '複数選択もまとめて移動',
+               'createPageDragGhost', 'directCardDrag', 'page-drag-ghost']:
+    if needed not in html + appjs + css:
+        raise SystemExit(f'direct page movement UX missing: {needed}')
+if 'grid-template-columns:repeat(3,minmax(0,1fr))' not in css:
+    raise SystemExit('thumbnail assignment lanes must remain simultaneously visible on desktop')
+for needed in ['boardSavePromise=boardSavePromise.then(persist,persist)',
+               'newerBoardExists=requestRevision!==boardSaveRevision',
+               'pendingBoardSaveVolumes=afterVolumes',
+               'undo?.afterVolumes||collectBoardVolumes()',
+               'rememberPageLayoutUndo(undo.label,undo.volumes,afterVolumes)',
+               'void saveBoardOrder()',
+               'savedBeforeHistory=await boardSavePromise',
+               'beforeVolumes=JSON.parse(beforeSignature)',
+               'afterVolumes=JSON.parse(drag.previewSignature||afterSignature)']:
+    if needed not in appjs:
+        raise SystemExit(f'page movement save serialization missing: {needed}')
 
 
 # 2026-08-06 page-preview organizer controls -------------------------------
@@ -1384,7 +1428,7 @@ for needed in ['.page-keyboard-hint', '.page-row:focus-visible']:
 # two statements, but raises ReferenceError at runtime in the browser.
 if re.search(r'\basync\s+async\s+function\b', appjs):
     raise SystemExit('app.js contains a duplicated async function prefix')
-for needed in ['async function saveBoardOrder()', 'async function sortPagesBySheet(btn=null)']:
+for needed in ['function saveBoardOrder()', 'async function sortPagesBySheet(btn=null)']:
     if needed not in appjs:
         raise SystemExit(f'page-board async function is missing: {needed}')
 
