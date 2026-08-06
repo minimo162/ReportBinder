@@ -3,13 +3,15 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.*;
 
-import org.apache.pdfbox.multipdf.PDFMergerUtility;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDFont;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitDestination;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline;
+import org.apache.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem;
 import org.apache.pdfbox.util.Matrix;
 
 /**
@@ -44,30 +46,106 @@ public class ReportPdfComposer {
         File parent = outFile.getParentFile();
         if (parent != null) parent.mkdirs();
 
+        Map<String, Object> document = map(manifest.get("document"));
+        boolean includeCover = bool(document.get("includeCover"), false);
+        boolean includeToc = bool(document.get("includeToc"), false);
+        boolean includeSectionDividers = bool(document.get("includeSectionDividers"), false);
+        String documentTitle = str(document.get("title"));
+        if (documentTitle.isEmpty()) documentTitle = str(manifest.get("projectId"));
+
+        List<ContentSpec> specs = new ArrayList<>();
+        for (Object o : pages) {
+            Map<String, Object> entry = (Map<String, Object>) o;
+            File source = new File(str(entry.get("sourcePdf")));
+            if (!source.isFile()) throw new FileNotFoundException(source.getAbsolutePath());
+            try (PDDocument src = PDDocument.load(source)) {
+                int sourcePageCount = src.getNumberOfPages();
+                int start = integer(entry.get("sourcePageStart"), 1);
+                int end = integer(entry.get("sourcePageEnd"), sourcePageCount);
+                if (start < 1 || end < start || end > sourcePageCount) {
+                    throw new IllegalArgumentException("Invalid page range " + start + "-" + end + " for " + source.getAbsolutePath() + " (pages=" + sourcePageCount + ")");
+                }
+                specs.add(new ContentSpec(entry, source, start, end));
+            }
+        }
+
+        int tocLinesPerPage = 34;
+        int tocPageCount = includeToc ? Math.max(1, (specs.size() + tocLinesPerPage - 1) / tocLinesPerPage) : 0;
+        int plannedPage = (includeCover ? 1 : 0) + tocPageCount;
+        String previousSection = null;
+        for (ContentSpec spec : specs) {
+            String section = str(spec.entry.get("sectionId"));
+            if (includeSectionDividers && !section.equals(previousSection)) plannedPage++;
+            spec.outputStartPage = plannedPage + 1;
+            plannedPage += spec.count();
+            previousSection = section;
+        }
+
         int physicalPageNo = 0;
         try (PDDocument out = new PDDocument()) {
             PDFont pageFont = loadArialOrFallback(out);
-            PDFMergerUtility merger = new PDFMergerUtility();
+            PDFont documentFont = loadDocumentFont(out);
+            PDDocumentOutline outline = new PDDocumentOutline();
+            out.getDocumentCatalog().setDocumentOutline(outline);
+            // PDFBox 2.x may keep imported page resources backed by the source
+            // document until the destination is saved. Closing each source
+            // immediately after import can therefore produce
+            // "COSStream has been closed" for Office-generated PDFs. Keep one
+            // source document per path alive through out.save(), then close all
+            // of them in the finally block.
+            Map<String, PDDocument> sourceDocuments = new LinkedHashMap<>();
+            try {
 
-            for (Object o : pages) {
-                Map<String, Object> entry = (Map<String, Object>) o;
-                File source = new File(str(entry.get("sourcePdf")));
+            if (includeCover) {
+                PDPage cover = new PDPage(PDRectangle.A4);
+                out.addPage(cover); physicalPageNo++;
+                drawGeneratedPage(out, cover, documentFont, documentTitle, Arrays.asList(str(document.get("subtitle")), str(document.get("targetName")), str(manifest.get("createdAt"))), true);
+            }
+            if (includeToc) {
+                for (int tocPage = 0; tocPage < tocPageCount; tocPage++) {
+                    PDPage page = new PDPage(PDRectangle.A4);
+                    out.addPage(page); physicalPageNo++;
+                    List<String> lines = new ArrayList<>();
+                    int from = tocPage * tocLinesPerPage;
+                    int to = Math.min(specs.size(), from + tocLinesPerPage);
+                    for (int i = from; i < to; i++) {
+                        ContentSpec spec = specs.get(i);
+                        lines.add(str(spec.entry.get("bookmarkTitle")) + "    " + spec.outputStartPage);
+                    }
+                    drawGeneratedPage(out, page, documentFont, tocPage == 0 ? "目次 / Table of Contents" : "目次 / Table of Contents (continued)", lines, false);
+                    drawPageNumber(out, page, pageFont, fontSize, bottomPt, formatPageNumber(physicalPageNo, pageNumber));
+                }
+            }
+
+            previousSection = null;
+            for (ContentSpec spec : specs) {
+                Map<String, Object> entry = spec.entry;
+                String section = str(entry.get("sectionId"));
+                if (includeSectionDividers && !section.equals(previousSection)) {
+                    PDPage divider = new PDPage(PDRectangle.A4);
+                    out.addPage(divider); physicalPageNo++;
+                    String sectionTitle = str(entry.get("sectionTitle"));
+                    if (sectionTitle.isEmpty()) sectionTitle = section;
+                    drawGeneratedPage(out, divider, documentFont, sectionTitle, Collections.<String>emptyList(), true);
+                }
+                previousSection = section;
                 String numberingMode = str(entry.get("numberingMode"));
                 if (numberingMode.isEmpty()) numberingMode = "visible";
                 if (!"visible".equals(numberingMode) && !"none".equals(numberingMode)) {
                     throw new IllegalArgumentException("Unsupported numberingMode: " + numberingMode);
                 }
                 float punchShiftPt = flt(entry.get("punchShiftPt"), 0f);
-                if (!source.isFile()) throw new FileNotFoundException(source.getAbsolutePath());
-
-                try (PDDocument src = PDDocument.load(source)) {
-                    int before = out.getNumberOfPages();
-                    int sourcePageCount = src.getNumberOfPages();
-                    merger.appendDocument(out, src);
-
-                    for (int i = 0; i < sourcePageCount; i++) {
+                String sourceKey = spec.source.getCanonicalPath();
+                PDDocument src = sourceDocuments.get(sourceKey);
+                if (src == null) {
+                    src = PDDocument.load(spec.source);
+                    sourceDocuments.put(sourceKey, src);
+                }
+                    PDPage firstImported = null;
+                    for (int sourceIndex = spec.start - 1; sourceIndex < spec.end; sourceIndex++) {
                         physicalPageNo++;
-                        PDPage newPage = out.getPage(before + i);
+                        PDPage newPage = out.importPage(src.getPage(sourceIndex));
+                        if (firstImported == null) firstImported = newPage;
 
                         float shift = 0f;
                         if (punchShiftPt != 0f) shift = (physicalPageNo % 2 == 1) ? punchShiftPt : -punchShiftPt;
@@ -77,12 +155,71 @@ public class ReportPdfComposer {
                             drawPageNumber(out, newPage, pageFont, fontSize, bottomPt, formatPageNumber(physicalPageNo, pageNumber));
                         }
                     }
+                    String bookmarkTitle = str(entry.get("bookmarkTitle"));
+                    if (!bookmarkTitle.isEmpty() && firstImported != null) {
+                        PDPageFitDestination destination = new PDPageFitDestination();
+                        destination.setPage(firstImported);
+                        PDOutlineItem item = new PDOutlineItem();
+                        item.setTitle(bookmarkTitle);
+                        item.setDestination(destination);
+                        outline.addLast(item);
+                    }
+            }
+            outline.openNode();
+            out.save(outFile);
+            } finally {
+                for (PDDocument src : sourceDocuments.values()) {
+                    try { src.close(); } catch (IOException ignored) { }
                 }
             }
-            out.save(outFile);
         }
         long elapsedMs = System.currentTimeMillis() - startedAt;
-        System.out.println("created: " + outFile.getAbsolutePath() + " pages=" + physicalPageNo + " elapsedMs=" + elapsedMs + " mode=merge-wrap");
+        System.out.println("created: " + outFile.getAbsolutePath() + " pages=" + physicalPageNo + " items=" + specs.size() + " elapsedMs=" + elapsedMs + " mode=structured-compose");
+    }
+
+    private static class ContentSpec {
+        final Map<String, Object> entry;
+        final File source;
+        final int start;
+        final int end;
+        int outputStartPage;
+        ContentSpec(Map<String, Object> entry, File source, int start, int end) {
+            this.entry = entry; this.source = source; this.start = start; this.end = end;
+        }
+        int count() { return end - start + 1; }
+    }
+
+    private static void drawGeneratedPage(PDDocument doc, PDPage page, PDFont font, String title, List<String> lines, boolean centered) throws IOException {
+        PDRectangle box = page.getMediaBox();
+        String safeTitle = safePdfText(font, title.isEmpty() ? "ReportBinder" : title);
+        try (PDPageContentStream cs = new PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true)) {
+            cs.beginText();
+            cs.setFont(font, centered ? 24f : 18f);
+            float titleWidth = font.getStringWidth(safeTitle) / 1000f * (centered ? 24f : 18f);
+            float titleX = centered ? box.getLowerLeftX() + Math.max(48f, (box.getWidth() - titleWidth) / 2f) : box.getLowerLeftX() + 54f;
+            cs.newLineAtOffset(titleX, centered ? box.getLowerLeftY() + box.getHeight() * .62f : box.getUpperRightY() - 72f);
+            cs.showText(safeTitle);
+            cs.endText();
+            float y = centered ? box.getLowerLeftY() + box.getHeight() * .48f : box.getUpperRightY() - 108f;
+            for (String line : lines) {
+                if (line == null || line.trim().isEmpty()) continue;
+                String safe = safePdfText(font, line);
+                cs.beginText(); cs.setFont(font, 10.5f); cs.newLineAtOffset(box.getLowerLeftX() + 54f, y); cs.showText(safe); cs.endText();
+                y -= 18f;
+                if (y < 48f) break;
+            }
+        }
+    }
+
+    private static String safePdfText(PDFont font, String text) {
+        String value = text == null ? "" : text;
+        try { font.getStringWidth(value); return value; } catch (Exception ignored) { }
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            String one = String.valueOf(value.charAt(i));
+            try { font.getStringWidth(one); out.append(one); } catch (Exception e) { out.append('?'); }
+        }
+        return out.toString();
     }
 
     private static void wrapExistingPageContent(PDDocument doc, PDPage page, float shift) throws IOException {
@@ -129,6 +266,24 @@ public class ReportPdfComposer {
             }
         }
         System.err.println("WARN: Arial font was not available or could not be loaded by this PDFBox version. Falling back to Helvetica.");
+        return PDType1Font.HELVETICA;
+    }
+
+    private static PDFont loadDocumentFont(PDDocument doc) throws IOException {
+        String windir = System.getenv("WINDIR");
+        List<File> candidates = new ArrayList<>();
+        if (windir != null && !windir.isEmpty()) {
+            candidates.add(new File(windir, "Fonts/NotoSansJP-VF.ttf"));
+            candidates.add(new File(windir, "Fonts/arial.ttf"));
+        }
+        candidates.add(new File("C:/Windows/Fonts/NotoSansJP-VF.ttf"));
+        candidates.add(new File("C:/Windows/Fonts/arial.ttf"));
+        for (File f : candidates) {
+            if (f.isFile()) {
+                PDFont font = tryLoadType0Font(doc, f);
+                if (font != null) return font;
+            }
+        }
         return PDType1Font.HELVETICA;
     }
 
@@ -186,6 +341,18 @@ public class ReportPdfComposer {
         return text;
     }
     private static String str(Object o) { return o == null ? "" : String.valueOf(o); }
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> map(Object o) { return o instanceof Map ? (Map<String, Object>)o : new LinkedHashMap<String, Object>(); }
+    private static boolean bool(Object o, boolean def) {
+        if (o == null) return def;
+        if (o instanceof Boolean) return ((Boolean)o).booleanValue();
+        return Boolean.parseBoolean(String.valueOf(o));
+    }
+    private static int integer(Object o, int def) {
+        if (o == null) return def;
+        if (o instanceof Number) return ((Number)o).intValue();
+        try { return Integer.parseInt(String.valueOf(o)); } catch (Exception e) { return def; }
+    }
     private static float flt(Object o, float def) {
         if (o == null) return def;
         if (o instanceof Number) return ((Number)o).floatValue();

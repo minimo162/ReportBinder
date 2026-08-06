@@ -1,5 +1,5 @@
 from pathlib import Path
-import json, os, re, subprocess, zipfile
+import json, os, re, shutil, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
@@ -8,12 +8,33 @@ required = [
     'app/lib/pdfbox/src/ReportPdfComposer.java','app/lib/pdfbox/src/BatchPdfSplitter.java','app/lib/pdfbox/src/PdfBatchRasterizer.java','app/lib/pdfbox/build.ps1',
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
-    'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json','tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md'
+    'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
+    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
+    'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
+    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1',
+    'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
 if (root/'app/config.json').exists(): raise SystemExit('runtime app/config.json must not be distributed')
 json.loads((root/'app/default-config.json').read_text(encoding='utf-8'))
+
+scale_benchmark=(root/'app/tools/scale-benchmark.ps1').read_text(encoding='utf-8')
+for needed in ['Interactive Office session is required', "'/api/scan-updates'", "onlyUpdated=$true",
+               "'/api/final/build-all'", 'ConvertTo-ReadinessSummary', 'acceptanceThresholds',
+               'exactlyThreeSourcesDetected', 'Remove-BenchmarkWorkspace']:
+    if needed not in scale_benchmark: raise SystemExit(f'scale benchmark acceptance coverage missing: {needed}')
+scale_fixture=(root/'app/tools/create-scale-benchmark-fixtures.py').read_text(encoding='utf-8')
+for needed in ['--update-only', 'create_pdf', 'create_word', 'WD_BREAK.PAGE', 'document.add_table']:
+    if needed not in scale_fixture: raise SystemExit(f'scale PDF/Word fixture coverage missing: {needed}')
+scale_workbooks=(root/'app/tools/create-scale-benchmark-workbooks.mjs').read_text(encoding='utf-8')
+for needed in ['@oai/artifact-tool', '--update-only', 'workbook.inspect', 'Dept04', 'large-excel-01-v2-preview.png']:
+    if needed not in scale_workbooks: raise SystemExit(f'scale workbook fixture coverage missing: {needed}')
+scale_report=json.loads((root/'docs/benchmarks/scale-benchmark-windows-20260807.json').read_text(encoding='utf-8'))
+if scale_report.get('schemaVersion') != 2 or not scale_report.get('acceptance', {}).get('passed'):
+    raise SystemExit('large mixed-source benchmark acceptance report is missing or failed')
+if scale_report.get('workload', {}).get('updatedSourceCount') != 3:
+    raise SystemExit('large benchmark must detect exactly one updated PDF, Word, and Excel source')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
 
@@ -157,7 +178,7 @@ try_pos=write_json_block.find('try {')
 tmp_write_pos=write_json_block.find('Write-Utf8NoBomFile $tmp $json')
 if try_pos < 0 or tmp_write_pos < try_pos:
     raise SystemExit('atomic JSON temp write must be inside fallback try block')
-for route in ['/api/state','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
+for route in ['/api/state','/api/v2/state','/api/diagnostics/run','/api/v2/pack-templates','/api/v2/packs','/api/v2/sources/','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
     if route not in server: raise SystemExit(f'route not found: {route}')
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
@@ -165,7 +186,8 @@ for needle in [
     'manifest_${Volume}_${cat}.json','~building_${Volume}_${cat}.pdf','Require-WorkbookCategory','System.ArgumentException',
     'Mark-VolumeNeedsRebuild','staleReasons','Sort-PagesBySheet','Insert-PageInSheetOrder','Renumber-VolumeOrder',
     'CenterHorizontally = $true','LeftMargin = Convert-CmToPt 1.2','RightMargin = Convert-CmToPt 1.2','punchShiftPt=(Convert-CmToPt 0.2)',
-    'lib\\java\\bin\\java.exe','Apply-DefaultNumberingPerVolume','first-page-none','ExcelPrintProfileVersion'
+    'lib\\java\\bin\\java.exe','Apply-DefaultNumberingPerVolume','first-page-none','ExcelPrintProfileVersion',
+    'ConvertTo-NormalizedPageRange','Resolve-OutputFileNamePattern','physicalPages=$snap.physicalPages','schemaVersion=3'
 ]:
     if needle not in server: raise SystemExit(f'server feature not found: {needle}')
 if len(re.findall(r'(?<!function )Save-Structure\s',server)):
@@ -220,7 +242,7 @@ java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit=Update-
 if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commit order is invalid')
 
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
-for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor']:
+for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor','data-thumb-page-range','savePackSettings','pack-output-pattern']:
     if needle not in appjs: raise SystemExit(f'ui feature not found: {needle}')
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
@@ -240,7 +262,7 @@ for needle in ['--accent:#5e6ad2','--sidebar-w:240px','backdrop-filter','box-sha
 if 'font-weight:900' in css or 'radial-gradient' in css: raise SystemExit('old visual style remains')
 
 # V4.5 Excel screen width and Explorer-matching timestamp checks.
-for needle in ['availableFilesScannedAt','formatDateTimeWithSeconds','formatSubmissionFileModifiedAt','modifiedAtDisplay','setFileSelectionSummary','title="Excelファイルの最終保存日時"']:
+for needle in ['availableFilesScannedAt','formatDateTimeWithSeconds','formatSubmissionFileModifiedAt','modifiedAtDisplay','setFileSelectionSummary','title="原稿ファイルの最終保存日時"']:
     if needle not in appjs: raise SystemExit(f'v4.5 Excel UI feature not found: {needle}')
 if '<th class="numeric-col">シート数</th>' in appjs or '<th class="numeric-col">ページ数</th>' in appjs:
     raise SystemExit('Excel tables must not show sheet/page count columns')
@@ -257,8 +279,10 @@ for needle in ['font-family:"BIZ UDPGothic"','grid-template-columns:minmax(460px
     if needle not in css: raise SystemExit(f'v4.3 readability CSS feature not found: {needle}')
 for needle in ['.workbook-table .pdf-status-col{width:320px}', '.excel-grid{grid-template-columns:minmax(340px,.65fr) minmax(720px,1.35fr)', '.excel-grid>.card+.card{margin-top:0}', '.excel-grid .file-name-cell strong{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere', '.pdf-status-stack{display:grid;gap:5px}', '@media(max-width:1320px){.excel-grid{grid-template-columns:1fr}']:
     if needle not in css: raise SystemExit(f'change column readability CSS missing: {needle}')
-for needle in ['<div class="file-meta"', '更新日時：', 'シートPDF作成日時：', '<th class="pdf-status-col">シートPDFの状態</th>', '差分は作成後に確認します', '前回のシートPDFとの差分']:
+for needle in ['<div class="file-meta"', '更新日時：', '変換PDF作成日時：', '<th class="pdf-status-col">変換PDFの状態</th>', '差分は作成後に確認します', '前回の変換PDFとの差分', 'sourceTypeBadge', 'data-source-owner', 'data-source-required']:
     if needle not in appjs: raise SystemExit(f'file identity UX feature missing: {needle}')
+for needle in ['class="pack-switcher"', 'aria-label="資料パック"', '原稿・変換PDF', '未登録原稿', '登録済み原稿']:
+    if needle not in html: raise SystemExit(f'generalized document pack UI feature missing: {needle}')
 if '<th class="date-col" title="Excelファイルの最終保存日時">更新日時</th>' in appjs or '<th class="date-col" title="最後にページPDFを作成した日時">PDF作成日時</th>' in appjs:
     raise SystemExit('Excel timestamps must be secondary metadata under the file name')
 if '<th class="change-col">変更</th>' in appjs or '<th class="status-col">状態</th>' in appjs:
@@ -274,6 +298,39 @@ if len(expected)!=6: raise SystemExit('six-key migration model invalid')
 order=json.loads((root/'app/tools/fixtures/structure-mixed-order.json').read_text(encoding='utf-8'))
 renumbered=[(i+1)*10 for i,_ in enumerate(sorted(order['orders']))]
 if renumbered != order['expected']: raise SystemExit('10-step order fixture invalid')
+v2_general=json.loads((root/'app/tools/fixtures/structure-v2-generalized-ja.json').read_text(encoding='utf-8'))
+v3_expected=json.loads((root/'app/tools/fixtures/structure-v3-migration-expected.json').read_text(encoding='utf-8'))
+if v2_general['schemaVersion'] != 2 or v3_expected['schemaVersion'] != 3:
+    raise SystemExit('schema v2-to-v3 fixture versions are invalid')
+if set(v3_expected['packIds']) != {'pack_ecm','pack_bod','pack_dmm'}:
+    raise SystemExit('schema v3 built-in pack fixture is invalid')
+for needed in ['function Sync-StructureV3FromLegacy','function ConvertTo-StructureV3','function ConvertTo-V4StructureCompatibilityView',
+               'structure.json.v2.bak',"Set-NoteProperty $Structure 'schemaVersion' 3"]:
+    if needed not in server: raise SystemExit(f'schema v3 compatibility feature missing: {needed}')
+for needed in ['function Get-SourceAdapterDescriptor','function Test-SourceCandidate','function Get-SourceCandidates','function Inspect-Source',
+               'function Register-Source','function Register-SourcesBatch','function Render-Source','function Get-SourceChangeSummary',
+               "adapterId = 'excel-com-v1'",'Render-Source $language $id $excel $true']:
+    if needed not in server: raise SystemExit(f'source adapter feature missing: {needed}')
+powershell = shutil.which('powershell.exe') or shutil.which('powershell')
+if powershell:
+    schema_check=subprocess.run(
+        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/schema-v3-selfcheck.ps1')],
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+    )
+    if schema_check.returncode != 0 or 'schema-v3 selfcheck ok' not in schema_check.stdout:
+        raise SystemExit('schema v3 PowerShell selfcheck failed:\n'+schema_check.stdout)
+    adapter_check=subprocess.run(
+        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/source-adapter-selfcheck.ps1')],
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+    )
+    if adapter_check.returncode != 0 or 'source-adapter selfcheck ok' not in adapter_check.stdout:
+        raise SystemExit('source adapter PowerShell selfcheck failed:\n'+adapter_check.stdout)
+    operations_check=subprocess.run(
+        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/operational-readiness-selfcheck.ps1')],
+        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+    )
+    if operations_check.returncode != 0 or 'operational readiness selfcheck ok' not in operations_check.stdout:
+        raise SystemExit('operational readiness PowerShell selfcheck failed:\n'+operations_check.stdout)
 
 logs=[x for x in (root/'app/logs').glob('*') if x.name!='.gitkeep'] if (root/'app/logs').exists() else []
 if logs: raise SystemExit('runtime logs must not be distributed')
@@ -286,7 +343,7 @@ if python_cache:
     raise SystemExit('Python cache must not be distributed: ' + ', '.join(str(x.relative_to(root)) for x in python_cache))
 
 with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
-    for cls in ['ReportPdfComposer.class','BatchPdfSplitter.class','BatchPdfSplitter$PdfBox.class']:
+    for cls in ['ReportPdfComposer.class','ReportPdfComposer$ContentSpec.class','BatchPdfSplitter.class','BatchPdfSplitter$PdfBox.class']:
         if cls not in set(zf.namelist()): raise SystemExit(f'jar class missing: {cls}')
 
 root_files={x.name for x in root.iterdir() if x.is_file()}
@@ -829,8 +886,8 @@ if '"page-' in _engine_code or '-before.png' in _engine_code or '-overlay.png' i
 for needed in ['string prefix = pageNumber.ToString("0000")', 'stem + "-b.png"', 'stem + "-a.png"']:
     if needed not in engine:
         raise SystemExit(f'short diff asset naming missing: {needed}')
-if '$Script:DiffDetailAlgorithmVersion = 20' not in server:
-    raise SystemExit('direct-PDF comparison changes must bump DiffDetailAlgorithmVersion to 20')
+if '$Script:DiffDetailAlgorithmVersion = 21' not in server:
+    raise SystemExit('generalized page mapping changes must bump DiffDetailAlgorithmVersion to 21')
 if server.count(')).Substring(7, 16)') < 2:
     raise SystemExit('diff detail cache keys must use at least 64 bits')
 if 'function Test-DiffDetailMatchesContext' not in server:
@@ -867,14 +924,18 @@ verifier = (root/'app/tools/verify-thirdparty.ps1').read_text(encoding='utf-8-si
 for needed in ['RequirePortableJava', 'SHA-512 verified', 'verified npm package tarball', 'PdfPageAnalyzer.class']:
     if needed not in verifier: raise SystemExit(f'third-party verifier check missing: {needed}')
 package_release = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
-for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAVA_VERSION.txt']:
+for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAVA_VERSION.txt',
+               'function Remove-ReleaseDevelopmentFiles', 'function Write-ReleaseManifest',
+               "'release-manifest.json'", "'ReportPdfComposer$ContentSpec.class'",
+               "$excludedTopLevelNames", "'tmp'"]:
     if needed not in package_release: raise SystemExit(f'release dependency gate missing: {needed}')
 for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelopmentFiles', 'function Assert-SharedFolderLayout',
                'ReportBinder_共有フォルダー用_', "'日本語管理.vbs'", "'英語管理.vbs'", 'Start-Process']:
     if needed not in package_release: raise SystemExit(f'shared-folder release feature missing: {needed}')
 _shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
 for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
-               "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'"]:
+               "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'",
+               "'app\\tools\\scale-benchmark.ps1'", "'docs\\benchmarks'"]:
     if needed not in _shared_cleanup:
         raise SystemExit(f'shared-folder cleanup omission: {needed}')
 if "-IncludeJava $true" not in package_release:
@@ -910,7 +971,7 @@ if "history: '履歴・比較'" not in appjs or "activeView === 'history'" not i
     raise SystemExit('history navigation is not wired')
 
 # Final PDF names must use the selected category, not a category inherited from an Excel file name.
-for needed in ['function Get-CategoryProjectId', 'Get-OutputFileName $Volume $projectId $cat', 'Get-OutputFileName $v ([string]$snapshots[$v].projectId) $Category']:
+for needed in ['function Get-CategoryProjectId', 'Resolve-OutputFileNamePattern', '$outName=[string]$snapshotBefore.outputFileName', '$outName = [string]$snapshots[$v].outputFileName']:
     if needed not in server: raise SystemExit(f'category-aware final filename missing: {needed}')
 if '$outName=Get-OutputFileName $Volume $projectId;' in server:
     raise SystemExit('legacy final output still omits category')
@@ -920,7 +981,7 @@ for needed in [
     '$Script:VisualHashProfileVersion = 3',
     '$Script:VisualHashDpi = 120',
     'function Test-SheetVisualEquivalent',
-    '$Script:DiffDetailAlgorithmVersion = 20',
+    '$Script:DiffDetailAlgorithmVersion = 21',
 ]:
     if needed not in server:
         raise SystemExit(f'comparison tolerance/browser setting missing: {needed}')
@@ -1020,7 +1081,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260806_v101', 'style.css?v=20260806_v65']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260806_v102', 'style.css?v=20260806_v66']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
@@ -1032,6 +1093,13 @@ if 'SaveLayerImages(' in compare_page:
 with zipfile.ZipFile(root/'app/lib/pdfbox/ReportPdfComposer.jar') as zf:
     if 'PdfBatchRasterizer.class' not in set(zf.namelist()):
         raise SystemExit('ReportPdfComposer.jar must contain PdfBatchRasterizer.class')
+
+composer_source = (root/'app/lib/pdfbox/src/ReportPdfComposer.java').read_text(encoding='utf-8')
+for needed in ['Map<String, PDDocument> sourceDocuments', 'out.save(outFile)', 'for (PDDocument src : sourceDocuments.values())']:
+    if needed not in composer_source:
+        raise SystemExit(f'composer source-document lifetime regression: {needed}')
+if composer_source.index('out.save(outFile)') > composer_source.index('for (PDDocument src : sourceDocuments.values())'):
+    raise SystemExit('composer must save the destination before closing imported source documents')
 
 # 2026-07-31 comparison/final-output pipeline fixes ---------------------------
 _render_job = server.split('function Invoke-RenderJobFromFile', 1)[1].split('\nfunction ', 1)[0]
@@ -1050,7 +1118,7 @@ _post_analysis = server.split('function Invoke-PostRenderAnalysis', 1)[1].split(
 if '$pdf -and $name -and (Test-Path' in _post_analysis:
     raise SystemExit('post-render analysis must not repeat one SMB stat per rendered sheet')
 _final_build = server.split('function Invoke-FinalBuildTransaction', 1)[1].split('\nfunction ', 1)[0]
-for forbidden in ['Scan-Updates $Language', 'exports\\manifest_', '$ready = Get-FinalBuildReadiness']:
+for forbidden in ['Scan-Updates $Language', '$ready = Get-FinalBuildReadiness']:
     if forbidden in _final_build:
         raise SystemExit(f'final build still contains redundant shared-folder work: {forbidden}')
 for needed in ['Assert-FinalBuildSourcesUnchanged $snapshots $targets',
@@ -1067,7 +1135,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260806_v101' not in html:
+if 'app.js?v=20260806_v102' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1093,7 +1161,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260806_v101' not in html:
+if 'app.js?v=20260806_v102' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1222,7 +1290,7 @@ if '<pre id="log" hidden></pre>' not in html:
 # fallback before the UI resorts to a whole-page indication.
 for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
                'preferredDiffPageIndex(sheet)', 'preferredDiffPageIndex(preferred)',
-               'このページに変更はありません。シート内の別ページに変更があります。',
+               'このページに変更はありません。同じ原稿内の別ページに変更があります。',
                "if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified'", 'analysis.fallbackUsed']:
     if needed not in appjs:
         raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
@@ -1348,7 +1416,7 @@ for needed in ['[string]$_.workbookId -eq $WorkbookId', '[string]$_.sheetName -e
     if needed not in _locked_render_commit:
         raise SystemExit(f'unrestricted worksheet render commit fallback missing: {needed}')
 for needed in ['未振り分け（出力しない）', '本体または補足へ移したページだけ',
-               'Excelのシート順に整える', '未振り分けへ戻す', 'assignment-guide']:
+               '原稿内の順序に整える', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
 
@@ -1431,5 +1499,57 @@ if re.search(r'\basync\s+async\s+function\b', appjs):
 for needed in ['function saveBoardOrder()', 'async function sortPagesBySheet(btn=null)']:
     if needed not in appjs:
         raise SystemExit(f'page-board async function is missing: {needed}')
+
+
+# 2026-08-06 Word source adapter -------------------------------------------
+for needed in ["sourceType = 'word'", "adapterId = 'word-com-v1'",
+               'function Inspect-WordSourceFile', 'function Register-WordSource',
+               'function Render-WordSource', 'function Render-WordSnapshotForComparison',
+               'function Invoke-WordDocumentToPdf', '$Script:WordRenderTimeoutSeconds = 120',
+               'wordRenderProfileVersion = $Script:WordRenderProfileVersion',
+               "Get-SourceCandidates @('excel','word','pdf')"]:
+    if needed not in server:
+        raise SystemExit(f'Word source adapter behavior missing: {needed}')
+for needed in ["id=\"i-file-word\"", 'Excel・Word・PDF原稿']:
+    if needed not in html:
+        raise SystemExit(f'Word source UI markup missing: {needed}')
+for needed in ['CURRENT_WORD_RENDER_PROFILE_VERSION', "word:'i-file-word'",
+               "sourceTypeValue(source) === 'word'", "['excel','word','pdf']"]:
+    if needed not in appjs:
+        raise SystemExit(f'Word source UI behavior missing: {needed}')
+for needed in ['ConvertTo-Win32ExtendedPath', "return '\\\\?\\UNC\\'", 'Write-Utf8NoBomFileShared']:
+    if needed not in server:
+        raise SystemExit(f'long comparison path support missing: {needed}')
+
+
+# 2026-08-06 generalized history comparison --------------------------------
+for needed in ['function Get-ComparisonUnitMappings', 'function Set-ComparisonUnitMappingResult',
+               "'exact-hash-sequence'", "'ambiguous-sequence'", 'unitMappings = @()',
+               'beforeSheetName = $beforeName', 'afterSheetName = $afterName',
+               '$Script:DiffDetailAlgorithmVersion = 21']:
+    if needed not in server:
+        raise SystemExit(f'generalized history comparison missing: {needed}')
+for needed in ['function diffUnitDisplayName', 'function diffMatchConfidenceLabel',
+               'sheet?.beforeSheetName', 'sheet?.afterSheetName', '対応不確実', '対応推定']:
+    if needed not in appjs:
+        raise SystemExit(f'generalized history UI missing: {needed}')
+
+
+# 2026-08-07 deployment and operational readiness ---------------------------
+for needed in ['function Get-OfficeApplicationDiagnostic', 'function Get-SystemDiagnostics',
+               "'windows-session-unavailable'", 'minimumSupportedMajor=16',
+               "status=$overall", "PDF原稿は処理できます"]:
+    if needed not in server:
+        raise SystemExit(f'environment diagnostics missing: {needed}')
+for needed in ['id="run-diagnostics-btn"', 'id="diagnostics-result"', '動作環境の診断']:
+    if needed not in html:
+        raise SystemExit(f'environment diagnostics markup missing: {needed}')
+for needed in ['function renderDiagnosticsResult', 'async function runSystemDiagnostics',
+               "api('/api/diagnostics/run'", 'diagnosticsResult']:
+    if needed not in appjs:
+        raise SystemExit(f'environment diagnostics behavior missing: {needed}')
+for needed in ['.diagnostic-list', '.diagnostic-row', '.diagnostics-summary']:
+    if needed not in css:
+        raise SystemExit(f'environment diagnostics styling missing: {needed}')
 
 print('selfcheck ok')

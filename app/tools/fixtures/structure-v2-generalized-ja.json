@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 2,
+  "language": "ja",
+  "workbooks": [
+    {
+      "workbookId": "ecm-source",
+      "fileName": "01_ECM_月次.xlsx",
+      "relativePath": "01_ECM_月次.xlsx",
+      "displayName": "ECM月次",
+      "category": "ecm",
+      "status": "rendered",
+      "currentExcelHash": "sha256:ecm",
+      "currentSnapshotId": "snapshot-ecm-current",
+      "lastRenderedSnapshotId": "snapshot-ecm-rendered",
+      "lastRenderedVersionId": "render-ecm-1",
+      "lastRenderedAt": "2026-08-01T10:00:00+09:00"
+    },
+    {
+      "workbookId": "bod-source",
+      "fileName": "02_BOD_報告.xlsx",
+      "relativePath": "02_BOD_報告.xlsx",
+      "displayName": "BOD報告",
+      "category": "bod",
+      "status": "new"
+    },
+    {
+      "workbookId": "dmm-source",
+      "fileName": "03_DMM_参考.xlsx",
+      "relativePath": "03_DMM_参考.xlsx",
+      "displayName": "DMM参考",
+      "category": "dmm",
+      "status": "new"
+    }
+  ],
+  "pages": [
+    {
+      "pageId": "ecm-item-1",
+      "workbookId": "ecm-source",
+      "sheetName": "1 売上",
+      "sheetIndex": 1,
+      "title": "1 売上",
+      "volume": "ja-main",
+      "order": 20,
+      "enabled": true,
+      "numberingMode": "none",
+      "numberingManual": false,
+      "contentPdf": "content-pdf\\ecm-source\\render-ecm-1\\sheet.pdf"
+    },
+    {
+      "pageId": "bod-item-1",
+      "workbookId": "bod-source",
+      "sheetName": "1 報告",
+      "sheetIndex": 1,
+      "title": "1 報告",
+      "volume": "ja-appendix",
+      "order": 10,
+      "enabled": true,
+      "numberingMode": "visible",
+      "numberingManual": true,
+      "contentPdf": ""
+    },
+    {
+      "pageId": "dmm-item-1",
+      "workbookId": "dmm-source",
+      "sheetName": "参考",
+      "sheetIndex": 1,
+      "title": "参考",
+      "volume": "none",
+      "order": 30,
+      "enabled": false,
+      "numberingMode": "visible",
+      "numberingManual": false,
+      "contentPdf": ""
+    }
+  ],
+  "volumes": {
+    "ja-main|ecm": {
+      "status": "built",
+      "lastBuiltAt": "2026-08-01T11:00:00+09:00",
+      "outputPdf": "C:\\output\\ecm-main.pdf",
+      "builtFingerprint": "fingerprint-ecm",
+      "staleReasons": [],
+      "message": ""
+    },
+    "ja-appendix|ecm": { "status": "not-built", "builtFingerprint": "", "staleReasons": [], "message": "" },
+    "ja-main|bod": { "status": "not-built", "builtFingerprint": "", "staleReasons": [], "message": "" },
+    "ja-appendix|bod": { "status": "needs-rebuild", "builtFingerprint": "old-bod", "staleReasons": ["layout"], "message": "再出力が必要です" },
+    "ja-main|dmm": { "status": "not-built", "builtFingerprint": "", "staleReasons": [], "message": "" },
+    "ja-appendix|dmm": { "status": "not-built", "builtFingerprint": "", "staleReasons": [], "message": "" }
+  },
+  "updatedAt": "2026-08-01T11:00:00+09:00"
+}

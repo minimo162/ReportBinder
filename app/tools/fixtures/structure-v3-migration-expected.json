@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 3,
+  "packIds": ["pack_ecm", "pack_bod", "pack_dmm"],
+  "sourceIds": ["ecm-source", "bod-source", "dmm-source"],
+  "items": {
+    "ecm-item-1": { "packId": "pack_ecm", "targetId": "main", "order": 20, "enabled": true },
+    "bod-item-1": { "packId": "pack_bod", "targetId": "appendix", "order": 10, "enabled": true },
+    "dmm-item-1": { "packId": "pack_dmm", "targetId": "unassigned", "order": 30, "enabled": false }
+  },
+  "outputs": {
+    "pack_ecm|main": { "status": "built", "builtFingerprint": "fingerprint-ecm" },
+    "pack_bod|appendix": { "status": "needs-rebuild", "builtFingerprint": "old-bod" }
+  },
+  "artifactCount": 1,
+  "migrationIssueCodes": ["content-pdf-missing"],
+  "v4SchemaVersion": 2,
+  "v4WorkbookCount": 3,
+  "v4PageCount": 3
+}
