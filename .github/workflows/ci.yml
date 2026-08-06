@@ -2,6 +2,8 @@ name: ReportBinder CI
 
 on:
   pull_request:
+    branches:
+      - main
   push:
     branches:
       - main
@@ -51,4 +53,3 @@ jobs:
           Remove-Item -LiteralPath .\app\thirdparty-cache -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath .\app\lib\pdfbox\classes -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath .\app\tools\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
-
