@@ -917,7 +917,11 @@ function Select-FolderDialog([string]$Title, [string]$InitialDir) {
         $escapedHelper = $helper -replace "'", "''"
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$escapedHelper'"))
         $args = "-NoProfile -STA -ExecutionPolicy Bypass -EncodedCommand $encoded"
-        $proc = Start-Process -FilePath $psExe -ArgumentList $args -WindowStyle Hidden -PassThru -Wait
+        $proc = Start-Process -FilePath $psExe -ArgumentList $args -WindowStyle Hidden -PassThru
+        if (-not $proc.WaitForExit(60000)) {
+            try { $proc.Kill() } catch { }
+            throw 'フォルダ選択画面が応答しません。画面でパスを直接入力してください。'
+        }
         if ($proc.ExitCode -ne 0) { throw "フォルダ選択ダイアログを開けませんでした。ExitCode=$($proc.ExitCode)" }
         if (Test-Path -LiteralPath $tmp) {
             $selected = (Get-Content -LiteralPath $tmp -Raw -Encoding UTF8).Trim()
@@ -3007,7 +3011,22 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 $latest=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1)
                 if(-not $latest.Count){throw "Workbookが見つかりません: $WorkbookId"}
                 $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected
-                foreach($r in $rendered){$pageId="$WorkbookId-$([regex]::Replace([string]$r.sheetName,'[^0-9A-Za-z]+','-'))";$pg=@(Get-Array $st.pages|Where-Object{(Resolve-PageId $_)-eq $pageId}|Select-Object -First 1);if($pg.Count){Set-NoteProperty $pg[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf));Set-NoteProperty $pg[0] 'status' 'rendered';Set-NoteProperty $pg[0] 'warnings' @($r.warnings);Set-NoteProperty $pg[0] 'updatedAt' (New-NowIso)}}
+                foreach ($r in $rendered) {
+                    $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
+                    # Unrestricted worksheet names use stable hashed page IDs. The legacy
+                    # sanitized ID above cannot identify Japanese-only names, so retain the
+                    # same workbook/sheet fallback used by the in-memory render result.
+                    $pg = @(Get-Array $st.pages | Where-Object {
+                        (Resolve-PageId $_) -eq $pageId -or
+                        ([string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq [string]$r.sheetName)
+                    } | Select-Object -First 1)
+                    if ($pg.Count) {
+                        Set-NoteProperty $pg[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf))
+                        Set-NoteProperty $pg[0] 'status' 'rendered'
+                        Set-NoteProperty $pg[0] 'warnings' @($r.warnings)
+                        Set-NoteProperty $pg[0] 'updatedAt' (New-NowIso)
+                    }
+                }
                 # V5-§2.4: currentExcel* はコピーしない(Scan-Updates の専有)。
                 foreach($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash','warnings','lastRenderLog')){Set-NoteProperty $lw $name (Get-DataProperty $wb $name $null)}
                 Set-NoteProperty $lw 'lastRenderedSnapshotId' ([string]$SourceSnapshotId)
