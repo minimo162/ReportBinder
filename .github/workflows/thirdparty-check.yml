@@ -1,49 +1,58 @@
-name: Third-party dependency check
+name: ReportBinder CI
 
 on:
   pull_request:
-    paths:
-      - 'app/tools/install-thirdparty.ps1'
-      - 'app/tools/verify-thirdparty.ps1'
-      - 'app/tools/package-release.ps1'
-      - 'app/tools/selfcheck.py'
-      - 'app/lib/pdfbox/**'
-      - 'app/web/pdfjs/**'
-      - 'docs/THIRD_PARTY_SETUP.md'
-      - 'THIRD_PARTY_NOTICES.md'
-      - '.github/workflows/thirdparty-check.yml'
+    branches:
+      - main
+  push:
+    branches:
+      - main
   workflow_dispatch:
+
+concurrency:
+  group: reportbinder-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  verify-on-windows-powershell-51:
+  validate-windows-powershell-51:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Install and verify all external dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install Python test dependencies
+        run: python -m pip install --disable-pip-version-check -r .\app\tools\ci-requirements.txt
+
+      - name: Install verified external dependencies
         shell: powershell
-        run: |
-          $PSVersionTable.PSVersion
-          .\app\tools\install-thirdparty.ps1 -Force
-          .\app\tools\verify-thirdparty.ps1 -RequirePdfJs -RequirePortableJava
+        run: .\app\tools\install-thirdparty.ps1 -Force
 
-      - name: Rebuild ReportPdfComposer against downloaded PDFBox
+      - name: Rebuild ReportPdfComposer
         shell: powershell
-        run: |
-          .\app\lib\pdfbox\build.ps1
+        run: .\app\lib\pdfbox\build.ps1
 
-      - name: Remove transient download and build caches
+      - name: Run complete CI acceptance suite
+        shell: powershell
+        run: .\app\tools\ci-selfcheck.ps1
+
+      - name: Remove transient dependencies and build output
+        if: always()
         shell: powershell
         run: |
           Remove-Item -LiteralPath .\app\thirdparty-cache -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath .\app\lib\pdfbox\classes -Recurse -Force -ErrorAction SilentlyContinue
-
-      - name: Run repository self-check
-        shell: powershell
-        run: |
-          py -3 .\app\tools\selfcheck.py
+          Remove-Item -LiteralPath .\app\tools\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue

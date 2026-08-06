@@ -252,9 +252,19 @@ app\tools\stop-reportbinder.cmd
 
 ## 回帰確認
 
+日常の短い確認は次を実行します。
+
 ```text
 python app\tools\selfcheck.py
 ```
+
+PR前に第三者依存物、PowerShell構文、差分、最終組版、運用復旧、配布物までまとめて確認する場合:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\ci-selfcheck.ps1
+```
+
+同じ完全検査は、すべてのpull requestとmainへのpushで`.github/workflows/thirdparty-check.yml`（表示名: ReportBinder CI）から自動実行されます。Excel / Word COMを使う実機E2Eとlargeベンチマークは、対話Windowsセッションが必要なためリリース受け入れ時に別途実行します。
 
 最終PDFの表紙・目次・区切り・ページ範囲・ブックマークを実PDFで確認する場合:
 

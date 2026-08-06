@@ -11,7 +11,8 @@ required = [
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
     'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
-    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1',
+    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/ci-requirements.txt',
+    '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
     'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
@@ -35,6 +36,18 @@ if scale_report.get('schemaVersion') != 2 or not scale_report.get('acceptance', 
     raise SystemExit('large mixed-source benchmark acceptance report is missing or failed')
 if scale_report.get('workload', {}).get('updatedSourceCount') != 3:
     raise SystemExit('large benchmark must detect exactly one updated PDF, Word, and Excel source')
+ci_selfcheck=(root/'app/tools/ci-selfcheck.ps1').read_text(encoding='utf-8')
+for needed in ['Assert-PowerShellSyntax', 'Assert-VersionDocumented', 'Diff regression',
+               'Final composition regression', 'Operational readiness regression',
+               'ZIP release smoke test', 'Assert-PackageContents']:
+    if needed not in ci_selfcheck: raise SystemExit(f'CI acceptance coverage missing: {needed}')
+ci_workflow=(root/'.github/workflows/thirdparty-check.yml').read_text(encoding='utf-8')
+for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -Force',
+               'ci-requirements.txt', 'build.ps1', 'ci-selfcheck.ps1']:
+    if needed not in ci_workflow: raise SystemExit(f'GitHub CI workflow coverage missing: {needed}')
+release_workflow=(root/'.github/workflows/release.yml').read_text(encoding='utf-8')
+for needed in ['workflow_dispatch:', 'package-release.ps1', '-SharedFolderOnly', 'actions/upload-artifact@v6']:
+    if needed not in release_workflow: raise SystemExit(f'GitHub release workflow coverage missing: {needed}')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
 
@@ -935,7 +948,7 @@ for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelop
 _shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
 for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
                "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'",
-               "'app\\tools\\scale-benchmark.ps1'", "'docs\\benchmarks'"]:
+               "'app\\tools\\scale-benchmark.ps1'", "'app\\tools\\ci-selfcheck.ps1'", "'app\\tools\\ci-requirements.txt'", "'docs\\benchmarks'"]:
     if needed not in _shared_cleanup:
         raise SystemExit(f'shared-folder cleanup omission: {needed}')
 if "-IncludeJava $true" not in package_release:
@@ -1226,8 +1239,8 @@ for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.06.47':
-    raise SystemExit('workflow UX release must bump the immutable runtime version')
+if str(runtime_info.get('version','')) != '2026.08.07.48':
+    raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'data-progress-view="folders"', '提出用PDF']:
     if needed not in html:
         raise SystemExit(f'workflow UX markup is missing: {needed}')
