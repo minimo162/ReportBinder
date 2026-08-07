@@ -588,7 +588,7 @@ function Get-InputHistorySettings {
     $config = Get-AppConfig
     $ih = Get-DataProperty $config 'inputHistory' $null
     return [ordered]@{
-        retainSourceVersions = [int](Get-DataProperty $ih 'retainSourceVersions' 2)
+        retainSourceVersions = [int](Get-DataProperty $ih 'retainSourceVersions' 5)
         retainContentPdfVersions = [int](Get-DataProperty $ih 'retainContentPdfVersions' 3)
         sourceRetentionDaysAfterBuild = (Get-DataProperty $ih 'sourceRetentionDaysAfterBuild' $null)
         softCapMegabytes = [int](Get-DataProperty $ih 'softCapMegabytes' 5120)
@@ -4917,6 +4917,7 @@ function Remove-WorkbookContentPdfsCore([string]$Workspace, [string]$WorkbookId,
                 if ($keep -contains $name) { continue }
                 if (Test-ContentPdfProtected $Workspace $WorkbookId $name) { continue }
                 Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                [void]$Script:ContentPdfSheetIndexCache.Remove(([IO.Path]::GetFullPath($d.FullName)).ToLowerInvariant())
             }
         }
         return
@@ -4930,6 +4931,7 @@ function Remove-WorkbookContentPdfsAll([string]$Workspace, [string]$WorkbookId, 
         foreach ($dir in @(Get-ChildItem -LiteralPath $bookDir -Directory -ErrorAction SilentlyContinue)) {
             if ([string]::IsNullOrWhiteSpace($KeepVersionId) -or [string]$dir.Name -ne $KeepVersionId) {
                 Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                [void]$Script:ContentPdfSheetIndexCache.Remove(([IO.Path]::GetFullPath($dir.FullName)).ToLowerInvariant())
             }
         }
     } catch { }
@@ -7923,18 +7925,14 @@ function Handle-Api($Context) {
             $body = Read-BodyJson $Context.Request
             $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
             $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
-            if (-not (New-SnapshotPin $language $wbId $snapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
-                throw '履歴の保護情報を保存できませんでした。'
-            }
-            [void](Update-SnapshotSummaryCacheEntry $language $wbId $snapshotId)
+            [void](Set-ManualSnapshotPin $language $wbId $snapshotId $true)
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/history/unpin') {
             $body = Read-BodyJson $Context.Request
             $wbId = Assert-SafeStorageSegment ([string]$body.workbookId) 'workbookId'
             $snapshotId = Assert-SafeStorageSegment ([string]$body.snapshotId) 'snapshotId'
-            Remove-SnapshotPin $language $wbId $snapshotId 'manual'
-            [void](Update-SnapshotSummaryCacheEntry $language $wbId $snapshotId)
+            [void](Set-ManualSnapshotPin $language $wbId $snapshotId $false)
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/layout/snapshots') {
@@ -8377,8 +8375,11 @@ function Get-SnapshotManifest([string]$Language, [string]$WorkbookId, [string]$S
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
     $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
     $cacheKey = ($Language + '|' + $safeWorkbookId + '|' + $safeSnapshotId).ToLowerInvariant()
-    if ($Script:SnapshotManifestCache.ContainsKey($cacheKey)) { return $Script:SnapshotManifestCache[$cacheKey] }
     $path = Join-Path (Get-SnapshotDir $Language $safeWorkbookId $safeSnapshotId) 'manifest.json'
+    if ($Script:SnapshotManifestCache.ContainsKey($cacheKey)) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $Script:SnapshotManifestCache[$cacheKey] }
+        [void]$Script:SnapshotManifestCache.Remove($cacheKey)
+    }
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     try {
         $manifest = Read-JsonFile $path $null
@@ -8397,10 +8398,32 @@ function Get-SnapshotIds([string]$Language, [string]$WorkbookId) {
     if ($null -ne $cached -and [Int64](Get-DataProperty $cached 'stamp' -1) -eq $stamp) {
         return @(Get-Array (Get-DataProperty $cached 'ids' @()))
     }
-    $ids = @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
-             Sort-Object Name | ForEach-Object { [string]$_.Name })
+    # manifest.json is the completion marker. Pending/crashed directories are not
+    # history generations and must not consume the recent-generation allowance.
+    # Enumerate completion markers in one directory walk instead of issuing one
+    # remote Test-Path call per generation on a shared workspace.
+    $ids = @(Get-ChildItem -LiteralPath $dir -File -Filter 'manifest.json' -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+             Where-Object { [string]$_.Directory.Parent.FullName -eq [string]$dir } |
+             Sort-Object { $_.Directory.Name } | ForEach-Object { [string]$_.Directory.Name })
     $Script:SnapshotIdCache[$cacheKey] = [pscustomobject][ordered]@{ stamp = $stamp; ids = $ids }
     return $ids
+}
+
+function Clear-SnapshotRuntimeCaches([string]$Language, [string]$WorkbookId, [string]$SnapshotId = '') {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $workbookPrefix = ($Language + '|' + $safeWorkbookId + '|').ToLowerInvariant()
+    $snapshotKey = if ([string]::IsNullOrWhiteSpace($SnapshotId)) { '' } else { ($workbookPrefix + (Assert-SafeStorageSegment $SnapshotId 'snapshotId').ToLowerInvariant()) }
+    foreach ($key in @($Script:SnapshotManifestCache.Keys)) {
+        if (($snapshotKey -and [string]$key -eq $snapshotKey) -or (-not $snapshotKey -and [string]$key -like ($workbookPrefix + '*'))) {
+            [void]$Script:SnapshotManifestCache.Remove($key)
+        }
+    }
+    foreach ($key in @($Script:VisualHashCache.Keys)) {
+        if (($snapshotKey -and [string]$key -like ($snapshotKey + '|*')) -or (-not $snapshotKey -and [string]$key -like ($workbookPrefix + '*'))) {
+            [void]$Script:VisualHashCache.Remove($key)
+        }
+    }
+    Clear-SnapshotSummaryCache $Language $safeWorkbookId
 }
 
 function Find-SnapshotBySourceHash([string]$Language, [string]$WorkbookId, [string]$SourceHash) {
@@ -8455,9 +8478,11 @@ function Get-SnapshotLeaseDir([string]$Language, [string]$WorkbookId, [string]$S
 function New-SnapshotPin([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$PinName, $Data) {
     # V5-IV-2: 保護はファイルの作成・削除で表す。配列の書き換えはしない。
     try {
+        $safePinName = Assert-SafeStorageSegment $PinName 'pinName'
+        if ($null -eq (Get-SnapshotManifest $Language $WorkbookId $SnapshotId)) { return $false }
         $dir = Get-SnapshotPinDir $Language $WorkbookId $SnapshotId
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Write-JsonFile (Join-Path $dir ("{0}.json" -f $PinName)) $Data
+        Write-JsonFile (Join-Path $dir ("{0}.json" -f $safePinName)) $Data
         return $true
     } catch { return $false }
 }
@@ -8475,11 +8500,34 @@ function Get-SnapshotPins([string]$Language, [string]$WorkbookId, [string]$Snaps
     return @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.BaseName })
 }
 
+function Set-ManualSnapshotPin([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [bool]$Pinned) {
+    $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
+    $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
+    $historyLock = Join-Path (Get-WorkspacePath $Language) 'locks\history-cleanup.lock'
+    return Invoke-WithLock $historyLock {
+        if ($null -eq (Get-SnapshotManifest $Language $safeWorkbookId $safeSnapshotId)) {
+            throw [ArgumentException]::new('保護する履歴版が見つかりません。')
+        }
+        if ($Pinned) {
+            if (-not (New-SnapshotPin $Language $safeWorkbookId $safeSnapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
+                throw '履歴の保護情報を保存できませんでした。'
+            }
+        } else {
+            Remove-SnapshotPin $Language $safeWorkbookId $safeSnapshotId 'manual'
+        }
+        [void](Update-SnapshotSummaryCacheEntry $Language $safeWorkbookId $safeSnapshotId)
+        return $true
+    }
+}
+
 function New-SnapshotLease([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$Purpose, [string]$JobId, [int]$MinutesValid = 30, [string]$VersionId = '') {
     try {
+        $safePurpose = Assert-SafeStorageSegment $Purpose 'purpose'
+        $safeJobId = Assert-SafeStorageSegment $JobId 'jobId'
+        if ($null -eq (Get-SnapshotManifest $Language $WorkbookId $SnapshotId)) { return '' }
         $dir = Get-SnapshotLeaseDir $Language $WorkbookId $SnapshotId
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $name = ('{0}_{1}.json' -f $Purpose, $JobId)
+        $name = ('{0}_{1}.json' -f $safePurpose, $safeJobId)
         Write-JsonFile (Join-Path $dir $name) ([ordered]@{
             jobId = $JobId; purpose = $Purpose; versionId = $VersionId
             createdAt = New-NowIso; heartbeatAt = New-NowIso
@@ -8602,6 +8650,7 @@ function Complete-Snapshot([string]$Language, [string]$WorkbookId, [string]$Snap
     if (-not (Test-Path -LiteralPath $pending)) { return $false }
     try {
         Move-Item -LiteralPath $pending -Destination $final -Force
+        Clear-SnapshotRuntimeCaches $Language $WorkbookId $SnapshotId
         Write-HistoryEvent $Language 'input.snapshot.created' ([ordered]@{ workbookId = $WorkbookId; snapshotId = $SnapshotId })
         return $true
     } catch { return $false }
@@ -8615,7 +8664,14 @@ function Save-SnapshotSourceFile([string]$Language, [string]$WorkbookId, [string
     $extension = [IO.Path]::GetExtension($SourcePath).ToLowerInvariant()
     if ($extension -notin @('.xlsx','.xlsm','.docx','.pptx','.pdf')) { $extension = '.xlsx' }
     $dest = Join-Path $dir ("source$extension")
-    if (Test-Path -LiteralPath $dest) { return [ordered]@{ ok = $true; path = $dest; reused = $true } }
+    $expectedHash = Normalize-FileHash $SourceHash
+    if (Test-Path -LiteralPath $dest) {
+        $existingHash = Normalize-FileHash (New-Sha256 $dest)
+        if (-not [string]::IsNullOrWhiteSpace($existingHash) -and $existingHash -eq $expectedHash) {
+            Set-SnapshotSourceState $Language $WorkbookId $SnapshotId $true ''
+            return [ordered]@{ ok = $true; path = $dest; reused = $true }
+        }
+    }
 
     $tmpDir = Join-Path (Get-WorkspacePath $Language) ('state\tmp\' + (New-RbId))
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
@@ -8630,7 +8686,7 @@ function Save-SnapshotSourceFile([string]$Language, [string]$WorkbookId, [string
         if (-not $copied) { return [ordered]@{ ok = $false; reason = 'copy-failed'; message = $lastError } }
         try { Unblock-File -LiteralPath $tmp -ErrorAction SilentlyContinue } catch { }
         $copyHash = Normalize-FileHash (New-Sha256 $tmp)
-        if ($copyHash -ne (Normalize-FileHash $SourceHash)) { return [ordered]@{ ok = $false; reason = 'hash-mismatch' } }
+        if ($copyHash -ne $expectedHash) { return [ordered]@{ ok = $false; reason = 'hash-mismatch' } }
         $after = Get-Item -LiteralPath $SourcePath -ErrorAction Stop
         if ($after.Length -ne $before.Length -or $after.LastWriteTimeUtc -ne $before.LastWriteTimeUtc) {
             return [ordered]@{ ok = $false; reason = 'source-changed-during-copy' }
@@ -8760,7 +8816,14 @@ function Capture-RenderInput([string]$Language, [string]$WorkbookId, [string]$Sn
     if (Test-SourceRetentionEnabled) {
         $state = Get-SnapshotSourceState $Language $WorkbookId $snap
         if ([bool]$state.sourceRetained) {
-            return [ordered]@{ path = [string]$state.sourcePath; snapshotId = $snap; ephemeral = $false; hash = $hash; verified = $true }
+            $retainedHash = Normalize-FileHash (New-Sha256 ([string]$state.sourcePath))
+            if (-not [string]::IsNullOrWhiteSpace($retainedHash) -and $retainedHash -eq $hash) {
+                return [ordered]@{ path = [string]$state.sourcePath; snapshotId = $snap; ephemeral = $false; hash = $hash; verified = $true }
+            }
+            # Never render a corrupted retained source as the requested immutable
+            # generation. Mark it unavailable, then attempt recovery from the live file.
+            try { Remove-Item -LiteralPath ([string]$state.sourcePath) -Force -ErrorAction SilentlyContinue } catch { }
+            Set-SnapshotSourceState $Language $WorkbookId $snap $false 'hash-mismatch'
         }
         # 現物が消えている: 提出フォルダの現物が同じハッシュなら復元する。
         if (Test-Path -LiteralPath $livePath) {
@@ -8869,15 +8932,18 @@ function Invoke-InputHistoryCleanup([string]$Language) {
         foreach ($wbDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
             $workbookId = [string]$wbDir.Name
             $protected = @(Get-ProtectedSnapshotIds $Language $workbookId)
-            $all = @(Get-SnapshotIds $Language $workbookId)
             # 未完成世代(manifest なし)を削除
+            $removedIncomplete = $false
             foreach ($d in @(Get-ChildItem -LiteralPath $wbDir.FullName -Directory -ErrorAction SilentlyContinue)) {
                 if (-not (Test-Path -LiteralPath (Join-Path $d.FullName 'manifest.json'))) {
                     if ($d.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddHours(-6)) {
                         Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                        $removedIncomplete = $true
                     }
                 }
             }
+            if ($removedIncomplete) { Clear-SnapshotRuntimeCaches $Language $workbookId }
+            $all = @(Get-SnapshotIds $Language $workbookId)
             if ($all.Count -eq 0) { continue }
             $keepRecent = @($all | Select-Object -Last ([Math]::Max(1, [int]$cfg.retainSourceVersions)))
             foreach ($sn in $all) {
@@ -8905,6 +8971,7 @@ function Invoke-InputHistoryCleanup([string]$Language) {
                     if ($canRemoveSource) {
                         Remove-Item -LiteralPath ([string]$state.sourcePath) -Force -ErrorAction SilentlyContinue
                         Set-SnapshotSourceState $Language $workbookId $sn $false 'retention'
+                        Clear-SnapshotRuntimeCaches $Language $workbookId $sn
                         Write-HistoryEvent $Language 'input.source.removed' ([ordered]@{ workbookId = $workbookId; snapshotId = $sn; reason = 'retention' })
                     }
                 }
@@ -8914,6 +8981,7 @@ function Invoke-InputHistoryCleanup([string]$Language) {
                     $m = Get-SnapshotManifest $Language $workbookId $sn
                     if ($null -ne $m -and [string](Get-DataProperty $m 'status' '') -eq 'complete') {
                         Remove-Item -LiteralPath (Get-SnapshotDir $Language $workbookId $sn) -Recurse -Force -ErrorAction SilentlyContinue
+                        Clear-SnapshotRuntimeCaches $Language $workbookId $sn
                         Write-HistoryEvent $Language 'history.cleanup' ([ordered]@{ kind = 'snapshot'; workbookId = $workbookId; snapshotId = $sn })
                     }
                 }
@@ -8969,9 +9037,12 @@ function Get-ContentPdfVersionDir([string]$Workspace, [string]$WorkbookId, [stri
 function New-ContentPdfPin([string]$Workspace, [string]$WorkbookId, [string]$VersionId, [string]$PinName, $Data) {
     # V5-P0(#4): 失敗を握りつぶさず $true/$false で返す。呼出元が結果を検査してロールバックできるようにする。
     try {
-        $dir = Join-Path (Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId) 'pins'
+        $safePinName = Assert-SafeStorageSegment $PinName 'pinName'
+        $versionDir = Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId
+        if (-not (Test-Path -LiteralPath $versionDir -PathType Container)) { return $false }
+        $dir = Join-Path $versionDir 'pins'
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $pinPath = Join-Path $dir ("{0}.json" -f $PinName)
+        $pinPath = Join-Path $dir ("{0}.json" -f $safePinName)
         Write-JsonFile $pinPath $Data
         return (Test-Path -LiteralPath $pinPath)
     } catch { return $false }
@@ -8988,9 +9059,13 @@ function Remove-ContentPdfPin([string]$Workspace, [string]$WorkbookId, [string]$
 
 function New-ContentPdfLease([string]$Workspace, [string]$WorkbookId, [string]$VersionId, [string]$Purpose, [string]$JobId, [int]$MinutesValid = 120) {
     try {
-        $dir = Join-Path (Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId) 'leases'
+        $safePurpose = Assert-SafeStorageSegment $Purpose 'purpose'
+        $safeJobId = Assert-SafeStorageSegment $JobId 'jobId'
+        $versionDir = Get-ContentPdfVersionDir $Workspace $WorkbookId $VersionId
+        if (-not (Test-Path -LiteralPath $versionDir -PathType Container)) { return '' }
+        $dir = Join-Path $versionDir 'leases'
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $name = ('{0}_{1}.json' -f $Purpose, $JobId)
+        $name = ('{0}_{1}.json' -f $safePurpose, $safeJobId)
         $path = Join-Path $dir $name
         Write-JsonFile $path ([ordered]@{
             jobId = $JobId; purpose = $Purpose; versionId = $VersionId
@@ -9677,8 +9752,11 @@ function Get-VisualHashes([string]$Language, [string]$WorkbookId, [string]$Snaps
     $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
     $safeVersionId = Assert-SafeStorageSegment $VersionId 'versionId'
     $cacheKey = ($Language + '|' + $safeWorkbookId + '|' + $safeSnapshotId + '|' + $safeVersionId).ToLowerInvariant()
-    if ($Script:VisualHashCache.ContainsKey($cacheKey)) { return $Script:VisualHashCache[$cacheKey] }
     $p = Join-Path (Get-RenderRecordDir $Language $safeWorkbookId $safeSnapshotId $safeVersionId) 'visual-hashes.json'
+    if ($Script:VisualHashCache.ContainsKey($cacheKey)) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) { return $Script:VisualHashCache[$cacheKey] }
+        [void]$Script:VisualHashCache.Remove($cacheKey)
+    }
     if (-not (Test-Path -LiteralPath $p)) { return $null }
     try {
         $hashes = Read-JsonFile $p $null
@@ -10336,6 +10414,45 @@ function Remove-FinalTransactionBackupDir([string]$Language, [string]$Transactio
 
 # ---- レイアウト投影スナップショットと限定復元 (V5-§4.2) -------------
 
+function ConvertTo-NormalizedLayoutSnapshotPage($Page, [string[]]$AllowedVolumes) {
+    $pageId = [string](Get-DataProperty $Page 'pageId' '')
+    if ([string]::IsNullOrWhiteSpace($pageId)) { throw [ArgumentException]::new('ページ構成履歴にpageIdがありません。') }
+    $storedVolume = [string](Get-DataProperty $Page 'volume' 'none')
+    $volumeInvalid = ($AllowedVolumes -notcontains $storedVolume)
+    $volume = $(if ($volumeInvalid) { 'none' } else { $storedVolume })
+    $numberingMode = [string](Get-DataProperty $Page 'numberingMode' 'visible')
+    if ($numberingMode -notin @('none','visible')) { throw [ArgumentException]::new("ページ構成履歴のnumberingModeが不正です: $pageId") }
+    try { $order = [double](Get-DataProperty $Page 'order' 0) } catch { throw [ArgumentException]::new("ページ構成履歴のorderが不正です: $pageId") }
+    if ([double]::IsNaN($order) -or [double]::IsInfinity($order)) { throw [ArgumentException]::new("ページ構成履歴のorderが不正です: $pageId") }
+    $range = ConvertTo-NormalizedPageRange (Get-DataProperty $Page 'pageRange' $null)
+    return [pscustomobject][ordered]@{
+        pageId = $pageId
+        title = [string](Get-DataProperty $Page 'title' '')
+        volume = $volume
+        storedVolume = $storedVolume
+        volumeInvalid = $volumeInvalid
+        enabled = ($volume -ne 'none')
+        order = $order
+        orderManual = [bool](Get-DataProperty $Page 'orderManual' $false)
+        numberingMode = $numberingMode
+        numberingManual = [bool](Get-DataProperty $Page 'numberingManual' $false)
+        pageRange = $range
+    }
+}
+
+function Get-NormalizedLayoutSnapshotPages($Snapshot, [string[]]$AllowedVolumes) {
+    $pages = @()
+    $seen = @{}
+    foreach ($page in @(Get-Array (Get-DataProperty $Snapshot 'pages' @()))) {
+        $normalized = ConvertTo-NormalizedLayoutSnapshotPage $page $AllowedVolumes
+        $pageId = [string]$normalized.pageId
+        if ($seen.ContainsKey($pageId)) { throw [ArgumentException]::new("ページ構成履歴に重複したpageIdがあります: $pageId") }
+        $seen[$pageId] = $true
+        $pages += $normalized
+    }
+    return @($pages)
+}
+
 function Save-LayoutSnapshot([string]$Language, [string]$PackIdOrCategory, [string]$Reason, $Structure = $null) {
     if (-not (Test-InputHistoryEnabled)) { return '' }
     try {
@@ -10404,6 +10521,10 @@ function Read-LayoutSnapshot([string]$Language, [string]$PackIdOrCategory, [stri
     if (-not (Test-Path -LiteralPath $p)) { throw "レイアウト履歴が見つかりません: $SnapshotId" }
     $snapshot = Read-JsonFile $p $null
     if ($null -eq $snapshot) { throw "レイアウト履歴を読み込めません: $SnapshotId" }
+    $recordedSnapshotId = [string](Get-DataProperty $snapshot 'snapshotId' '')
+    $recordedLanguage = [string](Get-DataProperty $snapshot 'language' '')
+    if (-not [string]::IsNullOrWhiteSpace($recordedSnapshotId) -and $recordedSnapshotId -ne $safeSnapshotId) { throw 'ページ構成履歴の識別子がファイル名と一致しません。' }
+    if (-not [string]::IsNullOrWhiteSpace($recordedLanguage) -and $recordedLanguage -ne $Language) { throw '別の言語のページ構成履歴は復元できません。' }
     $recordedPackId = [string](Get-DataProperty $snapshot 'packId' '')
     $recordedCategory = [string](Get-DataProperty $snapshot 'category' '')
     if (-not [string]::IsNullOrWhiteSpace($recordedPackId) -and $recordedPackId -ne [string]$scope.packId) { throw '別の資料パックのページ構成履歴は復元できません。' }
@@ -10423,16 +10544,18 @@ function Get-LayoutRestorePreview([string]$Language, [string]$PackIdOrCategory, 
         if (-not (Test-WorkbookPack $wb[0] ([string]$scope.packId))) { continue }
         $currentIds[(Resolve-PageId $p)] = $p
     }
-    $applied = 0; $pastOnly = @(); $volumeChanges = @()
+    $allowedVolumes = @(Get-PackVolumeList $Language $scope.pack $true)
+    $applied = 0; $pastOnly = @(); $volumeChanges = @(); $invalidVolumePageIds = @()
     $snapIds = @{}
-    foreach ($sp in @(Get-Array (Get-DataProperty $snap 'pages' @()))) {
-        $pageKey = [string]$sp.pageId
+    foreach ($normalized in @(Get-NormalizedLayoutSnapshotPages $snap $allowedVolumes)) {
+        $pageKey = [string]$normalized.pageId
         $snapIds[$pageKey] = $true
         if (-not $currentIds.ContainsKey($pageKey)) { $pastOnly += $pageKey; continue }
         $applied++
         $cur = $currentIds[$pageKey]
-        if ([string]$cur.volume -ne [string]$sp.volume) {
-            $volumeChanges += [ordered]@{ pageId = $pageKey; title = [string]$cur.title; from = [string]$cur.volume; to = [string]$sp.volume }
+        if ([bool]$normalized.volumeInvalid) { $invalidVolumePageIds += $pageKey }
+        if ([string]$cur.volume -ne [string]$normalized.volume) {
+            $volumeChanges += [ordered]@{ pageId = $pageKey; title = [string]$cur.title; from = [string]$cur.volume; to = [string]$normalized.volume; storedVolume = [string]$normalized.storedVolume; normalized = [bool]$normalized.volumeInvalid }
         }
     }
     $currentOnly = @($currentIds.Keys | Where-Object { -not $snapIds.ContainsKey($_) })
@@ -10446,27 +10569,38 @@ function Get-LayoutRestorePreview([string]$Language, [string]$PackIdOrCategory, 
         pastOnlyPageIds = @($pastOnly)
         currentOnlyPageIds = @($currentOnly)
         volumeChanges = @($volumeChanges)
-        requiresRebuild = $true
+        invalidVolumePageIds = @($invalidVolumePageIds)
+        requiresRebuild = ($applied -gt 0)
     }
 }
 
 function Restore-LayoutSnapshot([string]$Language, [string]$PackIdOrCategory, [string]$SnapshotId) {
     $snap = Read-LayoutSnapshot $Language $PackIdOrCategory $SnapshotId
     $scope = Get-LayoutScopeInfo (Get-Structure $Language) $PackIdOrCategory $false
-    # 復元の直前にも保存しておき、「復元を取り消す」を可能にする。
-    $undoId = Save-LayoutSnapshot $Language ([string]$scope.packId) 'pre-restore'
-    $applied = Update-StructureLocked $Language {
+    $restoreResult = Update-StructureLocked $Language {
         param($st)
         $lockedScope = Get-LayoutScopeInfo $st ([string]$scope.packId) $false
+        $allowedVolumes = @(Get-PackVolumeList $Language $lockedScope.pack $true)
         $workbookIds = @{}
         foreach ($wb in @(Get-Array $st.workbooks | Where-Object { Test-WorkbookPack $_ ([string]$lockedScope.packId) })) { $workbookIds[[string]$wb.workbookId] = $true }
         $map = @{}
         foreach ($p in @(Get-Array $st.pages | Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) })) { $map[(Resolve-PageId $p)] = $p }
-        $n = 0
-        foreach ($sp in @(Get-Array (Get-DataProperty $snap 'pages' @()))) {
-            $pageKey = [string]$sp.pageId
+        $records = @()
+        foreach ($normalized in @(Get-NormalizedLayoutSnapshotPages $snap $allowedVolumes)) {
+            $pageKey = [string]$normalized.pageId
             if (-not $map.ContainsKey($pageKey)) { continue }
-            $p = $map[$pageKey]
+            $records += [pscustomobject][ordered]@{ page = $map[$pageKey]; snapshot = $normalized }
+        }
+        if ($records.Count -eq 0) { return [ordered]@{ applied = 0; undoSnapshotId = ''; invalidVolumePageCount = 0 } }
+        # Save the exact locked pre-restore state. A failed undo snapshot must abort
+        # before structure.json is changed.
+        $undoId = Save-LayoutSnapshot $Language ([string]$lockedScope.packId) 'pre-restore' $st
+        if ([string]::IsNullOrWhiteSpace($undoId)) { throw '復元直前のページ構成を保存できないため、復元を中止しました。' }
+        $n = 0; $invalidVolumePageCount = 0
+        foreach ($record in $records) {
+            $p = $record.page
+            $sp = $record.snapshot
+            if ([bool]$sp.volumeInvalid) { $invalidVolumePageCount++ }
             # V5-§4.2: 適用してよいのはレイアウト項目のみ。
             # contentPdf / status / warnings / currentExcelHash / lastRendered* / volumes は触らない。
             Set-NoteProperty $p 'title' ([string]$sp.title)
@@ -10480,13 +10614,14 @@ function Restore-LayoutSnapshot([string]$Language, [string]$PackIdOrCategory, [s
             Set-NoteProperty $p 'updatedAt' (New-NowIso)
             $n++
         }
+        foreach ($volume in $allowedVolumes) { [void](Renumber-VolumeOrder $st $volume ([string]$lockedScope.packId)) }
         Apply-DefaultNumberingPerVolume $Language $st ([string]$lockedScope.packId)
         $vols = @(Get-PackVolumeList $Language $lockedScope.pack $false)
         Mark-VolumeNeedsRebuild $st $Language ([string]$lockedScope.packId) $vols 'layout-restored' 'ページ構成を過去の状態へ戻しました'
-        return $n
+        return [ordered]@{ applied = $n; undoSnapshotId = $undoId; invalidVolumePageCount = $invalidVolumePageCount }
     }
-    Write-HistoryEvent $Language 'layout.restored' ([ordered]@{ packId = [string]$scope.packId; category = [string]$scope.category; snapshotId = $SnapshotId; undoSnapshotId = $undoId; appliedPageCount = $applied })
-    return [ordered]@{ packId = [string]$scope.packId; category = [string]$scope.category; appliedPageCount = $applied; undoSnapshotId = $undoId }
+    Write-HistoryEvent $Language 'layout.restored' ([ordered]@{ packId = [string]$scope.packId; category = [string]$scope.category; snapshotId = $SnapshotId; undoSnapshotId = [string]$restoreResult.undoSnapshotId; appliedPageCount = [int]$restoreResult.applied })
+    return [ordered]@{ packId = [string]$scope.packId; category = [string]$scope.category; appliedPageCount = [int]$restoreResult.applied; undoSnapshotId = [string]$restoreResult.undoSnapshotId; invalidVolumePageCount = [int]$restoreResult.invalidVolumePageCount }
 }
 
 # ---- 最終PDFアーカイブ (V5-§4.1) -----------------------------------
@@ -11036,8 +11171,21 @@ function Get-ContentPdfSheetIndex([string]$Language, [string]$WorkbookId, [strin
     $dir = Get-ContentPdfVersionDir $workspace $WorkbookId $safeVersionId
     $cacheKey = ([IO.Path]::GetFullPath($dir)).ToLowerInvariant()
     $cached = $Script:ContentPdfSheetIndexCache[$cacheKey]
-    if ($null -ne $cached) { return (Get-DataProperty $cached 'index' @{}) }
-    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @{} }
+    if ($null -ne $cached) {
+        $cachedIndex = Get-DataProperty $cached 'index' @{}
+        $allFilesExist = $true
+        foreach ($cachedPath in @($cachedIndex.Values)) {
+            if (-not (Test-Path -LiteralPath ([string]$cachedPath) -PathType Leaf)) { $allFilesExist = $false; break }
+        }
+        # An empty cached generation has no file whose existence can prove that
+        # its parent still exists, so validate the directory in that case.
+        if ($cachedIndex.Count -eq 0 -and -not (Test-Path -LiteralPath $dir -PathType Container)) { $allFilesExist = $false }
+        if ($allFilesExist) { return $cachedIndex }
+    }
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        [void]$Script:ContentPdfSheetIndexCache.Remove($cacheKey)
+        return @{}
+    }
     $stamp = [IO.Directory]::GetLastWriteTimeUtc($dir).Ticks
     $root = [IO.Path]::GetFullPath($workspace)
     if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
@@ -11046,7 +11194,7 @@ function Get-ContentPdfSheetIndex([string]$Language, [string]$WorkbookId, [strin
         $full = [IO.Path]::GetFullPath($file.FullName)
         if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { continue }
         $key = ([string]$file.BaseName).ToLowerInvariant()
-        if (-not $index.ContainsKey($key)) { $index[$key] = $full }
+        if (-not $index.ContainsKey($key) -and (Test-Path -LiteralPath $full -PathType Leaf)) { $index[$key] = $full }
     }
     if (-not $Script:ContentPdfSheetIndexCache.ContainsKey($cacheKey) -and
         $Script:ContentPdfSheetIndexCache.Count -ge $Script:ContentPdfSheetIndexCacheLimit) {

@@ -11,7 +11,7 @@ required = [
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
     'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
-    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/ci-requirements.txt',
+    'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
     'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
@@ -39,7 +39,7 @@ if scale_report.get('workload', {}).get('updatedSourceCount') != 3:
 ci_selfcheck=(root/'app/tools/ci-selfcheck.ps1').read_text(encoding='utf-8')
 for needed in ['Assert-PowerShellSyntax', 'Assert-VersionDocumented', 'Diff regression',
                'Final composition regression', 'Operational readiness regression',
-               'ZIP release smoke test', 'Assert-PackageContents']:
+               'History logic regression', 'ZIP release smoke test', 'Assert-PackageContents']:
     if needed not in ci_selfcheck: raise SystemExit(f'CI acceptance coverage missing: {needed}')
 ci_workflow=(root/'.github/workflows/thirdparty-check.yml').read_text(encoding='utf-8')
 for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -Force',
@@ -711,6 +711,9 @@ for needed in ['$Script:SnapshotManifestCache', '$Script:VisualHashCache', '$Scr
 _snapshot_ids = server.split('function Get-SnapshotIds', 1)[1].split('\nfunction ', 1)[0]
 if "Where-Object { Test-Path" in _snapshot_ids:
     raise SystemExit('snapshot listing must not stat every manifest')
+for needed in ["-Filter 'manifest.json'", "-Depth 1", 'function Clear-SnapshotRuntimeCaches']:
+    if needed not in (_snapshot_ids + server):
+        raise SystemExit(f'completed snapshot/cache integrity safeguard missing: {needed}')
 _pdf_index = server.split('function Get-ContentPdfSheetIndex', 1)[1].split('\nfunction ', 1)[0]
 if _pdf_index.index('$cached =') > _pdf_index.index('Test-Path -LiteralPath $dir'):
     raise SystemExit('immutable content PDF index must be checked before SMB directory access')
@@ -959,7 +962,7 @@ for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelop
 _shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
 for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
                "'app\\tools\\package-release.ps1'", "'共有フォルダー用フォルダー作成.cmd'",
-               "'app\\tools\\scale-benchmark.ps1'", "'app\\tools\\ci-selfcheck.ps1'", "'app\\tools\\ci-requirements.txt'", "'docs\\benchmarks'"]:
+               "'app\\tools\\scale-benchmark.ps1'", "'app\\tools\\ci-selfcheck.ps1'", "'app\\tools\\history-logic-selfcheck.ps1'", "'app\\tools\\ci-requirements.txt'", "'docs\\benchmarks'"]:
     if needed not in _shared_cleanup:
         raise SystemExit(f'shared-folder cleanup omission: {needed}')
 if "-IncludeJava $true" not in package_release:
@@ -1256,7 +1259,9 @@ for needed in ["'/api/v2/layout/snapshots'", "'/api/v2/layout/restore/preview'",
     if needed not in (server + html + appjs):
         raise SystemExit(f'pack-scoped layout history is missing: {needed}')
 _layout_restore = server.split('function Restore-LayoutSnapshot', 1)[1].split('\nfunction ', 1)[0]
-for needed in ["Set-NoteProperty $p 'pageRange'", '$workbookIds.ContainsKey']:
+for needed in ["Set-NoteProperty $p 'pageRange'", '$workbookIds.ContainsKey',
+               'Get-NormalizedLayoutSnapshotPages', "Save-LayoutSnapshot $Language ([string]$lockedScope.packId) 'pre-restore' $st",
+               'invalidVolumePageCount']:
     if needed not in _layout_restore:
         raise SystemExit(f'pack-scoped layout restore invariant is missing: {needed}')
 for needed in ['function ConvertTo-NormalizedPackTemplate', 'function Save-PackTemplate',
@@ -1273,7 +1278,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.07.62':
+if str(runtime_info.get('version','')) != '2026.08.07.64':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'data-progress-view="folders"', '提出用PDF']:
     if needed not in html:

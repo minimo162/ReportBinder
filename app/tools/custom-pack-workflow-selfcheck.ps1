@@ -171,6 +171,38 @@ $outputState = Get-DataProperty $saved.outputs "$packId|main" $null
 Assert-CustomPackTest ([string]$outputState.status -in @('built','needs-rebuild') -and -not [string]::IsNullOrWhiteSpace([string]$outputState.builtFingerprint)) 'Custom pack output state was not saved.'
 Assert-CustomPackTest (@(Get-PublicPackList $saved 'ja' | Where-Object { [string]$_.packId -eq $packId -and [bool]$_.workflowAvailable }).Count -eq 1) 'Custom pack is not advertised as operational.'
 
+# A saved layout may outlive a custom output target. Restoring it must not revive
+# the removed target; the affected page is safely returned to the unassigned tray.
+$obsoleteTargetSnapshotId = Save-LayoutSnapshot 'ja' $packId 'obsolete-target-test'
+Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($obsoleteTargetSnapshotId)) 'Obsolete-target layout snapshot was not saved.'
+[void](Update-StructureLocked 'ja' {
+    param($st)
+    $targetPack = @($st.packs | Where-Object { [string]$_.packId -eq $packId } | Select-Object -First 1)[0]
+    $targets = @(Get-Array (Get-DataProperty $targetPack.templateConfig 'targets' @()) | Where-Object { [string]$_.targetId -ne 'executive-summary' })
+    Set-NoteProperty $targetPack.templateConfig 'targets' @($targets)
+    $targetPage = @($st.pages | Where-Object { (Resolve-PageId $_) -eq $dynamicPageId } | Select-Object -First 1)[0]
+    Set-NoteProperty $targetPage 'volume' 'ja-main'
+    Set-NoteProperty $targetPage 'enabled' $true
+    return $true
+})
+$obsoletePreview = Get-LayoutRestorePreview 'ja' $packId $obsoleteTargetSnapshotId
+Assert-CustomPackTest (@($obsoletePreview.invalidVolumePageIds).Count -eq 1 -and [string]$obsoletePreview.invalidVolumePageIds[0] -eq $dynamicPageId) 'Removed output target was not identified in restore preview.'
+$obsoleteChange = @($obsoletePreview.volumeChanges | Where-Object { [string]$_.pageId -eq $dynamicPageId } | Select-Object -First 1)[0]
+Assert-CustomPackTest ([string]$obsoleteChange.to -eq 'none' -and [string]$obsoleteChange.storedVolume -eq 'ja-executive-summary' -and [bool]$obsoleteChange.normalized) 'Removed output target was not normalized in restore preview.'
+$obsoleteRestore = Restore-LayoutSnapshot 'ja' $packId $obsoleteTargetSnapshotId
+$obsoletePage = @((Get-Structure 'ja').pages | Where-Object { (Resolve-PageId $_) -eq $dynamicPageId } | Select-Object -First 1)[0]
+Assert-CustomPackTest ([int]$obsoleteRestore.invalidVolumePageCount -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$obsoleteRestore.undoSnapshotId)) 'Removed output target restore did not retain a safe undo point.'
+Assert-CustomPackTest ([string]$obsoletePage.volume -eq 'none' -and -not [bool]$obsoletePage.enabled) 'Removed output target was revived by layout restore.'
+
+$duplicateSnapshotId = Save-LayoutSnapshot 'ja' $packId 'duplicate-page-test'
+$duplicateSnapshotPath = Join-Path (Get-LayoutHistoryDir 'ja' $packId) ("{0}.json" -f $duplicateSnapshotId)
+$duplicateSnapshot = Read-JsonFile $duplicateSnapshotPath $null
+$duplicateSnapshot.pages = @($duplicateSnapshot.pages) + @($duplicateSnapshot.pages[0])
+Write-JsonFile $duplicateSnapshotPath $duplicateSnapshot
+$duplicateError = ''
+try { [void](Get-LayoutRestorePreview 'ja' $packId $duplicateSnapshotId) } catch { $duplicateError = $_.Exception.Message }
+Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($duplicateError)) 'A corrupted layout snapshot with duplicate page IDs was accepted.'
+
 Write-Output "custom-pack workflow selfcheck ok ($($pages.Count) source pages -> $([int]$ready.pageCount) output pages)"
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

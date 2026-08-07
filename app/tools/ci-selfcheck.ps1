@@ -59,7 +59,7 @@ function Assert-PackageContents([string]$OutputRoot) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
     $forbiddenFragments = @(
         'app/tools/selfcheck.py', 'app/tools/ci-selfcheck.ps1', 'app/tools/ci-requirements.txt', 'app/tools/fixtures/',
-        'app/tools/scale-benchmark.ps1', 'docs/benchmarks/', '.github/'
+        'app/tools/scale-benchmark.ps1', 'app/tools/history-logic-selfcheck.ps1', 'docs/benchmarks/', '.github/'
     )
     $archives = @(Get-ChildItem -LiteralPath $OutputRoot -File -Filter '*.zip')
     if ($archives.Count -ne 2) { throw "Expected two ZIP releases, found $($archives.Count)." }
@@ -111,6 +111,7 @@ try {
     Invoke-Checked 'Final composition regression' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'final-composition-selfcheck.py')))
     Invoke-Checked 'Operational readiness regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'operational-readiness-selfcheck.ps1'))
     Invoke-Checked 'Pack lifecycle regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-lifecycle-selfcheck.ps1'))
+    Invoke-Checked 'History logic regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'history-logic-selfcheck.ps1'))
     Invoke-Checked 'Custom pack workflow regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'custom-pack-workflow-selfcheck.ps1'))
 
     if (-not $SkipPackageSmoke) {
