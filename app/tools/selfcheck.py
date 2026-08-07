@@ -10,7 +10,7 @@ required = [
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
     'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
-    'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
+    'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
     'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
@@ -191,8 +191,11 @@ try_pos=write_json_block.find('try {')
 tmp_write_pos=write_json_block.find('Write-Utf8NoBomFile $tmp $json')
 if try_pos < 0 or tmp_write_pos < try_pos:
     raise SystemExit('atomic JSON temp write must be inside fallback try block')
-for route in ['/api/state','/api/v2/state','/api/diagnostics/run','/api/v2/pack-templates','/api/v2/packs','/api/v2/sources/','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
+for route in ['/api/state','/api/v2/state','/api/diagnostics/run','/api/v2/pack-templates','/api/v2/packs','/api/v2/sources/','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/jobs/cancel','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
     if route not in server: raise SystemExit(f'route not found: {route}')
+for needle in ['function New-DocumentPack', 'function Copy-DocumentPack', 'function Set-DocumentPackArchived',
+               "^/api/v2/packs/([^/]+)/duplicate$", "^/api/v2/packs/([^/]+)/archive$", "^/api/v2/packs/([^/]+)/restore$"]:
+    if needle not in server: raise SystemExit(f'pack lifecycle API missing: {needle}')
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
     'Get-VolumeStateKey','builtFingerprint','Get-FinalBuildInputSnapshot','contentPdfLastWriteUtcTicks','contentPdfSize',
@@ -245,10 +248,14 @@ fp_block=server.split('function Get-FinalBuildInputSnapshot',1)[1].split('functi
 if 'currentExcelHash' in fp_block: raise SystemExit('currentExcelHash must not be in final build fingerprint')
 for needle in ['contentPdfSize','contentPdfLastWriteUtcTicks','lastRenderedVersionId']:
     if needle not in fp_block: raise SystemExit(f'fingerprint input missing: {needle}')
-# Category must fail closed on all final paths.
-for fn in ['Build-FinalPdf','Serve-FinalPdfByVolume','Get-FinalBuildInputSnapshot']:
+# Legacy category endpoints must fail closed; the shared snapshot resolves either a
+# validated built-in category or an existing document pack.
+for fn in ['Build-FinalPdf','Serve-FinalPdfByVolume']:
     block=server.split(f'function {fn}',1)[1].split('\nfunction ',1)[0]
     if 'Require-WorkbookCategory' not in block: raise SystemExit(f'category not required: {fn}')
+snapshot_block=server.split('function Get-FinalBuildInputSnapshot',1)[1].split('\nfunction ',1)[0]
+if 'Resolve-DocumentPackScope' not in snapshot_block:
+    raise SystemExit('final build snapshot must require an existing document pack')
 # Long-running Excel/Java work must be outside the structure transaction body.
 build=server.split('function Build-FinalPdf',1)[1].split('function Get-StatePayload',1)[0]
 java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit=Update-StructureLocked')
@@ -257,12 +264,14 @@ if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commi
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor','data-thumb-page-range','savePackSettings','pack-output-pattern']:
     if needle not in appjs: raise SystemExit(f'ui feature not found: {needle}')
+for needle in ['function renderPackSwitcher', 'function openPackEditor', 'function submitPackEditor', 'function duplicatePack', 'function archivePack', 'function restorePack', 'includeArchived=true', 'ReportBinderPackId']:
+    if needle not in appjs: raise SystemExit(f'pack management UI behavior missing: {needle}')
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
 if "body:{volumes:collectBoardVolumes()}" in appjs: raise SystemExit('page reorder must send category')
 
 html=(root/'app/web/index.html').read_text(encoding='utf-8')
-for needle in ['workspace-top','step-bar','data-preset="ecm"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','final-main-fix','final-appendix-fix','notice-actions','language-popover','<symbol id="i-home"','<symbol id="i-edit"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"','id="page-view-thumbnail-btn"','id="page-layout-undo-btn"','id="page-command-bar"','id="page-search-input"','id="page-thumbnail-size"']:
+for needle in ['workspace-top','step-bar','id="pack-menu-button"','id="pack-menu-list"','id="create-pack-btn"','id="pack-editor-modal"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','id="final-target-grid"','id="bulk-target-buttons"','notice-actions','language-popover','<symbol id="i-home"','<symbol id="i-edit"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"','id="page-view-thumbnail-btn"','id="page-layout-undo-btn"','id="page-command-bar"','id="page-search-input"','id="page-thumbnail-size"']:
     if needle not in html: raise SystemExit(f'html feature not found: {needle}')
 for dead in ['collapse-hint','pagination-lite','info-dot','menu-col','recent-folder-list','page-output-summary','category-card','workflow-card']:
     if dead in html: raise SystemExit(f'dead ui remains: {dead}')
@@ -328,19 +337,19 @@ powershell = shutil.which('powershell.exe') or shutil.which('powershell')
 if powershell:
     schema_check=subprocess.run(
         [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/schema-v3-selfcheck.ps1')],
-        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
     )
     if schema_check.returncode != 0 or 'schema-v3 selfcheck ok' not in schema_check.stdout:
         raise SystemExit('schema v3 PowerShell selfcheck failed:\n'+schema_check.stdout)
     adapter_check=subprocess.run(
         [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/source-adapter-selfcheck.ps1')],
-        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
     )
     if adapter_check.returncode != 0 or 'source-adapter selfcheck ok' not in adapter_check.stdout:
         raise SystemExit('source adapter PowerShell selfcheck failed:\n'+adapter_check.stdout)
     operations_check=subprocess.run(
         [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/operational-readiness-selfcheck.ps1')],
-        cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
     )
     if operations_check.returncode != 0 or 'operational readiness selfcheck ok' not in operations_check.stdout:
         raise SystemExit('operational readiness PowerShell selfcheck failed:\n'+operations_check.stdout)
@@ -879,6 +888,8 @@ if os.name == 'nt':
         ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', runtime_check],
         capture_output=True,
         text=True,
+        encoding='utf-8',
+        errors='replace',
     )
     if checked.returncode:
         raise SystemExit('Windows PowerShell/C# compile check failed:\n' + checked.stdout + checked.stderr)
@@ -1094,10 +1105,11 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'app.js?v=20260806_v102', 'style.css?v=20260806_v66']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'app.js?v=20260807_v117', 'style.css?v=20260807_v73']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
-for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer']:
+for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
+               'function buildDiffSummaryCsv', 'function exportDiffSummary', "text/csv;charset=utf-8"]:
     if needed not in appjs:
         raise SystemExit(f'browser region rendering missing: {needed}')
 compare_page = diff_engine.split('public static ReportBinderDiffPage ComparePage', 1)[1]
@@ -1148,7 +1160,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260806_v102' not in html:
+if 'app.js?v=20260807_v117' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1174,7 +1186,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260806_v102' not in html:
+if 'app.js?v=20260807_v117' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1219,7 +1231,7 @@ _default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfu
 for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
     if forbidden in _default_paths:
         raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
-_publish = server.split('function Publish-FinalPdfToShared',1)[1].split('\nfunction ',1)[0]
+_publish = server.split('function Publish-DocumentPackPdfToShared',1)[1].split('\nfunction ',1)[0]
 for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
                "if ($Language -eq 'ja') { 'J' } else { 'E' }",
                '"{0}_{1}_{2}" -f $stamp, $languageMarker, $userName',
@@ -1233,13 +1245,35 @@ for forbidden in ["Join-Path ([string]$paths.submissionDir) '共有発行'",
                   '$fileName = "{0}_{1}_{2}.pdf"']:
     if forbidden in _publish:
         raise SystemExit(f'obsolete shared publish layout remains: {forbidden}')
-for needed in ["'/api/final/publish'", "id=\"publish-main-btn\"", "id=\"publish-appendix-btn\"",
-               "api('/api/final/publish'", "publishable=available&&String(r.displayState||'')==='built'"]:
+for needed in ["'/api/final/publish'", "'/api/v2/outputs/publish'", 'data-final-publish',
+               "publishable=available&&String(r.displayState||'')==='built'"]:
     if needed not in (server + html + appjs):
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
+for needed in ["'/api/v2/layout/snapshots'", "'/api/v2/layout/restore/preview'", "'/api/v2/layout/restore'",
+               'function Get-LayoutScopeInfo', 'Test-WorkbookPack $wb[0] ([string]$scope.packId)',
+               'layoutSnapshotId=$layoutSnapshotId', 'id="page-layout-revisions-btn"',
+               'id="page-layout-revisions-modal"', "custom?'/api/v2/layout/restore/preview'"]:
+    if needed not in (server + html + appjs):
+        raise SystemExit(f'pack-scoped layout history is missing: {needed}')
+_layout_restore = server.split('function Restore-LayoutSnapshot', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["Set-NoteProperty $p 'pageRange'", '$workbookIds.ContainsKey']:
+    if needed not in _layout_restore:
+        raise SystemExit(f'pack-scoped layout restore invariant is missing: {needed}')
+for needed in ['function ConvertTo-NormalizedPackTemplate', 'function Save-PackTemplate',
+               'function Remove-PackTemplate', 'function New-PackTemplateSnapshot',
+               'function Get-PackEffectiveTemplate', "'/api/v2/pack-templates'",
+               "code='required-source-missing'", "'required-source-stale'",
+               "'required-source-failed'", 'Get-NewItemTargetId']:
+    if needed not in server:
+        raise SystemExit(f'user template workflow is missing: {needed}')
+for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
+               'id="template-new-destination"', 'data-source-default-target',
+               'function openTemplateManager', 'function submitTemplateManager']:
+    if needed not in (html + appjs):
+        raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.07.48':
+if str(runtime_info.get('version','')) != '2026.08.07.62':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'data-progress-view="folders"', '提出用PDF']:
     if needed not in html:
@@ -1415,20 +1449,20 @@ for forbidden in ["sheetName -match '^[0-9]+", '半角数字だけにしてく�
     if forbidden in server:
         raise SystemExit(f'numeric-only worksheet restriction remains: {forbidden}')
 for needed in ['function Get-WorksheetStorageStem', 'function New-WorksheetPageId',
-               'sheetIndex = $i', "volume='none'", 'enabled=$false',
-               'newPagesAreUnassigned=$true', 'Get-WorksheetStorageStem $sheetName',
+               'sheetIndex = $i', '$newVolume = Get-LegacyVolumeFromTargetId', 'enabled=($newVolume -ne \'none\')',
+               "newPagesAreUnassigned=($newVolume -eq 'none')", 'Get-WorksheetStorageStem $sheetName',
                "Set-NoteProperty $page 'enabled' ($volume -ne 'none')"]:
     if needed not in server:
         raise SystemExit(f'unrestricted worksheet/inbox behavior missing: {needed}')
 _update_pages = server.split('function Update-WorkbookPagesFromInspection',1)[1].split('\nfunction ',1)[0]
-for needed in ['$knownBySheet', "Insert-PageInSheetOrder $Structure $page 'none'", '$removed.Count -gt 0']:
+for needed in ['$knownBySheet', 'Insert-PageInSheetOrder $Structure $page $newVolume', '$removed.Count -gt 0']:
     if needed not in _update_pages:
         raise SystemExit(f'existing page assignment preservation missing: {needed}')
 _locked_render_commit = server.split('$pageSync = Update-StructureLocked $Language',1)[1].split('$timingsMs.total',1)[0]
 for needed in ['[string]$_.workbookId -eq $WorkbookId', '[string]$_.sheetName -eq [string]$r.sheetName']:
     if needed not in _locked_render_commit:
         raise SystemExit(f'unrestricted worksheet render commit fallback missing: {needed}')
-for needed in ['未振り分け（出力しない）', '本体または補足へ移したページだけ',
+for needed in ['未振り分け（出力しない）', '出力先へ移したページだけ',
                '原稿内の順序に整える', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
@@ -1456,8 +1490,7 @@ for needed in ['boardSavePromise=boardSavePromise.then(persist,persist)',
 # 2026-08-06 page-preview organizer controls -------------------------------
 for needed in ['id="preview-page-tools"', 'id="preview-prev-page"',
                'id="preview-next-page"', 'id="preview-page-position"',
-               'id="preview-move-main"', 'id="preview-move-appendix"',
-               'id="preview-move-none"']:
+               'id="preview-target-buttons"', 'id="preview-move-none"']:
     if needed not in html:
         raise SystemExit(f'page-preview organizer markup missing: {needed}')
 for needed in ['function previewOrganizerPageIds', 'function syncPreviewOrganizerControls',
@@ -1512,6 +1545,21 @@ if re.search(r'\basync\s+async\s+function\b', appjs):
 for needed in ['function saveBoardOrder()', 'async function sortPagesBySheet(btn=null)']:
     if needed not in appjs:
         raise SystemExit(f'page-board async function is missing: {needed}')
+if "if(data.state)state=normalizeStatePayload(data.state)" in appjs:
+    raise SystemExit('source registration incorrectly applies the V2 domain state to the legacy UI view')
+if "selectedFiles.clear();lastFileRangeAnchor='';await refresh();" not in appjs:
+    raise SystemExit('source registration does not refresh the compatibility UI state')
+if "packId:String(pack?.packId||activePackId||'')" not in appjs:
+    raise SystemExit('page V2 requests do not consistently identify the active document pack')
+for needed in [
+    "packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); volumes=$volumes",
+    "packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); pageId=$itemId",
+]:
+    if needed not in server:
+        raise SystemExit(f'page V2 route compatibility is missing: {needed}')
+for needed in ["$excelStartupError = ''", 'Excel原稿をエラーとして記録し、他形式の処理を続けます。', 'if ($KeepHostOpen -and $null -eq $SharedHost)']:
+    if needed not in server:
+        raise SystemExit(f'mixed-source render isolation is missing: {needed}')
 
 
 # 2026-08-06 Word source adapter -------------------------------------------
@@ -1520,19 +1568,67 @@ for needed in ["sourceType = 'word'", "adapterId = 'word-com-v1'",
                'function Render-WordSource', 'function Render-WordSnapshotForComparison',
                'function Invoke-WordDocumentToPdf', '$Script:WordRenderTimeoutSeconds = 120',
                'wordRenderProfileVersion = $Script:WordRenderProfileVersion',
-               "Get-SourceCandidates @('excel','word','pdf')"]:
+               "Get-SourceCandidates @('excel','word','pdf','powerpoint')"]:
     if needed not in server:
         raise SystemExit(f'Word source adapter behavior missing: {needed}')
-for needed in ["id=\"i-file-word\"", 'Excel・Word・PDF原稿']:
+for needed in ["id=\"i-file-word\"", 'Excel・Word・PowerPoint・PDF原稿']:
     if needed not in html:
         raise SystemExit(f'Word source UI markup missing: {needed}')
 for needed in ['CURRENT_WORD_RENDER_PROFILE_VERSION', "word:'i-file-word'",
-               "sourceTypeValue(source) === 'word'", "['excel','word','pdf']"]:
+               "sourceTypeValue(source) === 'word'", "['excel','word','powerpoint','pdf']"]:
     if needed not in appjs:
         raise SystemExit(f'Word source UI behavior missing: {needed}')
 for needed in ['ConvertTo-Win32ExtendedPath', "return '\\\\?\\UNC\\'", 'Write-Utf8NoBomFileShared']:
     if needed not in server:
         raise SystemExit(f'long comparison path support missing: {needed}')
+
+
+# 2026-08-07 PowerPoint source adapter ------------------------------------
+for needed in ["sourceType = 'powerpoint'", "adapterId = 'powerpoint-com-v1'",
+               'function Inspect-PowerPointSourceFile', 'function Register-PowerPointSource',
+               'function Render-PowerPointSource', 'function Render-PowerPointSnapshotForComparison',
+               'function Convert-PowerPointSplitPages', '(Get-WorksheetStorageStem $name)',
+               'function Invoke-PowerPointToPdf', '$Script:PowerPointRenderTimeoutSeconds = 120',
+               'powerPointRenderProfileVersion = $Script:PowerPointRenderProfileVersion',
+               "Get-OfficeApplicationDiagnostic 'PowerPoint.Application' 'Microsoft PowerPoint'"]:
+    if needed not in server:
+        raise SystemExit(f'PowerPoint source adapter behavior missing: {needed}')
+for needed in ['id="i-file-powerpoint"', 'id="template-source-powerpoint"']:
+    if needed not in html:
+        raise SystemExit(f'PowerPoint source UI markup missing: {needed}')
+for needed in ['CURRENT_POWERPOINT_RENDER_PROFILE_VERSION', "powerpoint:'i-file-powerpoint'",
+               "sourceTypeValue(source) === 'powerpoint'", 'office.powerPoint']:
+    if needed not in appjs:
+        raise SystemExit(f'PowerPoint source UI behavior missing: {needed}')
+for needed in ['New-Object -ComObject PowerPoint.Application', '$powerPoint.AutomationSecurity = 3',
+               '$presentations.Open($inputPath, -1, 0, 0)', 'Get-Process POWERPNT']:
+    if needed not in (root/'app/tools/powerpoint-render-worker.ps1').read_text(encoding='utf-8'):
+        raise SystemExit(f'PowerPoint render worker safety missing: {needed}')
+
+
+# 2026-08-07 safe render job cancellation ---------------------------------
+for needed in ['function Request-RenderJobCancellation', 'function Test-RenderJobCancellationRequested',
+               'function Set-RenderJobCancelledStatus', "status' 'cancelled'", "'/api/jobs/cancel'"]:
+    if needed not in server:
+        raise SystemExit(f'render job cancellation behavior missing: {needed}')
+for needed in ['id="progress-cancel"', 'PDF作成を中止']:
+    if needed not in html:
+        raise SystemExit(f'render job cancellation UI markup missing: {needed}')
+for needed in ['activeRenderJobId', 'cancelActiveRenderJob', "'/api/jobs/cancel'",
+               "['completed','completed-with-errors','failed','cancelled']"]:
+    if needed not in appjs:
+        raise SystemExit(f'render job cancellation UI behavior missing: {needed}')
+
+# 2026-08-07 cross-department deadline progress -----------------------------
+for needed in ["$state='overdue-source'", 'overdueRequiredSourceCount=$overdueRequired',
+               'dueSoonRequiredSourceCount=$dueSoonRequired', 'overdueRequiredCount=',
+               'dueSoonRequiredCount=']:
+    if needed not in server:
+        raise SystemExit(f'cross-pack deadline progress missing: {needed}')
+for needed in ["'overdue-source':['期限超過','danger']", 'overdueRequiredCount',
+               'dueSoonRequiredCount', 'nearestRequiredDueDate']:
+    if needed not in appjs:
+        raise SystemExit(f'cross-pack deadline UI missing: {needed}')
 
 
 # 2026-08-06 generalized history comparison --------------------------------
