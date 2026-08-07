@@ -43,13 +43,13 @@ Ensure-Package $paths -Languages @('ja')
 
 $overdueDueDate = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
 $workflowTemplate = Save-PackTemplate 'ja' ([pscustomobject]@{
-    displayName='部門レビュー'; acceptedSourceTypes=@('excel','word','pdf')
+    displayName='Department review'; acceptedSourceTypes=@('excel','word','pdf')
     sourceRequirements=@([pscustomobject]@{requirementId='requirement_department_report';displayName='Monthly department report';ownerDepartment='Finance';required=$true;acceptedSourceTypes=@('pdf');defaultTargetId='main';dueDate=$overdueDueDate})
-    targets=@([pscustomobject]@{targetId='main';displayName='審議資料';required=$true},[pscustomobject]@{targetId='appendix';displayName='参考資料';required=$false},[pscustomobject]@{targetId='executive-summary';displayName='要約版';required=$false})
+    targets=@([pscustomobject]@{targetId='main';displayName='Review packet';required=$true},[pscustomobject]@{targetId='appendix';displayName='Reference';required=$false},[pscustomobject]@{targetId='executive-summary';displayName='Executive summary';required=$false})
     rules=[pscustomobject]@{newItemDestination='main';retainManualOrder=$true;blockBuildWhenRequiredSourceIsStale=$true;blockBuildWhenRequiredSourceFailed=$true}
     output=[pscustomobject]@{fileNamePattern='{packName}_{targetName}.pdf';tableOfContents=$false}
 })
-$pack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='月次部門資料'; templateId=[string]$workflowTemplate.templateId; settings=[pscustomobject]@{ documentTitle='月次部門資料'; includeCover=$true } })
+$pack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='Monthly department packet'; templateId=[string]$workflowTemplate.templateId; settings=[pscustomobject]@{ documentTitle='Monthly department packet'; includeCover=$true } })
 $packId = [string]$pack.packId
 $unregisteredReady = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $packId
 Assert-CustomPackTest (@($unregisteredReady.blockers | Where-Object { [string]$_.code -eq 'required-source-unregistered' -and [string]$_.requirementId -eq 'requirement_department_report' }).Count -eq 1) 'Unregistered required source was not reported.'
@@ -93,7 +93,7 @@ $afterRender = Get-Structure 'ja'
 $pages = @($afterRender.pages | Where-Object { [string]$_.workbookId -eq $sourceId } | Sort-Object order)
 Assert-CustomPackTest ($pages.Count -eq @($rendered.rendered).Count) 'Rendered custom pack pages are missing.'
 Assert-CustomPackTest (@($pages | Where-Object { [string]$_.volume -ne 'ja-main' -or -not [bool]$_.enabled }).Count -eq 0) 'Template new-item destination was not applied.'
-Assert-CustomPackTest ([string](Get-PackTargetDisplayName 'ja' $pack 'main') -eq '審議資料') 'Template target display name was not applied.'
+Assert-CustomPackTest ([string](Get-PackTargetDisplayName 'ja' $pack 'main') -eq 'Review packet') 'Template target display name was not applied.'
 $items = @($afterRender.items | Where-Object { [string]$_.sourceId -eq $sourceId })
 Assert-CustomPackTest ($items.Count -eq $pages.Count -and @($items | Where-Object { [string]$_.packId -ne $packId }).Count -eq 0) 'V3 items lost the custom pack assignment.'
 
