@@ -89,11 +89,23 @@ Assert-OperationsTest ([string]$manualJournal.phase -eq 'manual-recovery-require
 # started in a service/non-interactive Windows session.
 $diagnostics = Get-SystemDiagnostics 'ja'
 Assert-OperationsTest (@('ready','limited','blocked') -contains [string]$diagnostics.status) 'Diagnostics status is invalid.'
-Assert-OperationsTest ($null -ne $diagnostics.office.excel -and $null -ne $diagnostics.office.word) 'Office diagnostics are missing.'
+Assert-OperationsTest ($null -ne $diagnostics.office.excel -and $null -ne $diagnostics.office.word -and $null -ne $diagnostics.office.powerPoint) 'Office diagnostics are missing.'
 Assert-OperationsTest ([bool]$diagnostics.runtime.pdfbox.ready) 'Bundled PDF engine was not detected.'
 Assert-OperationsTest ([bool]$diagnostics.runtime.pdfjs.ready) 'Bundled PDF viewer was not detected.'
 
-Write-Output ('operational readiness selfcheck ok (environment={0}, excel={1}, word={2})' -f $diagnostics.status, $diagnostics.office.excel.status, $diagnostics.office.word.status)
+# Automation settings are validated and persisted, and retry metadata survives
+# process restarts so failures can be retried without a tight loop.
+$autoSettings = Update-AutoRenderSettings ([pscustomobject]@{ enabled=$false; quietPeriodSeconds=5; maxRetryCount=99; retryBaseSeconds=1; minFreeMegabytes=1; notifyOnCompletion=$true; notifyOnFailure=$true })
+$normalizedAuto = Get-AutoRenderSettings
+Assert-OperationsTest ([int]$normalizedAuto.quietPeriodSeconds -eq 10 -and [int]$normalizedAuto.maxRetryCount -eq 10 -and [int]$normalizedAuto.retryBaseSeconds -eq 10 -and [int]$normalizedAuto.minFreeMegabytes -eq 100) 'Automation settings were not clamped safely.'
+$retryState = New-AutoState 'test-workbook'
+Assert-OperationsTest ([int]$retryState.schemaVersion -eq 2 -and [int]$retryState.retryCount -eq 0 -and -not $retryState.notificationId) 'Automation retry state schema is incomplete.'
+$retryState.state = 'failed'
+$retryState.pendingHash = ('A' * 64)
+Assert-OperationsTest (-not (Test-AutoFailureSuperseded $retryState ('A' * 64))) 'The failed source version would be retried in a tight loop.'
+Assert-OperationsTest (Test-AutoFailureSuperseded $retryState ('B' * 64)) 'A newly saved source version does not recover from retry exhaustion.'
+
+Write-Output ('operational readiness selfcheck ok (environment={0}, excel={1}, word={2}, powerpoint={3})' -f $diagnostics.status, $diagnostics.office.excel.status, $diagnostics.office.word.status, $diagnostics.office.powerPoint.status)
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)
     & $script -Mode ja -NoOpen

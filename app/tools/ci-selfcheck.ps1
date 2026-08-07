@@ -29,7 +29,10 @@ function Get-PythonCommand {
 
 function Assert-PowerShellSyntax {
     $errors = New-Object Collections.Generic.List[string]
-    foreach ($file in Get-ChildItem -LiteralPath $repoRoot -Recurse -File -Filter '*.ps1') {
+    # Runtime artifacts and E2E fixtures live under repo/tmp and may be created or
+    # removed by a running server while CI is enumerating. Product PowerShell is
+    # confined to app/, so keep the syntax walk deterministic and in scope.
+    foreach ($file in Get-ChildItem -LiteralPath $appRoot -Recurse -File -Filter '*.ps1') {
         if ($file.FullName -like "$PackageOutputDir*") { continue }
         $tokens = $null
         $parseErrors = $null
@@ -107,6 +110,8 @@ try {
     Invoke-Checked 'Diff regression' $node @((Join-Path $repoRoot 'tests\diff-regression.mjs'))
     Invoke-Checked 'Final composition regression' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'final-composition-selfcheck.py')))
     Invoke-Checked 'Operational readiness regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'operational-readiness-selfcheck.ps1'))
+    Invoke-Checked 'Pack lifecycle regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-lifecycle-selfcheck.ps1'))
+    Invoke-Checked 'Custom pack workflow regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'custom-pack-workflow-selfcheck.ps1'))
 
     if (-not $SkipPackageSmoke) {
         New-Item -ItemType Directory -Path $PackageOutputDir -Force | Out-Null

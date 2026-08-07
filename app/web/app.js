@@ -25,6 +25,13 @@ let state = null;
 let availableFiles = [];
 let availableFilesScannedAt = '';
 let activePreset = (() => { try { const v = sessionStorage.getItem('ReportBinderCategory'); return ['ecm','bod','dmm'].includes(v) ? v : 'ecm'; } catch { return 'ecm'; } })();
+let activePackId = (() => { try { return sessionStorage.getItem('ReportBinderPackId') || ''; } catch { return ''; } })();
+let packAdminPacks = [];
+let archivedPacksExpanded = false;
+let packEditorMode = 'create';
+let packEditorPackId = '';
+let packEditorReturnFocus = null;
+let templateManagerReturnFocus = null;
 let lastSubmissionDefaultBase = '';
 let draggingRow = null;
 let boardSaveTimer = null;
@@ -61,8 +68,15 @@ let updateMonitorInFlight = false;
 let updateVisibilityBound = false;
 let lastUpdateScanAt = 0;
 let renderJobActive = false;
+let activeRenderJobId = '';
+let activeRenderCancelRequested = false;
+let activeRenderJobStatus = null;
 let folderPickerBusy = false;
 let diagnosticsResult = null;
+let packProgressAttentionOnly = false;
+let finalPreflightCheckedAt = '';
+let autoStateInFlight = null;
+const seenAutoNotificationIds = new Set();
 let activeView = (() => { try { return sessionStorage.getItem('ReportBinderView') || 'dashboard'; } catch { return 'dashboard'; } })();
 let fileFilterText = '';
 const pdfObjectUrls = new Set();
@@ -114,6 +128,7 @@ let pageHighlightTimer = null;
 const CURRENT_RENDER_PROFILE_VERSION = 2026060403;
 const CURRENT_PDF_IMPORT_PROFILE_VERSION = 2026080601;
 const CURRENT_WORD_RENDER_PROFILE_VERSION = 2026080601;
+const CURRENT_POWERPOINT_RENDER_PROFILE_VERSION = 2026080701;
 function currentRenderProfileVersion() {
   const v = Number(state?.excelPrintProfileVersion || 0);
   return Number.isFinite(v) && v > 0 ? v : CURRENT_RENDER_PROFILE_VERSION;
@@ -149,7 +164,11 @@ function setActiveView(view, options = {}) {
   if (activeView === 'history' && state && (viewChanged || !historyPanelsInitialized || options.reloadPanels)) {
     void loadHistoryPanels({force:!!options.reloadPanels});
   }
-  if (activeView === 'final' && state) void loadFinalReadiness();
+  if (activeView === 'final' && state) {
+    void loadFinalReadiness();
+    void loadFinalArchives();
+  }
+  if (activeView === 'excel' && state?.configured) void loadAutoStateDetail();
 }
 
 function formatDateTime(value) {
@@ -200,14 +219,11 @@ function workbookDisplayName(w) { return String(w?.displayName || w?.fileName ||
 function fileDisplayName(f) { return String(f?.fileName || f?.relativePath || '').trim() || '原稿'; }
 function pageCountsByVolume() {
   const pages = pagesForActivePreset();
-  const main = mainVolume();
-  const appendix = appendixVolume();
-  return {
-    main: pages.filter(p => p.enabled !== false && String(p.volume || main) === main).length,
-    appendix: pages.filter(p => p.enabled !== false && String(p.volume || main) === appendix).length,
-    none: pages.filter(p => p.enabled === false || String(p.volume || main) === 'none').length,
-    total: pages.length
-  };
+  const first=activeTargetVolumes()[0]||mainVolume();
+  const counts={none:pages.filter(p=>p.enabled===false||String(p.volume||first)==='none').length,total:pages.length,volumes:{}};
+  for(const volume of activeTargetVolumes())counts.volumes[volume]=pages.filter(p=>p.enabled!==false&&String(p.volume||first)===volume).length;
+  counts.main=counts.volumes[mainVolume()]||0;counts.appendix=counts.volumes[appendixVolume()]||0;
+  return counts;
 }
 function latestWorkbookStamp(w) { return w?.lastRenderedAt || w?.updatedAt || w?.modifiedAt || w?.registeredAt || ''; }
 function outputFileName(path) { return String(path || '').split(/[\\/]/).filter(Boolean).pop() || 'PDF'; }
@@ -240,6 +256,16 @@ function badge(text, cls='') { return `<span class="badge ${cls}">${escapeHtml(t
 function modeTitle(mode) { return ({ja:'日本語管理', en:'英語管理'})[mode] || mode; }
 function mainVolume() { return state?.language === 'en' ? 'en-main' : 'ja-main'; }
 function appendixVolume() { return state?.language === 'en' ? 'en-appendix' : 'ja-appendix'; }
+function targetVolume(targetId) { return `${state?.language === 'en' ? 'en' : 'ja'}-${String(targetId || '').trim().toLowerCase()}`; }
+function targetIdFromVolume(volume) {
+  const match=String(volume||'').toLowerCase().match(/^(?:ja|en)-([a-z0-9][a-z0-9_-]{0,47})$/);
+  return match?match[1]:String(volume||'').toLowerCase()==='none'?'unassigned':'';
+}
+function activeTargetDefinitions() {
+  const targets=asArray(activePackRecord()?.targets).filter(target=>String(target?.targetId||'').trim());
+  return targets.length?targets:[{targetId:'main',displayName:state?.language==='en'?'Main':'本体',required:true},{targetId:'appendix',displayName:state?.language==='en'?'Appendix':'補足',required:false}];
+}
+function activeTargetVolumes() { return activeTargetDefinitions().map(target=>targetVolume(target.targetId)); }
 
 function volumeLabel(v) { return ({'ja-main':'本体','ja-appendix':'補足','en-main':'Main','en-appendix':'Appendix','none':'出力しない'})[v] || v; }
 function assignmentVolumeLabel(v) { return String(v)==='none'?'未振り分け':volumeLabel(v); }
@@ -269,12 +295,13 @@ function getPageByWorkbookSheet(workbookId, sheetName) {
 
 
 function volumeReadiness(volume, preset=activePreset) {
-  return state?.finalReadiness?.[preset]?.volumes?.[volume] || {
+  const key=activePackRecord()?.category ? preset : (activePackId||preset);
+  return state?.finalReadiness?.[key]?.volumes?.[volume] || {
     canBuild:false, pageCount:0, status:'not-built', displayState:'not-built', blockers:[], staleReasons:[], outputPdf:'', outputPdfExists:false
   };
 }
 function activeReadinessItems() {
-  return [mainVolume(), appendixVolume()].map(volume => ({volume, ready:volumeReadiness(volume)})).filter(x => Number(x.ready.pageCount || 0) > 0);
+  return activeTargetVolumes().map(volume => ({volume, ready:volumeReadiness(volume)})).filter(x => Number(x.ready.pageCount || 0) > 0);
 }
 function aggregateFinalState() {
   const items = activeReadinessItems();
@@ -291,7 +318,7 @@ function finalIsComplete() {
   return items.length > 0 && items.every(x => x.ready.status === 'built' && x.ready.outputPdfExists === true && asArray(x.ready.blockers).length === 0);
 }
 function unresolvedPageCount() {
-  return pagesForActivePreset().filter(p => p.enabled !== false && String(p.volume || 'none') === 'none').length;
+  return pagesForActivePreset().filter(p => p.enabled === false || String(p.volume || 'none') === 'none').length;
 }
 function isEditing() {
   const el = document.activeElement;
@@ -299,7 +326,10 @@ function isEditing() {
 }
 function isModalOpen() { return !!$('preview-modal') && !$('preview-modal').classList.contains('hidden'); }
 function isConfirmModalOpen() { return !!$('confirm-modal') && !$('confirm-modal').classList.contains('hidden'); }
-function isAnyModalOpen() { return isModalOpen() || isDiffModalOpen() || isConfirmModalOpen(); }
+function isPackEditorOpen() { return !!$('pack-editor-modal') && !$('pack-editor-modal').classList.contains('hidden'); }
+function isTemplateManagerOpen() { return !!$('template-manager-modal') && !$('template-manager-modal').classList.contains('hidden'); }
+function isPageLayoutRevisionsOpen() { return !!$('page-layout-revisions-modal') && !$('page-layout-revisions-modal').classList.contains('hidden'); }
+function isAnyModalOpen() { return isModalOpen() || isDiffModalOpen() || isConfirmModalOpen() || isPackEditorOpen() || isTemplateManagerOpen() || isPageLayoutRevisionsOpen(); }
 function shouldPreserveEditorDom() { return isEditing() || draggingRow !== null || isAnyModalOpen(); }
 function iconUse(id, cls='') { return `<svg class="icon ${cls}" aria-hidden="true"><use href="#${id}"></use></svg>`; }
 
@@ -510,13 +540,17 @@ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function updateProgressPanel(job) {
   const panel = $('progress-panel');
   if (!panel || !job) return;
+  job = Object.assign({}, activeRenderJobStatus || {}, job);
+  activeRenderJobStatus = job;
   let pct = Math.max(0, Math.min(100, Number(job.percent || 0)));
   const status = String(job.status || '');
   if (pct <= 0 && ['queued','running','waiting'].includes(status)) pct = status === 'queued' ? 1 : 3;
   const total = Math.max(0, Number(job.total || 0));
   const done = Math.max(0, Number(job.completed || 0) + Number(job.failed || 0));
   const checking = status === 'waiting' || status === 'missing' || job.transient || job.transientMissing;
-  $('progress-title').textContent = status === 'completed'
+  $('progress-title').textContent = status === 'cancelled'
+    ? 'PDF作成を中止しました'
+    : status === 'completed'
     ? 'PDF作成が完了しました'
     : (status === 'completed-with-errors' || status === 'failed'
       ? 'PDF作成を確認してください'
@@ -530,7 +564,15 @@ function updateProgressPanel(job) {
   const target = job.currentSheet ? `${job.currentWorkbookName || ''} / ${sourceUnitReference(currentSource, job.currentSheet)}` : (job.currentWorkbookName || '');
   $('progress-message').textContent = job.message || (target ? `${target} を処理しています。` : '処理しています。');
   panel.querySelector('.progress-track')?.setAttribute('aria-valuenow', String(pct));
-  panel.classList.toggle('indeterminate', (checking || pct <= 0) && !['completed','completed-with-errors','failed'].includes(status));
+  const terminal = ['completed','completed-with-errors','failed','cancelled'].includes(status);
+  const cancelButton = $('progress-cancel');
+  if (cancelButton) {
+    const requested = activeRenderCancelRequested || !!job.cancelRequested;
+    cancelButton.hidden = !activeRenderJobId || terminal;
+    cancelButton.disabled = requested;
+    cancelButton.textContent = requested ? '中止を受け付けました' : 'PDF作成を中止';
+  }
+  panel.classList.toggle('indeterminate', (checking || pct <= 0) && !terminal);
   panel.classList.remove('hidden');
 }
 function hideProgressPanel() {
@@ -595,7 +637,7 @@ async function waitForRenderJob(jobId) {
     }
     updateProgressPanel(last);
     const status = String(last.status || '');
-    if (['completed','completed-with-errors','failed'].includes(status)) return last;
+    if (['completed','completed-with-errors','failed','cancelled'].includes(status)) return last;
     if (status === 'waiting' || status === 'missing' || last.transient || last.transientMissing) {
       transientStatuses += 1;
       if (transientStatuses > 70) {
@@ -619,6 +661,28 @@ async function waitForRenderJob(jobId) {
   }
 }
 
+async function cancelActiveRenderJob() {
+  const jobId = normalizeRenderJobId(activeRenderJobId);
+  if (!jobId || activeRenderCancelRequested) return;
+  const accepted = await confirmAction({
+    title:'PDF作成を中止しますか？',
+    message:'未処理の原稿を残して、PDF作成ジョブを停止します。',
+    detail:'現在処理中の原稿は、安全に完了した後で停止します。完了済みの変換PDFとページ構成は保持されます。',
+    confirmLabel:'PDF作成を中止',
+    danger:true
+  });
+  if (!accepted) return;
+  activeRenderCancelRequested = true;
+  updateProgressPanel({status:'running',cancelRequested:true,percent:0,message:'中止を受け付けています。'});
+  try {
+    const response = await api('/api/jobs/cancel',{method:'POST',body:{jobId}});
+    updateProgressPanel({status:String(response.status||'running'),cancelRequested:true,percent:0,message:response.message||'中止を受け付けました。現在処理中の原稿が終わると停止します。'});
+  } catch (error) {
+    activeRenderCancelRequested = false;
+    showMessage('danger','PDF作成を中止できませんでした',userFriendlyError(error.message||'中止要求を送信できませんでした。'),error.detail||error);
+  }
+}
+
 function apiUrl(path, params={}) {
   const url = new URL(withToken(path), window.location.origin);
   for (const [k, v] of Object.entries(params || {})) {
@@ -628,7 +692,7 @@ function apiUrl(path, params={}) {
 }
 
 async function fetchPdfObjectUrl(path, params={}) {
-  const postPdf = (path === '/api/file' || path === '/api/final/file');
+  const postPdf = (path === '/api/file' || path === '/api/final/file' || path === '/api/v2/outputs/file');
   const headers = {'X-ReportBinder-Token': token, 'Accept': 'application/pdf,application/json'};
   if (postPdf) headers['Content-Type'] = 'application/json';
   const res = await fetch(apiUrl(path, postPdf ? {} : params), {
@@ -711,12 +775,15 @@ function startUpdateMonitor() {
 let finalReadinessInFlight = null;
 async function loadFinalReadiness(){
   if(!state||!configured())return;
-  const preset=activePreset;
+  const pack=activePackRecord(),preset=activePreset,key=pack?.category?preset:String(pack?.packId||activePackId);
   if(finalReadinessInFlight)return finalReadinessInFlight;
-  finalReadinessInFlight=api(`/api/final/readiness?category=${encodeURIComponent(preset)}`).then(r=>{
+  const request=pack?.category?api(`/api/final/readiness?category=${encodeURIComponent(preset)}`):api(`/api/v2/outputs/readiness?packId=${encodeURIComponent(key)}`);
+  finalReadinessInFlight=request.then(r=>{
     state.finalReadiness=state.finalReadiness||{};
-    state.finalReadiness[preset]={volumes:r.volumes||{}};
-    if(activeView==='final'&&activePreset===preset){renderGlobalHeader();renderNavBadges();renderFinalOverview();}
+    const volumes=r.volumes||Object.fromEntries(Object.entries(r.targets||{}).map(([targetId,ready])=>[targetVolume(targetId),ready]));
+    state.finalReadiness[key]={volumes};
+    finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
+    if(activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
   }).catch(e=>log('最終PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
   return finalReadinessInFlight;
 }
@@ -881,7 +948,7 @@ function renderDashboardOverview() {
     else if(needsPdf>0){title.textContent=`変換PDFを作成してください（${needsPdf}件）`;caption.textContent='原稿の最新内容をページ構成用のPDFへ変換します。';action.textContent='PDF変換へ';action.dataset.dashboardAction='excel';}
     else if(blockers.length>0){title.textContent='提出用PDFを出力できません';caption.textContent=blockers[0]?.message||'原稿・変換PDFを確認してください。';action.textContent='原稿・変換PDFへ';action.dataset.dashboardAction='excel';}
     else if(unassigned>0){title.textContent=`ページ構成を確認してください（${unassigned}ページ）`;caption.textContent='出力先が未設定のページがあります。';action.textContent='ページ構成へ進む';action.dataset.dashboardAction='pages';}
-    else if(['needs-rebuild','output-missing','not-built'].includes(agg.state)){title.textContent=agg.text;caption.textContent='本体・補足の状態を確認して出力してください。';action.textContent='提出用PDFへ進む';action.dataset.dashboardAction='final';}
+    else if(['needs-rebuild','output-missing','not-built'].includes(agg.state)){title.textContent=agg.text;caption.textContent='各出力先の状態を確認して出力してください。';action.textContent='提出用PDFへ進む';action.dataset.dashboardAction='final';}
     else{title.textContent='最新の状態です';caption.textContent='提出用PDFとページ構成は最新です。';action.textContent='出力フォルダを確認';action.dataset.dashboardAction='final';}
   }
   const cat=$('dashboard-category-summary');if(cat)cat.textContent=`${presetLabel()} 資料パック / 登録済み原稿：${workbooks.length}件 / 変換PDF作成が必要：${needsPdf}件`;
@@ -893,6 +960,17 @@ function renderDashboardOverview() {
   });
   if(!rows.length)rows.push({text:configured()?`${presetLabel()}の原稿を登録してください`:'ReportBinderへようこそ',badge:configured()?'原稿登録':'お知らせ',cls:'neutral',time:''});
   activity.innerHTML=rows.map(r=>`<div class="activity-row"><span class="activity-text">${escapeHtml(r.text)}</span>${badge(r.badge,r.cls)}<span class="activity-time">${escapeHtml(formatDateTime(r.time))}</span></div>`).join('');
+  renderPackProgressDashboard();
+}
+
+function renderPackProgressDashboard(){
+  const progress=state?.packProgress||{},summary=$('pack-progress-summary'),box=$('pack-progress-list'),toggle=$('pack-progress-attention-only');if(!box)return;if(toggle)toggle.checked=packProgressAttentionOnly;
+  if(summary)summary.textContent=`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`;
+  const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'no-pages':6,'not-started':7,complete:8};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??9)-(priority[String(b.state)]??9)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
+  const stateInfo=value=>({complete:['完了','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention']}[String(value)]||['要確認','attention']);
+  if(!rows.length){box.innerHTML=`<div class="empty-state">${packProgressAttentionOnly?'対応が必要な資料パックはありません。':'資料パックはまだありません。'}</div>`;return;}
+  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${nearestDue}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}p</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
+  box.querySelectorAll('[data-pack-progress-open]').forEach(button=>button.addEventListener('click',async()=>{await applyPresetSelection(String(button.dataset.packProgressOpen||''));setActiveView(String(button.dataset.packProgressAction||'excel'));}));
 }
 
 
@@ -910,35 +988,36 @@ function renderDiagnosticsResult(){
   const statusLabel=value=>({ready:'利用可能',limited:'一部利用可能',blocked:'修復が必要','not-installed':'未導入',unsupported:'非対応版',unavailable:'起動不可'})[String(value||'')]||'要確認';
   const statusClass=value=>String(value)==='ready'?'neutral':String(value)==='blocked'?'danger':'attention';
   const appRow=app=>{const item=app||{},detail=item.available?`Version ${item.version||'16'}${item.build?` / Build ${item.build}`:''}`:(item.userAction||'利用できません。');return`<div class="diagnostic-row"><div><strong>${escapeHtml(item.displayName||'Office')}</strong><span>${escapeHtml(detail)}</span></div>${badge(statusLabel(item.status),statusClass(item.status))}</div>`;};
-  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}<div class="diagnostic-row"><div><strong>PDF処理エンジン</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>ローカル保存容量</strong><span>管理データ ${formatCapacity(storage.dataFreeBytes)} / 出力 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
+  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDF処理エンジン</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>ローカル保存容量</strong><span>管理データ ${formatCapacity(storage.dataFreeBytes)} / 出力 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
 }
 
 async function runSystemDiagnostics(btn){
-  await runBusy(btn,async()=>{try{const response=await api('/api/diagnostics/run',{method:'POST',body:{}});diagnosticsResult=response.diagnostics||null;renderDiagnosticsResult();const limited=String(diagnosticsResult?.status||'')!=='ready';showMessage(limited?'warn':'ok',limited?'一部の機能に対応が必要です':'動作環境を確認しました',diagnosticsResult?.summary||'',limited?[diagnosticsResult?.office?.excel?.userAction,diagnosticsResult?.office?.word?.userAction].filter(Boolean):null);}catch(error){showMessage('danger','動作環境を診断できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
+  await runBusy(btn,async()=>{try{const response=await api('/api/diagnostics/run',{method:'POST',body:{}});diagnosticsResult=response.diagnostics||null;renderDiagnosticsResult();const limited=String(diagnosticsResult?.status||'')!=='ready';showMessage(limited?'warn':'ok',limited?'一部の機能に対応が必要です':'動作環境を確認しました',diagnosticsResult?.summary||'',limited?[diagnosticsResult?.office?.excel?.userAction,diagnosticsResult?.office?.word?.userAction,diagnosticsResult?.office?.powerPoint?.userAction].filter(Boolean):null);}catch(error){showMessage('danger','動作環境を診断できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
 }
 
 
 
 function renderPageOverview() {
   const counts=pageCountsByVolume(); const strip=$('page-summary-strip');
-  if(strip)strip.innerHTML=[['未振り分け',counts.none,'attention'],['本体PDF',counts.main,''],['補足PDF',counts.appendix,'']].map(([label,n,cls])=>`<div class="page-summary-item ${cls&&n?'attention':''}"><div class="summary-label">${label}</div><div><span class="summary-value">${n}</span> ページ</div></div>`).join('');
+  const summaryItems=[['未振り分け',counts.none,'attention'],...activeTargetDefinitions().map(target=>[`${target.displayName||target.targetId} PDF`,counts.volumes[targetVolume(target.targetId)]||0,''])];
+  if(strip)strip.innerHTML=summaryItems.map(([label,n,cls])=>`<div class="page-summary-item ${cls&&n?'attention':''}"><div class="summary-label">${escapeHtml(label)}</div><div><span class="summary-value">${n}</span> ページ</div></div>`).join('');
   const manual=pagesForActivePreset().some(p=>p.orderManual===true); const label=$('sort-state-label'); if(label){label.textContent=manual?'手動':'原稿内の順序';label.classList.toggle('manual',manual);}
   updateBulkSelectionLabel();
 }
 function renderFinalOverview() {
-  const setText=(id,v)=>{const el=$(id);if(el)el.textContent=v;};
   const settings=packForPreset()?.settings||{};
   const setValue=(id,value)=>{const el=$(id);if(el)el.value=String(value??'');};
   const setChecked=(id,value)=>{const el=$(id);if(el)el.checked=!!value;};
   setValue('pack-document-title',settings.documentTitle||presetLabel());setValue('pack-document-subtitle',settings.documentSubtitle||'');setValue('pack-output-pattern',settings.outputFileNamePattern||(state?.language==='en'?'{projectId}_E_{targetName}.pdf':'{projectId}_J_{targetName}.pdf'));
   setChecked('pack-include-cover',settings.includeCover);setChecked('pack-include-toc',settings.includeToc);setChecked('pack-include-section-dividers',settings.includeSectionDividers);
-  const main=volumeReadiness(mainVolume()), appendix=volumeReadiness(appendixVolume());
-  setText('final-main-pages',Number(main.pageCount||0));setText('final-appendix-pages',Number(appendix.pageCount||0));
-  const renderFreshness=(ready,containerId,buttonId,fixId)=>{
-    const box=$(containerId),btn=$(buttonId),fix=$(fixId);if(!box)return;
+  const entries=activeTargetDefinitions().map(target=>({target,volume:targetVolume(target.targetId),ready:volumeReadiness(targetVolume(target.targetId))}));
+  renderFinalPreflight(entries);
+  const grid=$('final-target-grid');if(grid)grid.innerHTML=entries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${escapeHtml(target.displayName||target.targetId)}だけ出力</button><button class="btn secondary hidden" type="button" data-final-publish>共有発行</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const renderFreshness=(ready,card)=>{
+    const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
     const blockers=asArray(ready.blockers),reasons=asArray(ready.staleReasons).slice(0,3);const display=String(ready.displayState||'not-built');
     let title='提出用PDFは未出力',cls='neutral',body='出力すると、このカテゴリ専用の提出用PDFを作成します。';
-    if(Number(ready.pageCount||0)===0){title='出力ページがありません';body='ページ構成で本体または補足にページを設定してください。';}
+    if(Number(ready.pageCount||0)===0){title='出力ページがありません';body='ページ構成でこの出力先にページを設定してください。';}
     else if(display==='blocked'){title='提出用PDFを出力できません';cls='danger';body=`<ul class="blocker-list">${blockers.slice(0,3).map(b=>`<li>${escapeHtml(b.message||'出力条件を確認してください。')}</li>`).join('')}</ul>`;}
     else if(display==='needs-rebuild'){title='再出力が必要';cls='attention';body=reasons.length?`<ul class="reason-list">${reasons.map(r=>`<li><span>${escapeHtml(r.detail||'入力が変更されました')}</span><time>${escapeHtml(formatDateTime(r.at))}</time></li>`).join('')}</ul>`:'入力が変更されています。';}
     else if(display==='output-missing'){title='前回出力が見つかりません';cls='attention';body='ファイルが削除または移動されています。もう一度出力してください。';}
@@ -948,8 +1027,45 @@ function renderFinalOverview() {
     if(btn)btn.disabled=Number(ready.pageCount||0)===0||blockers.length>0;
     if(fix)fix.classList.toggle('hidden',blockers.length===0||Number(ready.pageCount||0)===0);
   };
-  renderFreshness(main,'final-main-state','build-main-btn','final-main-fix');renderFreshness(appendix,'final-appendix-state','build-appendix-btn','final-appendix-fix');const allBtn=$('build-all-btn');if(allBtn){const targets=[main,appendix].filter(r=>Number(r.pageCount||0)>0);allBtn.disabled=(targets.length===0||targets.some(r=>asArray(r.blockers).filter(b=>String(b.code||'')!=='no-pages').length>0));}
-  const history=$('final-history');if(history){const rows=[];for(const [label,r] of [['本体PDF',main],['補足PDF',appendix]])if(r.outputPdf||r.lastBuiltAt)rows.push({label,r});history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${label}</span><span>${Number(r.pageCount||0)} ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力履歴はありません。</div>';}
+  for(const entry of entries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
+  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn)allBtn.disabled=(buildable.length===0||buildable.some(ready=>asArray(ready.blockers).filter(blocker=>String(blocker.code||'')!=='no-pages').length>0));
+  const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)} ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力履歴はありません。</div>';}
+  renderVolumeLinks();
+}
+
+function renderFinalPreflight(entries=[]) {
+  const summary=$('final-preflight-summary'),list=$('final-preflight-list');if(!summary||!list)return;
+  const workbooks=workbooksForActivePreset(),requirements=activeSourceRequirements(),requiredRequirements=requirements.filter(item=>item?.required!==false);
+  const missingRequired=requiredRequirements.filter(requirement=>!workbooks.some(workbook=>String(workbook?.requirementId||'')===String(requirement?.requirementId||'')&&String(workbook?.status||'')!=='missing'));
+  const conversionPending=workbooks.filter(workbook=>!isLatestPdfWorkbook(workbook));
+  const unassigned=unresolvedPageCount();
+  const requiredTargets=entries.filter(entry=>entry.target?.required!==false),emptyRequiredTargets=requiredTargets.filter(entry=>Number(entry.ready?.pageCount||0)===0);
+  const blockedTargets=entries.filter(entry=>Number(entry.ready?.pageCount||0)>0&&asArray(entry.ready?.blockers).filter(blocker=>String(blocker?.code||'')!=='no-pages').length>0);
+  const settings=packForPreset()?.settings||{},title=String(settings.documentTitle||presetLabel()).trim(),pattern=String(settings.outputFileNamePattern||(state?.language==='en'?'{projectId}_E_{targetName}.pdf':'{projectId}_J_{targetName}.pdf')).trim();
+  const checks=[];
+  checks.push({label:'必須原稿',state:missingRequired.length?'danger':'ok',detail:requiredRequirements.length?(missingRequired.length?`${missingRequired.length}件が未提出です`:`${requiredRequirements.length}件すべて提出済みです`):'必須原稿の指定はありません',view:'excel'});
+  checks.push({label:'変換PDF',state:workbooks.length===0||conversionPending.length?'danger':'ok',detail:workbooks.length===0?'原稿がまだ登録されていません':conversionPending.length?`${conversionPending.length}件の作成・更新が必要です`:`${workbooks.length}件すべて最新です`,view:'excel'});
+  checks.push({label:'ページ構成',state:unassigned?'attention':'ok',detail:unassigned?`${unassigned}ページが未振り分けです`:'未振り分けページはありません',view:'pages'});
+  const targetProblems=emptyRequiredTargets.length+blockedTargets.length;
+  checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':'excel'});
+  checks.push({label:'仕上げ設定',state:title&&pattern?'ok':'danger',detail:title&&pattern?`資料名「${title}」・出力名を設定済み`:'資料タイトルと出力ファイル名を設定してください',view:'final'});
+  const problemCount=checks.filter(check=>check.state!=='ok').length,ready=problemCount===0;
+  summary.className=`final-preflight-summary ${ready?'ready':'attention'}`;
+  summary.innerHTML=`<div><strong>${ready?'出力準備が整っています':'出力前に確認が必要です'}</strong><span>${ready?'すべての確認項目を満たしています。':`${problemCount}項目を確認してください。`}</span></div>${badge(ready?'準備完了':`${problemCount}項目`,ready?'ok':'attention')}<time>確認 ${escapeHtml(finalPreflightCheckedAt?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`;
+  list.innerHTML=checks.map(check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ghost compact" type="button" data-preflight-view="${escapeAttr(check.view)}">確認する</button>`}</div>`).join('');
+  list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>setActiveView(String(button.dataset.preflightView||'final'))));
+}
+
+async function refreshFinalPreflight(btn) {
+  await runBusy(btn,async()=>{
+    if(configured())await api('/api/scan-updates',{method:'POST',body:{force:true}});
+    state=normalizeStatePayload(await api('/api/state'));
+    if(configured())await loadFiles(null);
+    await loadFinalReadiness();
+    finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
+    renderAll();
+    showMessage('ok','出力前チェックを更新しました','原稿・変換PDF・ページ構成・出力設定を最新状態で確認しました。');
+  },false);
 }
 
 
@@ -959,10 +1075,7 @@ function updateBulkSelectionLabel() {
   if (el) el.textContent = count ? `${count}ページ選択・ドラッグでまとめて移動` : 'カードをドラッグして移動';
   const bar = $('page-command-bar');
   if (bar) bar.classList.toggle('has-selection', count > 0);
-  for (const id of ['bulk-main-btn','bulk-appendix-btn','bulk-none-btn','clear-selected-pages-btn']) {
-    const button = $(id);
-    if (button) button.disabled = count === 0;
-  }
+  document.querySelectorAll('[data-bulk-target],#bulk-none-btn,#clear-selected-pages-btn').forEach(button=>button.disabled=count===0);
   const undoEntry=pageLayoutUndoStack[pageLayoutUndoStack.length-1],redoEntry=pageLayoutRedoStack[pageLayoutRedoStack.length-1],undo=$('page-layout-undo-btn'),redo=$('page-layout-redo-btn');
   if(undo){undo.disabled=pageLayoutHistoryBusy||!undoEntry;undo.title=undoEntry?`${undoEntry.label}を元に戻す（Ctrl+Z）`:'元に戻せるページ構成変更はありません';undo.setAttribute('aria-label',undo.title);}
   if(redo){redo.disabled=pageLayoutHistoryBusy||!redoEntry;redo.title=redoEntry?`${redoEntry.label}をやり直す（Ctrl+Shift+Z）`:'やり直せるページ構成変更はありません';redo.setAttribute('aria-label',redo.title);}
@@ -982,6 +1095,10 @@ function requiredRenderProfileVersion(source) {
   if (sourceTypeValue(source) === 'word') {
     const v = Number(state?.wordRenderProfileVersion || 0);
     return Number.isFinite(v) && v > 0 ? v : CURRENT_WORD_RENDER_PROFILE_VERSION;
+  }
+  if (sourceTypeValue(source) === 'powerpoint') {
+    const v = Number(state?.powerPointRenderProfileVersion || 0);
+    return Number.isFinite(v) && v > 0 ? v : CURRENT_POWERPOINT_RENDER_PROFILE_VERSION;
   }
   return currentRenderProfileVersion();
 }
@@ -1009,6 +1126,140 @@ function confirmAction({title='操作を実行しますか？',message='',detail
   $('confirm-modal').classList.remove('hidden');
   requestAnimationFrame(()=>$('confirm-cancel')?.focus());
   return new Promise(resolve=>{confirmResolver=resolve;});
+}
+
+function findPackForManagement(packId) {
+  const id=String(packId||'');
+  return packAdminPacks.find(pack=>String(pack?.packId||'')===id)
+    || asArray(state?.packs).find(pack=>String(pack?.packId||'')===id)
+    || null;
+}
+function updatePackTemplateDescription() {
+  const templateId=String($('pack-editor-template')?.value||'');
+  const template=asArray(state?.packTemplates).find(item=>String(item?.templateId||'')===templateId);
+  const description=$('pack-editor-template-description');if(description)description.textContent=String(template?.description||'Excel・Word・PowerPoint・PDFをまとめる資料パックです。');
+}
+function openPackEditor(mode='create',packId='') {
+  const modal=$('pack-editor-modal');if(!modal)return;
+  const pack=findPackForManagement(packId);
+  if(mode==='rename'&&!pack){showMessage('warn','資料パックが見つかりません','一覧を読み込み直してください。');return;}
+  packEditorMode=mode==='rename'?'rename':'create';packEditorPackId=packEditorMode==='rename'?String(pack.packId||''):'';packEditorReturnFocus=$('pack-menu-button')||document.activeElement;
+  $('pack-editor-title').textContent=packEditorMode==='rename'?'資料パック名を変更':'新しい資料パック';
+  $('pack-editor-description').textContent=packEditorMode==='rename'?'packIdや登録情報を変えず、画面に表示する名前だけを変更します。':'用途が分かる名前を付けてください。';
+  const name=$('pack-editor-name');if(name)name.value=packEditorMode==='rename'?String(pack.displayName||''):'';
+  const field=$('pack-editor-template-field');field?.classList.toggle('hidden',packEditorMode==='rename');
+  const select=$('pack-editor-template');
+  if(select){
+    const templates=asArray(state?.packTemplates);select.innerHTML=templates.map(template=>`<option value="${escapeAttr(template.templateId||'')}">${escapeHtml(template.displayName||template.templateId||'ひな形')}</option>`).join('');
+    select.value=packEditorMode==='rename'?String(pack?.templateId||''):String(templates.find(template=>String(template.templateId)==='builtin-generic-department-pack')?.templateId||templates[0]?.templateId||'');
+  }
+  $('pack-editor-save').textContent=packEditorMode==='rename'?'名前を変更':'作成';updatePackTemplateDescription();
+  closePackMenu();modal.classList.remove('hidden');requestAnimationFrame(()=>name?.focus());
+}
+function closePackEditor(returnFocus=true) {
+  const modal=$('pack-editor-modal');if(!modal||modal.classList.contains('hidden'))return;
+  modal.classList.add('hidden');const focus=packEditorReturnFocus;packEditorReturnFocus=null;packEditorPackId='';
+  if(returnFocus&&focus?.isConnected&&typeof focus.focus==='function')focus.focus();
+}
+async function refreshPacksAfterMutation() {
+  packAdminPacks=[];await refresh();await loadPackAdminPacks();renderPackSwitcher();
+}
+async function submitPackEditor(btn) {
+  const name=String($('pack-editor-name')?.value||'').trim();
+  if(!name){showMessage('warn','資料パック名を入力してください','用途が分かる名前を入力してください。');$('pack-editor-name')?.focus();return;}
+  await runBusy(btn,async()=>{
+    let response;
+    if(packEditorMode==='rename')response=await api(`/api/v2/packs/${encodeURIComponent(packEditorPackId)}`,{method:'PATCH',body:{displayName:name}});
+    else response=await api('/api/v2/packs',{method:'POST',body:{displayName:name,templateId:String($('pack-editor-template')?.value||'builtin-generic-department-pack')}});
+    const createdName=String(response?.result?.displayName||name),wasRename=packEditorMode==='rename';
+    closePackEditor(false);await refreshPacksAfterMutation();
+    if(!wasRename&&response?.result?.packId)await applyPresetSelection(String(response.result.packId));
+    showMessage('ok',wasRename?'資料パック名を変更しました':'資料パックを作成しました',wasRename?`${createdName}として表示します。`:`${createdName}へ切り替えました。続けて原稿を登録できます。`);
+  },false);
+}
+const templateManagerFieldIds=['template-name','template-description','template-source-excel','template-source-word','template-source-powerpoint','template-source-pdf','template-new-destination','template-output-pattern','template-block-stale','template-block-failed','template-include-toc'];
+function newTemplateTarget(){return {targetId:`output_${Date.now().toString(16).slice(-8)}`,displayName:'',required:false};}
+function collectTemplateTargets(){return [...document.querySelectorAll('[data-template-target]')].map(row=>({targetId:String(row.querySelector('[data-target-id]')?.value||'').trim().toLowerCase(),displayName:String(row.querySelector('[data-target-name]')?.value||'').trim(),required:!!row.querySelector('[data-target-required]')?.checked}));}
+function templateTargetOptions(selected='unassigned'){return `<option value="unassigned" ${selected==='unassigned'?'selected':''}>未振り分け</option>${collectTemplateTargets().filter(target=>target.targetId).map(target=>`<option value="${escapeAttr(target.targetId)}" ${selected===target.targetId?'selected':''}>${escapeHtml(target.displayName||target.targetId)}</option>`).join('')}`;}
+function renderTemplateTargets(targets=[],readOnly=false){
+  const box=$('template-targets-list');if(!box)return;const items=asArray(targets).length?asArray(targets):[{targetId:'main',displayName:state?.language==='en'?'Main':'本体',required:true},{targetId:'appendix',displayName:state?.language==='en'?'Appendix':'補足',required:false}];box.innerHTML=items.map((target,index)=>`<div class="template-target-row" data-template-target><label><span>出力先ID</span><input data-target-id type="text" maxlength="48" pattern="[a-z0-9][a-z0-9_-]*" value="${escapeAttr(target.targetId||'')}" ${readOnly?'disabled':''}></label><label><span>表示名</span><input data-target-name type="text" maxlength="60" value="${escapeAttr(target.displayName||'')}" ${readOnly?'disabled':''}></label><label class="template-check"><input data-target-required type="checkbox" ${target.required?'checked':''} ${readOnly?'disabled':''}> 必須</label><button class="btn ghost compact" type="button" data-remove-target ${readOnly||items.length<=1?'disabled':''}>削除</button></div>`).join('');
+  box.querySelectorAll('[data-remove-target]').forEach((button,index)=>button.addEventListener('click',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned'),next=collectTemplateTargets().filter((_,itemIndex)=>itemIndex!==index);renderTemplateTargets(next,false);renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,false);}));
+  box.querySelectorAll('[data-target-id],[data-target-name]').forEach(input=>input.addEventListener('change',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned');renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,readOnly);}));
+}
+function renderTemplateDestinationOptions(selected='unassigned'){const select=$('template-new-destination');if(select)select.innerHTML=templateTargetOptions(selected);}
+function newTemplateRequirement(){return {requirementId:`requirement_${Date.now().toString(16)}${Math.random().toString(16).slice(2,8)}`,displayName:'',ownerDepartment:'',required:true,acceptedSourceTypes:['excel','word','powerpoint','pdf'],defaultTargetId:'unassigned',dueDate:''};}
+function collectTemplateRequirements(){return [...document.querySelectorAll('[data-template-requirement]')].map(row=>({requirementId:String(row.dataset.templateRequirement||''),displayName:String(row.querySelector('[data-requirement-name]')?.value||'').trim(),ownerDepartment:String(row.querySelector('[data-requirement-owner]')?.value||'').trim(),required:!!row.querySelector('[data-requirement-required]')?.checked,acceptedSourceTypes:[...row.querySelectorAll('[data-requirement-type]:checked')].map(input=>String(input.value||'')),defaultTargetId:String(row.querySelector('[data-requirement-target]')?.value||'unassigned'),dueDate:String(row.querySelector('[data-requirement-due]')?.value||'')}));}
+function renderTemplateRequirements(requirements=[],readOnly=false){
+  const box=$('template-requirements-list');if(!box)return;const items=asArray(requirements);box.innerHTML=items.length?items.map((r,index)=>{const types=asArray(r.acceptedSourceTypes).map(String),id=String(r.requirementId||newTemplateRequirement().requirementId);return `<div class="template-requirement-row" data-template-requirement="${escapeAttr(id)}"><div class="template-requirement-head"><strong>必要原稿 ${index+1}</strong><button class="btn ghost compact" type="button" data-remove-requirement ${readOnly?'disabled':''}>削除</button></div><div class="template-manager-grid"><label><span>原稿名</span><input type="text" maxlength="120" value="${escapeAttr(r.displayName||'')}" data-requirement-name ${readOnly?'disabled':''}></label><label><span>担当部署</span><input type="text" maxlength="120" value="${escapeAttr(r.ownerDepartment||'')}" data-requirement-owner ${readOnly?'disabled':''}></label><label><span>期限</span><input type="date" value="${escapeAttr(r.dueDate||'')}" data-requirement-due ${readOnly?'disabled':''}></label><label><span>新規ページの配置</span><select data-requirement-target ${readOnly?'disabled':''}>${templateTargetOptions(String(r.defaultTargetId||'unassigned'))}</select></label></div><div class="template-inline-options"><label><input type="checkbox" data-requirement-required ${r.required!==false?'checked':''} ${readOnly?'disabled':''}> 必須</label>${['excel','word','powerpoint','pdf'].map(type=>`<label><input type="checkbox" value="${type}" data-requirement-type ${types.includes(type)?'checked':''} ${readOnly?'disabled':''}> ${{excel:'Excel',word:'Word',powerpoint:'PowerPoint',pdf:'PDF'}[type]}</label>`).join('')}</div></div>`;}).join(''):'<div class="template-requirements-empty">必要原稿は未設定です。必要に応じて追加してください。</div>';
+  box.querySelectorAll('[data-remove-requirement]').forEach(button=>button.addEventListener('click',()=>{const current=collectTemplateRequirements();const id=String(button.closest('[data-template-requirement]')?.dataset.templateRequirement||'');renderTemplateRequirements(current.filter(item=>item.requirementId!==id),false);}));
+}
+function templateManagerSelected(){const id=String($('template-manager-select')?.value||'');return asArray(state?.packTemplates).find(item=>String(item?.templateId||'')===id)||null;}
+function renderTemplateManagerSelect(selectedId=''){
+  const select=$('template-manager-select');if(!select)return;
+  const templates=asArray(state?.packTemplates);select.innerHTML=`<option value="">＋ 新しいひな形</option>${templates.map(t=>`<option value="${escapeAttr(t.templateId||'')}">${escapeHtml(t.displayName||t.templateId||'ひな形')}${t.builtIn?'（組み込み）':''}</option>`).join('')}`;
+  select.value=templates.some(t=>String(t.templateId||'')===String(selectedId||''))?String(selectedId):'';populateTemplateManager();
+}
+function populateTemplateManager(){
+  const t=templateManagerSelected(),builtIn=!!t?.builtIn,targets=asArray(t?.targets),rules=t?.rules||{},output=t?.output||{},sourceTypes=asArray(t?.acceptedSourceTypes).map(String);
+  const setValue=(id,value)=>{const el=$(id);if(el)el.value=String(value??'');},setChecked=(id,value)=>{const el=$(id);if(el)el.checked=!!value;};
+  setValue('template-name',t?.displayName||'');setValue('template-description',t?.description||'');setChecked('template-source-excel',t?sourceTypes.includes('excel'):true);setChecked('template-source-word',t?sourceTypes.includes('word'):true);setChecked('template-source-powerpoint',t?sourceTypes.includes('powerpoint'):true);setChecked('template-source-pdf',t?sourceTypes.includes('pdf'):true);
+  renderTemplateTargets(targets,builtIn);renderTemplateDestinationOptions(rules.newItemDestination||'unassigned');setValue('template-output-pattern',output.fileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');setChecked('template-block-stale',t?rules.blockBuildWhenRequiredSourceIsStale:true);setChecked('template-block-failed',t?rules.blockBuildWhenRequiredSourceFailed:true);setChecked('template-include-toc',output.tableOfContents);
+  renderTemplateRequirements(t?.sourceRequirements||[],builtIn);
+  templateManagerFieldIds.forEach(id=>{const el=$(id);if(el)el.disabled=builtIn;});const save=$('template-manager-save'),remove=$('template-manager-delete'),duplicate=$('template-manager-duplicate'),exportButton=$('template-manager-export'),stateText=$('template-manager-state'),usageCount=t?asArray(packAdminPacks.length?packAdminPacks:state?.packs).filter(pack=>String(pack?.templateId||'')===String(t.templateId||'')).length:0;if(save){save.disabled=builtIn;save.textContent=t?'変更を保存':'作成';}if(remove)remove.classList.toggle('hidden',!t||builtIn);if(duplicate)duplicate.classList.toggle('hidden',!t);if(exportButton)exportButton.classList.toggle('hidden',!t);if(stateText)stateText.textContent=builtIn?`組み込みひな形・使用中 ${usageCount}件。内容を基にする場合は「複製」を選んでください。`:(t?`バージョン ${Number(t.templateVersion||1)}・使用中 ${usageCount}件・変更は新しく作る資料パックから反映されます。`:'新しいひな形を作成します。');
+  const addRequirement=$('template-add-requirement'),addTarget=$('template-add-target');if(addRequirement)addRequirement.disabled=builtIn;if(addTarget)addTarget.disabled=builtIn;
+}
+function openTemplateManager(){const modal=$('template-manager-modal');if(!modal)return;templateManagerReturnFocus=$('manage-pack-templates-btn')||document.activeElement;closePackMenu();modal.classList.remove('hidden');renderTemplateManagerSelect('');requestAnimationFrame(()=>$('template-name')?.focus());}
+function closeTemplateManager(returnFocus=true){const modal=$('template-manager-modal');if(!modal||modal.classList.contains('hidden'))return;modal.classList.add('hidden');const focus=templateManagerReturnFocus;templateManagerReturnFocus=null;if(returnFocus&&focus?.isConnected&&typeof focus.focus==='function')focus.focus();}
+function templateManagerRequest(){
+  const acceptedSourceTypes=[['template-source-excel','excel'],['template-source-word','word'],['template-source-powerpoint','powerpoint'],['template-source-pdf','pdf']].filter(([id])=>!!$(id)?.checked).map(([,type])=>type);
+  return {displayName:String($('template-name')?.value||'').trim(),description:String($('template-description')?.value||'').trim(),acceptedSourceTypes,sourceRequirements:collectTemplateRequirements(),targets:collectTemplateTargets(),rules:{newItemDestination:String($('template-new-destination')?.value||'unassigned'),retainManualOrder:true,blockBuildWhenRequiredSourceIsStale:!!$('template-block-stale')?.checked,blockBuildWhenRequiredSourceFailed:!!$('template-block-failed')?.checked},output:{fileNamePattern:String($('template-output-pattern')?.value||'').trim(),pageNumbering:'continuous',bookmarks:'from-items',tableOfContents:!!$('template-include-toc')?.checked}};
+}
+async function submitTemplateManager(btn){
+  const body=templateManagerRequest(),selected=templateManagerSelected();if(!body.displayName){showMessage('warn','ひな形名を入力してください','用途が分かる名前を入力してください。');$('template-name')?.focus();return;}if(!body.acceptedSourceTypes.length){showMessage('warn','原稿形式を選んでください','Excel・Word・PowerPoint・PDFから1つ以上選択してください。');return;}
+  const invalidTarget=body.targets.find(target=>!target.targetId||!target.displayName||!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(target.targetId));if(!body.targets.length||invalidTarget||new Set(body.targets.map(target=>target.targetId)).size!==body.targets.length){showMessage('warn','出力先の設定を確認してください','出力先IDは英小文字・数字・ハイフン・アンダースコアで重複なく入力し、表示名も設定してください。');return;}const invalidRequirement=body.sourceRequirements.find(item=>!item.displayName||!item.acceptedSourceTypes.length);if(invalidRequirement){showMessage('warn','必要原稿の設定を確認してください','原稿名を入力し、扱う形式を1つ以上選択してください。');return;}
+  await runBusy(btn,async()=>{const response=await api(selected?`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`:'/api/v2/pack-templates',{method:selected?'PATCH':'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok',selected?'ひな形を更新しました':'ひな形を作成しました','新しく作る資料パックで選択できます。');},false);
+}
+async function deleteManagedTemplate(btn){const selected=templateManagerSelected();if(!selected||selected.builtIn)return;const accepted=await confirmAction({title:'このひな形を削除しますか？',message:`「${selected.displayName||'ひな形'}」を削除します。`,detail:'使用中の資料パックがあるひな形は削除できません。',confirmLabel:'削除',danger:true});if(!accepted)return;await runBusy(btn,async()=>{const response=await api(`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`,{method:'DELETE'});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect('');showMessage('ok','ひな形を削除しました','資料パック作成時の一覧から削除しました。');},false);}
+async function duplicateManagedTemplate(btn){const selected=templateManagerSelected();if(!selected)return;const body=templateManagerRequest();body.displayName=`${body.displayName||selected.displayName||'ひな形'}（コピー）`;await runBusy(btn,async()=>{const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形を複製しました','用途に合わせて名前や必要原稿を編集できます。');},false);}
+function exportManagedTemplate(){const selected=templateManagerSelected();if(!selected)return;const data=templateManagerRequest();data.templateSchemaVersion=1;const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`ReportBinder-template-${String(selected.displayName||'template').replace(/[\\/:*?"<>|]/g,'_')}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showMessage('ok','ひな形JSONを出力しました','別のPCや利用者へ渡して読み込めます。');}
+async function importManagedTemplateFile(file,btn){if(!file)return;try{const body=JSON.parse(await file.text());delete body.templateId;delete body.templateVersion;const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形JSONを読み込みました','内容を確認してから資料パックを作成してください。');}catch(error){showMessage('danger','ひな形JSONを読み込めません',userFriendlyError(error.message),error.detail||error.message);}finally{if(btn)btn.value='';}}
+async function duplicatePack(packId,btn) {
+  const pack=findPackForManagement(packId);if(!pack)return;
+  closePackMenu();
+  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/duplicate`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','資料パックを複製しました',`${response?.result?.displayName||pack.displayName}を新しい資料パックとして作成しました。`);},false);
+}
+async function archivePack(packId) {
+  const pack=findPackForManagement(packId);if(!pack)return;
+  closePackMenu();
+  const accepted=await confirmAction({title:'資料パックをアーカイブしますか？',message:`「${pack.displayName||'資料パック'}」を通常の一覧から隠します。`,detail:'登録情報は削除されず、アーカイブ済み一覧から復元できます。',confirmLabel:'アーカイブ',danger:true});
+  if(!accepted)return;
+  await runBusy(null,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/archive`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','資料パックをアーカイブしました','必要になったら資料パック一覧から復元できます。');},false);
+}
+async function restorePack(packId,btn) {
+  const pack=findPackForManagement(packId);if(!pack)return;
+  closePackMenu();
+  await runBusy(btn,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/restore`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','資料パックを復元しました',`${pack.displayName||'資料パック'}を通常の一覧へ戻しました。`);},false);
+}
+async function upgradePackTemplate(packId,btn){
+  closePackMenu();
+  try{
+    const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/template-upgrade`),preview=response.preview||{},changes=asArray(preview.changes);
+    if(!preview.updateAvailable){showMessage('ok','ひな形は最新です','この資料パックに適用できる更新はありません。');return;}
+    const accepted=await confirmAction({title:'新しいひな形を適用しますか？',message:`${preview.packName||'資料パック'}を v${Number(preview.fromVersion||1)} から v${Number(preview.toVersion||1)} へ更新します。`,detail:[...changes.map(item=>`・${item}`),'','既存原稿とページ構成は保持され、提出用PDFは再出力が必要になります。'].join('\n'),confirmLabel:'ひな形を更新'});
+    if(!accepted)return;
+    await runBusy(btn,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/template-upgrade`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','ひな形を更新しました','必要原稿リストと出力条件を更新しました。既存の原稿・ページ構成は保持しています。');},false);
+  }catch(error){showMessage('danger','ひな形を更新できません',userFriendlyError(error.message),error.detail||error.message);}
+}
+function handlePackMenuAction(event) {
+  const select=event.target.closest('[data-pack-select]');if(select){void applyPresetSelection(select.dataset.packSelect);closePackMenu();return;}
+  const unavailable=event.target.closest('[data-pack-unavailable]');if(unavailable){showMessage('warn','この資料パックは利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
+  const action=event.target.closest('[data-pack-action]');if(!action)return;
+  const packId=String(action.dataset.packId||'');
+  if(action.dataset.packAction==='rename')openPackEditor('rename',packId);
+  else if(action.dataset.packAction==='duplicate')void duplicatePack(packId,action);
+  else if(action.dataset.packAction==='archive')void archivePack(packId);
+  else if(action.dataset.packAction==='restore')void restorePack(packId,action);
+  else if(action.dataset.packAction==='template-upgrade')void upgradePackTemplate(packId,action);
 }
 
 function syncPageBoardViewControls() {
@@ -1049,7 +1300,7 @@ function rememberPageLayoutUndo(label,volumes=null,afterVolumes=null){
 async function applyPageLayoutHistory(direction,btn=null){
   if(pageLayoutHistoryBusy)return;if(pendingPageLayoutUndo){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}const saved=await saveBoardOrder();if(!saved)return;}const savedBeforeHistory=await boardSavePromise;if(!savedBeforeHistory)return;
   const redo=direction==='redo',source=redo?pageLayoutRedoStack:pageLayoutUndoStack,target=redo?pageLayoutUndoStack:pageLayoutRedoStack,entry=source[source.length-1];if(!entry)return;pageLayoutHistoryBusy=true;updateBulkSelectionLabel();const button=btn||$(redo?'page-layout-redo-btn':'page-layout-undo-btn');if(button){button.disabled=true;button.classList.add('busy');}
-  try{const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes:redo?entry.after:entry.before}});source.pop();target.push(entry);trimPageLayoutHistory(target);applyPageMutationResult(response);selectedPages.clear();lastPageRangeAnchor='';syncPageSelectionUi();showMessage('ok',redo?'ページ構成をやり直しました':'ページ構成を元に戻しました',entry.label,null,[{label:redo?'元に戻す':'やり直す',handler:()=>redo?undoLastPageLayout():redoLastPageLayout()}],8000);}
+  try{const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes:redo?entry.after:entry.before})});source.pop();target.push(entry);trimPageLayoutHistory(target);applyPageMutationResult(response);selectedPages.clear();lastPageRangeAnchor='';syncPageSelectionUi();showMessage('ok',redo?'ページ構成をやり直しました':'ページ構成を元に戻しました',entry.label,null,[{label:redo?'元に戻す':'やり直す',handler:()=>redo?undoLastPageLayout():redoLastPageLayout()}],8000);}
   catch(error){showMessage('danger',redo?'ページ構成をやり直せません':'ページ構成を元に戻せません',userFriendlyError(error.message),error.detail||error.stack||error.message);}
   finally{pageLayoutHistoryBusy=false;if(button)button.classList.remove('busy');updateBulkSelectionLabel();}
 }
@@ -1057,8 +1308,8 @@ async function undoLastPageLayout(btn=null){return applyPageLayoutHistory('undo'
 async function redoLastPageLayout(btn=null){return applyPageLayoutHistory('redo',btn);}
 
 function renderVolumeLinks() {
-  for (const [volume,id,publishId] of [[mainVolume(),'open-main-link','publish-main-btn'],[appendixVolume(),'open-appendix-link','publish-appendix-btn']]) {
-    const a=$(id),publish=$(publishId);const r=volumeReadiness(volume);
+  document.querySelectorAll('[data-final-volume]').forEach(card=>{
+    const volume=String(card.dataset.finalVolume||''),a=card.querySelector('[data-final-open]'),publish=card.querySelector('[data-final-publish]'),r=volumeReadiness(volume);
     const available=!!(r.outputPdf && r.outputPdfExists);
     const publishable=available&&String(r.displayState||'')==='built';
     if(a){
@@ -1066,7 +1317,7 @@ function renderVolumeLinks() {
       else{a.removeAttribute('href');a.classList.add('hidden');}
     }
     if(publish){publish.classList.toggle('hidden',!publishable);publish.disabled=!publishable;}
-  }
+  });
 }
 
 
@@ -1095,7 +1346,7 @@ function getRegisteredByRelativePath() {
 }
 function isXlsxFile(file) {
   const name = String(file?.fileName || file?.relativePath || '').toLowerCase();
-  return name.endsWith('.xlsx');
+  return name.endsWith('.xlsx') || name.endsWith('.xlsm');
 }
 function categoryMatchesName(name, preset = activePreset) {
   const n = String(name || '').toUpperCase();
@@ -1106,18 +1357,50 @@ function categoryMatchesName(name, preset = activePreset) {
 }
 function presetMatches(file, preset) {
   const accepted = asArray(packForPreset(preset)?.acceptedSourceTypes).map(x => String(x || '').toLowerCase());
-  return (accepted.length ? accepted : ['excel','word','pdf']).includes(sourceTypeValue(file));
+  return (accepted.length ? accepted : ['excel','word','powerpoint','pdf']).includes(sourceTypeValue(file));
 }
 function workbookMatchesPreset(w, preset = activePreset) {
+  if(activePackId){
+    const explicit=String(w?.packId||'');
+    if(explicit)return explicit===String(activePackId);
+    const active=activePackRecord();
+    if(active?.category)return workbookCategoryValue(w)===String(active.category).toLowerCase();
+  }
   const category = workbookCategoryValue(w);
   if (['ecm','bod','dmm'].includes(category)) return category === preset;
   return categoryMatchesName(w?.fileName || w?.displayName || w?.relativePath || w?.workbookId, preset);
 }
 function packForPreset(preset = activePreset) {
   const category = String(preset || '').toLowerCase();
-  return asArray(state?.packs).find(pack => String(pack?.category || '').toLowerCase() === category)
+  const packs = asArray(state?.packs);
+  if (category === String(activePreset || '').toLowerCase() && activePackId) {
+    const selected = packs.find(pack => String(pack?.packId || '') === activePackId);
+    if (selected) return selected;
+  }
+  return packs.find(pack => String(pack?.category || '').toLowerCase() === category)
     || asArray(state?.packs).find(pack => String(pack?.packId || '').toLowerCase() === `pack_${category}`)
     || null;
+}
+function activePackRecord() { return packForPreset(activePreset); }
+function activePackIsBuiltIn(){return !!String(activePackRecord()?.category||'');}
+function pageApiBody(extra={}){
+  const pack=activePackRecord();
+  return Object.assign({packId:String(pack?.packId||activePackId||'')},extra);
+}
+function reconcileActivePackSelection() {
+  const workflowPacks = asArray(state?.packs).filter(pack => pack?.workflowAvailable && !pack?.archived);
+  let selected = workflowPacks.find(pack => String(pack?.packId || '') === activePackId)
+    || workflowPacks.find(pack => String(pack?.category || '').toLowerCase() === String(activePreset || '').toLowerCase())
+    || workflowPacks[0]
+    || null;
+  if (!selected) return null;
+  activePackId = String(selected.packId || '');
+  if(String(selected.category||''))activePreset = String(selected.category).toLowerCase();
+  try {
+    sessionStorage.setItem('ReportBinderPackId', activePackId);
+    sessionStorage.setItem('ReportBinderCategory', activePreset);
+  } catch {}
+  return selected;
 }
 function presetLabel(preset = activePreset) {
   return String(packForPreset(preset)?.displayName || ({ecm:'ECM', bod:'BOD', dmm:'DMM'})[preset] || 'ECM');
@@ -1128,21 +1411,22 @@ function sourceTypeValue(source) {
   const path = String(source?.relativePath || source?.fileName || '').toLowerCase();
   if (path.endsWith('.xlsx') || path.endsWith('.xlsm') || path.endsWith('.xls')) return 'excel';
   if (path.endsWith('.docx') || path.endsWith('.doc')) return 'word';
+  if (path.endsWith('.pptx')) return 'powerpoint';
   if (path.endsWith('.pdf')) return 'pdf';
   return 'file';
 }
 function sourceTypeLabel(source) {
-  return ({excel:'Excel', word:'Word', pdf:'PDF', file:'ファイル'})[sourceTypeValue(source)] || 'ファイル';
+  return ({excel:'Excel', word:'Word', powerpoint:'PowerPoint', pdf:'PDF', file:'ファイル'})[sourceTypeValue(source)] || 'ファイル';
 }
 function sourceTypeBadge(source) {
   const type = sourceTypeValue(source);
   return `<span class="source-type-badge ${escapeAttr(type)}">${escapeHtml(sourceTypeLabel(source))}</span>`;
 }
-function sourceIconId(source) { return ({excel:'i-file-excel',word:'i-file-word',pdf:'i-file-pdf'})[sourceTypeValue(source)] || 'i-file-pdf'; }
-function sourceUnitLabel(source) { return sourceTypeValue(source) === 'excel' ? 'シート' : 'ページ'; }
+function sourceIconId(source) { return ({excel:'i-file-excel',word:'i-file-word',powerpoint:'i-file-powerpoint',pdf:'i-file-pdf'})[sourceTypeValue(source)] || 'i-file-pdf'; }
+function sourceUnitLabel(source) { return sourceTypeValue(source) === 'excel' ? 'シート' : sourceTypeValue(source)==='powerpoint'?'スライド':'ページ'; }
 function sourceUnitReference(source, key) {
   const value = String(key || '');
-  return sourceTypeValue(source) === 'excel' ? `シート ${value}` : `ページ ${value.replace(/^Page\s+/i, '')}`;
+  return sourceTypeValue(source) === 'excel' ? `シート ${value}` : sourceTypeValue(source)==='powerpoint'?`スライド ${value.replace(/^Slide\s+/i,'')}`:`ページ ${value.replace(/^Page\s+/i, '')}`;
 }
 function filesForActivePreset(files) {
   return asArray(files).filter(f => presetMatches(f, activePreset));
@@ -1167,19 +1451,51 @@ function fileOrderValue(name) {
 function updateCategoryLabels() { /* category is always visible in the global header */ }
 
 function updatePresetTabs() {
-  document.querySelectorAll('[data-preset]').forEach(btn => {
-    const active = btn.dataset.preset === activePreset;
-    const label = presetLabel(btn.dataset.preset);
-    btn.textContent = label;
-    btn.title = `${label} 資料パック`;
-    btn.classList.toggle('active', active);
-    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
-  });
+  reconcileActivePackSelection();
+  renderPackSwitcher();
   updateCategoryLabels();
 }
+function packMenuRow(pack, archived=false) {
+  const id=String(pack?.packId||''),name=String(pack?.displayName||'名称未設定'),workflow=!!pack?.workflowAvailable;
+  const active=!archived&&workflow&&id===activePackId;
+  const status=archived?'アーカイブ済み':(workflow?(active?'利用中':'選択して使用'):'現在は利用できません');
+  const selectAttrs=archived?'disabled':(workflow?`data-pack-select="${escapeAttr(id)}"`:`data-pack-unavailable="${escapeAttr(id)}"`);
+  const archiveAction=!archived&&pack?.archivable?`<button class="danger" type="button" data-pack-action="archive" data-pack-id="${escapeAttr(id)}">保管</button>`:'';
+  const restoreAction=archived?`<button type="button" data-pack-action="restore" data-pack-id="${escapeAttr(id)}">復元</button>`:'';
+  const templateUpgrade=!archived&&pack?.templateUpdateAvailable?`<button class="attention" type="button" data-pack-action="template-upgrade" data-pack-id="${escapeAttr(id)}">ひな形更新</button>`:'';
+  return `<div class="pack-menu-row" data-pack-row="${escapeAttr(id)}"><button class="pack-option${active?' active':''}" type="button" ${selectAttrs} ${active?'aria-current="true"':''}><span class="pack-option-marker" aria-hidden="true"></span><span class="pack-option-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(status)}${pack?.templateUpdateAvailable?`・ひな形 v${Number(pack.availableTemplateVersion||1)}あり`:''}</small></span></button><div class="pack-row-actions">${restoreAction}${templateUpgrade}<button type="button" data-pack-action="duplicate" data-pack-id="${escapeAttr(id)}">複製</button><button type="button" data-pack-action="rename" data-pack-id="${escapeAttr(id)}">名前</button>${archiveAction}</div></div>`;
+}
+function renderPackSwitcher() {
+  const selected=activePackRecord();
+  const label=$('active-pack-name');if(label)label.textContent=String(selected?.displayName||presetLabel());
+  const all=packAdminPacks.length?packAdminPacks:asArray(state?.packs);
+  const active=all.filter(pack=>!pack?.archived),archived=all.filter(pack=>!!pack?.archived);
+  const list=$('pack-menu-list');if(list)list.innerHTML=active.length?active.map(pack=>packMenuRow(pack,false)).join(''):'<div class="pack-menu-empty">使用できる資料パックがありません。</div>';
+  const toggle=$('toggle-archived-packs');
+  if(toggle){toggle.classList.toggle('hidden',archived.length===0);toggle.textContent=`アーカイブ済み（${archived.length}件）${archivedPacksExpanded?'を閉じる':'を表示'}`;toggle.setAttribute('aria-expanded',String(archivedPacksExpanded));}
+  const archivedList=$('archived-pack-list');
+  if(archivedList){archivedList.classList.toggle('hidden',!archivedPacksExpanded||archived.length===0);archivedList.innerHTML=archived.map(pack=>packMenuRow(pack,true)).join('');}
+}
+function closePackMenu(returnFocus=false) {
+  const menu=$('pack-menu'),button=$('pack-menu-button');if(!menu)return;
+  menu.classList.add('hidden');button?.setAttribute('aria-expanded','false');
+  if(returnFocus)button?.focus();
+}
+async function loadPackAdminPacks() {
+  const response=await api('/api/v2/packs?includeArchived=true');
+  packAdminPacks=asArray(response.packs);
+  renderPackSwitcher();
+  return packAdminPacks;
+}
+async function togglePackMenu() {
+  const menu=$('pack-menu'),button=$('pack-menu-button');if(!menu||!button)return;
+  if(!menu.classList.contains('hidden')){closePackMenu(true);return;}
+  menu.classList.remove('hidden');button.setAttribute('aria-expanded','true');renderPackSwitcher();
+  try{await loadPackAdminPacks();}catch(error){showMessage('danger','資料パック一覧を読み込めません',userFriendlyError(error.message),error.detail||error.message);}
+}
 function visibleUnregisteredFiles(files) {
-  const registered = getRegisteredByRelativePath();
-  return filesForActivePreset(files).filter(f => !registered.has(registeredCategoryPathKey(f.relativePath, activePreset)));
+  const registered=new Set(workbooksForActivePreset().map(w=>String(w.relativePath||'').replace(/\\/g,'/').toLowerCase()));
+  return filesForActivePreset(files).filter(f => !registered.has(String(f.relativePath||'').replace(/\\/g,'/').toLowerCase()));
 }
 
 function capturePageBoardScroll() {
@@ -1368,10 +1684,10 @@ async function moveSelectedPagesToVolume(volume, btn) {
   if(!ids.length){showMessage('warn','ページを選択してください','移動するページにチェックを入れてください。');return;}
   await runBusy(btn,async()=>{
     const beforeVolumes=collectBoardVolumes();
-    const main=mainVolume(),appendix=appendixVolume();const volumes={[main]:[],[appendix]:[],none:[]};const selected=new Set(ids);
-    for(const p of [...pagesForActivePreset()].sort(pageSort)){const id=resolvedPageId(p);if(!id||selected.has(id))continue;const v=(p.enabled===false||String(p.volume||main)==='none')?'none':String(p.volume||main);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
+    const first=activeTargetVolumes()[0]||mainVolume(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),selected=new Set(ids);
+    for(const p of [...pagesForActivePreset()].sort(pageSort)){const id=resolvedPageId(p);if(!id||selected.has(id))continue;const v=(p.enabled===false||String(p.volume||first)==='none')?'none':String(p.volume||first);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
     if(!volumes[target])volumes[target]=[];volumes[target].push(...ids);
-    const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes}});applyPageMutationResult(response);rememberPageLayoutUndo(`${ids.length}ページの移動`,beforeVolumes);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
+    const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});applyPageMutationResult(response);rememberPageLayoutUndo(`${ids.length}ページの移動`,beforeVolumes);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
     showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
   });
   syncPageSelectionUi();
@@ -1467,10 +1783,14 @@ function renderFileList(files) {
   }));
 }
 async function applyPresetSelection(presetOrButton) {
-  const preset=typeof presetOrButton==='string'?presetOrButton:(presetOrButton?.dataset?.preset||activePreset);
-  if(!['ecm','bod','dmm'].includes(preset))return;const presetChanged=preset!==activePreset;
+  const requested=typeof presetOrButton==='string'?presetOrButton:(presetOrButton?.dataset?.packSelect||presetOrButton?.dataset?.preset||activePackId||activePreset);
+  const pack=asArray(state?.packs).find(item=>String(item?.packId||'')===String(requested))
+    || asArray(state?.packs).find(item=>String(item?.category||'').toLowerCase()===String(requested||'').toLowerCase());
+  if(!pack?.workflowAvailable){showMessage('warn','この資料パックは利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
+  const preset=String(pack.category||activePreset||'ecm').toLowerCase();
+  const nextPackId=String(pack.packId||'');const presetChanged=preset!==activePreset||nextPackId!==activePackId;
   if(presetChanged&&pendingPageLayoutUndo){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}await saveBoardOrder();}
-  activePreset=preset;try{sessionStorage.setItem('ReportBinderCategory',activePreset);}catch{}
+  activePreset=preset;activePackId=nextPackId;try{sessionStorage.setItem('ReportBinderCategory',activePreset);sessionStorage.setItem('ReportBinderPackId',activePackId);}catch{}
   selectedFiles.clear();selectedWorkbooks.clear();selectedPages.clear();lastFileRangeAnchor='';lastWorkbookRangeAnchor='';lastPageRangeAnchor='';lastPageBoardRenderSignature='';
   if(presetChanged)clearPageLayoutHistory();else updateBulkSelectionLabel();pageVolumeCollapseOverrides.clear();
   if(configured()&&!availableFiles.length)await loadFilesSilently();
@@ -1482,10 +1802,12 @@ async function applyPresetSelection(presetOrButton) {
 }
 
 async function registerSelected(btn) {
-  const rels=[...selectedFiles];if(!rels.length){showMessage('warn','原稿を選択してください','登録するExcel・Word・PDFにチェックを入れてください。');return;}
+  const rels=[...selectedFiles];if(!rels.length){showMessage('warn','原稿を選択してください','登録するExcel・Word・PowerPoint・PDFにチェックを入れてください。');return;}
   await runBusy(btn,async()=>{
-    const data=await api('/api/workbooks/register-batch',{method:'POST',body:{relativePaths:rels,category:activePreset}});const result=data.result||{},registered=asArray(result.registered),errors=asArray(result.errors);
-    selectedFiles.clear();lastFileRangeAnchor='';if(data.state)state=normalizeStatePayload(data.state);else await refresh();
+    const data=await api('/api/v2/sources/register-batch',{method:'POST',body:{relativePaths:rels,packId:activePackId}});const result=data.result||{},registered=asArray(result.registered),errors=asArray(result.errors);
+    // 登録APIのstateは汎用V2ドメインで、旧UIが参照するworkbooks/pagesを含まない。
+    // 互換viewを持つ正規stateを取り直し、登録直後に0件へ見える状態ずれを防ぐ。
+    selectedFiles.clear();lastFileRangeAnchor='';await refresh();
     selectedWorkbooks=new Set(registered.map(x=>String(x.workbookId||'')).filter(Boolean));lastWorkbookRangeAnchor='';renderAll();await loadFiles(null);
     if(registered.length&&errors.length===0)showMessage('ok',`${registered.length}件を登録しました`,`登録した${registered.length}件が選択されています。`,null,[{label:`登録した${registered.length}件をPDF作成`,primary:true,view:'excel',handler:()=>renderSelectedWorkbooks($('render-selected-btn'))}],0);
     else if(registered.length)showMessage('warn',`${registered.length}件を登録しました`,`${errors.length}件は登録できませんでした。`,errors,[{label:'登録分をPDF作成',view:'excel',handler:()=>renderSelectedWorkbooks($('render-selected-btn'))}],0);
@@ -1628,6 +1950,27 @@ function diffMatchConfidenceLabel(sheet){
   if(kind==='unknown'||confidence<.5)return `対応不確実 ${Math.round(confidence*100)}%`;
   if(confidence<.999)return `対応推定 ${Math.round(confidence*100)}%`;
   return '対応確実';
+}
+function diffCsvCell(value){
+  const text=String(value??'').replace(/\r?\n/g,' ').replace(/"/g,'""');
+  return `"${text}"`;
+}
+function buildDiffSummaryCsv(detail,workbookName){
+  const cmp=detail?.comparison||{},scope=String(cmp.scope||'')==='history'?'任意2版':'自動比較';
+  const headers=['原稿','比較種別','比較元日時','比較先日時','比較元項目','比較先項目','判定','対応確信度','対応方法','比較元ページ数','比較先ページ数','詳細'];
+  const rows=asArray(detail?.sheets).map(sheet=>{
+    const kind=String(sheet?.kind||'unknown'),confidence=(kind==='added'||kind==='removed')?'':`${Math.round(Math.max(0,Math.min(1,Number(sheet?.matchConfidence??1)))*100)}%`;
+    return [workbookName,scope,formatDateTime(cmp.baselineAt),formatDateTime(cmp.currentAt),String(sheet?.beforeSheetName||''),String(sheet?.afterSheetName||''),diffKindMeta(kind).label,confidence,String(sheet?.matchMethod||''),Number(sheet?.beforePages||0),Number(sheet?.afterPages||0),String(sheet?.message||'')];
+  });
+  return [headers,...rows].map(row=>row.map(diffCsvCell).join(',')).join('\r\n');
+}
+function exportDiffSummary(){
+  const detail=diffViewState.detail,sheets=asArray(detail?.sheets);if(!detail||!sheets.length)return;
+  const workbookName=String(detail?.workbookName||getWorkbook(diffViewState.workbookId)?.displayName||'source');
+  const csv=buildDiffSummaryCsv(detail,workbookName),blob=new Blob(['\uFEFF',csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+  const stamp=new Date().toISOString().replace(/[-:]/g,'').replace('T','-').slice(0,15),stem=workbookName.replace(/[\\/:*?"<>|]/g,'_').slice(0,80)||'source';
+  a.href=url;a.download=`ReportBinder-diff-${stem}-${stamp}.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  const button=$('diff-export-summary');if(button){button.textContent='CSVを出力しました';setTimeout(()=>{if(button.isConnected)button.textContent='差分レポートCSV';},1800);}
 }
 function ensureDiffPdfJs(){
   if(diffPdfJsPromise)return diffPdfJsPromise;
@@ -2611,6 +2954,7 @@ function renderDiffDetail(detail){
   if(tabs?.[1])tabs[1].textContent=historical?'比較先':'現在版';
   setDiffBrowserProgress(false);
   const sheets=asArray(detail?.sheets);
+  if($('diff-export-summary'))$('diff-export-summary').disabled=!sheets.length;
   if(!sheets.some(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey)){
     const preferred=sheets.find(s=>['modified','added','removed','unknown'].includes(String(s.kind||'')))||sheets[0];
     diffViewState.selectedSheetKey=String(preferred?.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(preferred);diffViewState.regionIndex=-1;
@@ -2623,6 +2967,7 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   diffReturnFocus=opener||document.activeElement;clearDiffBrowserResources();
   diffViewState.workbookId=id;diffViewState.fromSnapshotId=String(historyRange?.fromSnapshotId||'');diffViewState.toSnapshotId=String(historyRange?.toSnapshotId||'');
   diffViewState.detail=null;diffViewState.selectedSheetKey='';diffViewState.pageIndex=0;diffViewState.regionIndex=-1;diffViewState.filter='all';diffViewState.mode='side';diffViewState.mobileTab='before';
+  if($('diff-export-summary'))$('diff-export-summary').disabled=true;
   $('diff-modal')?.classList.remove('hidden');document.body.style.overflow='hidden';
   if($('diff-title'))$('diff-title').textContent='差分詳細：'+workbookDisplayName(getWorkbook(id));
   if($('diff-subtitle'))$('diff-subtitle').textContent='比較情報を読み込んでいます。';
@@ -2659,9 +3004,19 @@ async function saveSourceMetadata(sourceId, patch, control) {
     showMessage('danger','原稿設定を保存できません',userFriendlyError(error.message),error.detail||null);
   }
 }
+function activeSourceRequirements(){return asArray(activePackRecord()?.sourceRequirements);}
+function renderSourceRequirementStatus(workbooks=workbooksForActivePreset()){
+  const box=$('source-requirement-status');if(!box)return;const requirements=activeSourceRequirements();box.classList.toggle('hidden',requirements.length===0);if(!requirements.length){box.innerHTML='';return;}
+  const rows=requirements.map(requirement=>{const assigned=asArray(workbooks).find(w=>String(w?.requirementId||'')===String(requirement?.requirementId||''));let stateLabel='未提出',stateClass=requirement?.required===false?'neutral':'danger';if(assigned){if(String(assigned.status||'')==='missing'){stateLabel='ファイルなし';stateClass='danger';}else if(isLatestPdfWorkbook(assigned)){stateLabel='提出・変換済み';stateClass='ok';}else{stateLabel='提出済み・変換待ち';stateClass='attention';}}const details=[requirement.ownerDepartment||'',requirement.dueDate?`期限 ${requirement.dueDate}`:'',requirement.required===false?'任意':'必須'].filter(Boolean).join('・');return `<div class="source-requirement-item ${assigned?'assigned':'unassigned'}"><div><strong>${escapeHtml(requirement.displayName||'必要原稿')}</strong><span>${escapeHtml(details)}</span></div><div><span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span><small>${escapeHtml(assigned?workbookDisplayName(assigned):'登録後、原稿設定から割り当てます')}</small></div></div>`;});
+  const complete=rows.length&&requirements.every(requirement=>requirement.required===false||asArray(workbooks).some(w=>String(w?.requirementId||'')===String(requirement?.requirementId||'')&&String(w?.status||'')!=='missing'));
+  box.innerHTML=`<div class="source-requirement-title"><strong>必要原稿</strong><span>${complete?'必須原稿はすべて提出済みです':'未提出の必須原稿があります'}</span></div><div class="source-requirement-list">${rows.join('')}</div>`;
+}
 function sourceSettingsHtml(w){
-  const id=String(w?.workbookId||''),owner=String(w?.ownerDepartment||''),required=w?.required!==false;
-  return `<div class="source-settings" aria-label="原稿設定"><label class="source-owner-label">担当部署<input class="source-owner-input" type="text" maxlength="120" value="${escapeAttr(owner)}" placeholder="未設定" data-source-owner="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の担当部署"></label><label class="source-required-label"><input type="checkbox" data-source-required="${escapeAttr(id)}" ${required?'checked':''}> 必須</label></div>`;
+  const id=String(w?.workbookId||''),owner=String(w?.ownerDepartment||''),required=w?.required!==false,defaultTarget=String(w?.defaultTargetId||'unassigned');
+  const sourceType=sourceTypeValue(w),requirements=activeSourceRequirements().filter(item=>asArray(item?.acceptedSourceTypes).map(String).includes(sourceType)),assignedElsewhere=new Map(workbooksForActivePreset().filter(item=>String(item?.workbookId||'')!==id&&item?.requirementId).map(item=>[String(item.requirementId),workbookDisplayName(item)])),requirementId=String(w?.requirementId||'');
+  const requirementSelect=requirements.length?`<label class="source-requirement-label">必要原稿<select class="source-requirement-select" data-source-requirement="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の必要原稿"><option value="">割り当てなし</option>${requirements.map(item=>{const rid=String(item.requirementId||''),occupied=assignedElsewhere.get(rid);return `<option value="${escapeAttr(rid)}" ${rid===requirementId?'selected':''} ${occupied?'disabled':''}>${escapeHtml(item.displayName||'必要原稿')}${item.required===false?'（任意）':'（必須）'}${occupied?`・${escapeHtml(occupied)}へ割当済み`:''}</option>`;}).join('')}</select></label>`:'';
+  const targetOptions=activeTargetDefinitions().map(target=>`<option value="${escapeAttr(target.targetId)}" ${defaultTarget===String(target.targetId)?'selected':''}>${escapeHtml(target.displayName||target.targetId)}</option>`).join('');
+  return `<div class="source-settings" aria-label="原稿設定">${requirementSelect}<label class="source-owner-label">担当部署<input class="source-owner-input" type="text" maxlength="120" value="${escapeAttr(owner)}" placeholder="未設定" data-source-owner="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の担当部署"></label><label class="source-required-label"><input type="checkbox" data-source-required="${escapeAttr(id)}" ${required?'checked':''}> 必須</label><label class="source-default-target-label">新規ページの配置<select class="source-default-target" data-source-default-target="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の新規ページ配置"><option value="unassigned" ${defaultTarget==='unassigned'?'selected':''}>ひな形に従う</option>${targetOptions}</select></label></div>`;
 }
 function syncDiffScroll(source,target){
   if(diffSyncingScroll||diffViewState.mode!=='side'||!source||!target)return;
@@ -2675,7 +3030,8 @@ function syncDiffScroll(source,target){
 
 function renderWorkbooks() {
   const list=workbooksForActivePreset();const box=$('workbook-list');if(!box)return;const summary=$('workbook-selection-summary');
-  if(!list.length){box.className='table-shell empty-state';box.textContent=`${presetLabel()}の登録済み原稿はまだありません。`;selectedWorkbooks.clear();lastWorkbookRangeAnchor='';if(summary)summary.textContent='0件中 0件を選択';updateRenderTargetUi();return;}
+  renderSourceRequirementStatus(list);
+  if(!list.length){box.className='table-shell empty-state';box.textContent=`${presetLabel()}の登録済み原稿はまだありません。`;selectedWorkbooks.clear();lastWorkbookRangeAnchor='';if(summary)summary.textContent='0件中 0件を選択';syncWorkbookSelectionUi();return;}
   selectedWorkbooks=new Set([...selectedWorkbooks].filter(id=>list.some(w=>String(w.workbookId)===String(id))));const allSelected=list.every(w=>selectedWorkbooks.has(String(w.workbookId||''))),someSelected=list.some(w=>selectedWorkbooks.has(String(w.workbookId||'')));
   box.className='table-shell';box.innerHTML=`<table class="data-table workbook-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-workbooks ${allSelected?'checked':''} aria-label="登録済み原稿をすべて選択"></th><th>原稿ファイル</th><th class="pdf-status-col">変換PDFの状態</th></tr></thead><tbody>${list.map(w=>{const id=String(w.workbookId||''),checked=selectedWorkbooks.has(id),renderedAt=formatDateTime(w.lastRenderedAt||'');return `<tr data-workbook-row class="${checked?'selected-row':''} ${w.status==='render-error'?'error-row':''}"><td class="check-col"><input type="checkbox" data-workbook-check value="${escapeAttr(id)}" ${checked?'checked':''} aria-label="${escapeAttr(workbookDisplayName(w))}を選択"></td><td><div class="file-name-cell"><span class="file-icon ${escapeAttr(sourceTypeValue(w))}">${iconUse(sourceIconId(w))}</span><div class="source-file-detail"><div class="source-name-line"><strong title="${escapeAttr(workbookDisplayName(w))}">${escapeHtml(workbookDisplayName(w))}</strong>${sourceTypeBadge(w)}</div><div class="file-meta" title="最後に変換PDFを作成した日時">変換PDF作成日時：${escapeHtml(renderedAt)}</div>${sourceSettingsHtml(w)}</div></div></td><td class="pdf-status-col">${workbookPdfStatusCell(w)}</td></tr>`;}).join('')}</tbody></table>`;
   if(summary)summary.textContent=`${list.length}件中 ${selectedWorkbooks.size}件を選択`;const selectAll=box.querySelector('[data-select-all-workbooks]');if(selectAll){selectAll.indeterminate=someSelected&&!allSelected;selectAll.addEventListener('change',e=>{selectedWorkbooks=e.target.checked?new Set(list.map(w=>String(w.workbookId||'')).filter(Boolean)):new Set();lastWorkbookRangeAnchor='';syncWorkbookSelectionUi();renderWorkbooks();});}
@@ -2686,7 +3042,9 @@ function renderWorkbooks() {
   });
   box.querySelectorAll('[data-source-owner]').forEach(input=>input.addEventListener('change',()=>saveSourceMetadata(input.dataset.sourceOwner,{ownerDepartment:input.value},input)));
   box.querySelectorAll('[data-source-required]').forEach(input=>input.addEventListener('change',()=>saveSourceMetadata(input.dataset.sourceRequired,{required:input.checked},input)));
-  box.querySelectorAll('[data-workbook-row]').forEach(row=>row.addEventListener('click',e=>{if(e.target.closest('input,button,a,select,textarea,label'))return;const ch=row.querySelector('[data-workbook-check]');if(!ch)return;ch.checked=!ch.checked;handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));updateRenderTargetUi();
+  box.querySelectorAll('[data-source-default-target]').forEach(select=>select.addEventListener('change',()=>saveSourceMetadata(select.dataset.sourceDefaultTarget,{defaultTargetId:select.value},select)));
+  box.querySelectorAll('[data-source-requirement]').forEach(select=>select.addEventListener('change',()=>saveSourceMetadata(select.dataset.sourceRequirement,{requirementId:select.value},select)));
+  box.querySelectorAll('[data-workbook-row]').forEach(row=>row.addEventListener('click',e=>{if(e.target.closest('input,button,a,select,textarea,label'))return;const ch=row.querySelector('[data-workbook-check]');if(!ch)return;ch.checked=!ch.checked;handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));syncWorkbookSelectionUi();
 }
 
 function summarizeRenderResults(results) {
@@ -2713,18 +3071,20 @@ function summarizeRenderResults(results) {
   return {kind:'ok', title:'PDF作成は不要です', message:'対象はありません。', detail:null};
 }
 async function renderWorkbookIds(ids, btn, options={}) {
-  const workbookIds=normalizeWorkbookIdListForActivePreset(ids);const onlyUpdated=!!options.onlyUpdated&&!workbookIds.length;const activeWorkbooks=workbooksForActivePreset().filter(w=>String(w.status||'')!=='missing');
+  let workbookIds=normalizeWorkbookIdListForActivePreset(ids);let onlyUpdated=!!options.onlyUpdated&&!workbookIds.length;const activeWorkbooks=workbooksForActivePreset().filter(w=>String(w.status||'')!=='missing');
+  if(onlyUpdated){workbookIds=defaultPdfTargetWorkbookIds();onlyUpdated=false;}
   if(!workbookIds.length&&!onlyUpdated){hideProgressPanel();showMessage(activeWorkbooks.length?'ok':'warn',activeWorkbooks.length?'変換PDF作成が必要な原稿はありません':'登録済み原稿がありません',activeWorkbooks.length?'登録済み原稿の変換PDFは最新です。':'先に原稿を登録してください。');return;}
-  renderJobActive=true;const estimateTotal=workbookIds.length||defaultPdfTargetWorkbookIds().length||(onlyUpdated?activeWorkbooks.length:0);const startMessage=options.startMessage||(onlyUpdated?'PDF作成対象を確認しています。':`${workbookIds.length}件の原稿をPDF変換します。`);
+  renderJobActive=true;activeRenderJobId='';activeRenderCancelRequested=false;activeRenderJobStatus=null;const estimateTotal=workbookIds.length||defaultPdfTargetWorkbookIds().length||(onlyUpdated?activeWorkbooks.length:0);const startMessage=options.startMessage||(onlyUpdated?'PDF作成対象を確認しています。':`${workbookIds.length}件の原稿をPDF変換します。`);
   updateProgressPanel({status:'queued',total:estimateTotal,completed:0,failed:0,percent:0,message:startMessage});
-  try{await runBusy(btn,async()=>{hideErrorPanel();showMessage('','PDF作成を開始しています',startMessage);const body={category:activePreset};if(workbookIds.length)body.workbookIds=workbookIds;if(onlyUpdated)body.onlyUpdated=true;
-    const started=await api('/api/workbooks/render/start',{method:'POST',body});const job=normalizeRenderJobFromStart(started);const jobId=assertJobId(job,started);updateProgressPanel(Object.assign({total:estimateTotal,completed:0,failed:0},job));const finished=await waitForRenderJob(jobId);const appendedIds=asArray(finished.results).flatMap(r=>asArray(r?.sheetSync?.insertedAtEndPageIds)).map(String).filter(Boolean);setHighlightedPages(appendedIds);await refresh();renderAll();await loadFiles(null);
+  try{await runBusy(btn,async()=>{hideErrorPanel();showMessage('','PDF作成を開始しています',startMessage);const body={packId:activePackId};if(workbookIds.length)body.sourceIds=workbookIds;if(onlyUpdated)body.onlyUpdated=true;
+    const started=await api('/api/v2/sources/render/start',{method:'POST',body});const job=normalizeRenderJobFromStart(started);const jobId=assertJobId(job,started);activeRenderJobId=jobId;updateProgressPanel(Object.assign({total:estimateTotal,completed:0,failed:0},job));const finished=await waitForRenderJob(jobId);const appendedIds=asArray(finished.results).flatMap(r=>asArray(r?.sheetSync?.insertedAtEndPageIds)).map(String).filter(Boolean);setHighlightedPages(appendedIds);await refresh();renderAll();await loadFiles(null);
     const msg=summarizeRenderResults(finished.results||[]);const hasErrors=finished.status==='failed'||finished.status==='completed-with-errors'||asArray(finished.errors).length>0;
-    if(finished.status==='failed')showMessage('danger','PDF作成が停止しました',userFriendlyError(finished.message||'PDF作成を完了できませんでした。'),finished.errors||finished);
+    if(finished.status==='cancelled'){showMessage('warn','PDF作成を中止しました',finished.message||'未処理の原稿を残して停止しました。',finished.results||finished);setTimeout(hideProgressPanel,2400);}
+    else if(finished.status==='failed')showMessage('danger','PDF作成が停止しました',userFriendlyError(finished.message||'PDF作成を完了できませんでした。'),finished.errors||finished);
     else if(asArray(finished.errors).length)showMessage('danger','PDF作成でエラーがあります',`${finished.failed||finished.errors.length}件の原稿をPDF変換できませんでした。`,finished.errors);
     else{const endCount=asArray(finished.results).reduce((n,r)=>n+Number(r?.sheetSync?.insertedAtEndCount||0),0);const suffix=endCount?`\n新しい${endCount}ページを末尾に追加しました。`:'';const actions=[{label:'ページ構成を確認',primary:true,view:'pages',handler:endCount?scrollToHighlightedPages:null}];if(endCount)actions.push({label:'原稿内の順序に整える',view:'pages',handler:sortPagesBySheet});else actions.push({label:'提出用PDFへ',view:'final'});showMessage(msg.kind,msg.title,msg.message+suffix,msg.detail,actions,0);setTimeout(hideProgressPanel,1800);}
     if(hasErrors)updateProgressPanel(finished);
-  },false);}finally{renderJobActive=false;updateRenderTargetUi();}
+  },false);}finally{renderJobActive=false;activeRenderJobId='';activeRenderCancelRequested=false;activeRenderJobStatus=null;const cancel=$('progress-cancel');if(cancel)cancel.hidden=true;updateRenderTargetUi();}
 }
 
 function defaultPdfTargetWorkbookIds() {
@@ -2854,26 +3214,30 @@ function applyPageFilters(pages){
   return pages.filter(page=>(!showChangedOnly||!state?.inputHistoryEnabled||pageIsChanged(page))&&pageMatchesSearch(page));
 }
 
+function renderPageTargetControls(){
+  const targets=activeTargetDefinitions(),bulk=$('bulk-target-buttons'),preview=$('preview-target-buttons');
+  if(bulk){bulk.innerHTML=targets.map(target=>`<button class="btn secondary" type="button" data-bulk-target="${escapeAttr(targetVolume(target.targetId))}" disabled>${escapeHtml(target.displayName||target.targetId)}へ入れる</button>`).join('');bulk.querySelectorAll('[data-bulk-target]').forEach(button=>button.addEventListener('click',()=>moveSelectedPagesToVolume(button.dataset.bulkTarget,button)));}
+  if(preview){preview.innerHTML=targets.map(target=>`<button class="btn secondary compact" type="button" data-preview-target="${escapeAttr(targetVolume(target.targetId))}">${escapeHtml(target.displayName||target.targetId)}へ</button>`).join('');preview.querySelectorAll('[data-preview-target]').forEach(button=>button.addEventListener('click',()=>moveCurrentPreviewPageToVolume(button.dataset.previewTarget,button)));}
+}
+
 function renderPages() {
-  const box=$('page-board');if(!box)return;const sourcePages=[...pagesForActivePreset()].sort(pageSort);const visiblePages=applyPageFilters(sourcePages);const visibleIds=new Set(visiblePages.map(resolvedPageId));const allPages=sourcePages;
+  const box=$('page-board');if(!box)return;renderPageTargetControls();const sourcePages=[...pagesForActivePreset()].sort(pageSort);const visiblePages=applyPageFilters(sourcePages);const visibleIds=new Set(visiblePages.map(resolvedPageId));const allPages=sourcePages;
   const needsPdf=workbooksForActivePreset().filter(w=>!isLatestPdfWorkbook(w));const agg=aggregateFinalState();
   const signature=JSON.stringify([pageBoardView,pageFilterText,showChangedOnly,[...pageVolumeCollapseOverrides.entries()],allPages.map(p=>[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,pageRangeText(p),p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf,p.sheetIndex]),needsPdf.map(w=>w.workbookId),agg.state]);
   if(lastPageBoardRenderSignature===signature&&box.childElementCount)return;lastPageBoardRenderSignature=signature;
   const scrollSnap=capturePageBoardScroll();selectedPages=new Set([...selectedPages].filter(id=>allPages.some(p=>resolvedPageId(p)===id)));
   const banners=[];const unassigned=allPages.filter(p=>String(p.volume)==='none'||p.enabled===false).length;
-  if(unassigned)banners.push(`<div class="page-status-banner attention"><strong>未振り分けのページが ${unassigned} ページあります</strong><span>本体または補足へ移したページだけが提出用PDFに含まれます。</span></div>`);
+  if(unassigned)banners.push(`<div class="page-status-banner attention"><strong>未振り分けのページが ${unassigned} ページあります</strong><span>出力先へ移したページだけが提出用PDFに含まれます。</span></div>`);
   if(needsPdf.length)banners.push(`<div class="page-status-banner"><strong>変換PDF作成が必要な原稿があります</strong><span>${needsPdf.length}件。先に変換PDFを作成してください。</span></div>`);
   if(agg.state==='needs-rebuild')banners.push('<div class="page-status-banner"><strong>ページ構成または変換PDFが変更されています</strong><span>提出用PDFの再出力が必要です。</span></div>');
-  const panels=[
-    {volume:'none',title:'未振り分け（出力しない）',description:'新規ページはここに入ります。必要なページを選び、本体または補足へ移してください。'},
-    {volume:mainVolume(),title:volumeLabel(mainVolume()),description:'ここへ入れたページが本体PDFに含まれます。'},
-    {volume:appendixVolume(),title:volumeLabel(appendixVolume()),description:'ここへ入れたページが補足PDFに含まれます。'}
-  ];
+  const panels=[{volume:'none',title:'未振り分け（出力しない）',description:'新規ページはここに入ります。必要なページを選び、出力先へ移してください。'},...activeTargetDefinitions().map(target=>({volume:targetVolume(target.targetId),title:String(target.displayName||target.targetId),description:`ここへ入れたページが「${target.displayName||target.targetId}」PDFに含まれます。`}))];
   if(sourcePages.length>0&&visiblePages.length===0){const searching=!!String(pageFilterText||'').trim();const title=searching?'一致するページがありません':'変更されたページはありません';const hint=searching?'検索語を短くするか、クリアしてください。':'「変更分のみ」を解除すると、すべてのページを表示できます。';banners.push(`<div class="page-filter-empty"><strong>${title}</strong><span>${hint}</span></div>`);}
-  box.className=`board ${pageBoardView==='thumbnail'?'thumbnail-board':'detail-board'}`;box.innerHTML=banners.join('')+panels.map(panel=>volumePanelHtml(panel,allPages,visibleIds)).join('');attachBoardEvents();preparePageThumbnails();restorePageBoardScroll(scrollSnap);syncPageBoardViewControls();syncPageSelectionUi();
+  box.className=`board ${pageBoardView==='thumbnail'?'thumbnail-board':'detail-board'}`;box.innerHTML=banners.join('')+panels.map(panel=>dynamicVolumePanelHtml(panel,allPages,visibleIds)).join('');attachBoardEvents();preparePageThumbnails();restorePageBoardScroll(scrollSnap);syncPageBoardViewControls();syncPageSelectionUi();
 }
-function volumePanelHtml(panel,allPages,visibleIds){
-  const volume=panel.volume;const pages=allPages.filter(p=>volume==='none'?(String(p.volume)==='none'||p.enabled===false):(String(p.volume||mainVolume())===volume&&p.enabled!==false));const visibleCount=pages.filter(p=>visibleIds.has(resolvedPageId(p))).length;const collapsed=pageVolumeCollapseOverrides.has(volume)?!!pageVolumeCollapseOverrides.get(volume):(pageBoardView==='detail'&&pages.length===0);const filtering=(showChangedOnly&&state?.inputHistoryEnabled)||!!String(pageFilterText||'').trim();const countText=filtering?`${visibleCount} / ${pages.length}ページ`:`${pages.length}ページ`;const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" data-volume="${escapeAttr(volume)}">${pages.map((p,i)=>pageThumbnailHtml(p,i,!visibleIds.has(resolvedPageId(p)))).join('')||'<div class="empty-row page-empty-drop">ここへドロップ</div>'}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-pages="${escapeAttr(volume)}" aria-label="${escapeAttr(panel.title)}をすべて選択"></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((p,i)=>pageRowHtml(p,i,!visibleIds.has(resolvedPageId(p)))).join('')||'<tr class="empty-row"><td colspan="6">ここへドロップ</td></tr>'}</tbody></table></div>`;return `<section class="volume-panel ${volume==='none'?'inbox':''} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
+function dynamicVolumePanelHtml(panel,allPages,visibleIds){
+  const volume=panel.volume,first=activeTargetVolumes()[0]||mainVolume(),pages=allPages.filter(page=>volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||first)===volume&&page.enabled!==false)),visibleCount=pages.filter(page=>visibleIds.has(resolvedPageId(page))).length,collapsed=pageVolumeCollapseOverrides.has(volume)?!!pageVolumeCollapseOverrides.get(volume):(pageBoardView==='detail'&&pages.length===0),filtering=(showChangedOnly&&state?.inputHistoryEnabled)||!!String(pageFilterText||'').trim(),countText=filtering?`${visibleCount} / ${pages.length}ページ`:`${pages.length}ページ`;
+  const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<div class="empty-row page-empty-drop">ここへドロップ</div>'}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-pages="${escapeAttr(volume)}" aria-label="${escapeAttr(panel.title)}をすべて選択"></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="6">ここへドロップ</td></tr>'}</tbody></table></div>`;
+  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
 }
 function pageRowHtml(p, idx, filteredOut=false) {
   const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
@@ -3149,7 +3513,7 @@ function attachBoardEvents() {
       if(!e.altKey){if(e.key===' '||e.key==='Spacebar'){e.preventDefault();const ch=row.querySelector('[data-page-check]');if(ch){ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);}return;}if(e.key==='Enter'){const preview=row.querySelector('[data-preview-page]');if(preview){e.preventDefault();previewPage(preview.dataset.previewPage||row.dataset.pageId,pageFallbackFromRow(row));}return;}if(handlePageRowNavigation(row,e))return;return;}
       if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();const tbody=row.parentElement;const rows=[...tbody.querySelectorAll('.page-row:not(.page-filter-hidden)')];const idx=rows.indexOf(row);if(idx<0)return;const beforeVolumes=collectBoardVolumes();let moved=false;
       if(e.key==='ArrowLeft'||e.key==='ArrowRight'){
-        const volumeOrder=['none',mainVolume(),appendixVolume()],current=String(tbody.dataset.volume||''),currentIndex=volumeOrder.indexOf(current);if(currentIndex<0)return;const targetIndex=e.shiftKey?(e.key==='ArrowLeft'?0:volumeOrder.length-1):currentIndex+(e.key==='ArrowLeft'?-1:1);if(targetIndex<0||targetIndex>=volumeOrder.length||targetIndex===currentIndex)return;const targetVolume=volumeOrder[targetIndex],target=[...document.querySelectorAll('[data-volume]')].find(container=>String(container.dataset.volume||'')===targetVolume);if(!target)return;const targetPanel=target.closest('.volume-panel');targetPanel?.classList.remove('collapsed');targetPanel?.querySelector('[data-toggle-volume]')?.setAttribute('aria-expanded','true');pageVolumeCollapseOverrides.set(targetVolume,false);for(const movingRow of getRowsForDrag(row)){target.appendChild(movingRow);moved=true;}
+        const volumeOrder=['none',...activeTargetVolumes()],current=String(tbody.dataset.volume||''),currentIndex=volumeOrder.indexOf(current);if(currentIndex<0)return;const targetIndex=e.shiftKey?(e.key==='ArrowLeft'?0:volumeOrder.length-1):currentIndex+(e.key==='ArrowLeft'?-1:1);if(targetIndex<0||targetIndex>=volumeOrder.length||targetIndex===currentIndex)return;const targetVolume=volumeOrder[targetIndex],target=[...document.querySelectorAll('[data-volume]')].find(container=>String(container.dataset.volume||'')===targetVolume);if(!target)return;const targetPanel=target.closest('.volume-panel');targetPanel?.classList.remove('collapsed');targetPanel?.querySelector('[data-toggle-volume]')?.setAttribute('aria-expanded','true');pageVolumeCollapseOverrides.set(targetVolume,false);for(const movingRow of getRowsForDrag(row)){target.appendChild(movingRow);moved=true;}
       }else if(e.shiftKey){if(e.key==='ArrowUp'&&idx>0){tbody.insertBefore(row,rows[0]);moved=true;}else if(e.key==='ArrowDown'&&idx<rows.length-1){tbody.appendChild(row);moved=true;}}
       else if(e.key==='ArrowUp'&&idx>0){tbody.insertBefore(row,rows[idx-1]);moved=true;}else if(e.key==='ArrowDown'&&idx<rows.length-1){tbody.insertBefore(rows[idx+1],row);moved=true;}
       if(!moved)return;renumberBoardRows();scheduleBoardSave({label:e.key==='ArrowLeft'||e.key==='ArrowRight'?'キーボードでの出力先移動':'キーボードでの並べ替え',volumes:beforeVolumes});row.focus();
@@ -3213,7 +3577,7 @@ function saveBoardOrder() {
   const volumes=clonePageVolumes(pendingBoardSaveVolumes||collectBoardVolumes()),requestRevision=boardSaveRevision;pendingBoardSaveVolumes=null;
   const persist=async()=>{
     try{
-      const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes}});
+      const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});
       const newerBoardExists=requestRevision!==boardSaveRevision;
       if(!newerBoardExists)applyPageMutationResult(response);
       if(!newerBoardExists)showMessage('ok','ページ構成を保存しました','未振り分け・本体・補足の割り当てと並びを反映しました。',null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
@@ -3230,7 +3594,7 @@ function saveBoardOrder() {
 async function savePageFromRow(row, numberingChanged=false) {
   if(!row)return;
   const pageId=row.getAttribute('data-page-id'),page=getPage(pageId);
-  const body={category:activePreset,pageId,title:row.querySelector('[data-page-title]')?.value||page?.title||''};
+  const body=pageApiBody({pageId,title:row.querySelector('[data-page-title]')?.value||page?.title||''});
   const pageRangeInput=row.querySelector('[data-page-range]');if(pageRangeInput){const range=String(pageRangeInput.value||'').trim();if(range)body.pageRange=range;else body.clearPageRange=true;}
   const numbering=row.querySelector('[data-page-numbering]')?.value||'auto';
   if(numberingChanged){if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering;body.numberingManual=true;}}
@@ -3241,7 +3605,7 @@ async function savePageFromRow(row, numberingChanged=false) {
 }
 
 function pageSettingsBody(pageId,title,numbering,pageRange=''){
-  const body={category:activePreset,pageId:String(pageId||''),title:String(title||'').trim()};const range=String(pageRange||'').trim();if(range)body.pageRange=range;else body.clearPageRange=true;if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering==='none'?'none':'visible';body.numberingManual=true;}return body;
+  const body=pageApiBody({pageId:String(pageId||''),title:String(title||'').trim()});const range=String(pageRange||'').trim();if(range)body.pageRange=range;else body.clearPageRange=true;if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering==='none'?'none':'visible';body.numberingManual=true;}return body;
 }
 async function restorePageSettings(previous){
   try{const response=await api('/api/pages/update',{method:'POST',body:pageSettingsBody(previous.pageId,previous.title,previous.numbering,previous.pageRange)});applyPageMutationResult(response);showMessage('ok','ページ設定を元に戻しました',previous.title);}
@@ -3258,7 +3622,7 @@ async function savePageFromThumbnail(row,btn){
 async function sortPagesBySheet(btn=null) {
   await runBusy(btn||$('sort-by-sheet-btn'),async()=>{
     const beforeVolumes=collectBoardVolumes();
-    const response=await api('/api/pages/sort-by-sheet',{method:'POST',body:{category:activePreset,volumes:[mainVolume(),appendixVolume(),'none']}});
+    const response=await api('/api/pages/sort-by-sheet',{method:'POST',body:pageApiBody({volumes:[...activeTargetVolumes(),'none']})});
     applyPageMutationResult(response);
     const changed=rememberPageLayoutUndo('原稿内の順序への整列',beforeVolumes);
     showMessage('ok',changed?'原稿内の順序に整えました':'すでに原稿内の順序です',changed?'未振り分け・本体・補足の各表を整列しました。':'ページの並びに変更はありませんでした。',null,changed?[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}]:[{label:'提出用PDFへ',view:'final'}],8000);
@@ -3284,20 +3648,20 @@ async function previewSelectedPage(btn) {
   if (!page) { showMessage('warn', 'ページを選択してください', '確認したいページを1つ選んでください。行をダブルクリックしても開けます。'); return; }
   await previewPage(resolvedPageId(page), page);
 }
-function assignedPageVolume(page){return !page||page.enabled===false||String(page.volume)==='none'?'none':String(page.volume||mainVolume());}
+function assignedPageVolume(page){return !page||page.enabled===false||String(page.volume)==='none'?'none':String(page.volume||(activeTargetVolumes()[0]||mainVolume()));}
 function previewOrganizerPageIds(pageId){
   const current=getPage(pageId);if(!current)return[];const volume=assignedPageVolume(current),visible=visiblePageSelectionValues(),useVisible=visible.includes(String(pageId));const ordered=useVisible?visible.map(getPage).filter(Boolean):[...pagesForActivePreset()].sort(pageSort);return ordered.filter(page=>assignedPageVolume(page)===volume&&pagePreviewAvailable(page)).map(resolvedPageId);
 }
 function syncPreviewOrganizerControls(){
   const tools=$('preview-page-tools'),page=getPage(currentPreviewPageId);const active=!!(previewOrganizerMode&&page);if(tools)tools.classList.toggle('hidden',!active);if(!active){previewPageIds=[];return;}
   previewPageIds=previewOrganizerPageIds(currentPreviewPageId);if(!previewPageIds.includes(currentPreviewPageId))previewPageIds=[currentPreviewPageId];const index=Math.max(0,previewPageIds.indexOf(currentPreviewPageId)),volume=assignedPageVolume(page),position=$('preview-page-position'),previous=$('preview-prev-page'),next=$('preview-next-page');if(position)position.textContent=`${assignmentVolumeLabel(volume)} ${index+1} / ${previewPageIds.length}`;if(previous)previous.disabled=index<=0;if(next)next.disabled=index>=previewPageIds.length-1;
-  for(const [id,target]of[['preview-move-main',mainVolume()],['preview-move-appendix',appendixVolume()],['preview-move-none','none']]){const button=$(id);if(!button)continue;const current=volume===target;button.disabled=current;button.classList.toggle('active',current);button.setAttribute('aria-pressed',String(current));}
+  document.querySelectorAll('[data-preview-target],#preview-move-none').forEach(button=>{const target=button.id==='preview-move-none'?'none':String(button.dataset.previewTarget||''),current=volume===target;button.disabled=current;button.classList.toggle('active',current);button.setAttribute('aria-pressed',String(current));});
 }
 async function navigatePreviewPage(delta){
   if(!previewOrganizerMode)return;syncPreviewOrganizerControls();const index=previewPageIds.indexOf(currentPreviewPageId),nextIndex=index+Number(delta||0);if(index<0||nextIndex<0||nextIndex>=previewPageIds.length)return;const page=getPage(previewPageIds[nextIndex]);if(page)await previewPage(resolvedPageId(page),page,{preserveFocus:true});
 }
 async function moveCurrentPreviewPageToVolume(volume,btn){
-  const page=getPage(currentPreviewPageId),target=String(volume||'');if(!page||assignedPageVolume(page)===target)return;await runBusy(btn,async()=>{const beforeVolumes=collectBoardVolumes(),main=mainVolume(),appendix=appendixVolume(),volumes={[main]:[],[appendix]:[],none:[]},pageId=resolvedPageId(page);for(const candidate of[...pagesForActivePreset()].sort(pageSort)){const id=resolvedPageId(candidate);if(!id||id===pageId)continue;const assigned=assignedPageVolume(candidate);if(!volumes[assigned])volumes[assigned]=[];volumes[assigned].push(id);}if(!volumes[target])volumes[target]=[];volumes[target].push(pageId);try{const response=await api('/api/pages/reorder',{method:'POST',body:{category:activePreset,volumes}});applyPageMutationResult(response);rememberPageLayoutUndo('プレビューからのページ移動',beforeVolumes);syncPreviewOrganizerControls();showMessage('ok','ページを移動しました',`${page.title||page.sheetName||'ページ'}を${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()}],8000);}catch(error){showMessage('danger','ページを移動できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
+  const page=getPage(currentPreviewPageId),target=String(volume||'');if(!page||assignedPageVolume(page)===target)return;await runBusy(btn,async()=>{const beforeVolumes=collectBoardVolumes(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),pageId=resolvedPageId(page);for(const candidate of[...pagesForActivePreset()].sort(pageSort)){const id=resolvedPageId(candidate);if(!id||id===pageId)continue;const assigned=assignedPageVolume(candidate);if(!volumes[assigned])volumes[assigned]=[];volumes[assigned].push(id);}if(!volumes[target])volumes[target]=[];volumes[target].push(pageId);try{const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});applyPageMutationResult(response);rememberPageLayoutUndo('プレビューからのページ移動',beforeVolumes);syncPreviewOrganizerControls();showMessage('ok','ページを移動しました',`${page.title||page.sheetName||'ページ'}を${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()}],8000);}catch(error){showMessage('danger','ページを移動できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
 }
 async function previewPage(pageId, fallback={}, options={}) {
   const page=getPage(pageId)||getPageByWorkbookSheet(fallback.workbookId,fallback.sheetName);
@@ -3331,7 +3695,7 @@ function closePreview() {
 
 async function openFinalVolume(volume, category=activePreset) {
   let blank=null;try{blank=window.open('about:blank','_blank');}catch{}if(blank){try{blank.opener=null;}catch{}}
-  try{const objectUrl=await fetchPdfObjectUrl('/api/final/file',{volume,category});if(blank&&!blank.closed)blank.location.href=objectUrl;else window.open(objectUrl,'_blank');}
+  try{const custom=!activePackIsBuiltIn(),path=custom?'/api/v2/outputs/file':'/api/final/file',body=custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category};const objectUrl=await fetchPdfObjectUrl(path,body);if(blank&&!blank.closed)blank.location.href=objectUrl;else window.open(objectUrl,'_blank');}
   catch(e){if(blank){try{blank.close();}catch{}}showMessage('danger','PDFを開けません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
 }
 
@@ -3381,7 +3745,7 @@ async function chooseSubmissionFolder(btn) {
     lastPageRangeAnchor = '';
     renderAll();
     if (!availableFiles.length) await loadFilesSilently(); else renderFileList(availableFiles);
-    showMessage('ok', '提出フォルダを設定しました', 'Excel・Word・PDFを選んで登録してください。');
+    showMessage('ok', '提出フォルダを設定しました', 'Excel・Word・PowerPoint・PDFを選んで登録してください。');
   } catch(e) {
     showMessage('danger', '提出フォルダを選べません', userFriendlyError(e.message), e.detail || e.stack || e.message);
   } finally {
@@ -3403,7 +3767,7 @@ async function savePaths(btn) {
     await api('/api/paths', {method:'POST', body});
     await refresh();
     await loadFiles(null);
-    showMessage('ok', '提出フォルダを設定しました', 'Excel・Word・PDFを選んで登録してください。');
+    showMessage('ok', '提出フォルダを設定しました', 'Excel・Word・PowerPoint・PDFを選んで登録してください。');
   });
 }
 function showPostBuildWarning(volume) {
@@ -3413,12 +3777,13 @@ function showPostBuildWarning(volume) {
 }
 async function buildVolume(volume, btn) {
   const ready=volumeReadiness(volume);if(asArray(ready.blockers).length){setActiveView('excel');showMessage('warn','先に原稿の変換PDFを作成してください',ready.blockers[0]?.message||'出力条件を確認してください。');return;}
-  await runBusy(btn,async()=>{const result=await api('/api/final/build',{method:'POST',body:{volume,category:activePreset}});await refresh();showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,result.result?.outputPdf||'出力フォルダを確認してください。',result.result,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);showPostBuildWarning(volume);});
+  await runBusy(btn,async()=>{const custom=!activePackIsBuiltIn(),result=await api(custom?'/api/v2/outputs/build':'/api/final/build',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});await refresh();await loadFinalReadiness();const built=custom?asArray(result.result?.built)[0]:result.result;showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf||'出力フォルダを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);showPostBuildWarning(volume);});
 }
 
 async function publishFinalVolume(volume,btn) {
   await runBusy(btn,async()=>{
-    const response=await api('/api/final/publish',{method:'POST',body:{volume,category:activePreset}});
+    const custom=!activePackIsBuiltIn();
+    const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
     const result=response.result||{};
     showMessage('ok',`${volumeLabel(volume)}PDFを共有発行しました`,
       `${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
@@ -3429,10 +3794,11 @@ async function publishFinalVolume(volume,btn) {
 async function buildAllVolumes(btn) {
   // V5: 本体だけ成功する状態を作らないよう、サーバー側の準トランザクションAPIを1回だけ呼ぶ。
   await runBusy(btn, async () => {
-    const r = await api('/api/final/build-all', {method:'POST', body:{category: activePreset}});
+    const custom=!activePackIsBuiltIn();
+    const r = await api(custom?'/api/v2/outputs/build':'/api/final/build-all', {method:'POST', body:custom?{packId:activePackId,targetIds:activeTargetDefinitions().map(target=>String(target.targetId))}:{category: activePreset}});
     const built = asArray(r.result?.built);
     const skipped = asArray(r.result?.skipped);
-    await refresh();
+    await refresh();await loadFinalReadiness();
     if (built.length) {
       showMessage('ok','提出用PDFを出力しました', `${built.length}件を出力しました。`, {built, skipped},
                   [{label:'出力したPDFを確認', view:'final'}], 0);
@@ -3475,32 +3841,39 @@ setActiveView(activeView,{noScroll:true,instant:true});
 const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEventListener('input',()=>{fileFilterText=fileFilterInput.value||'';renderFileList(availableFiles);});
 bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('folders');setTimeout(()=>$('submissionDir')?.focus(),0);}else if(action==='render'){setActiveView('excel');selectRenderNeededWorkbooks();await renderSelectedWorkbooks($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
 bind('notice-close','click',hideMessage);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));bind('scan-folder-btn','click',()=>scanAndRefresh($('scan-folder-btn')));bind('choose-submission-btn','click',()=>chooseSubmissionFolder($('choose-submission-btn')));
+bind('progress-cancel','click',()=>cancelActiveRenderJob());
 bind('run-diagnostics-btn','click',()=>runSystemDiagnostics($('run-diagnostics-btn')));
+bind('template-add-target','click',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned');renderTemplateTargets([...collectTemplateTargets(),newTemplateTarget()],false);renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,false);});
+bind('pack-progress-attention-only','change',event=>{packProgressAttentionOnly=!!event.target.checked;renderPackProgressDashboard();});
 bind('confirm-cancel','click',()=>closeConfirmModal(false));bind('confirm-accept','click',()=>closeConfirmModal(true));const confirmModal=$('confirm-modal');if(confirmModal)confirmModal.addEventListener('click',e=>{if(e.target===confirmModal)closeConfirmModal(false);});
+bind('pack-menu-button','click',()=>togglePackMenu());bind('create-pack-btn','click',()=>openPackEditor('create'));bind('manage-pack-templates-btn','click',openTemplateManager);bind('toggle-archived-packs','click',()=>{archivedPacksExpanded=!archivedPacksExpanded;renderPackSwitcher();});
+const packMenu=$('pack-menu');if(packMenu)packMenu.addEventListener('click',handlePackMenuAction);
+bind('pack-editor-cancel','click',()=>closePackEditor());bind('pack-editor-template','change',updatePackTemplateDescription);const packEditorForm=$('pack-editor-form');if(packEditorForm)packEditorForm.addEventListener('submit',event=>{event.preventDefault();void submitPackEditor($('pack-editor-save'));});const packEditorModal=$('pack-editor-modal');if(packEditorModal)packEditorModal.addEventListener('click',event=>{if(event.target===packEditorModal)closePackEditor();});
+bind('template-manager-cancel','click',()=>closeTemplateManager());bind('template-manager-select','change',populateTemplateManager);bind('template-add-requirement','click',()=>renderTemplateRequirements([...collectTemplateRequirements(),newTemplateRequirement()],false));bind('template-manager-delete','click',()=>deleteManagedTemplate($('template-manager-delete')));bind('template-manager-duplicate','click',()=>duplicateManagedTemplate($('template-manager-duplicate')));bind('template-manager-export','click',exportManagedTemplate);bind('template-manager-import','click',()=>$('template-manager-import-file')?.click());bind('template-manager-import-file','change',event=>importManagedTemplateFile(event.target.files?.[0],event.target));const templateManagerForm=$('template-manager-form');if(templateManagerForm)templateManagerForm.addEventListener('submit',event=>{event.preventDefault();void submitTemplateManager($('template-manager-save'));});const templateManagerModal=$('template-manager-modal');if(templateManagerModal)templateManagerModal.addEventListener('click',event=>{if(event.target===templateManagerModal)closeTemplateManager();});
+document.addEventListener('click',event=>{if(!$('pack-menu')?.classList.contains('hidden')&&!event.target.closest('.pack-select-wrap'))closePackMenu();});
 bind('use-submission-path-btn','click',()=>savePaths($('use-submission-path-btn')));bind('submissionDir','keydown',event=>{if(event.key==='Enter'){event.preventDefault();savePaths($('use-submission-path-btn'));}});
-document.querySelectorAll('[data-preset]').forEach(btn=>btn.addEventListener('click',()=>applyPresetSelection(btn.dataset.preset)));
 bind('select-visible-files-btn','click',selectVisibleFiles);bind('clear-selected-files-btn','click',clearVisibleFilesSelection);bind('select-render-needed-btn','click',selectRenderNeededWorkbooks);bind('clear-selected-workbooks-btn','click',clearWorkbookSelection);bind('select-all-pages-btn','click',selectAllActivePages);bind('clear-selected-pages-btn','click',clearActivePageSelection);
-bind('page-view-thumbnail-btn','click',()=>setPageBoardView('thumbnail'));bind('page-view-detail-btn','click',()=>setPageBoardView('detail'));bind('page-layout-undo-btn','click',()=>undoLastPageLayout($('page-layout-undo-btn')));bind('page-layout-redo-btn','click',()=>redoLastPageLayout($('page-layout-redo-btn')));
+bind('page-view-thumbnail-btn','click',()=>setPageBoardView('thumbnail'));bind('page-view-detail-btn','click',()=>setPageBoardView('detail'));bind('page-layout-undo-btn','click',()=>undoLastPageLayout($('page-layout-undo-btn')));bind('page-layout-redo-btn','click',()=>redoLastPageLayout($('page-layout-redo-btn')));bind('page-layout-revisions-btn','click',()=>openPageLayoutRevisions());
+bind('page-layout-revisions-refresh','click',()=>loadLayoutSnapshots());bind('page-layout-revisions-close','click',()=>closePageLayoutRevisions());const pageLayoutRevisionsModal=$('page-layout-revisions-modal');if(pageLayoutRevisionsModal)pageLayoutRevisionsModal.addEventListener('click',event=>{if(event.target===pageLayoutRevisionsModal)closePageLayoutRevisions();});
 const pageSearchInput=$('page-search-input'),pageSearchClear=$('page-search-clear');
 if(pageSearchInput)pageSearchInput.addEventListener('input',()=>{pageFilterText=String(pageSearchInput.value||'');pageSearchClear?.classList.toggle('hidden',!pageFilterText);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 if(pageSearchClear)pageSearchClear.addEventListener('click',()=>{pageFilterText='';if(pageSearchInput){pageSearchInput.value='';pageSearchInput.focus();}pageSearchClear.classList.add('hidden');selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 const pageThumbnailSizeInput=$('page-thumbnail-size');if(pageThumbnailSizeInput){pageThumbnailSizeInput.value=String(pageThumbnailSize);pageThumbnailSizeInput.addEventListener('input',()=>applyPageThumbnailSize(pageThumbnailSizeInput.value));pageThumbnailSizeInput.addEventListener('change',()=>{try{sessionStorage.setItem('ReportBinderPageThumbnailSize',String(pageThumbnailSize));}catch{}});}
-bind('bulk-main-btn','click',()=>moveSelectedPagesToVolume(mainVolume(),$('bulk-main-btn')));bind('bulk-appendix-btn','click',()=>moveSelectedPagesToVolume(appendixVolume(),$('bulk-appendix-btn')));bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
+bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
 bind('register-selected-btn','click',()=>registerSelected($('register-selected-btn')));bind('unregister-selected-btn','click',()=>unregisterSelected($('unregister-selected-btn')));bind('render-selected-btn','click',()=>renderSelectedWorkbooks($('render-selected-btn')));bind('render-all-btn','click',()=>renderAllWorkbooks($('render-all-btn')));bind('sort-by-sheet-btn','click',()=>sortPagesBySheet($('sort-by-sheet-btn')));
-bind('build-main-btn','click',()=>buildVolume(mainVolume(),$('build-main-btn')));bind('build-appendix-btn','click',()=>buildVolume(appendixVolume(),$('build-appendix-btn')));bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
+bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
 bind('save-pack-settings-btn','click',()=>savePackSettings($('save-pack-settings-btn')));
-bind('publish-main-btn','click',()=>publishFinalVolume(mainVolume(),$('publish-main-btn')));bind('publish-appendix-btn','click',()=>publishFinalVolume(appendixVolume(),$('publish-appendix-btn')));
+bind('final-preflight-refresh','click',()=>refreshFinalPreflight($('final-preflight-refresh')));
 const changedOnlyToggle=$('changed-only-toggle');
 if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 bind('history-refresh-btn','click',()=>loadHistoryPanels({force:true}));
 // V5-P1(#12): 版履歴パネルの対象Excel切り替え。
 bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',snapshotHistoryState.workbookId);}catch{}snapshotHistoryState.snapshots=[];snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';void loadSnapshotHistory();});
-bind('final-main-fix','click',()=>setActiveView('excel'));bind('final-appendix-fix','click',()=>setActiveView('excel'));
-bind('open-main-link','click',e=>{e.preventDefault();openFinalVolume(mainVolume(),activePreset);});bind('open-appendix-link','click',e=>{e.preventDefault();openFinalVolume(appendixVolume(),activePreset);});
 bind('mode-badge','click',()=>{const pop=$('language-popover'),btn=$('mode-badge');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));});
 bind('preview-close','click',closePreview);const previewModal=$('preview-modal');if(previewModal)previewModal.addEventListener('click',e=>{if(e.target===previewModal)closePreview();});
-bind('preview-prev-page','click',()=>navigatePreviewPage(-1));bind('preview-next-page','click',()=>navigatePreviewPage(1));bind('preview-move-main','click',()=>moveCurrentPreviewPageToVolume(mainVolume(),$('preview-move-main')));bind('preview-move-appendix','click',()=>moveCurrentPreviewPageToVolume(appendixVolume(),$('preview-move-appendix')));bind('preview-move-none','click',()=>moveCurrentPreviewPageToVolume('none',$('preview-move-none')));
+bind('preview-prev-page','click',()=>navigatePreviewPage(-1));bind('preview-next-page','click',()=>navigatePreviewPage(1));bind('preview-move-none','click',()=>moveCurrentPreviewPageToVolume('none',$('preview-move-none')));
 bind('diff-close','click',closeDiffDetail);
+bind('diff-export-summary','click',exportDiffSummary);
 const diffModal=$('diff-modal');if(diffModal)diffModal.addEventListener('click',e=>{if(e.target===diffModal)closeDiffDetail();});
 bind('diff-mode-side','click',()=>{diffViewState.mode='side';applyDiffMode();});
 bind('diff-mode-overlay','click',()=>{diffViewState.mode='overlay';applyDiffMode();});
@@ -3527,12 +3900,12 @@ window.addEventListener('keydown',e=>{
   if(activeView==='pages'&&!isAnyModalOpen()&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!editableTarget&&shortcutKey==='a'){e.preventDefault();selectAllActivePages();return;}
   if(activeView==='pages'&&!isAnyModalOpen()&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!editableTarget){const wantsUndo=shortcutKey==='z'&&!e.shiftKey,wantsRedo=(shortcutKey==='z'&&e.shiftKey)||(shortcutKey==='y'&&!e.shiftKey),available=wantsUndo?(pageLayoutUndoStack.length>0||!!pendingPageLayoutUndo):(wantsRedo&&pageLayoutRedoStack.length>0);if(available){e.preventDefault();void(wantsUndo?undoLastPageLayout():redoLastPageLayout());return;}}
   if(e.key==='Escape'){
-    if(isConfirmModalOpen())closeConfirmModal(false);else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
+    if(isConfirmModalOpen())closeConfirmModal(false);else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
     return;
   }
   if(isModalOpen()&&!isDiffModalOpen()&&previewOrganizerMode&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!e.target.matches('input,select,textarea')&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();void navigatePreviewPage(e.key==='ArrowLeft'?-1:1);return;}
   if(e.key!=='Tab')return;
-  const modal=isConfirmModalOpen()?$('confirm-modal'):(isDiffModalOpen()?$('diff-modal'):(isModalOpen()?$('preview-modal'):null));
+  const modal=isConfirmModalOpen()?$('confirm-modal'):(isPageLayoutRevisionsOpen()?$('page-layout-revisions-modal'):(isTemplateManagerOpen()?$('template-manager-modal'):(isPackEditorOpen()?$('pack-editor-modal'):(isDiffModalOpen()?$('diff-modal'):(isModalOpen()?$('preview-modal'):null)))));
   if(!modal)return;
   const focusable=[...modal.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"]),iframe')].filter(el=>el.offsetParent!==null);
   if(!focusable.length)return;
@@ -3562,6 +3935,15 @@ window.addEventListener('pagehide', () => { clearDiffBrowserResources(true); for
 
 
 // ---- V5: 自動処理の状態表示と履歴タイムライン ----
+async function loadAutoStateDetail(){
+  if(autoStateInFlight)return autoStateInFlight;autoStateInFlight=api('/api/auto/state').then(response=>{state.auto=response.auto||state.auto;renderAutoStatus();showAutoNotifications(state.auto);}).catch(error=>log('自動PDF作成の状態を取得できません',error.detail||error.message)).finally(()=>{autoStateInFlight=null;});return autoStateInFlight;
+}
+function showAutoNotifications(auto){
+  const enabledResults=new Set([...(auto?.notifyOnCompletion?['completed']:[]),...(auto?.notifyOnFailure?['failed']:[])]);const item=asArray(auto?.items).filter(entry=>entry.notificationId&&enabledResults.has(String(entry.lastResult||''))&&!seenAutoNotificationIds.has(String(entry.notificationId))).sort((a,b)=>String(b.lastResultAt||'').localeCompare(String(a.lastResultAt||'')))[0];if(!item)return;seenAutoNotificationIds.add(String(item.notificationId));const wb=getWorkbook(item.workbookId),name=wb?workbookDisplayName(wb):String(item.workbookId||'原稿');if(String(item.lastResult)==='completed')showMessage('ok','自動PDF作成が完了しました',name);else showMessage('danger','自動PDF作成に失敗しました',`${name}：${item.lastError||'原稿を確認して再実行してください。'}`,null,[{label:'原稿を確認',view:'excel'}],0);
+}
+async function saveAutoSettings(btn){
+  const body={enabled:!!$('auto-enabled')?.checked,quietPeriodSeconds:Number($('auto-quiet-seconds')?.value||180),maxRetryCount:Number($('auto-max-retries')?.value||3),minFreeMegabytes:Number($('auto-min-free')?.value||1024),notifyOnCompletion:!!$('auto-notify-success')?.checked,notifyOnFailure:!!$('auto-notify-failure')?.checked};await runBusy(btn,async()=>{const response=await api('/api/auto/settings',{method:'PATCH',body});state.auto=response.auto||body;renderAutoStatus();showMessage('ok','自動PDF作成の設定を保存しました',body.enabled?'原稿更新後、静止を確認して自動変換します。':'自動PDF作成を停止しました。');},false);
+}
 function renderAutoStatus(){
   const box=$('auto-status');
   if(!box)return;
@@ -3571,20 +3953,21 @@ function renderAutoStatus(){
   const items=asArray(auto.items);
   const cap=Number(auto.softCapMegabytes||0),size=Number(auto.historySizeMb||0);
   const overCap=cap>0&&size>=cap*0.8;
-  const lines=items.slice(0,5).map(it=>{
+  const lines=items.slice(0,8).map(it=>{
     const wb=getWorkbook(it.workbookId);
     const name=wb?workbookDisplayName(wb):String(it.workbookId||'');
-    const reason={'excel-in-use':'Excelが使用されています','job-busy':'他のPDF作成が実行中です','start-failed':'開始できませんでした','file-missing':'ファイルが見つかりません'}[String(it.deferReason||'')]||'';
-    const label={waiting:'変更を検知（静止待ち）',deferred:'保留中',rendering:'PDF作成中',ready:'実行待ち'}[String(it.state||'')]||String(it.state||'');
-    return `<div class="auto-row"><span>${escapeHtml(name)}</span><span>${escapeHtml(label)}</span><span class="subtext">${escapeHtml(reason)}</span>${String(it.state||'')==='deferred'?`<button class="btn ghost compact" type="button" data-auto-run="${escapeAttr(it.workbookId)}">今すぐ実行</button>`:''}</div>`;
+    const reason={'excel-in-use':'Excelが使用されています','job-busy':'他のPDF作成が実行中です','start-failed':'開始できませんでした','file-missing':'ファイルが見つかりません','retry-backoff':`${Number(it.retryCount||0)}回目の再試行待ち（${formatDateTime(it.nextRetryAt)}）`,'retry-exhausted':it.lastError||'再試行回数の上限に達しました','disk-low':'空き容量が不足しています','job-status-missing':'実行状態を再確認しています'}[String(it.deferReason||'')]||'';
+    const label={idle:it.lastResult==='completed'?'完了':'待機中',waiting:'変更を検知（静止待ち）',deferred:'保留中',rendering:'PDF作成中',ready:'実行待ち','retry-wait':'再試行待ち',failed:'自動処理失敗'}[String(it.state||'')]||String(it.state||'');
+    const retryable=['deferred','retry-wait','failed'].includes(String(it.state||''));return `<div class="auto-row"><span>${escapeHtml(name)}</span><span>${escapeHtml(label)}</span><span class="subtext">${escapeHtml(reason||it.lastResultAt?`${reason}${reason?'・':''}${formatDateTime(it.lastResultAt)}`:'')}</span>${retryable?`<button class="btn ghost compact" type="button" data-auto-run="${escapeAttr(it.workbookId)}">今すぐ実行</button>`:''}</div>`;
   }).join('');
-  box.innerHTML=`<div class="card-head"><h3>自動PDF作成</h3><span class="caption">${auto.enabled?'有効':'無効'}${auto.enabled?`（変更後 ${Math.round(Number(auto.quietPeriodSeconds||180)/60)}分待機）`:''}</span></div>`
+  box.innerHTML=`<div class="card-head"><div><h3>自動PDF作成</h3><span class="caption">${auto.enabled?'有効':'無効'}${auto.enabled?`（変更後 ${Math.round(Number(auto.quietPeriodSeconds||180)/60)}分待機・最大${Number(auto.maxRetryCount||0)}回再試行）`:''}</span></div><button class="btn ghost compact" type="button" data-auto-settings-toggle>設定</button></div><div class="auto-settings" data-auto-settings hidden><label><input id="auto-enabled" type="checkbox" ${auto.enabled?'checked':''}> 自動PDF作成を有効にする</label><label>静止待ち<select id="auto-quiet-seconds">${[[60,'1分'],[180,'3分'],[300,'5分'],[600,'10分']].map(([value,label])=>`<option value="${value}" ${Number(auto.quietPeriodSeconds||180)===value?'selected':''}>${label}</option>`).join('')}</select></label><label>失敗時の再試行<select id="auto-max-retries">${[0,1,3,5].map(value=>`<option value="${value}" ${Number(auto.maxRetryCount||3)===value?'selected':''}>${value}回</option>`).join('')}</select></label><label>必要な空き容量<select id="auto-min-free">${[[512,'0.5 GB'],[1024,'1 GB'],[2048,'2 GB'],[5120,'5 GB']].map(([value,label])=>`<option value="${value}" ${Number(auto.minFreeMegabytes||1024)===value?'selected':''}>${label}</option>`).join('')}</select></label><label><input id="auto-notify-success" type="checkbox" ${auto.notifyOnCompletion!==false?'checked':''}> 完了を通知</label><label><input id="auto-notify-failure" type="checkbox" ${auto.notifyOnFailure!==false?'checked':''}> 失敗を通知</label><button class="btn primary compact" type="button" data-auto-settings-save>保存</button></div>`
     +(items.length?`<div class="auto-list">${lines}</div>`:'<div class="caption">保留中の変更はありません。</div>')
     +(overCap?`<p class="warn-strip">変更履歴の使用量が ${size}MB です（上限の目安 ${cap}MB）。</p>`:'');
   box.querySelectorAll('[data-auto-run]').forEach(b=>b.addEventListener('click',async()=>{
     try{await api('/api/auto/run-now',{method:'POST',body:{workbookId:b.getAttribute('data-auto-run')}});await refresh();}
     catch(e){showMessage('danger','実行を要求できません',userFriendlyError(e.message));}
   }));
+  box.querySelector('[data-auto-settings-toggle]')?.addEventListener('click',()=>{const settings=box.querySelector('[data-auto-settings]');if(settings)settings.hidden=!settings.hidden;});box.querySelector('[data-auto-settings-save]')?.addEventListener('click',event=>saveAutoSettings(event.currentTarget));
 }
 
 async function loadHistoryTimeline(){
@@ -3604,53 +3987,68 @@ async function loadHistoryTimeline(){
 }
 
 
-// ---- V5-P1: レイアウト履歴・復元・アーカイブのUI配線 ----
+// ---- ページ構成の永続履歴・限定復元 ----
+let pageLayoutRevisionsReturnFocus=null;
+function openPageLayoutRevisions(returnFocus=null){
+  const modal=$('page-layout-revisions-modal');if(!modal)return;
+  pageLayoutRevisionsReturnFocus=returnFocus||document.activeElement;modal.classList.remove('hidden');
+  requestAnimationFrame(()=>$('page-layout-revisions-close')?.focus());
+  void loadLayoutSnapshots();
+}
+function closePageLayoutRevisions(returnFocus=true){
+  const modal=$('page-layout-revisions-modal');if(!modal||modal.classList.contains('hidden'))return;
+  modal.classList.add('hidden');const focus=pageLayoutRevisionsReturnFocus;pageLayoutRevisionsReturnFocus=null;
+  if(returnFocus&&focus?.isConnected&&typeof focus.focus==='function')focus.focus();
+}
 async function loadLayoutSnapshots(){
-  const box=$('layout-history');
+  const box=$('page-layout-revisions-list');
   if(!box)return;
   if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴は無効です。</div>';return;}
+  box.innerHTML='<div class="empty-state">保存履歴を読み込んでいます。</div>';
   try{
-    const r=await api(`/api/layout/snapshots?category=${encodeURIComponent(activePreset)}`);
+    const custom=!activePackIsBuiltIn();
+    const r=await api(custom?`/api/v2/layout/snapshots?packId=${encodeURIComponent(activePackId)}`:`/api/layout/snapshots?category=${encodeURIComponent(activePreset)}`);
     const list=asArray(r.snapshots);
-    if(!list.length){box.innerHTML='<div class="caption">保存されたページ構成はまだありません。</div>';return;}
-    const reasonLabel={reorder:'並べ替え','sort-by-sheet':'原稿内の順序に整える','volume-change':'出力先の変更',numbering:'ページ番号の変更',enabled:'出力対象の変更','final-build':'最終PDF出力時',restore:'復元',
+    if(!list.length){box.innerHTML='<div class="empty-state">保存履歴はまだありません。ページを移動・並べ替え・設定変更すると、その直前の構成を自動保存します。</div>';return;}
+    const reasonLabel={reorder:'ページの移動・並べ替え','sort-by-sheet':'原稿内の順序に整える','page-update':'ページ設定の変更','volume-change':'出力先の変更',numbering:'ページ番号の変更',enabled:'出力対象の変更',restore:'復元',
       'pre-restore':'復元の直前'};
-    box.innerHTML=list.map(x=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(x.createdAt))}</span><span>${escapeHtml(reasonLabel[String(x.reason||'')]||String(x.reason||''))}</span><span class="subtext">${Number(x.pageCount||0)}ページ</span><button class="btn ghost compact" type="button" data-restore-layout="${escapeAttr(x.snapshotId)}">この状態に戻す</button></div>`).join('');
+    box.innerHTML=list.map(x=>`<div class="page-layout-revision"><div><strong>${escapeHtml(reasonLabel[String(x.reason||'')]||String(x.reason||'ページ構成の変更'))}</strong><span>${escapeHtml(formatDateTime(x.createdAt))}・${Number(x.pageCount||0)}ページ</span></div><button class="btn secondary compact" type="button" data-restore-layout="${escapeAttr(x.snapshotId)}">この構成に戻す</button></div>`).join('');
     box.querySelectorAll('[data-restore-layout]').forEach(b=>b.addEventListener('click',()=>previewLayoutRestore(b.getAttribute('data-restore-layout'))));
-  }catch(e){box.innerHTML=`<div class="caption">履歴を読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
+  }catch(e){box.innerHTML=`<div class="empty-state">履歴を読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
 }
 
 async function previewLayoutRestore(snapshotId){
   try{
-    const r=await api('/api/layout/restore/preview',{method:'POST',body:{category:activePreset,snapshotId}});
+    const custom=!activePackIsBuiltIn(),body=custom?{packId:activePackId,snapshotId}:{category:activePreset,snapshotId};
+    const r=await api(custom?'/api/v2/layout/restore/preview':'/api/layout/restore/preview',{method:'POST',body});
     const p=r.preview||{};
     const volumeLines=asArray(p.volumeChanges).slice(0,10).map(v=>`・${v.title||v.pageId}：${volumeLabel(v.from)} → ${volumeLabel(v.to)}`).join('\n');
-      const text=[`${formatDateTime(p.createdAt)} の構成に戻します`,'',
-      `適用されるページ：${Number(p.appliedPageCount||0)}`,
+      const detail=[`適用されるページ：${Number(p.appliedPageCount||0)}`,
       `過去にだけ存在するページ：${asArray(p.pastOnlyPageIds).length}（適用しません）`,
       `現在にだけ存在するページ：${asArray(p.currentOnlyPageIds).length}（そのまま残ります）`,
       volumeLines?`\n出力先の変更：\n${volumeLines}`:'',
       '','復元後、提出用PDFの再出力が必要になります。'].filter(Boolean).join('\n');
-    const accepted=await confirmAction({title:'このページ構成に戻しますか？',message:`${formatDateTime(p.createdAt)} の構成を適用します。`,detail:text.split('\n').slice(2).join('\n'),confirmLabel:'この構成に戻す'});
-    if(!accepted)return;
-    const res=await api('/api/layout/restore',{method:'POST',body:{category:activePreset,snapshotId}});
+    closePageLayoutRevisions(false);
+    const accepted=await confirmAction({title:'このページ構成に戻しますか？',message:`${formatDateTime(p.createdAt)} の構成を適用します。`,detail,confirmLabel:'この構成に戻す'});
+    if(!accepted){openPageLayoutRevisions($('page-layout-revisions-btn'));return;}
+    const res=await api(custom?'/api/v2/layout/restore':'/api/layout/restore',{method:'POST',body});
+    clearPageLayoutHistory();
     await refresh();
-    await loadLayoutSnapshots();
-    showMessage('ok','ページ構成を復元しました',`${Number(res.result?.appliedPageCount||0)}ページに適用しました。取り消す場合は履歴の「復元の直前」から戻せます。`,null,
+    $('page-layout-revisions-btn')?.focus();
+    showMessage('ok','ページ構成を復元しました',`${Number(res.result?.appliedPageCount||0)}ページに適用しました。取り消す場合は保存履歴の「復元の直前」から戻せます。`,null,
                 [{label:'提出用PDFを確認',view:'final'}],0);
   }catch(e){showMessage('danger','復元できません',userFriendlyError(e.message));}
 }
 
 function volumeLabel(v){
-  return {'ja-main':'本体','ja-appendix':'補足','en-main':'Main','en-appendix':'Appendix','none':'出力しない'}[String(v||'')]||String(v||'');
+  const volume=String(v||'');if(volume==='none')return '出力しない';const targetId=targetIdFromVolume(volume);if(targetId){const target=activeTargetDefinitions().find(item=>String(item?.targetId||'')===targetId);if(target?.displayName)return String(target.displayName);}return {'ja-main':'本体','ja-appendix':'補足','en-main':'Main','en-appendix':'Appendix'}[volume]||volume;
 }
 
 async function loadFinalArchives(){
-  const box=$('final-archives');
+  const box=$('final-archive-history');
   if(!box)return;
-  if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴は無効です。</div>';return;}
   try{
-    const r=await api(`/api/final/archives?category=${encodeURIComponent(activePreset)}`);
+    const r=await api(activePackIsBuiltIn()?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(activePackId)}`);
     const list=asArray(r.archives);
     if(!list.length){box.innerHTML='<div class="caption">保存された出力はまだありません。</div>';return;}
     box.innerHTML=list.slice(0,20).map(a=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(a.builtAt))}</span><span>${escapeHtml(volumeLabel(a.volume))}</span><span class="subtext">${escapeHtml(String(a.outputFileName||''))}（${Number(a.pageCount||0)}ページ）</span></div>`).join('');

@@ -23,10 +23,20 @@ const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTempla
   'buildColumnTextRowStructureDiffResult','buildDocumentTextRowStructureDiffResult','buildTextLayoutShiftDiffResult',
   'buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
   'diffPdfTextItemsInBand','buildLocalizedTextRowStructureDiffResult','mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
-  'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise'];
+  'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise','diffKindMeta','diffCsvCell','buildDiffSummaryCsv'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
 vm.runInContext(names.map(name=>functionSource(appCode,name)).join('\n'),app);
 const item=(text,x,y,width=60,height=12)=>({text,x,y,width,height});
+
+app.asArray=value=>Array.isArray(value)?value:[];
+app.formatDateTime=value=>String(value||'');
+const diffCsv=app.buildDiffSummaryCsv({comparison:{scope:'history',baselineAt:'2026-08-01',currentAt:'2026-08-07'},sheets:[
+  {kind:'modified',beforeSheetName:'Page 1',afterSheetName:'Page 2',matchConfidence:.8,matchMethod:'sequence-between-anchors',beforePages:1,afterPages:1,message:'見出しを「A」から「B」に変更'},
+  {kind:'added',beforeSheetName:'',afterSheetName:'Page 3',matchConfidence:1,matchMethod:'added',beforePages:0,afterPages:1,message:'追加ページ'}
+]},'部門"報告.csv');
+assert.match(diffCsv,/"任意2版"/);assert.match(diffCsv,/"80%"/);assert.match(diffCsv,/"sequence-between-anchors"/);
+assert.match(diffCsv,/"部門""報告.csv"/,'CSV quotes must be escaped');
+assert.match(diffCsv,/"追加"/);assert.doesNotMatch(diffCsv,/"added","0%"/,'added pages have no match confidence');
 
 const beforeNumbers=[item('Report',40,20,80),item('Header',40,60,180),item('1 Item 580,400',40,90,290),
   item('2 Review 42,000',40,120,290),item('Total 622,400',190,150,140)];

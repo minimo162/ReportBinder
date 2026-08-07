@@ -6,21 +6,40 @@ validationエラーはHTTP 400、未処理エラーはHTTP 500です。
 
 管理データの保存形式は汎用資料パック対応の`schemaVersion: 3`です。Local API V4は既存UIとの互換性のため、`structure`を従来の`schemaVersion: 2`、`workbooks / pages / volumes`形式へ変換して返します。保存データ上では`pack / source / unit / item / artifact / output`と互換フィールドが同期されます。
 
-V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/render/start`は、内部では共通原稿dispatcherを経由し、Excelは`excel-com-v1`、Wordは`word-com-v1`、PDFは`pdfbox-import-v1`アダプターへ接続します。レスポンスには共通項目として`sourceId / sourceType / adapterId / packId`が追加される場合があります。従来の`workbookId / category`も維持します。
+V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/render/start`は、内部では共通原稿dispatcherを経由し、Excelは`excel-com-v1`、Wordは`word-com-v1`、PowerPointは`powerpoint-com-v1`、PDFは`pdfbox-import-v1`アダプターへ接続します。レスポンスには共通項目として`sourceId / sourceType / adapterId / packId`が追加される場合があります。従来の`workbookId / category`も維持します。
 
 ## V2 汎用資料パックAPI
 
 新UI向けの汎用ドメインAPIは`/api/v2`に置きます。APIの`v2`はHTTP契約、レスポンスの`domainSchemaVersion: 3`は保存ドメインの版を表します。
 
-- `GET /api/v2/state`: `packs / sources / units / items / artifacts / outputs`を返す
-- `GET /api/v2/pack-templates`: ECM / BOD / DMMの組み込みテンプレートを返す
-- `GET /api/v2/packs`: 現在の資料パック一覧を返す
-- `GET /api/v2/source-candidates`: 登録可能なExcel・Word・PDF原稿を返す
+- `GET /api/v2/state`: `packs / sources / units / items / artifacts / outputs / packProgress`を返す。`packProgress`は未提出必須原稿に加え、`overdueRequiredCount / dueSoonRequiredCount / nearestRequiredDueDate`で期限超過・7日以内・次の期限を集計する
+- `GET /api/v2/pack-templates`: 組み込みテンプレートと利用者定義ひな形を返す
+- `POST /api/v2/pack-templates`: 利用者定義ひな形を作成する
+- `PATCH /api/v2/pack-templates/{templateId}`: 利用者定義ひな形を更新し、版を進める
+- `DELETE /api/v2/pack-templates/{templateId}`: 未使用の利用者定義ひな形を削除する
+- `GET /api/v2/packs`: 使用中の資料パック一覧を返す。`includeArchived=true`でアーカイブ済みも含める
+- `POST /api/v2/packs`: 任意の資料パックを作成する
+- `POST /api/v2/packs/{packId}/duplicate`: 設定を引き継いで資料パックを複製する
+- `GET /api/v2/packs/{packId}/template-upgrade`: 利用中のひな形と最新版との差分を返す
+- `POST /api/v2/packs/{packId}/template-upgrade`: 確認後に最新版のひな形を資料パックへ適用する
+- `PATCH /api/v2/packs/{packId}`: 名称または仕上げ設定を変更する
+- `POST /api/v2/packs/{packId}/archive`: 任意資料パックを一覧からアーカイブする
+- `POST /api/v2/packs/{packId}/restore`: アーカイブした資料パックを復元する
+- `GET /api/v2/source-candidates`: 登録可能なExcel（`.xlsx` / `.xlsm`）・Word（`.docx`）・PowerPoint（`.pptx`）・PDF原稿を返す
 - `POST /api/v2/sources/register-batch`: 複数形式の原稿を一括登録する
 - `POST /api/v2/sources/unregister`: `sourceId`で登録解除する
 - `POST /api/v2/sources/scan-updates`: 登録済み原稿の更新を検出する
 - `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する
 - `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する
+- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする
+- `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する
+- `GET /api/v2/layout/snapshots?packId={packId}`: 資料パックの保存済みページ構成を返す
+- `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
+- `POST /api/v2/layout/restore`: 保存済みのページ構成を同じ資料パックへ復元する
+- `GET /api/v2/outputs/readiness?packId={packId}`: 本体・補足の出力可否と再出力理由を返す
+- `POST /api/v2/outputs/build`: 資料パックの提出用PDFを出力する
+- `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する
+- `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す
 
 `PATCH`の例：
 
@@ -32,7 +51,81 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 }
 ```
 
-既存のECM/BOD/DMM操作は引き続きV4 APIと互換です。組み込みテンプレートの`acceptedSourceTypes`は`excel / word / pdf`です。
+既存のECM/BOD/DMM操作は引き続きV4 APIと互換です。組み込みテンプレートの`acceptedSourceTypes`は`excel / word / pdf / powerpoint`です。
+
+### 利用者定義ひな形
+
+利用者定義ひな形は言語別の`dataDir\<language>\templates`にJSON保存します。`displayName`、1つ以上の`acceptedSourceTypes`、1〜12件の任意出力先、ルール、出力既定値を指定できます。`targetId`は小文字英数字で始まる48文字以内の小文字英数字・`_`・`-`とし、ひな形内で重複できません。
+
+```json
+{
+  "displayName": "監査レビュー",
+  "description": "監査部提出用",
+  "acceptedSourceTypes": ["excel", "word", "powerpoint", "pdf"],
+  "targets": [
+    { "targetId": "main", "displayName": "監査報告", "required": true },
+    { "targetId": "appendix", "displayName": "証憑", "required": false }
+  ],
+  "rules": {
+    "newItemDestination": "main",
+    "retainManualOrder": true,
+    "blockBuildWhenRequiredSourceIsStale": true,
+    "blockBuildWhenRequiredSourceFailed": true
+  },
+  "output": {
+    "fileNamePattern": "{packName}_{targetName}_{yyyyMMdd}.pdf",
+    "tableOfContents": true
+  }
+}
+```
+
+更新のたびに`templateVersion`が増えます。資料パックは作成時点のひな形を`templateConfig`として保持するため、後からひな形を編集しても既存パックの出力先名や設定は自動では変わりません。`template-upgrade`で差分を確認してから明示適用できます。新版で削除された出力先のページは未振り分けへ移動します。使用中のひな形と組み込みひな形は削除できません。画面では利用者定義ひな形を複製し、JSONとして書き出し・読み込みできます。
+
+`rules.newItemDestination`は、原稿の`defaultTargetId`が`unassigned`の場合だけ使用します。既存ページの手動配置は再変換後も保持します。必須原稿では、ファイル欠落を`required-source-missing`、未変換を`required-source-not-rendered`、更新を`required-source-stale`、変換失敗を`required-source-failed`としてreadinessに返します。
+
+### 資料パックの作成・複製・保管
+
+新規作成では`displayName`が必須です。`templateId`を省略すると`builtin-generic-department-pack`を使用します。
+
+```json
+{
+  "displayName": "月次部門報告",
+  "templateId": "builtin-generic-department-pack",
+  "settings": {
+    "documentTitle": "月次部門報告書",
+    "includeCover": true,
+    "outputFileNamePattern": "{packName}_{yyyyMMdd}.pdf"
+  }
+}
+```
+
+複製はテンプレートと仕上げ設定だけを引き継ぎ、登録原稿、ページ構成、出力PDF、履歴は複製しません。`displayName`を省略すると「元の名前 (コピー)」のような重複しない名前を付けます。
+
+名称変更は従来の仕上げ設定と同じ`PATCH`へ`displayName`を渡します。設定を`settings`内にまとめる形式と、従来どおり直下へ置く形式の両方を受け付けます。
+
+```json
+{
+  "displayName": "四半期部門報告",
+  "settings": {
+    "documentSubtitle": "2026年度 第1四半期"
+  }
+}
+```
+
+アーカイブは削除ではなく、通常一覧から隠す操作です。データは保持され、`restore`で戻せます。現行の固定UIとの互換性を守るため、組み込みECM / BOD / DMMはアーカイブできません。
+
+### ページ構成の保存履歴と復元
+
+ページの移動、並べ替え、タイトル・番号表示・ページ範囲などの設定変更では、変更直前の構成を資料パック単位で自動保存します。履歴にはレイアウト項目だけを保存し、原稿ファイル、変換PDF、更新検出状態には触れません。
+
+```json
+{
+  "packId": "pack_0123456789abcdef",
+  "snapshotId": "20260807T130000.000_abcd1234"
+}
+```
+
+`restore/preview`は現在も存在するページへの適用数、過去にだけ存在するページ、現在にだけ存在するページ、出力先が変わるページを返します。`restore`は同じ`packId`のページにだけ適用し、復元の直前にも新しい履歴を保存します。組み込みECM / BOD / DMMは従来の`/api/layout/*`と互換です。
 
 ## GET /api/state
 
@@ -58,7 +151,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
     }
   },
   "packTemplates": [
-    { "templateId": "builtin-ecm", "packId": "pack_ecm", "acceptedSourceTypes": ["excel", "word", "pdf"] }
+    { "templateId": "builtin-ecm", "packId": "pack_ecm", "acceptedSourceTypes": ["excel", "word", "powerpoint", "pdf"] }
   ],
   "packs": [
     { "packId": "pack_ecm", "displayName": "ECM", "category": "ecm", "workflowAvailable": true }
@@ -146,10 +239,10 @@ Office、Java、PDFBox、PDF.js、保存先の動作環境を診断します。E
 
 ## GET /api/submission-files
 
-提出フォルダ直下の原稿一覧を返します。現在のUIが登録対象として表示するのは`.xlsx`、`.docx`、`.pdf`です。Wordの一時ファイル`~$*.docx`、`.docm`、子フォルダ内のファイルは候補に含めません。
+提出フォルダ直下の原稿一覧を返します。現在のUIが登録対象として表示するのは`.xlsx`、`.xlsm`、`.docx`、`.pptx`、`.pdf`です。Word/PowerPointの一時ファイル`~$*`、`.docm`、`.pptm`、子フォルダ内のファイルは候補に含めません。
 
 - `scannedAt`: 一覧を取得した日時
-- `files[].sourceType`: `excel`、`word`または`pdf`
+- `files[].sourceType`: `excel`、`word`、`powerpoint`または`pdf`
 - `files[].adapterId`: 使用する原稿アダプター
 - `files[].modifiedAt`: ファイルサーバーから再取得した原稿の最終保存日時
 - `files[].modifiedAtUtcTicks`: 更新判定・調査用のUTC ticks
@@ -161,7 +254,7 @@ categoryは必須です。
 ```json
 {
   "category": "ecm",
-  "relativePaths": ["FY160-4Q_ECM_J_00_Cover.xlsx", "department-report.docx", "department-appendix.pdf"]
+  "relativePaths": ["FY160-4Q_ECM_J_00_Cover.xlsx", "department-report.docx", "briefing.pptx", "department-appendix.pdf"]
 }
 ```
 
@@ -208,6 +301,14 @@ PDF必要分：
 { "jobId": "job_20260728_120000_abcdefgh" }
 ```
 
+## POST /api/jobs/cancel
+
+```json
+{ "jobId": "job_20260728_120000_abcdefgh" }
+```
+
+実行中のPDF作成へ安全な中止要求を送ります。現在処理中の原稿は完了させ、次の原稿へ進む前に`cancelled`で終了します。完了済みの変換PDF、ページ構成、履歴比較資産は保持します。`/api/jobs/status`では受付後に`cancelRequested: true`を返します。
+
 完了結果の各workbookには、ページ追加情報を含みます。
 
 ```jsonc
@@ -223,7 +324,7 @@ PDF必要分：
 
 ## POST /api/scan-updates
 
-登録済みExcel・Word・PDF原稿の更新を確認します。Word/PDFの差し替えは`source-updated`となり、再変換後に物理ページの追加・削除も同期します。
+登録済みExcel・Word・PowerPoint・PDF原稿の更新を確認します。Word/PowerPoint/PDFの差し替えは`source-updated`となり、再変換後に物理ページ・スライドの追加・削除も同期します。
 
 ```json
 { "forceHash": false }
@@ -449,6 +550,79 @@ ecm / bod / dmm
 ```
 
 ファイル名には`{projectId}`、`{packName}`、`{targetName}`、`{yyyyMMdd}`を使用できます。
+
+## 任意資料パックの原稿・ページ・出力
+
+任意資料パックも、組み込みパックと同じExcel・Word・PowerPoint・PDFアダプターを使用します。Excelは`.xlsx`と`.xlsm`、Wordは`.docx`、PowerPointは`.pptx`を受け付け、Office Automation Securityを強制してマクロを実行しません。v2 APIでは`category`ではなく、作成時に返された`packId`を指定します。
+
+```text
+POST  /api/v2/sources/register-batch
+POST  /api/v2/sources/render/start
+POST  /api/v2/items/reorder
+PATCH /api/v2/items/{itemId}
+GET   /api/v2/layout/snapshots?packId=pack_...
+POST  /api/v2/layout/restore/preview
+POST  /api/v2/layout/restore
+GET   /api/v2/outputs/readiness?packId=pack_...
+POST  /api/v2/outputs/build
+POST  /api/v2/outputs/file
+POST  /api/v2/outputs/publish
+GET   /api/v2/outputs/archives?packId=pack_...
+```
+
+原稿登録:
+
+```json
+{ "packId": "pack_...", "relativePaths": ["部門資料.xlsx", "説明.docx", "説明会.pptx", "添付.pdf"] }
+```
+
+ページ構成は`volumes`（例: `ja-main` / `ja-executive-summary` / `none`）または`targets`（例: `main` / `executive-summary` / `unassigned`）で指定できます。使用できるキーは資料パックが保持するひな形の`targets`から決まり、固定の本体・補足には限定されません。
+
+```json
+{
+  "packId": "pack_...",
+  "targets": {
+    "main": ["item-1", "item-2"],
+    "appendix": ["item-3"],
+    "unassigned": []
+  }
+}
+```
+
+最終PDFの出力:
+
+```json
+{ "packId": "pack_...", "targetIds": ["main", "appendix"] }
+```
+
+共有発行:
+
+```json
+{ "packId": "pack_...", "targetId": "main" }
+```
+
+最新状態の最終PDFだけを共有発行できます。提出フォルダー直下の一時フォルダーへコピーし、サイズ検証後に日時・言語・利用者名付きフォルダーへ切り替えます。
+
+最終PDFの作成時には、PDF、manifest、SHA-256、使用した原稿版と変換環境を`exports/archive/<packId>/...`へ保存します。`GET /api/v2/outputs/archives`は新しい順にアーカイブ情報を返します。
+
+## 自動PDF作成
+
+- `GET /api/auto/state`: 原稿ごとの待機・実行・再試行・失敗状態と現在の設定を返す
+- `PATCH /api/auto/settings`: 自動処理の設定を検証して保存し、スケジューラーを開始または停止する
+- `POST /api/auto/render`: 指定原稿を待機時間なしで実行する
+
+```json
+{
+  "enabled": true,
+  "quietPeriodSeconds": 180,
+  "maxRetryCount": 3,
+  "minFreeMegabytes": 1024,
+  "notifyOnCompletion": true,
+  "notifyOnFailure": true
+}
+```
+
+失敗時は指数バックオフで再試行し、上限へ達した同じ原稿版は停止します。原稿が再保存されて新しいハッシュになった場合は、新規更新として静止待ちから自動復帰します。管理データまたは出力先の空き容量が`minFreeMegabytes`未満の場合は`disk-low`として保留し、成果物を変更しません。
 
 ## ページ範囲
 

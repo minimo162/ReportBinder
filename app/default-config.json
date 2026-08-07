@@ -16,6 +16,11 @@
     "enabled": false,
     "quietPeriodSeconds": 180,
     "requireStableHashCount": 2,
-    "deferWhileExcelInUse": true
+    "deferWhileExcelInUse": true,
+    "maxRetryCount": 3,
+    "retryBaseSeconds": 60,
+    "minFreeMegabytes": 1024,
+    "notifyOnCompletion": true,
+    "notifyOnFailure": true
   }
 }
