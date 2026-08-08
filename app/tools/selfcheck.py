@@ -1153,7 +1153,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v148', 'style.css?v=20260808_v93']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v149', 'style.css?v=20260808_v93']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1208,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260808_v148' not in html:
+if 'app.js?v=20260808_v149' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1234,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260808_v148' not in html:
+if 'app.js?v=20260808_v149' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1340,7 +1340,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.08.34':
+if str(runtime_info.get('version','')) != '2026.08.08.35':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
@@ -1942,5 +1942,42 @@ if 'if (replacingExistingFolder) {' not in _choose:
     raise SystemExit('the confirmation must apply only when an existing folder is being replaced')
 if 'function restorePreviousSubmissionFolder' not in appjs:
     raise SystemExit('the previous source folder must remain reachable after the switch')
+
+
+# 2026-08-09 final PDF output runs as a cancellable job ---------------------
+for needed in ['function Start-FinalBuildJob', 'function Invoke-FinalBuildJobFromFile',
+               'function Read-FinalJobStatus', 'function Request-FinalJobCancellation',
+               'function Get-ActiveFinalJobStatus', 'function Report-FinalBuildPhase',
+               "'/api/v2/outputs/build/status'", "'/api/v2/outputs/build/cancel'",
+               '[string]$FinalJobPath', 'Invoke-FinalBuildJobFromFile $FinalJobPath']:
+    if needed not in server:
+        raise SystemExit(f'final build job plumbing missing: {needed}')
+# 出力を要求の中で完結させると、直列処理のサーバーでは進捗も中止も受け取れない。
+_build_route = server.split("$path -eq '/api/v2/outputs/build') {", 1)[1].split('if ($method', 1)[0]
+if 'Start-FinalBuildJob' not in _build_route or 'Build-DocumentPackPdf' in _build_route:
+    raise SystemExit('/api/v2/outputs/build must hand off to a background job, not build inline')
+# 組み込みパックの一括出力は準トランザクションのまま。1冊ずつのループに落とすと
+# 「本体だけ成功する」状態が復活する。
+_job_runner = _ps_function(server, 'Invoke-FinalBuildJobFromFile', 'server.ps1')
+if 'Invoke-FinalBuildTransaction' not in _job_runner or '$isTransactionalAll' not in _job_runner:
+    raise SystemExit('the built-in all-targets build must stay transactional inside the job')
+if 'Test-FinalJobCancellationRequested' not in _job_runner:
+    raise SystemExit('the job runner must honour a cancellation request')
+for needed in ['async function runFinalBuildJob', 'function updateFinalProgressPanel',
+               'async function cancelActiveFinalJob', 'let activeFinalJobId',
+               '/api/v2/outputs/build/status?jobId=']:
+    if needed not in appjs:
+        raise SystemExit(f'final build progress UI missing: {needed}')
+if 'if(activeFinalJobId)return void cancelActiveFinalJob();' not in appjs:
+    raise SystemExit('the shared cancel button must route to whichever job is running')
+# 進捗パネルを出す以上、runBusy の4秒で消えるトーストと二重に出さない。
+for fn in ('buildVolume', 'buildAllVolumes'):
+    _body = appjs.split(f'async function {fn}(', 1)[1].split('\nasync function ', 1)[0]
+    if 'runFinalBuildJob' not in _body:
+        raise SystemExit(f'{fn} must go through the job flow')
+    if '}, false);' not in _body and '},false);' not in _body:
+        raise SystemExit(f'{fn} must suppress the generic processing toast while the progress panel is shown')
+if '/api/v2/outputs/build/status' not in (root/'docs/API.md').read_text(encoding='utf-8-sig'):
+    raise SystemExit('the new output job endpoints must be documented')
 
 print('selfcheck ok')

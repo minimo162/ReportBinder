@@ -5,6 +5,7 @@
     [string]$Token = '',
     [switch]$NoOpen,
     [string]$RenderJobPath = '',
+    [string]$FinalJobPath = '',
     [string]$DiffJobPath = '',
     [string]$AutoSchedulerPath = '',
     [int]$ParentProcessId = 0
@@ -5954,6 +5955,269 @@ function Start-HiddenPowerShellChild([string]$PowerShellExe, [string]$Command, [
     }
 }
 
+# ---- 提出用PDFの出力ジョブ -------------------------------------------------
+# HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると
+# その間の進捗ポーリングも中止要求も受け付けられない。変換PDFと同じく子プロセスへ
+# 出し、状態ファイルをブラウザが読む方式に揃える。
+$Script:FinalBuildProgress = $null
+
+function Report-FinalBuildPhase([string]$Message) {
+    if ($null -eq $Script:FinalBuildProgress) { return }
+    try { & $Script:FinalBuildProgress $Message } catch { }
+}
+
+function Normalize-FinalJobId([string]$JobId) {
+    $value = ([string]$JobId).Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
+    try { $value = [Uri]::UnescapeDataString($value).Trim() } catch { }
+    if ($value -match '(?i)(final_[0-9]{8}_[0-9]{6}_[0-9a-f]{8})') { return $matches[1].ToLowerInvariant() }
+    return ''
+}
+
+function Get-FinalJobStatusPath([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw '提出用PDFの出力ジョブを確認できませんでした。' }
+    return (Join-Path (Get-RenderJobDir $Language) "$normalized.status.json")
+}
+
+function Get-FinalJobCancellationPath([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw '中止する出力ジョブを確認できませんでした。' }
+    return (Join-Path (Get-RenderJobDir $Language) "$normalized.cancel.json")
+}
+
+function Test-FinalJobCancellationRequested([string]$Language, [string]$JobId) {
+    try { return (Test-Path -LiteralPath (Get-FinalJobCancellationPath $Language $JobId) -PathType Leaf) } catch { return $false }
+}
+
+function Request-FinalJobCancellation([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    $statusPath = Get-FinalJobStatusPath $Language $normalized
+    $status = Read-JsonFile $statusPath $null
+    if ($null -eq $status) { throw '中止する出力ジョブが見つかりません。' }
+    $statusText = ([string](Get-DataProperty $status 'status' '')).ToLowerInvariant()
+    if (@('completed','completed-with-errors','failed','cancelled') -contains $statusText) {
+        return [pscustomobject][ordered]@{ ok=$true; jobId=$normalized; accepted=$false; alreadyFinished=$true; status=$statusText; message='提出用PDFの出力はすでに終了しています。' }
+    }
+    Write-JsonFile (Get-FinalJobCancellationPath $Language $normalized) ([ordered]@{ schemaVersion=1; jobId=$normalized; requestedAt=(New-NowIso) })
+    return [pscustomobject][ordered]@{ ok=$true; jobId=$normalized; accepted=$true; alreadyFinished=$false; status=$statusText; cancelRequested=$true
+        message='中止を受け付けました。作成中の1冊は最後まで書き上げてから停止します。' }
+}
+
+function Read-FinalJobStatus([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    $statusPath = Get-FinalJobStatusPath $Language $normalized
+    $status = Read-JsonFile $statusPath $null
+    if ($null -eq $status) {
+        return [pscustomobject][ordered]@{ ok=$true; jobId=$normalized; status='missing'; percent=0; total=0; completed=0; failed=0; message='出力の状態を読み取れませんでした。' }
+    }
+    $statusText = ([string](Get-DataProperty $status 'status' '')).ToLowerInvariant()
+    if (@('completed','completed-with-errors','failed','cancelled') -notcontains $statusText) {
+        # 子プロセスが落ちたまま「実行中」で残ると、以後の出力が永久に始められない。
+        $processId = Get-IntDataProperty $status 'processId' 0
+        $alive = $false
+        if ($processId -gt 0) { try { $alive = ($null -ne (Get-Process -Id $processId -ErrorAction Stop)) } catch { $alive = $false } }
+        if (-not $alive -and $processId -gt 0) {
+            Set-NoteProperty $status 'status' 'failed'
+            Set-NoteProperty $status 'percent' 100
+            Set-NoteProperty $status 'message' '出力プロセスが予期せず終了しました。もう一度出力してください。'
+            Write-RenderJobStatus $statusPath $status
+        }
+    }
+    if ($null -eq $status.PSObject.Properties['ok']) { Set-NoteProperty $status 'ok' $true }
+    return ([pscustomobject]$status)
+}
+
+function Get-ActiveFinalJobStatus([string]$Language) {
+    $dir = Get-RenderJobDir $Language
+    $cutoff = (Get-Date).ToUniversalTime().AddHours(-4)
+    foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter 'final_*.status.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
+        if ($file.LastWriteTimeUtc -lt $cutoff) { continue }
+        $status = Read-JsonFile $file.FullName $null
+        if ($null -eq $status) { continue }
+        $statusText = ([string](Get-DataProperty $status 'status' '')).ToLowerInvariant()
+        if (@('completed','completed-with-errors','failed','cancelled') -contains $statusText) { continue }
+        $refreshed = Read-FinalJobStatus $Language ([string](Get-DataProperty $status 'jobId' ''))
+        $refreshedText = ([string](Get-DataProperty $refreshed 'status' '')).ToLowerInvariant()
+        if (@('completed','completed-with-errors','failed','cancelled','missing') -contains $refreshedText) { continue }
+        return $refreshed
+    }
+    return $null
+}
+
+function Start-FinalBuildJob([string]$Language, [string]$PackId, [string[]]$TargetIds) {
+    $active = Get-ActiveFinalJobStatus $Language
+    if ($null -ne $active) {
+        Set-NoteProperty $active 'message' ('提出用PDFを作成中です。 ' + [string]$active.message)
+        return $active
+    }
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackId $false
+    $allowed = @(Get-PackTargetIds $Language $scope.pack)
+    $requested = @($TargetIds | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($requested.Count -eq 0) { $requested = @($allowed[0]) }
+    foreach ($targetId in $requested) {
+        if ($allowed -notcontains $targetId) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
+    }
+    $jobId = 'final_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
+    $jobDir = Get-RenderJobDir $Language
+    $inputPath = Join-Path $jobDir "$jobId.input.json"
+    $statusPath = Join-Path $jobDir "$jobId.status.json"
+    $stdoutPath = Join-Path $jobDir "$jobId.out.log"
+    $stderrPath = Join-Path $jobDir "$jobId.err.log"
+    $initial = [pscustomobject][ordered]@{
+        ok=$true; jobId=$jobId; kind='final-build'; status='launching'; total=$requested.Count; completed=0; failed=0; percent=1
+        message='提出用PDFの作成を開始します。'; currentTargetId=''; currentTargetName=''; phase=''
+        packId=[string]$scope.packId; targetIds=@($requested); built=@(); skipped=@(); errors=@()
+        processId=0; stdoutPath=$stdoutPath; stderrPath=$stderrPath; startedAt=(New-NowIso); updatedAt=(New-NowIso)
+    }
+    Write-JsonFile $statusPath $initial
+    Write-JsonFile $inputPath ([ordered]@{ jobId=$jobId; mode=$Language; packId=[string]$scope.packId; targetIds=@($requested); statusPath=$statusPath; stdoutPath=$stdoutPath; stderrPath=$stderrPath })
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+    $script = Join-Path $Script:AppRoot 'server.ps1'
+    $jobCommand = "& '$($script.Replace("'", "''"))' -Mode '$($Language.Replace("'", "''"))' -FinalJobPath '$($inputPath.Replace("'", "''"))'"
+    try {
+        $proc = Start-HiddenPowerShellChild $psExe $jobCommand $stdoutPath $stderrPath
+        if ($proc -and $proc.Id) {
+            Set-NoteProperty $initial 'processId' ([int]$proc.Id)
+            Set-NoteProperty $initial 'message' '出力プロセスを起動しました。準備しています。'
+            Set-NoteProperty $initial 'percent' 2
+            Write-RenderJobStatus $statusPath $initial
+        }
+    } catch {
+        Set-NoteProperty $initial 'status' 'failed'
+        Set-NoteProperty $initial 'percent' 100
+        Set-NoteProperty $initial 'message' ("出力プロセスを起動できませんでした: " + $_.Exception.Message)
+        Write-RenderJobStatus $statusPath $initial
+        throw
+    }
+    return $initial
+}
+
+function Invoke-FinalBuildJobFromFile([string]$JobPath) {
+    $job = Read-JsonFile $JobPath $null
+    if ($null -eq $job) { throw "Final build job file is not readable: $JobPath" }
+    $language = [string]$job.mode
+    if ([string]::IsNullOrWhiteSpace($language)) { $language = $Mode }
+    $jobId = [string]$job.jobId
+    $packId = [string]$job.packId
+    $statusPath = [string]$job.statusPath
+    $targetIds = @(Get-Array $job.targetIds | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $processId = 0
+    try { $processId = [System.Diagnostics.Process]::GetCurrentProcess().Id } catch { $processId = 0 }
+    $status = Read-JsonFile $statusPath $null
+    if ($null -eq $status) { $status = [pscustomobject][ordered]@{ ok=$true; jobId=$jobId; kind='final-build' } }
+    Set-NoteProperty $status 'status' 'running'
+    Set-NoteProperty $status 'processId' $processId
+    Set-NoteProperty $status 'total' $targetIds.Count
+    Set-NoteProperty $status 'completed' 0
+    Set-NoteProperty $status 'failed' 0
+    Set-NoteProperty $status 'percent' 3
+    Set-NoteProperty $status 'message' '出力条件を確認しています。'
+    Write-RenderJobStatus $statusPath $status
+
+    $structure = Get-Structure $language
+    $scope = Resolve-DocumentPackScope $structure $packId $false
+    $built = @(); $skipped = @(); $errors = @()
+    $index = 0
+    $cancelled = $false
+
+    # 組み込みパックの一括出力は準トランザクションAPIが「本体だけ成功する」状態を防ぐ。
+    # 進捗のために1冊ずつのループへ置き換えると、その保証が失われる。
+    $allTargets = @(Get-PackTargetIds $language $scope.pack)
+    $isTransactionalAll = ([bool]$scope.builtIn) -and ($targetIds.Count -gt 1) -and
+        (@($allTargets | Where-Object { $targetIds -notcontains $_ }).Count -eq 0)
+    if ($isTransactionalAll) {
+        Set-NoteProperty $status 'phase' '一括出力'
+        Set-NoteProperty $status 'percent' 10
+        Set-NoteProperty $status 'message' 'すべての提出用PDFをまとめて作成しています。途中で分かれた状態にならないよう、一度に書き出します。'
+        Write-RenderJobStatus $statusPath $status
+        $Script:FinalBuildProgress = {
+            param($phaseMessage)
+            Set-NoteProperty $status 'phase' ([string]$phaseMessage)
+            Set-NoteProperty $status 'message' ('まとめて出力中 : ' + [string]$phaseMessage)
+            Write-RenderJobStatus $statusPath $status
+        }.GetNewClosure()
+        try {
+            $volumes = @($targetIds | ForEach-Object { Get-LegacyVolumeFromTargetId $language $_ })
+            $result = Invoke-FinalBuildTransaction $language ([string]$scope.category) $volumes
+            $built = @(Get-Array (Get-DataProperty $result 'built' @()))
+            $skipped = @(Get-Array (Get-DataProperty $result 'skipped' @()))
+            Set-NoteProperty $status 'completed' $targetIds.Count
+        } catch {
+            $message = [string]$_.Exception.Message
+            $errors += [ordered]@{ targetId=''; targetName='まとめて出力'; error=$message; userError=(ConvertTo-UserRenderError $message) }
+            Set-NoteProperty $status 'failed' $targetIds.Count
+        } finally {
+            $Script:FinalBuildProgress = $null
+        }
+        $index = $targetIds.Count
+        $targetIds = @()
+    }
+
+    foreach ($targetId in $targetIds) {
+        if (Test-FinalJobCancellationRequested $language $jobId) { $cancelled = $true; break }
+        $displayName = [string](Get-PackTargetDisplayName $language $scope.pack $targetId)
+        if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $targetId }
+        $basePercent = if ($targetIds.Count -le 0) { 100 } else { [int](3 + [Math]::Floor(($index / [double]$targetIds.Count) * 94)) }
+        Set-NoteProperty $status 'currentTargetId' $targetId
+        Set-NoteProperty $status 'currentTargetName' $displayName
+        Set-NoteProperty $status 'percent' $basePercent
+        Set-NoteProperty $status 'phase' '準備'
+        Set-NoteProperty $status 'message' "$displayName を準備しています。"
+        Write-RenderJobStatus $statusPath $status
+        # 出力の各段階を画面へ返す。1冊の作成でも無反応な時間が生まれないようにする。
+        $Script:FinalBuildProgress = {
+            param($phaseMessage)
+            Set-NoteProperty $status 'phase' ([string]$phaseMessage)
+            Set-NoteProperty $status 'message' ("$displayName : " + [string]$phaseMessage)
+            Write-RenderJobStatus $statusPath $status
+        }.GetNewClosure()
+        try {
+            $readiness = Get-FinalBuildReadiness (Get-Structure $language) $language (Get-LegacyVolumeFromTargetId $language $targetId) $packId
+            if ([int]$readiness.pageCount -le 0) { $skipped += $targetId }
+            else { $built += @(Build-DocumentPackPdf $language $packId $targetId) }
+            Set-NoteProperty $status 'completed' ([int](Get-IntDataProperty $status 'completed' 0) + 1)
+        } catch {
+            $message = [string]$_.Exception.Message
+            $errors += [ordered]@{ targetId=$targetId; targetName=$displayName; error=$message; userError=(ConvertTo-UserRenderError $message) }
+            Set-NoteProperty $status 'failed' ([int](Get-IntDataProperty $status 'failed' 0) + 1)
+        } finally {
+            $Script:FinalBuildProgress = $null
+        }
+        Set-NoteProperty $status 'built' @($built)
+        Set-NoteProperty $status 'skipped' @($skipped)
+        Set-NoteProperty $status 'errors' @($errors)
+        Write-RenderJobStatus $statusPath $status
+        $index++
+    }
+    $remaining = @($targetIds | Select-Object -Skip $index)
+    Set-NoteProperty $status 'currentTargetId' ''
+    Set-NoteProperty $status 'currentTargetName' ''
+    Set-NoteProperty $status 'phase' ''
+    Set-NoteProperty $status 'percent' 100
+    Set-NoteProperty $status 'built' @($built)
+    Set-NoteProperty $status 'skipped' @($skipped)
+    Set-NoteProperty $status 'errors' @($errors)
+    if ($cancelled) {
+        Set-NoteProperty $status 'status' 'cancelled'
+        Set-NoteProperty $status 'cancelRequested' $true
+        Set-NoteProperty $status 'message' ("$($built.Count) 冊を出力した時点で中止しました。残り $($remaining.Count) 冊は作成していません。")
+    } elseif ($errors.Count -gt 0) {
+        Set-NoteProperty $status 'status' 'completed-with-errors'
+        Set-NoteProperty $status 'message' ("$($built.Count) 冊を出力しました。$($errors.Count) 冊は出力できませんでした。")
+    } else {
+        Set-NoteProperty $status 'status' 'completed'
+        $summary = if ($built.Count -gt 0) { "$($built.Count) 冊の提出用PDFを出力しました。" } else { '出力対象のページがありませんでした。' }
+        if ($skipped.Count -gt 0) { $summary += " $($skipped.Count) 冊はページが無いため作成していません。" }
+        Set-NoteProperty $status 'message' $summary
+    }
+    Set-NoteProperty $status 'finishedAt' (New-NowIso)
+    Write-RenderJobStatus $statusPath $status
+    try { Remove-Item -LiteralPath (Get-FinalJobCancellationPath $language $jobId) -Force -ErrorAction SilentlyContinue } catch { }
+}
+
 function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyUpdated, [string]$Category = '', $SnapshotPins = $null) {
     # Return a job immediately. Expensive update scanning runs inside the background job,
     # so the PDF button does not appear to do nothing on large folders.
@@ -7078,6 +7342,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
 
     $paths = Get-Paths
     $workspace = Get-WorkspacePath $Language
+    Report-FinalBuildPhase '元原稿の更新を確認しています'
     try { [void](Scan-Updates $Language $null $false) } catch { }
     $lockPath = Join-Path $workspace ("locks\pack-output_{0}_{1}.lock" -f ([string]$scope.packId), $TargetId)
     return Invoke-WithLock $lockPath {
@@ -7111,10 +7376,12 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         }
         $manifestPath = Join-Path $workspace ("exports\manifest_{0}_{1}.json" -f ([string]$scope.packId), $TargetId)
         Write-JsonFile $manifestPath $manifest
+        Report-FinalBuildPhase ('ページを結合しています（' + [string]$snapshotBefore.pageCount + 'ページ）')
         $java = Resolve-JavaExe
         $run = Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath)
         if ([int]$run.exitCode -ne 0) { throw "PDFBox組版に失敗しました。exit=$([int]$run.exitCode)`n$([string]$run.text)" }
         if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '最終PDFを作成できませんでした。' }
+        Report-FinalBuildPhase '出力先へ保存しています'
         $buildId = New-RbId
         $commit = Update-StructureLocked $Language {
             param($st)
@@ -7913,14 +8180,18 @@ function Handle-Api($Context) {
             $scope = Resolve-DocumentPackScope $structure $packId $false
             $allowedTargetIds = @(Get-PackTargetIds $language $scope.pack)
             if ($targetIds.Count -eq 0) { $targetIds = @([string](Get-DataProperty $body 'targetId' $allowedTargetIds[0])) }
-            $built = @(); $skipped = @()
-            foreach ($targetId in @($targetIds | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Select-Object -Unique)) {
-                if ($allowedTargetIds -notcontains $targetId) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
-                $readiness = Get-FinalBuildReadiness (Get-Structure $language) $language (Get-LegacyVolumeFromTargetId $language $targetId) $packId
-                if ([int]$readiness.pageCount -le 0) { $skipped += $targetId; continue }
-                $built += @(Build-DocumentPackPdf $language $packId $targetId)
-            }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=[ordered]@{ built=@($built); skipped=@($skipped) }; state=(Get-V2StatePayload $language) }); return
+            # 出力は数十秒かかることがある。サーバーはリクエストを直列に処理するため、
+            # ここで完結させると進捗ポーリングも中止も受け付けられない。ジョブとして返す。
+            $job = Start-FinalBuildJob $language ([string]$scope.packId) @($targetIds | ForEach-Object { [string]$_ })
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=$job }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/build/status') {
+            $jobId = [string]$Context.Request.QueryString['jobId']
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=(Read-FinalJobStatus $language $jobId); state=(Get-V2StatePayload $language) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/build/cancel') {
+            $body = Read-BodyJson $Context.Request
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=(Request-FinalJobCancellation $language ([string](Get-DataProperty $body 'jobId' ''))) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/file') {
             $body = Read-BodyJson $Context.Request
@@ -13093,6 +13364,11 @@ if (-not [string]::IsNullOrWhiteSpace($DiffJobPath)) {
 
 if (-not [string]::IsNullOrWhiteSpace($RenderJobPath)) {
     Invoke-RenderJobFromFile $RenderJobPath
+    return
+}
+
+if (-not [string]::IsNullOrWhiteSpace($FinalJobPath)) {
+    Invoke-FinalBuildJobFromFile $FinalJobPath
     return
 }
 

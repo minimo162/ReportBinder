@@ -75,6 +75,9 @@ let lastUpdateScanAt = 0;
 let renderJobActive = false;
 let activeRenderJobId = '';
 let activeRenderCancelRequested = false;
+// 提出用PDFの出力ジョブ。進捗パネルは変換PDFと共用するため、中止の宛先を区別する。
+let activeFinalJobId = '';
+let activeFinalCancelRequested = false;
 let activeRenderJobStatus = null;
 let folderPickerBusy = false;
 let diagnosticsResult = null;
@@ -4272,7 +4275,83 @@ async function buildVolume(volume, btn) {
   const ready=volumeReadiness(volume);if(asArray(ready.blockers).length){setActiveView('excel');showMessage('warn','先に原稿の変換PDFを作成してください',ready.blockers[0]?.message||'出力条件を確認してください。');return;}
   const unassigned=unresolvedPageCount();
   if(unassigned){const accepted=await confirmAction({title:`未振り分け ${unassigned}ページを除外しますか？`,message:'未振り分けのページは、今回の提出用PDFに入りません。',detail:'意図しない原稿落ちを防ぐため、通常は「キャンセル」してページ構成を確認してください。',confirmLabel:'除外して出力'});if(!accepted)return;}
-  await runBusy(btn,async()=>{const custom=!activePackIsBuiltIn(),result=await api(custom?'/api/v2/outputs/build':'/api/final/build',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});await refresh();await loadFinalReadiness();const built=custom?asArray(result.result?.built)[0]:result.result;showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf||'出力フォルダを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);showPostBuildWarning(volume);});
+  await runBusy(btn,async()=>{
+    const job=await runFinalBuildJob([targetIdFromVolume(volume)]);
+    if(!job)return;
+    if(job.status==='cancelled'){showMessage('warn','提出用PDFの出力を中止しました',String(job.message||''),null,[],0);return;}
+    if(job.status==='failed'||asArray(job.errors).length){
+      showMessage('danger','提出用PDFを出力できませんでした',userFriendlyError(asArray(job.errors)[0]?.userError||asArray(job.errors)[0]?.error||job.message||''),job.errors,
+        [{label:'動作環境を診断',primary:true,handler:()=>runSystemDiagnostics($('run-diagnostics-btn'))}]);
+      return;
+    }
+    const built=asArray(job.built)[0];
+    showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf||'出力フォルダを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);
+    showPostBuildWarning(volume);
+  },false);
+}
+
+// 提出用PDFの出力はジョブとして走らせ、変換PDFと同じ進捗パネルで件数・段階・中止を出す。
+// 単発awaitのままだと、数十秒のあいだ4秒で消えるトーストしか手掛かりがない。
+async function runFinalBuildJob(targetIds){
+  const ids=asArray(targetIds).map(id=>String(id||'')).filter(Boolean);
+  if(!ids.length){showMessage('warn','出力先がありません','ページ構成で本体または補足にページを設定してください。');return null;}
+  const started=await api('/api/v2/outputs/build',{method:'POST',body:{packId:activePackId,targetIds:ids}});
+  const jobId=String(started.job?.jobId||'');
+  if(!jobId)throw new Error('出力ジョブを開始できませんでした。');
+  activeFinalJobId=jobId;activeFinalCancelRequested=false;
+  updateFinalProgressPanel(started.job);
+  try{
+    for(;;){
+      await sleep(700);
+      const polled=await api(`/api/v2/outputs/build/status?jobId=${encodeURIComponent(jobId)}`);
+      const job=polled.job||{};
+      updateFinalProgressPanel(job);
+      if(['completed','completed-with-errors','failed','cancelled','missing'].includes(String(job.status||'')))
+        { await refresh(); await loadFinalReadiness(); return job; }
+    }
+  } finally {
+    activeFinalJobId='';activeFinalCancelRequested=false;
+    hideProgressPanel();
+  }
+}
+function updateFinalProgressPanel(job){
+  if(!job)return;
+  // 変換PDFの進捗パネルをそのまま使う。中止ボタンの宛先だけ出力ジョブへ切り替える。
+  updateProgressPanel({
+    status:String(job.status||'running'),
+    percent:Number(job.percent||0),
+    total:Number(job.total||0),
+    completed:Number(job.completed||0),
+    failed:Number(job.failed||0),
+    message:String(job.message||''),
+    currentWorkbookName:'',
+    currentSheet:''
+  });
+  const title=$('progress-title');
+  if(title)title.textContent=String(job.status||'')==='cancelled'?'提出用PDFの出力を中止しました'
+    :String(job.status||'')==='completed'?'提出用PDFを出力しました'
+    :(String(job.status||'')==='failed'||String(job.status||'')==='completed-with-errors')?'提出用PDFの出力を確認してください'
+    :'提出用PDFを作成中';
+  const cancel=$('progress-cancel');
+  if(cancel){
+    const terminal=['completed','completed-with-errors','failed','cancelled','missing'].includes(String(job.status||''));
+    cancel.hidden=!activeFinalJobId||terminal;
+    cancel.disabled=activeFinalCancelRequested;
+    cancel.textContent=activeFinalCancelRequested?'中止を受け付けました':'出力を中止';
+  }
+}
+async function cancelActiveFinalJob(){
+  if(!activeFinalJobId||activeFinalCancelRequested)return;
+  activeFinalCancelRequested=true;
+  const cancel=$('progress-cancel');
+  if(cancel){cancel.disabled=true;cancel.textContent='中止を受け付けました';}
+  try{
+    const response=await api('/api/v2/outputs/build/cancel',{method:'POST',body:{jobId:activeFinalJobId}});
+    showMessage('warn','出力の中止を受け付けました',String(response.result?.message||'作成中の1冊は最後まで書き上げてから停止します。'),null,[],0);
+  }catch(e){
+    activeFinalCancelRequested=false;
+    showMessage('danger','出力を中止できません',userFriendlyError(e.message),e.detail||e.stack||e.message);
+  }
 }
 
 async function publishFinalVolume(volume,btn) {
@@ -4289,20 +4368,25 @@ async function publishFinalVolume(volume,btn) {
 async function buildAllVolumes(btn) {
   const unassigned=unresolvedPageCount();
   if(unassigned){setActiveView('pages');showMessage('warn',`未振り分け ${unassigned}ページを確認してください`,'必要なページを提出用PDFへ移してから出力します。');return;}
-  // V5: 本体だけ成功する状態を作らないよう、サーバー側の準トランザクションAPIを1回だけ呼ぶ。
+  // V5: 本体だけ成功する状態を作らないよう、組み込みパックの一括出力はサーバー側の
+  // 準トランザクションAPIを1回だけ呼ぶ。ジョブ化してもその分岐はサーバー側で維持している。
   await runBusy(btn, async () => {
-    const custom=!activePackIsBuiltIn();
-    const r = await api(custom?'/api/v2/outputs/build':'/api/final/build-all', {method:'POST', body:custom?{packId:activePackId,targetIds:activeTargetDefinitions().map(target=>String(target.targetId))}:{category: activePreset}});
-    const built = asArray(r.result?.built);
-    const skipped = asArray(r.result?.skipped);
-    await refresh();await loadFinalReadiness();
+    const job=await runFinalBuildJob(activeTargetDefinitions().map(target=>String(target.targetId)));
+    if(!job)return;
+    if(job.status==='cancelled'){showMessage('warn','提出用PDFの出力を中止しました',String(job.message||''),null,[],0);return;}
+    const built=asArray(job.built),skipped=asArray(job.skipped),errors=asArray(job.errors);
+    if(errors.length){
+      showMessage('danger','提出用PDFを出力できませんでした',userFriendlyError(errors[0]?.userError||errors[0]?.error||job.message||''),errors,
+        [{label:'動作環境を診断',primary:true,handler:()=>runSystemDiagnostics($('run-diagnostics-btn'))}]);
+      return;
+    }
     if (built.length) {
       showMessage('ok','提出用PDFを出力しました', `${built.length}件を出力しました。`, {built, skipped},
                   [{label:'出力したPDFを確認', view:'final'}], 0);
     } else {
       showMessage('warn','出力対象がありません','ページ構成で本体または補足にページを設定してください。');
     }
-  });
+  }, false);
 }
 
 
@@ -4339,7 +4423,7 @@ const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEve
 bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('excel');setTimeout(()=>$('change-source-folder-btn')?.focus(),0);}else if(action==='create-pack'){openPackEditor('create');}else if(action==='render'){setActiveView('excel');await renderUpdated($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
 bind('notice-close','click',hideMessage);bind('error-close','click',hideErrorPanel);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));
 bind('app-load-retry','click',()=>loadInitialAppState($('app-load-retry')));
-bind('progress-cancel','click',()=>cancelActiveRenderJob());
+bind('progress-cancel','click',()=>{if(activeFinalJobId)return void cancelActiveFinalJob();void cancelActiveRenderJob();});
 bind('run-diagnostics-btn','click',()=>runSystemDiagnostics($('run-diagnostics-btn')));
 bind('template-add-target','click',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned');renderTemplateTargets([...collectTemplateTargets(),newTemplateTarget()],false);renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,false);});
 bind('pack-progress-attention-only','change',event=>{packProgressAttentionOnly=!!event.target.checked;renderPackProgressDashboard();});
