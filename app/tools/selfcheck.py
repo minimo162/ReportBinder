@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import json, os, re, shutil, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
@@ -1153,7 +1153,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v146', 'style.css?v=20260808_v92']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v147', 'style.css?v=20260808_v93']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1208,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260808_v146' not in html:
+if 'app.js?v=20260808_v147' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1234,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260808_v146' not in html:
+if 'app.js?v=20260808_v147' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1340,7 +1340,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.08.32':
+if str(runtime_info.get('version','')) != '2026.08.08.33':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
@@ -1655,7 +1655,9 @@ if "if(data.state)state=normalizeStatePayload(data.state)" in appjs:
     raise SystemExit('source registration incorrectly applies the V2 domain state to the legacy UI view')
 if "selectedFiles.clear();lastFileRangeAnchor='';await refresh();" not in appjs:
     raise SystemExit('source registration does not refresh the compatibility UI state')
-if "packId:String(pack?.packId||activePackId||'')" not in appjs:
+# pageApiBody は packId を必ず載せる。楽観ロックの baseLayout も同じ関数で付ける。
+_page_body = appjs.split('function pageApiBody(', 1)[1].split('\nfunction ', 1)[0]
+if "const packId=String(pack?.packId||activePackId||'')" not in _page_body or 'Object.assign({packId}' not in _page_body:
     raise SystemExit('page V2 requests do not consistently identify the active document pack')
 for needed in [
     "packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); volumes=$volumes",
@@ -1890,5 +1892,42 @@ for line in _excel_calls:
     if '$inspected' in line or '$wb @()' in line or '$x[0] @()' in line:
         if '$allSheetNames' not in line:
             raise SystemExit(f'Excel page sync must pass the hidden-inclusive sheet list: {line.strip()[:90]}')
+
+
+# 2026-08-09 optimistic locking for the page board --------------------------
+for needed in ['function Get-PageLayoutFingerprint', 'function New-StructureConflictError',
+               'function Test-StructureConflictError', 'function Get-RequestedBaseLayout',
+               "'reportBinderConflict'", 'layoutFingerprints = $layoutFingerprints']:
+    if needed not in server:
+        raise SystemExit(f'page layout optimistic locking missing: {needed}')
+_locked = _ps_function(server, 'Update-StructureLocked', 'server.ps1')
+for needed in ['$BaseLayout', '$LayoutScope', "$result['layoutFingerprint']"]:
+    if needed not in _locked:
+        raise SystemExit(f'Update-StructureLocked must support layout-scoped conflicts: {needed}')
+# 配置を変えない書き込み（更新スキャン等）で指紋が動くと、衝突していない操作まで拒否する。
+_fingerprint = _ps_function(server, 'Get-PageLayoutFingerprint', 'server.ps1')
+for forbidden in ("'status'", "'title'", "'contentPdf'", 'updatedAt'):
+    if forbidden in _fingerprint:
+        raise SystemExit(f'the layout fingerprint must not depend on {forbidden} (background writes would false-conflict)')
+for needed in ("'volume'", "'order'", "'enabled'", 'Resolve-PageId'):
+    if needed not in _fingerprint:
+        raise SystemExit(f'the layout fingerprint must cover {needed}')
+for flavor in ('Reorder-Pages', 'Update-Page'):
+    _body = _ps_function(server, flavor, 'server.ps1')
+    if 'Get-RequestedBaseLayout' not in _body or '$baseLayout $requestedScope' not in _body:
+        raise SystemExit(f'{flavor} must forward the caller layout fingerprint')
+if '409' not in server or "code = 'structure-conflict'" not in server:
+    raise SystemExit('a layout conflict must answer 409 with a structure-conflict code')
+for needed in ['function activeLayoutFingerprint', 'function rememberLayoutFingerprint',
+               'function handlePageLayoutConflict', 'function handlePageSettingsConflict',
+               "err.code = String(data.code || '')", 'body.baseLayout=base']:
+    if needed not in appjs:
+        raise SystemExit(f'client-side conflict handling missing: {needed}')
+# 保存成功後に指紋を進めないと、自分の直前の変更を他タブの変更と誤認して2回目が必ず失敗する。
+_apply = appjs.split('function applyPageMutationResult', 1)[1].split('\nfunction ', 1)[0]
+if 'rememberLayoutFingerprint' not in _apply:
+    raise SystemExit('applyPageMutationResult must advance the stored layout fingerprint')
+if appjs.count("e.code==='structure-conflict'") + appjs.count("error.code==='structure-conflict'") < 4:
+    raise SystemExit('every page-mutating call site must handle the conflict response')
 
 print('selfcheck ok')

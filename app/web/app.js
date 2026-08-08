@@ -583,6 +583,8 @@ async function api(path, options = {}) {
     const err = new Error(data.error || `HTTP ${res.status}`);
     err.detail = data.detail || text;
     err.payload = data;
+    err.status = res.status;
+    err.code = String(data.code || '');
     throw err;
   }
   return data;
@@ -1609,7 +1611,22 @@ function activePackRecord() { return packForPreset(activePreset); }
 function activePackIsBuiltIn(){return !!String(activePackRecord()?.category||'');}
 function pageApiBody(extra={}){
   const pack=activePackRecord();
-  return Object.assign({packId:String(pack?.packId||activePackId||'')},extra);
+  const packId=String(pack?.packId||activePackId||'');
+  // 並べ替えAPIは画面全体の並びを絶対値で送るため、読み込んだ時点の配置指紋を
+  // 添えてサーバーに照合させる。他のタブが先に保存していれば409で拒否される。
+  const body=Object.assign({packId},extra);
+  const base=activeLayoutFingerprint(packId);
+  if(base)body.baseLayout=base;
+  return body;
+}
+function activeLayoutFingerprint(packId){
+  return String(state?.layoutFingerprints?.[String(packId||'')]||'');
+}
+function rememberLayoutFingerprint(packId,fingerprint){
+  const id=String(packId||''),value=String(fingerprint||'');
+  if(!id||!value||!state)return;
+  if(!state.layoutFingerprints)state.layoutFingerprints={};
+  state.layoutFingerprints[id]=value;
 }
 function reconcileActivePackSelection() {
   const workflowPacks = asArray(state?.packs).filter(pack => pack?.workflowAvailable && !pack?.archived);
@@ -3937,6 +3954,9 @@ function applyPageMutationResult(payload){
   const result=payload?.result||payload||{};
   const structure=state?.structure;
   if(!structure)return;
+  // 保存が通ったら、次の操作の基準を新しい指紋へ進める。ここを忘れると
+  // 自分の直前の変更を「他のタブの変更」と誤認して2回目以降が必ず失敗する。
+  if(result.layoutFingerprint)rememberLayoutFingerprint(activePackRecord()?.packId||activePackId,result.layoutFingerprint);
   if(Array.isArray(result.pages))structure.pages=result.pages;
   else if(result.page){
     const id=resolvedPageId(result.page);
@@ -3964,6 +3984,20 @@ function scheduleBoardSave(undo=null) {
   if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}
   void saveBoardOrder();
 }
+// 他のタブが先にページ構成を保存していた場合。こちらの並びで上書きすると相手の変更が
+// 消えるので、画面を最新へ戻し、何が起きたかと次にどうするかを伝える。
+async function handlePageLayoutConflict(rejectedVolumes,requestRevision){
+  const failedUndo=pageLayoutUndoStack[pageLayoutUndoStack.length-1];
+  if(failedUndo&&pageVolumeSnapshotsEqual(failedUndo.after,rejectedVolumes))pageLayoutUndoStack.pop();
+  try{await refresh();}catch{}
+  if(requestRevision!==boardSaveRevision)return;
+  selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';
+  renderPages();
+  updateBulkSelectionLabel();
+  showMessage('warn','ページ構成が別の画面で変更されました',
+    'この画面の並びは保存していません。最新の状態を読み込み直したので、内容を確認してからもう一度操作してください。',
+    null,[],0);
+}
 function saveBoardOrder() {
   if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}
   const undo=pendingPageLayoutUndo;pendingPageLayoutUndo=null;
@@ -3976,6 +4010,7 @@ function saveBoardOrder() {
       if(!newerBoardExists)showMessage('ok','ページ構成を保存しました','未振り分け・本体・補足の割り当てと並びを反映しました。',null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
       return true;
     }catch(e){
+      if(e.code==='structure-conflict'){void handlePageLayoutConflict(volumes,requestRevision);return false;}
       showMessage('danger','並び替えを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);
       lastPageBoardRenderSignature='';
       // 保存できなかった並びを画面に残すと、collectBoardVolumes() が次の操作でそれを一緒に
@@ -4004,19 +4039,27 @@ async function savePageFromRow(row, numberingChanged=false) {
   try{
     const response=await api('/api/pages/update',{method:'POST',body});
     applyPageMutationResult(response);
-  }catch(e){showMessage('danger','ページを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+  }catch(e){if(e.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
 }
 
+async function handlePageSettingsConflict(){
+  try{await refresh();}catch{}
+  lastPageBoardRenderSignature='';
+  renderPages();
+  showMessage('warn','ページ構成が別の画面で変更されました',
+    'この変更は保存していません。最新の状態を読み込み直したので、内容を確認してからもう一度操作してください。',
+    null,[],0);
+}
 function pageSettingsBody(pageId,title,numbering,pageRange=''){
   const body=pageApiBody({pageId:String(pageId||''),title:String(title||'').trim()});const range=String(pageRange||'').trim();if(range)body.pageRange=range;else body.clearPageRange=true;if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering==='none'?'none':'visible';body.numberingManual=true;}return body;
 }
 async function restorePageSettings(previous){
   try{const response=await api('/api/pages/update',{method:'POST',body:pageSettingsBody(previous.pageId,previous.title,previous.numbering,previous.pageRange)});applyPageMutationResult(response);showMessage('ok','ページ設定を元に戻しました',previous.title);}
-  catch(error){showMessage('danger','ページ設定を元に戻せません',userFriendlyError(error.message),error.detail||error.stack||error.message);}
+  catch(error){if(error.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページ設定を元に戻せません',userFriendlyError(error.message),error.detail||error.stack||error.message);}
 }
 async function savePageFromThumbnail(row,btn){
   if(!row)return;const pageId=String(row.dataset.pageId||''),page=getPage(pageId),titleInput=row.querySelector('[data-thumb-page-title]'),rangeInput=row.querySelector('[data-thumb-page-range]'),numberingInput=row.querySelector('[data-thumb-page-numbering]'),title=String(titleInput?.value||'').trim(),pageRange=String(rangeInput?.value||'').trim(),numbering=String(numberingInput?.value||'auto');if(!title){showMessage('warn','ページ名を入力してください','ページ名は空にできません。');titleInput?.focus();return;}if(pageRange&&!/^\d+(\s*-\s*\d+)?$/.test(pageRange)){showMessage('warn','ページ範囲を確認してください','「2」または「2-5」の形式で入力してください。');rangeInput?.focus();return;}const previous={pageId,title:String(page?.title||page?.sheetName||''),pageRange:pageRangeText(page),numbering:numberingSelectValue(page)};
-  await runBusy(btn,async()=>{try{const response=await api('/api/pages/update',{method:'POST',body:pageSettingsBody(pageId,title,numbering,pageRange)});applyPageMutationResult(response);showMessage('ok','ページ設定を保存しました',title,null,[{label:'元に戻す',handler:()=>restorePageSettings(previous)}],8000);}catch(error){showMessage('danger','ページ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
+  await runBusy(btn,async()=>{try{const response=await api('/api/pages/update',{method:'POST',body:pageSettingsBody(pageId,title,numbering,pageRange)});applyPageMutationResult(response);showMessage('ok','ページ設定を保存しました',title,null,[{label:'元に戻す',handler:()=>restorePageSettings(previous)}],8000);}catch(error){if(error.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
 }
 
 

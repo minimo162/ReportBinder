@@ -2492,15 +2492,77 @@ function Get-Structure([string]$Language) {
     return $structure
 }
 
-function Update-StructureLocked([string]$Language, [scriptblock]$Mutation) {
+# ページ構成の楽観ロック。並べ替えAPIは画面全体の並びを絶対値で送るため、
+# これが無いと後から保存した側が相手の変更を無言で巻き戻す。
+#
+# 判定材料は「配置そのものの指紋」にする。structure全体の版番号だと、5分ごとの
+# 更新スキャンやPDF作成のように配置を変えない書き込みでも増えてしまい、
+# 実際には衝突していない操作を拒否してしまう。
+function Get-PageLayoutFingerprint($Structure, [string]$PackId) {
+    $workbookIds = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $PackId })) {
+        $workbookIds[[string]$wb.workbookId] = $true
+    }
+    $parts = @(Get-Array $Structure.pages |
+        Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) } |
+        Sort-Object { [string](Resolve-PageId $_) } |
+        ForEach-Object {
+            '{0}~{1}~{2}~{3}' -f (Resolve-PageId $_),
+                [string](Get-DataProperty $_ 'volume' 'none'),
+                ([double](Get-DataProperty $_ 'order' 0)),
+                ([bool](Get-DataProperty $_ 'enabled' $false))
+        })
+    if ($parts.Count -eq 0) { return 'empty' }
+    $bytes = [Text.Encoding]::UTF8.GetBytes([string]::Join('|', [string[]]$parts))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function New-StructureConflictError([string]$Expected, [string]$Actual) {
+    $conflict = [System.InvalidOperationException]::new('他の画面でページ構成が変更されました。最新の状態を読み込み直してから操作してください。')
+    $conflict.Data['reportBinderConflict'] = $true
+    $conflict.Data['expectedLayout'] = $Expected
+    $conflict.Data['actualLayout'] = $Actual
+    return $conflict
+}
+
+function Test-StructureConflictError($Exception) {
+    if ($null -eq $Exception -or $null -eq $Exception.Data) { return $false }
+    try { return [bool]$Exception.Data['reportBinderConflict'] } catch { return $false }
+}
+
+function Get-RequestedBaseLayout($Body) {
+    $raw = [string](Get-DataProperty $Body 'baseLayout' '')
+    if ([string]::IsNullOrWhiteSpace($raw)) { return '' }
+    if ($raw -notmatch '^[a-z0-9]{1,128}$') { return '' }
+    return $raw
+}
+
+# $LayoutScope を渡した呼び出しだけが、ページ配置の衝突判定と指紋の返却を行う。
+# パックIDの解決には structure が要るため、ロックを取った中で解決する。
+function Update-StructureLocked([string]$Language, [scriptblock]$Mutation, [string]$BaseLayout = '', [string]$LayoutScope = $null) {
     $workspace = Get-WorkspacePath $Language
     $structureLock = Join-Path $workspace 'locks\structure.lock'
+    $layoutAware = ($null -ne $LayoutScope)
     return Invoke-WithLock $structureLock {
         $structure = Read-StructureUnlocked $Language
+        $layoutPackId = ''
+        if ($layoutAware) {
+            try { $layoutPackId = [string](Resolve-DocumentPackScope $structure ([string]$LayoutScope) $false).packId } catch { $layoutPackId = '' }
+        }
+        if ($layoutAware -and -not [string]::IsNullOrWhiteSpace($BaseLayout)) {
+            $currentLayout = Get-PageLayoutFingerprint $structure $layoutPackId
+            if ($BaseLayout -ne $currentLayout) { throw (New-StructureConflictError $BaseLayout $currentLayout) }
+        }
         $result = & $Mutation $structure
         Write-StructureUnlocked $Language $structure
         # 同一ファイルシステム時刻内の連続更新でも古い読取結果を返さない。
         $Script:StructureReadCache.Clear()
+        # 保存後の指紋を返す。画面はこれを次回の baseLayout として使う。
+        if ($layoutAware -and $result -is [System.Collections.IDictionary]) {
+            $result['layoutFingerprint'] = Get-PageLayoutFingerprint $structure $layoutPackId
+        }
         return $result
     }
 }
@@ -6222,6 +6284,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
 
 function Reorder-Pages([string]$Language, $Body) {
     $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
+    $baseLayout = Get-RequestedBaseLayout $Body
     return Update-StructureLocked $Language {
         param($structure)
         $cat = [string](Resolve-DocumentPackScope $structure $requestedScope $false).packId
@@ -6265,12 +6328,13 @@ function Reorder-Pages([string]$Language, $Body) {
         Apply-DefaultNumberingPerVolume $Language $structure $cat
         if ($affected.Count -gt 0) { Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました' }
         return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; affectedVolumes=@($affected); layoutSnapshotId=$layoutSnapshotId; updatedAt=(New-NowIso) }
-    }
+    } $baseLayout $requestedScope
 }
 
 
 function Update-Page([string]$Language, $Body) {
     $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
+    $baseLayout = Get-RequestedBaseLayout $Body
     return Update-StructureLocked $Language {
         param($structure)
         $cat = [string](Resolve-DocumentPackScope $structure $requestedScope $false).packId
@@ -6329,7 +6393,7 @@ function Update-Page([string]$Language, $Body) {
             Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました'
         }
         return [ordered]@{ page=$p; volumes=$structure.volumes; layoutSnapshotId=$layoutSnapshotId }
-    }
+    } $baseLayout $requestedScope
 }
 function Confirm-Page([string]$Language, $Body) {
     $cat=Require-WorkbookCategory ([string]$Body.category)
@@ -7142,6 +7206,12 @@ function Get-StatePayload([string]$Language) {
     $publicPacks = @(Get-PublicPackList $structure $Language)
     $packProgress = [pscustomobject][ordered]@{ packs=@(); totalCount=0; completeCount=0; attentionCount=0; missingRequiredCount=0; overdueRequiredCount=0; dueSoonRequiredCount=0; needsRenderCount=0; unassignedPageCount=0 }
     if ($configured -and -not $structureLoadError) { try { $packProgress = Get-PackProgressDashboard $structure $Language } catch { Write-Warning ('資料パック進捗を集計できません: ' + $_.Exception.Message) } }
+    # ページ構成の楽観ロック用。画面はこれを baseLayout として送り返す。
+    $layoutFingerprints = [ordered]@{}
+    if ($configured -and -not $structureLoadError) {
+        try { foreach ($pack in $publicPacks) { $layoutFingerprints[[string]$pack.packId] = Get-PageLayoutFingerprint $structure ([string]$pack.packId) } }
+        catch { Write-Warning ('ページ構成の指紋を計算できません: ' + $_.Exception.Message) }
+    }
     return [ordered]@{
         ok = $true
         token = $Script:Token
@@ -7150,6 +7220,7 @@ function Get-StatePayload([string]$Language) {
         packTemplates = $packTemplates
         packs = $publicPacks
         structure = ConvertTo-V4StructureCompatibilityView $structure
+        layoutFingerprints = $layoutFingerprints
         structureLoadError = $structureLoadError
         finalReadiness = $(if ($configured -and -not $structureLoadError) { Get-AllFinalReadiness $structure $Language $false } else { [ordered]@{} })
         packProgress = $packProgress
@@ -8165,6 +8236,14 @@ function Handle-Api($Context) {
     } catch [System.ArgumentException] {
         Write-JsonResponse $Context 400 ([ordered]@{ ok = $false; error = $_.Exception.Message })
     } catch {
+        # 楽観ロックの衝突は、利用者側で解決できる状態ずれ。サーバー障害と区別する。
+        if (Test-StructureConflictError $_.Exception) {
+            Write-JsonResponse $Context 409 ([ordered]@{
+                ok = $false; code = 'structure-conflict'; error = $_.Exception.Message
+                currentLayout = [string]$_.Exception.Data['actualLayout']
+            })
+            return
+        }
         Write-JsonResponse $Context 500 ([ordered]@{ ok = $false; error = $_.Exception.Message; detail = (Get-ErrorDetail $_) })
     }
 }
@@ -8519,7 +8598,9 @@ function Start-LocalTcpServer([int]$ListenPort, [string]$OpenUrl, [bool]$SkipOpe
                 try {
                     $ctx = [pscustomobject]@{ IsTcp = $true; TcpClient = $client; TcpStream = $client.GetStream(); Request = $null; Response = [pscustomobject]@{} }
                     $err = [ordered]@{ ok = $false; error = $_.Exception.Message }
-                    $status = $(if ($_.Exception -is [System.ArgumentException]) { 400 } else { 500 })
+                    $status = 500
+                    if ($_.Exception -is [System.ArgumentException]) { $status = 400 }
+                    elseif (Test-StructureConflictError $_.Exception) { $status = 409; $err['code'] = 'structure-conflict' }
                     Write-JsonResponse $ctx $status $err
                 } catch {
                     try { $client.Close() } catch {}
