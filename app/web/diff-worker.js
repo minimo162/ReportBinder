@@ -461,6 +461,55 @@ function mergeNearbyComponents(components,width,height){
   }
   return merged;
 }
+function collectMaskComponents(mask,counts,gridWidth,gridHeight,width,height,gapX=2){
+  const cellCount=gridWidth*gridHeight,grown=new Uint8Array(cellCount);
+  for(let gy=0;gy<gridHeight;gy++)for(let gx=0;gx<gridWidth;gx++){
+    const index=gy*gridWidth+gx;if(!mask[index])continue;
+    for(let ox=-gapX;ox<=gapX;ox++){
+      const nx=gx+ox;if(nx>=0&&nx<gridWidth)grown[gy*gridWidth+nx]=1;
+    }
+  }
+  const visited=new Uint8Array(cellCount),queue=new Int32Array(cellCount),raw=[];
+  for(let start=0;start<cellCount;start++){
+    if(!grown[start]||visited[start])continue;
+    let head=0,tail=0;queue[tail++]=start;visited[start]=1;
+    let minX=width,minY=height,maxX=-1,maxY=-1,pixels=0;
+    while(head<tail){
+      const current=queue[head++],cx=current%gridWidth,cy=Math.floor(current/gridWidth);
+      if(mask[current]){
+        const x0=cx*BLOCK,y0=cy*BLOCK;
+        minX=Math.min(minX,x0);minY=Math.min(minY,y0);maxX=Math.max(maxX,Math.min(width,x0+BLOCK)-1);maxY=Math.max(maxY,Math.min(height,y0+BLOCK)-1);pixels+=counts[current];
+      }
+      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+        if(!ox&&!oy)continue;
+        const nx=cx+ox,ny=cy+oy;if(nx<0||nx>=gridWidth||ny<0||ny>=gridHeight)continue;
+        const next=ny*gridWidth+nx;if(grown[next]&&!visited[next]){visited[next]=1;queue[tail++]=next;}
+      }
+    }
+    if(pixels<MIN_PIXELS||maxX<minX||maxY<minY)continue;
+    raw.push({minX:Math.max(0,minX-PADDING),minY:Math.max(0,minY-PADDING),maxX:Math.min(width-1,maxX+PADDING),maxY:Math.min(height-1,maxY+PADDING),pixels});
+  }
+  return raw;
+}
+function clearLongMaskRuns(mask,gridWidth,gridHeight){
+  const horizontalMinimum=Math.max(12,Math.ceil(gridWidth*.18)),verticalMinimum=Math.max(12,Math.ceil(gridHeight*.18));
+  for(let gy=0;gy<gridHeight;gy++){
+    let start=-1;
+    for(let gx=0;gx<=gridWidth;gx++){
+      const active=gx<gridWidth&&mask[gy*gridWidth+gx];
+      if(active&&start<0)start=gx;
+      if((!active||gx===gridWidth)&&start>=0){if(gx-start>=horizontalMinimum)for(let x=start;x<gx;x++)mask[gy*gridWidth+x]=0;start=-1;}
+    }
+  }
+  for(let gx=0;gx<gridWidth;gx++){
+    let start=-1;
+    for(let gy=0;gy<=gridHeight;gy++){
+      const active=gy<gridHeight&&mask[gy*gridWidth+gx];
+      if(active&&start<0)start=gy;
+      if((!active||gy===gridHeight)&&start>=0){if(gy-start>=verticalMinimum)for(let y=start;y<gy;y++)mask[y*gridWidth+gx]=0;start=-1;}
+    }
+  }
+}
 function buildFallbackRegion(counts,gridWidth,gridHeight,width,height){
   let seed=-1,peak=0;
   for(let index=0;index<counts.length;index++)if(counts[index]>peak){peak=counts[index];seed=index;}
@@ -1149,33 +1198,7 @@ function analyzeBrowserDiff(before,after,width,height){
     }
   }
   // Grow horizontally to combine one logical row, but not vertically across many spreadsheet rows.
-  const grown=new Uint8Array(cellCount),gapX=2;
-  for(let gy=0;gy<gridHeight;gy++)for(let gx=0;gx<gridWidth;gx++){
-    const index=gy*gridWidth+gx;if(!mask[index])continue;
-    for(let ox=-gapX;ox<=gapX;ox++){
-      const nx=gx+ox;if(nx>=0&&nx<gridWidth)grown[gy*gridWidth+nx]=1;
-    }
-  }
-  const visited=new Uint8Array(cellCount),queue=new Int32Array(cellCount),raw=[];
-  for(let start=0;start<cellCount;start++){
-    if(!grown[start]||visited[start])continue;
-    let head=0,tail=0;queue[tail++]=start;visited[start]=1;
-    let minX=width,minY=height,maxX=-1,maxY=-1,pixels=0;
-    while(head<tail){
-      const current=queue[head++],cx=current%gridWidth,cy=Math.floor(current/gridWidth);
-      if(mask[current]){
-        const x0=cx*BLOCK,y0=cy*BLOCK;
-        minX=Math.min(minX,x0);minY=Math.min(minY,y0);maxX=Math.max(maxX,Math.min(width,x0+BLOCK)-1);maxY=Math.max(maxY,Math.min(height,y0+BLOCK)-1);pixels+=counts[current];
-      }
-      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
-        if(!ox&&!oy)continue;
-        const nx=cx+ox,ny=cy+oy;if(nx<0||nx>=gridWidth||ny<0||ny>=gridHeight)continue;
-        const next=ny*gridWidth+nx;if(grown[next]&&!visited[next]){visited[next]=1;queue[tail++]=next;}
-      }
-    }
-    if(pixels<MIN_PIXELS||maxX<minX||maxY<minY)continue;
-    raw.push({minX:Math.max(0,minX-PADDING),minY:Math.max(0,minY-PADDING),maxX:Math.min(width-1,maxX+PADDING),maxY:Math.min(height-1,maxY+PADDING),pixels});
-  }
+  const raw=collectMaskComponents(mask,counts,gridWidth,gridHeight,width,height,2);
   let components=mergeNearbyComponents(raw,width,height),rowStructureBoxes=[];
   if(structuralRowBoxes.length){
     const rowBoxes=[];
@@ -1195,16 +1218,43 @@ function analyzeBrowserDiff(before,after,width,height){
     components.push(...localized.slice(0,3),...rowBoxes);
     if(rowAlignment.adjusted||rowHeightChange){
       // Page-height growth and shifted totals can leave strong residuals far from
-      // the inserted row. Once a structural row is found, keep only its band.
-      components=components.filter(component=>rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY));
+      // the inserted row. Keep the structural band and localized edits elsewhere;
+      // only broad residuals are alignment noise. Dropping every off-band component
+      // erases cell edits accumulated across older history generations.
+      if(tableRowStructureChange)components=components.filter(component=>rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY));
+      else components=components.filter(component=>{
+          if(rowBoxes.some(box=>component.maxY>=box.minY&&component.minY<=box.maxY))return true;
+          const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
+          return componentWidth<=width*.42&&componentHeight<=height*.14&&componentWidth*componentHeight<=width*height*.04;
+        });
     }
   }
   if(structuralColumnBoxes.length){
     // Residual antialiasing after an Excel fit-to-page scale can connect every table
-    // gridline into one huge rectangle. The discontinuity itself is the useful human
-    // signal, so replace such broad residuals with the actual inserted/resized band.
-    if(columnStructureChange||columnBoundaryChange||!reliableColumnRules)components=structuralColumnBoxes;
-    else{
+    // gridline into one huge rectangle. Keep the discontinuity as the primary signal,
+    // but do not discard independent cell edits elsewhere on the same page. Historical
+    // comparisons often combine a column resize in one generation with text edits from
+    // earlier generations, and replacing the component list hid those cumulative edits.
+    if(columnStructureChange||columnBoundaryChange||!reliableColumnRules){
+      const bandTop=Math.min(...structuralColumnBoxes.map(box=>box.minY)),bandBottom=Math.max(...structuralColumnBoxes.map(box=>box.maxY));
+      const localizedResiduals=components.filter(component=>{
+        const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
+        const componentArea=componentWidth*componentHeight;
+        const overlapsStructuralBand=component.maxY>=bandTop&&component.minY<=bandBottom;
+        const overlapsStructuralColumn=structuralColumnBoxes.some(box=>{
+          const overlapX=Math.min(component.maxX,box.maxX)-Math.max(component.minX,box.minX)+1;
+          const overlapY=Math.min(component.maxY,box.maxY)-Math.max(component.minY,box.minY)+1;
+          return overlapX>0&&overlapY>0;
+        });
+        if(overlapsStructuralColumn)return false;
+        // Outside the affected table band the alignment is identity, so even a wider
+        // component is a real page edit. Inside the band, retain only localized residuals
+        // and suppress the broad gridline/antialiasing artifacts caused by the resize.
+        if(!overlapsStructuralBand)return true;
+        return componentWidth<=width*.42&&componentHeight<=height*.35&&componentArea<=width*height*.08;
+      });
+      components=[...localizedResiduals,...structuralColumnBoxes];
+    }else{
       const structuralPixels=Math.max(...structuralColumnBoxes.map(box=>box.pixels||MIN_PIXELS));
       components=components.filter(component=>{
         const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
@@ -1215,6 +1265,38 @@ function analyzeBrowserDiff(before,after,width,height){
       components.push(...structuralColumnBoxes);
     }
     if(components.length>MAX_LAYOUT_REGIONS)components.sort((a,b)=>b.pixels-a.pixels).splice(MAX_LAYOUT_REGIONS);
+  }
+  if(structuralColumnBoxes.length||structuralRowBoxes.length&&!tableRowStructureChange){
+    // Structural rules can connect otherwise independent text edits into one page-wide
+    // component. Remove the known structural bands and long rule runs, then recover the
+    // remaining compact components as supplementary cumulative changes.
+    const recoveryMask=new Uint8Array(mask),exclusionBoxes=[...structuralRowBoxes,...structuralColumnBoxes];
+    for(const box of exclusionBoxes){
+      const minGX=Math.max(0,Math.floor((box.minX-PADDING)/BLOCK)),maxGX=Math.min(gridWidth-1,Math.floor((box.maxX+PADDING)/BLOCK));
+      const minGY=Math.max(0,Math.floor((box.minY-PADDING)/BLOCK)),maxGY=Math.min(gridHeight-1,Math.floor((box.maxY+PADDING)/BLOCK));
+      for(let gy=minGY;gy<=maxGY;gy++)for(let gx=minGX;gx<=maxGX;gx++)recoveryMask[gy*gridWidth+gx]=0;
+    }
+    clearLongMaskRuns(recoveryMask,gridWidth,gridHeight);
+    const recovered=mergeNearbyComponents(collectMaskComponents(recoveryMask,counts,gridWidth,gridHeight,width,height,1),width,height)
+      .filter(component=>{
+        const componentWidth=component.maxX-component.minX+1,componentHeight=component.maxY-component.minY+1;
+        const aspect=Math.max(componentWidth/componentHeight,componentHeight/componentWidth);
+        return componentWidth<=width*.25&&componentHeight<=height*.12&&componentWidth*componentHeight<=width*height*.02&&aspect<=6;
+      })
+      .sort((a,b)=>{
+        const score=component=>component.pixels*Math.sqrt(component.pixels/Math.max(1,(component.maxX-component.minX+1)*(component.maxY-component.minY+1)));
+        return score(b)-score(a);
+      }).slice(0,12);
+    for(const component of recovered){
+      const duplicate=components.some(existing=>{
+        const overlapX=Math.min(component.maxX,existing.maxX)-Math.max(component.minX,existing.minX)+1;
+        const overlapY=Math.min(component.maxY,existing.maxY)-Math.max(component.minY,existing.minY)+1;
+        if(overlapX<=0||overlapY<=0)return false;
+        const componentArea=(component.maxX-component.minX+1)*(component.maxY-component.minY+1);
+        return overlapX*overlapY/componentArea>=.35;
+      });
+      if(!duplicate)components.push(component);
+    }
   }
   const dominantHorizontal=components
     .filter(component=>(component.maxX-component.minX+1)>width*.2&&(component.maxY-component.minY+1)<height*.05)

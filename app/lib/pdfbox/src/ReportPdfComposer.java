@@ -46,13 +46,6 @@ public class ReportPdfComposer {
         File parent = outFile.getParentFile();
         if (parent != null) parent.mkdirs();
 
-        Map<String, Object> document = map(manifest.get("document"));
-        boolean includeCover = bool(document.get("includeCover"), false);
-        boolean includeToc = bool(document.get("includeToc"), false);
-        boolean includeSectionDividers = bool(document.get("includeSectionDividers"), false);
-        String documentTitle = str(document.get("title"));
-        if (documentTitle.isEmpty()) documentTitle = str(manifest.get("projectId"));
-
         List<ContentSpec> specs = new ArrayList<>();
         for (Object o : pages) {
             Map<String, Object> entry = (Map<String, Object>) o;
@@ -69,22 +62,9 @@ public class ReportPdfComposer {
             }
         }
 
-        int tocLinesPerPage = 34;
-        int tocPageCount = includeToc ? Math.max(1, (specs.size() + tocLinesPerPage - 1) / tocLinesPerPage) : 0;
-        int plannedPage = (includeCover ? 1 : 0) + tocPageCount;
-        String previousSection = null;
-        for (ContentSpec spec : specs) {
-            String section = str(spec.entry.get("sectionId"));
-            if (includeSectionDividers && !section.equals(previousSection)) plannedPage++;
-            spec.outputStartPage = plannedPage + 1;
-            plannedPage += spec.count();
-            previousSection = section;
-        }
-
         int physicalPageNo = 0;
         try (PDDocument out = new PDDocument()) {
             PDFont pageFont = loadArialOrFallback(out);
-            PDFont documentFont = loadDocumentFont(out);
             PDDocumentOutline outline = new PDDocumentOutline();
             out.getDocumentCatalog().setDocumentOutline(outline);
             // PDFBox 2.x may keep imported page resources backed by the source
@@ -96,39 +76,8 @@ public class ReportPdfComposer {
             Map<String, PDDocument> sourceDocuments = new LinkedHashMap<>();
             try {
 
-            if (includeCover) {
-                PDPage cover = new PDPage(PDRectangle.A4);
-                out.addPage(cover); physicalPageNo++;
-                drawGeneratedPage(out, cover, documentFont, documentTitle, Arrays.asList(str(document.get("subtitle")), str(document.get("targetName")), str(manifest.get("createdAt"))), true);
-            }
-            if (includeToc) {
-                for (int tocPage = 0; tocPage < tocPageCount; tocPage++) {
-                    PDPage page = new PDPage(PDRectangle.A4);
-                    out.addPage(page); physicalPageNo++;
-                    List<String> lines = new ArrayList<>();
-                    int from = tocPage * tocLinesPerPage;
-                    int to = Math.min(specs.size(), from + tocLinesPerPage);
-                    for (int i = from; i < to; i++) {
-                        ContentSpec spec = specs.get(i);
-                        lines.add(str(spec.entry.get("bookmarkTitle")) + "    " + spec.outputStartPage);
-                    }
-                    drawGeneratedPage(out, page, documentFont, tocPage == 0 ? "目次 / Table of Contents" : "目次 / Table of Contents (continued)", lines, false);
-                    drawPageNumber(out, page, pageFont, fontSize, bottomPt, formatPageNumber(physicalPageNo, pageNumber));
-                }
-            }
-
-            previousSection = null;
             for (ContentSpec spec : specs) {
                 Map<String, Object> entry = spec.entry;
-                String section = str(entry.get("sectionId"));
-                if (includeSectionDividers && !section.equals(previousSection)) {
-                    PDPage divider = new PDPage(PDRectangle.A4);
-                    out.addPage(divider); physicalPageNo++;
-                    String sectionTitle = str(entry.get("sectionTitle"));
-                    if (sectionTitle.isEmpty()) sectionTitle = section;
-                    drawGeneratedPage(out, divider, documentFont, sectionTitle, Collections.<String>emptyList(), true);
-                }
-                previousSection = section;
                 String numberingMode = str(entry.get("numberingMode"));
                 if (numberingMode.isEmpty()) numberingMode = "visible";
                 if (!"visible".equals(numberingMode) && !"none".equals(numberingMode)) {
@@ -182,44 +131,9 @@ public class ReportPdfComposer {
         final File source;
         final int start;
         final int end;
-        int outputStartPage;
         ContentSpec(Map<String, Object> entry, File source, int start, int end) {
             this.entry = entry; this.source = source; this.start = start; this.end = end;
         }
-        int count() { return end - start + 1; }
-    }
-
-    private static void drawGeneratedPage(PDDocument doc, PDPage page, PDFont font, String title, List<String> lines, boolean centered) throws IOException {
-        PDRectangle box = page.getMediaBox();
-        String safeTitle = safePdfText(font, title.isEmpty() ? "ReportBinder" : title);
-        try (PDPageContentStream cs = new PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true)) {
-            cs.beginText();
-            cs.setFont(font, centered ? 24f : 18f);
-            float titleWidth = font.getStringWidth(safeTitle) / 1000f * (centered ? 24f : 18f);
-            float titleX = centered ? box.getLowerLeftX() + Math.max(48f, (box.getWidth() - titleWidth) / 2f) : box.getLowerLeftX() + 54f;
-            cs.newLineAtOffset(titleX, centered ? box.getLowerLeftY() + box.getHeight() * .62f : box.getUpperRightY() - 72f);
-            cs.showText(safeTitle);
-            cs.endText();
-            float y = centered ? box.getLowerLeftY() + box.getHeight() * .48f : box.getUpperRightY() - 108f;
-            for (String line : lines) {
-                if (line == null || line.trim().isEmpty()) continue;
-                String safe = safePdfText(font, line);
-                cs.beginText(); cs.setFont(font, 10.5f); cs.newLineAtOffset(box.getLowerLeftX() + 54f, y); cs.showText(safe); cs.endText();
-                y -= 18f;
-                if (y < 48f) break;
-            }
-        }
-    }
-
-    private static String safePdfText(PDFont font, String text) {
-        String value = text == null ? "" : text;
-        try { font.getStringWidth(value); return value; } catch (Exception ignored) { }
-        StringBuilder out = new StringBuilder();
-        for (int i = 0; i < value.length(); i++) {
-            String one = String.valueOf(value.charAt(i));
-            try { font.getStringWidth(one); out.append(one); } catch (Exception e) { out.append('?'); }
-        }
-        return out.toString();
     }
 
     private static void wrapExistingPageContent(PDDocument doc, PDPage page, float shift) throws IOException {
@@ -266,24 +180,6 @@ public class ReportPdfComposer {
             }
         }
         System.err.println("WARN: Arial font was not available or could not be loaded by this PDFBox version. Falling back to Helvetica.");
-        return PDType1Font.HELVETICA;
-    }
-
-    private static PDFont loadDocumentFont(PDDocument doc) throws IOException {
-        String windir = System.getenv("WINDIR");
-        List<File> candidates = new ArrayList<>();
-        if (windir != null && !windir.isEmpty()) {
-            candidates.add(new File(windir, "Fonts/NotoSansJP-VF.ttf"));
-            candidates.add(new File(windir, "Fonts/arial.ttf"));
-        }
-        candidates.add(new File("C:/Windows/Fonts/NotoSansJP-VF.ttf"));
-        candidates.add(new File("C:/Windows/Fonts/arial.ttf"));
-        for (File f : candidates) {
-            if (f.isFile()) {
-                PDFont font = tryLoadType0Font(doc, f);
-                if (font != null) return font;
-            }
-        }
         return PDType1Font.HELVETICA;
     }
 
@@ -341,13 +237,6 @@ public class ReportPdfComposer {
         return text;
     }
     private static String str(Object o) { return o == null ? "" : String.valueOf(o); }
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> map(Object o) { return o instanceof Map ? (Map<String, Object>)o : new LinkedHashMap<String, Object>(); }
-    private static boolean bool(Object o, boolean def) {
-        if (o == null) return def;
-        if (o instanceof Boolean) return ((Boolean)o).booleanValue();
-        return Boolean.parseBoolean(String.valueOf(o));
-    }
     private static int integer(Object o, int def) {
         if (o == null) return def;
         if (o instanceof Number) return ((Number)o).intValue();

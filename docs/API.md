@@ -25,6 +25,8 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `PATCH /api/v2/packs/{packId}`: 名称または仕上げ設定を変更する
 - `POST /api/v2/packs/{packId}/archive`: 任意資料パックを一覧からアーカイブする
 - `POST /api/v2/packs/{packId}/restore`: アーカイブした資料パックを復元する
+- `GET /api/v2/packs/{packId}/review`: 必須出力の指紋、提出可否、レビュー状態、監査履歴を返す
+- `POST /api/v2/packs/{packId}/review`: `submit / approve / request-changes / reopen`でレビュー状態を更新する
 - `GET /api/v2/source-candidates`: 登録可能なExcel（`.xlsx` / `.xlsm`）・Word（`.docx`）・PowerPoint（`.pptx`）・PDF原稿を返す
 - `POST /api/v2/sources/register-batch`: 複数形式の原稿を一括登録する
 - `POST /api/v2/sources/unregister`: `sourceId`で登録解除する
@@ -73,8 +75,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
     "blockBuildWhenRequiredSourceFailed": true
   },
   "output": {
-    "fileNamePattern": "{packName}_{targetName}_{yyyyMMdd}.pdf",
-    "tableOfContents": true
+    "fileNamePattern": "{packName}_{targetName}_{yyyyMMdd}.pdf"
   }
 }
 ```
@@ -93,7 +94,6 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
   "templateId": "builtin-generic-department-pack",
   "settings": {
     "documentTitle": "月次部門報告書",
-    "includeCover": true,
     "outputFileNamePattern": "{packName}_{yyyyMMdd}.pdf"
   }
 }
@@ -126,6 +126,24 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 ```
 
 `restore/preview`は現在も存在するページへの適用数、過去にだけ存在するページ、現在にだけ存在するページ、出力先が変わるページを返します。`restore`は同じ`packId`のページにだけ適用し、復元の直前にも新しい履歴を保存します。組み込みECM / BOD / DMMは従来の`/api/layout/*`と互換です。
+
+### 差分レビュー状態
+
+`POST /api/history/diff-review`は、表示中の比較に含まれる1つのページ項目を確認済み・未確認へ切り替える。`workbookId`、任意比較の場合は`fromSnapshotId`と`toSnapshotId`、画面が取得した`baselineVersionId`と`currentVersionId`、`sheetKey`、`confirmed`を送る。確認状態は利用者のローカル設定へ保存され、snapshot、render version、差分アルゴリズム版のいずれかが変わった比較へは引き継がれない。
+
+### 資料パックの提出・承認・監査履歴
+
+提出用PDFを作成した後、`submit`で必須出力の現在の指紋を固定してレビューへ提出します。`approve`は提出後に内容が変わっていない場合だけ成功します。原稿、ページ構成、仕上げ設定などが変わって指紋が一致しなくなると状態は`stale`になり、再出力・再提出が必要です。`request-changes`には差し戻し理由が必須です。`reopen`は下書きへ戻します。
+
+```json
+{
+  "action": "request-changes",
+  "note": "補足資料の数値根拠を追記してください",
+  "actor": "reviewer-name"
+}
+```
+
+状態変更は`events`へ最大100件保存され、操作、操作者、日時、コメント、提出時指紋を追跡できます。ダッシュボードの`packProgress`は、出力完了後も`review-draft / in-review / review-changes / review-stale / complete`を区別します。
 
 ## GET /api/state
 
@@ -542,9 +560,6 @@ ecm / bod / dmm
 {
   "documentTitle": "月次経営会議資料",
   "documentSubtitle": "2026年8月",
-  "includeCover": true,
-  "includeToc": true,
-  "includeSectionDividers": true,
   "outputFileNamePattern": "{projectId}_{targetName}_{yyyyMMdd}.pdf"
 }
 ```
@@ -628,4 +643,4 @@ GET   /api/v2/outputs/archives?packId=pack_...
 
 `POST /api/pages/update`の`pageRange`に`"2"`または`"2-5"`を指定すると、項目が参照する変換PDFの一部だけを最終PDFへ含めます。全ページへ戻す場合は`clearPageRange: true`を送信します。
 
-最終PDFのmanifestはschema 3です。`pages`には論理項目と元PDF内の開始・終了ページ、`physicalPages`には表紙・目次・区切りを含む出力後の物理ページ番号を記録します。成功時のmanifestは`exports/manifest_<volume>_<category>.json`に保存されます。
+最終PDFのmanifestはschema 3です。`pages`には論理項目と元PDF内の開始・終了ページ、`physicalPages`には出力後の物理ページ番号を記録します。表紙・目次・区切りページも通常の原稿として登録し、ページ構成で配置します。成功時のmanifestは`exports/manifest_<volume>_<category>.json`に保存されます。

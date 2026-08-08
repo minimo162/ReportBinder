@@ -29,10 +29,45 @@ $submissionDir = Join-Path $Script:LocalConfigRoot 'submission'
 $dataDir = Join-Path $Script:LocalProjectsRoot 'history-test-project\data'
 $outputDir = Join-Path $Script:LocalConfigRoot 'output'
 foreach ($dir in @($submissionDir,$dataDir,$outputDir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-Save-AppConfig ([pscustomobject][ordered]@{ schemaVersion=2; lastSubmissionDir=$submissionDir; lastDataDir=$dataDir; lastOutputDir=$outputDir; lastMode='ja' })
+Save-AppConfig ([pscustomobject][ordered]@{ schemaVersion=2; lastSubmissionDir=$submissionDir; lastDataDir=$dataDir; lastOutputDir=$outputDir })
 $paths = [pscustomobject][ordered]@{ submissionDir=$submissionDir; dataDir=$dataDir; outputDir=$outputDir }
 Ensure-Package $paths -Languages @('ja')
 Assert-HistoryTest (Test-SourceRetentionEnabled) 'Source retention was not enabled for the history test workspace.'
+
+# Local diff detail caches are immutable comparison identities. Re-rendering either
+# snapshot, switching automatic/history scope, or bumping the algorithm must miss the
+# old cache even when the two snapshot IDs themselves are unchanged.
+$historyCacheV1 = Get-LocalDiffDetailCachePath 'ja' 'cache-key-source' 'base-snapshot' 'current-snapshot' 'base-render' 'current-render-1' 'history'
+$historyCacheV2 = Get-LocalDiffDetailCachePath 'ja' 'cache-key-source' 'base-snapshot' 'current-snapshot' 'base-render' 'current-render-2' 'history'
+$automaticCache = Get-LocalDiffDetailCachePath 'ja' 'cache-key-source' 'base-snapshot' 'current-snapshot' 'base-render' 'current-render-2' 'automatic'
+Assert-HistoryTest ($historyCacheV1 -ne $historyCacheV2) 'A re-rendered snapshot reused the previous local diff detail cache key.'
+Assert-HistoryTest ($historyCacheV2 -ne $automaticCache) 'Automatic and arbitrary-history comparisons shared a local diff detail cache key.'
+$savedDiffAlgorithmVersion = $Script:DiffDetailAlgorithmVersion
+try {
+    $Script:DiffDetailAlgorithmVersion = $savedDiffAlgorithmVersion + 1
+    $newAlgorithmCache = Get-LocalDiffDetailCachePath 'ja' 'cache-key-source' 'base-snapshot' 'current-snapshot' 'base-render' 'current-render-2' 'history'
+    Assert-HistoryTest ($historyCacheV2 -ne $newAlgorithmCache) 'A diff algorithm bump reused the previous local diff detail cache key.'
+} finally { $Script:DiffDetailAlgorithmVersion = $savedDiffAlgorithmVersion }
+
+$reviewContext = [pscustomobject][ordered]@{
+    available=$true; scope='history'; workbookId='cache-key-source'
+    baselineSnapshotId='base-snapshot'; baselineVersionId='base-render'
+    currentSnapshotId='current-snapshot'; currentVersionId='current-render-1'
+}
+$reviewPath = Get-DiffReviewStatePath 'ja' $reviewContext
+New-Item -ItemType Directory -Path (Split-Path -Parent $reviewPath) -Force | Out-Null
+Write-JsonFile $reviewPath ([ordered]@{
+    schemaVersion=1; workbookId='cache-key-source'; scope='history'
+    baselineSnapshotId='base-snapshot'; baselineVersionId='base-render'
+    currentSnapshotId='current-snapshot'; currentVersionId='current-render-1'
+    algorithmVersion=$Script:DiffDetailAlgorithmVersion; confirmedSheetKeys=@('s-review-a'); reviewedAt=(New-NowIso); reviewedBy='selfcheck'
+})
+$loadedReview = Get-DiffReviewStateForContext 'ja' $reviewContext
+Assert-HistoryTest (@($loadedReview.confirmedSheetKeys) -contains 's-review-a') 'Exact-generation diff review state was not restored.'
+$rerenderedReviewContext = $reviewContext.psobject.Copy()
+$rerenderedReviewContext.currentVersionId = 'current-render-2'
+Assert-HistoryTest ((Get-DiffReviewStatePath 'ja' $reviewContext) -ne (Get-DiffReviewStatePath 'ja' $rerenderedReviewContext)) 'Re-rendered comparison reused the previous review-state identity.'
+Assert-HistoryTest (@((Get-DiffReviewStateForContext 'ja' $rerenderedReviewContext).confirmedSheetKeys).Count -eq 0) 'Review confirmation leaked into a re-rendered comparison.'
 
 # Register one live source so Capture-RenderInput exercises the normal structure path.
 $sourcePath = Join-Path $submissionDir 'history-source.pdf'
@@ -82,15 +117,54 @@ $cacheSnapshotDir = Get-SnapshotDir 'ja' $sourceId $cacheSnapshotId
 New-Item -ItemType Directory -Path $cacheSnapshotDir -Force | Out-Null
 $cacheManifestPath = Join-Path $cacheSnapshotDir 'manifest.json'
 Write-JsonFile $cacheManifestPath ([ordered]@{ schemaVersion=1; snapshotId=$cacheSnapshotId; workbookId=$sourceId; relativePath='history-source.pdf'; sourceHash=$sourceHash; capturedAt=(New-NowIso); status='complete' })
-$renderDir = Get-RenderRecordDir 'ja' $sourceId $cacheSnapshotId $cacheVersionId
-New-Item -ItemType Directory -Path $renderDir -Force | Out-Null
-$visualPath = Join-Path $renderDir 'visual-hashes.json'
-Write-JsonFile $visualPath ([ordered]@{ schemaVersion=1; snapshotId=$cacheSnapshotId; versionId=$cacheVersionId; sheets=@([ordered]@{ sheetName='Summary'; visualHash='abc' }) })
 $workspace = Get-WorkspacePath 'ja'
 $contentDir = Get-ContentPdfVersionDir $workspace $sourceId $cacheVersionId
 New-Item -ItemType Directory -Path $contentDir -Force | Out-Null
 $contentPath = Join-Path $contentDir ((Get-WorksheetStorageStem 'Summary') + '.pdf')
 [IO.File]::WriteAllText($contentPath, 'test pdf placeholder', (New-Object Text.UTF8Encoding($false)))
+
+# 履歴画面をPDF解析より先に開くと「比較不可」の要約が温まる。
+# render record の保存後は履歴ルートの時刻が変わらなくても再集計されること。
+Clear-SnapshotSummaryCache 'ja' $sourceId
+$beforeRender = @(Get-SnapshotSummaries 'ja' $sourceId | Where-Object { [string]$_.snapshotId -eq $cacheSnapshotId } | Select-Object -First 1)
+Assert-HistoryTest ($beforeRender.Count -eq 1 -and -not [bool]$beforeRender[0].visualCompareReady) 'Pre-render history summary did not reproduce the unavailable state.'
+$Script:CurrentRenderEnvFingerprint = 'history-selfcheck-env'
+Write-RenderRecord 'ja' $sourceId $cacheSnapshotId $cacheVersionId 'normal' $true ([pscustomobject][ordered]@{
+    analyzerVersion=1; javaVersion='test'; javaVendor='test'
+    sheets=@([ordered]@{ sheetName='Summary'; visualHash='abc'; status='ok' })
+})
+$afterRender = @(Get-SnapshotSummaries 'ja' $sourceId | Where-Object { [string]$_.snapshotId -eq $cacheSnapshotId } | Select-Object -First 1)
+Assert-HistoryTest ($afterRender.Count -eq 1 -and [bool]$afterRender[0].visualCompareReady) 'Render record did not invalidate the stale unavailable history summary.'
+
+# A cache written by a previous runtime may contain the pre-fix false result with
+# the same history-directory timestamp. Restart must reject that schema and rebuild.
+$summaryCacheKey = ('ja|' + $sourceId).ToLowerInvariant()
+$legacySummaryPath = Get-LocalSnapshotSummaryCachePath 'ja' $sourceId
+$legacyStamp = [IO.Directory]::GetLastWriteTimeUtc((Get-WorkbookHistoryDir 'ja' $sourceId)).Ticks
+Write-JsonFile $legacySummaryPath ([ordered]@{
+    schemaVersion=1; stamp=$legacyStamp
+    summaries=@([ordered]@{ snapshotId=$cacheSnapshotId; visualCompareReady=$false; visualHashAvailable=$false; contentPdfAvailable=$false })
+})
+[void]$Script:SnapshotSummaryCache.Remove($summaryCacheKey)
+$rebuilt = @(Get-SnapshotSummaries 'ja' $sourceId | Where-Object { [string]$_.snapshotId -eq $cacheSnapshotId } | Select-Object -First 1)
+Assert-HistoryTest ($rebuilt.Count -eq 1 -and [bool]$rebuilt[0].visualCompareReady) 'Legacy unavailable summary cache was reused after restart.'
+
+$renderDir = Get-RenderRecordDir 'ja' $sourceId $cacheSnapshotId $cacheVersionId
+$visualPath = Join-Path $renderDir 'visual-hashes.json'
+
+# A normal user-selected folder can push immutable history assets past MAX_PATH.
+# Direct Test-Path fails there on Windows PowerShell 5.1, but history lookup must not.
+$longWorkbookId = 'long-' + ('w' * 120)
+$longSnapshotId = 'snapshot-' + ('s' * 40)
+$longVersionId = 'version-' + ('v' * 40)
+$longRenderPath = Join-Path (Get-RenderRecordDir 'ja' $longWorkbookId $longSnapshotId $longVersionId) 'visual-hashes.json'
+Assert-HistoryTest ($longRenderPath.Length -gt 260) 'Long-path history fixture did not exceed MAX_PATH.'
+Write-RenderRecord 'ja' $longWorkbookId $longSnapshotId $longVersionId 'normal' $true ([pscustomobject][ordered]@{
+    analyzerVersion=1; javaVersion='test'; javaVendor='test'
+    sheets=@([ordered]@{ sheetName='Summary'; visualHash='long-path-hash'; status='ok' })
+})
+Assert-HistoryTest (Test-FileExistsCompat $longRenderPath) 'Long-path render record was not written.'
+Assert-HistoryTest ($null -ne (Get-VisualHashes 'ja' $longWorkbookId $longSnapshotId $longVersionId)) 'Long-path visual hashes were reported as missing.'
 
 Assert-HistoryTest ($null -ne (Get-SnapshotManifest 'ja' $sourceId $cacheSnapshotId)) 'Snapshot manifest cache could not be warmed.'
 Assert-HistoryTest ($null -ne (Get-VisualHashes 'ja' $sourceId $cacheSnapshotId $cacheVersionId)) 'Visual hash cache could not be warmed.'
