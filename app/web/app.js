@@ -4170,6 +4170,21 @@ function continueFirstRunAfterFolderSelection(){
 async function chooseSubmissionFolder(btn) {
   if (folderPickerBusy) return;
   const replacingExistingFolder=!!activePackRecord()||asArray(state?.packs).length>0;
+  const previousFolder=String(state?.paths?.submissionDir||'');
+  // 原稿フォルダを変えると、作業データ領域ごと別のワークスペースに切り替わる。
+  // 登録済みの原稿も作った一式も画面から消えるため、押した瞬間に実行してはいけない。
+  if (replacingExistingFolder) {
+    const packCount=asArray(state?.packs).filter(pack=>!pack?.archived).length;
+    const sourceCount=asArray(state?.structure?.workbooks).length;
+    const accepted=await confirmAction({
+      title:'原稿フォルダを変更しますか？',
+      message:`いま表示している原稿 ${sourceCount} 件と一式 ${packCount} 件は、この画面から見えなくなります。`,
+      detail:`現在のフォルダ：${previousFolder||'(未設定)'}\n\n作業内容が消えるわけではありません。元に戻すには、このフォルダをもう一度選び直してください。`,
+      confirmLabel:'変更する',
+      danger:true
+    });
+    if(!accepted)return;
+  }
   folderPickerBusy = true;
   const old = btn?.textContent;
   if (btn) { btn.disabled = true; btn.textContent = '選択画面を開く'; }
@@ -4196,7 +4211,15 @@ async function chooseSubmissionFolder(btn) {
     lastPageRangeAnchor = '';
     renderAll();
     if (!availableFiles.length) await loadFilesSilently(); else renderFileList(availableFiles);
-    showMessage('ok', '原稿フォルダを設定しました', replacingExistingFolder?'新しいフォルダの原稿を確認しました。':'続けて、今回まとめる一式に名前を付けます。');
+    if (replacingExistingFolder) {
+      // 旧パスを残さないと、戻りたくなったときに選び直す先が分からなくなる。
+      // 画面のパス表示は既に新しい値へ上書きされている。
+      showMessage('ok', '原稿フォルダを変更しました', '新しいフォルダの原稿を確認しました。',
+        previousFolder?`前のフォルダ：${previousFolder}`:null,
+        previousFolder?[{label:'前のフォルダに戻す',handler:()=>restorePreviousSubmissionFolder(previousFolder)}]:[], 0);
+    } else {
+      showMessage('ok', '原稿フォルダを設定しました', '続けて、今回まとめる一式に名前を付けます。');
+    }
     if(replacingExistingFolder)setActiveView('excel');else continueFirstRunAfterFolderSelection();
   } catch(e) {
     showMessage('danger', '原稿フォルダを選べません', userFriendlyError(e.message), e.detail || e.stack || e.message);
@@ -4207,6 +4230,23 @@ async function chooseSubmissionFolder(btn) {
 }
 
 // Kept for compatibility with older local pages; the current UX uses chooseSubmissionFolder().
+// 変更直後に「やっぱり戻したい」を1操作で満たす。ネイティブのフォルダ選択画面から
+// 元のパスを探し直させると、パス表示が既に上書きされているため到達できない。
+async function restorePreviousSubmissionFolder(previousFolder) {
+  const target=String(previousFolder||'').trim();
+  if(!target)return;
+  try{
+    await api('/api/paths', {method:'POST', body:{submissionDir:target, dataDir:'', outputDir:''}});
+    await refresh();
+    await loadFiles(null);
+    selectedFiles.clear();selectedWorkbooks.clear();selectedPages.clear();
+    lastFileRangeAnchor='';lastWorkbookRangeAnchor='';lastPageRangeAnchor='';
+    renderAll();
+    showMessage('ok','前の原稿フォルダに戻しました',target);
+  }catch(e){
+    showMessage('danger','前のフォルダに戻せません',userFriendlyError(e.message),e.detail||e.stack||e.message);
+  }
+}
 async function savePaths(btn) {
   const submissionDir = pathElementValue('submissionDir').trim();
   if (!submissionDir) {
