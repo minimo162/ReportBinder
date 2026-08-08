@@ -2500,21 +2500,26 @@ function Get-Structure([string]$Language) {
 # 更新スキャンやPDF作成のように配置を変えない書き込みでも増えてしまい、
 # 実際には衝突していない操作を拒否してしまう。
 function Get-PageLayoutFingerprint($Structure, [string]$PackId) {
+    # /api/state がパックごとに毎回呼ぶ。Sort-Object とパイプラインは
+    # PowerShell 5.1 では固定コストが大きく（20ページでも十数ms）、
+    # 状態取得のたびに積み上がる。素のループと配列ソートで組み立てる。
     $workbookIds = @{}
-    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $PackId })) {
-        $workbookIds[[string]$wb.workbookId] = $true
+    foreach ($wb in @(Get-Array $Structure.workbooks)) {
+        if (Test-WorkbookPack $wb $PackId) { $workbookIds[[string]$wb.workbookId] = $true }
     }
-    $parts = @(Get-Array $Structure.pages |
-        Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) } |
-        Sort-Object { [string](Resolve-PageId $_) } |
-        ForEach-Object {
-            '{0}~{1}~{2}~{3}' -f (Resolve-PageId $_),
-                [string](Get-DataProperty $_ 'volume' 'none'),
-                ([double](Get-DataProperty $_ 'order' 0)),
-                ([bool](Get-DataProperty $_ 'enabled' $false))
-        })
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($page in @(Get-Array $Structure.pages)) {
+        if (-not $workbookIds.ContainsKey([string]$page.workbookId)) { continue }
+        $parts.Add(('{0}~{1}~{2}~{3}' -f (Resolve-PageId $page),
+            [string](Get-DataProperty $page 'volume' 'none'),
+            ([double](Get-DataProperty $page 'order' 0)),
+            ([bool](Get-DataProperty $page 'enabled' $false))))
+    }
     if ($parts.Count -eq 0) { return 'empty' }
-    $bytes = [Text.Encoding]::UTF8.GetBytes([string]::Join('|', [string[]]$parts))
+    # 先頭が pageId なので、合成文字列の序数ソートは pageId 順と同じ並びを与える。
+    $sorted = $parts.ToArray()
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $bytes = [Text.Encoding]::UTF8.GetBytes([string]::Join('|', $sorted))
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() }
     finally { $sha.Dispose() }
