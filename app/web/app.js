@@ -447,7 +447,7 @@ function showMessage(type, title, message, detail, actions=[], autoHideMs=null) 
   if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
   if (type === 'danger') {
     if (box) box.classList.add('hidden');
-    showErrorPanel(title, message, detail || message);
+    showErrorPanel(title, message, detail || message, actions);
     return;
   }
   if (!box) return;
@@ -510,7 +510,7 @@ function extractErrorItems(detail, fallbackMessage='') {
   }
   return items.filter(Boolean).slice(0, 8);
 }
-function showErrorPanel(title, summary, detail) {
+function showErrorPanel(title, summary, detail, actions=[]) {
   const panel = $('error-panel');
   if (!panel) return;
   const friendlySummary=userFriendlyError(summary);
@@ -520,6 +520,25 @@ function showErrorPanel(title, summary, detail) {
   const list=$('error-list');
   list.innerHTML = items.map(i => `<li>${i.label ? `<strong>${escapeHtml(i.label)}</strong>：` : ''}${escapeHtml(i.message)}</li>`).join('');
   list.classList.toggle('hidden',items.length===0);
+  const actionBox = $('error-actions');
+  if (actionBox) {
+    actionBox.innerHTML = '';
+    for (const action of asArray(actions)) {
+      if (!action?.label) continue;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `btn ${action.primary ? 'primary' : 'secondary'}`;
+      btn.textContent = action.label;
+      btn.addEventListener('click', async () => {
+        const previousTitle = $('error-title')?.textContent || '';
+        const previousSummary = $('error-summary')?.textContent || '';
+        if (action.view) setActiveView(action.view);
+        if (typeof action.handler === 'function') await action.handler();
+        if (($('error-title')?.textContent || '') === previousTitle && ($('error-summary')?.textContent || '') === previousSummary) hideErrorPanel();
+      });
+      actionBox.appendChild(btn);
+    }
+  }
   panel.classList.remove('hidden');
 }
 function hideErrorPanel() {
@@ -4145,7 +4164,7 @@ document.querySelectorAll('[data-view-shortcut]').forEach(btn=>btn.addEventListe
 setActiveView(activeView,{noScroll:true,instant:true});
 const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEventListener('input',()=>{fileFilterText=fileFilterInput.value||'';renderFileList(availableFiles);});
 bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('excel');setTimeout(()=>$('change-source-folder-btn')?.focus(),0);}else if(action==='create-pack'){openPackEditor('create');}else if(action==='render'){setActiveView('excel');await renderUpdated($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
-bind('notice-close','click',hideMessage);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));
+bind('notice-close','click',hideMessage);bind('error-close','click',hideErrorPanel);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));
 bind('app-load-retry','click',()=>loadInitialAppState($('app-load-retry')));
 bind('progress-cancel','click',()=>cancelActiveRenderJob());
 bind('run-diagnostics-btn','click',()=>runSystemDiagnostics($('run-diagnostics-btn')));
