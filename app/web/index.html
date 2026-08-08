@@ -1,10 +1,10 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260808_v90">
+  <link rel="stylesheet" href="style.css?v=20260808_v93">
 </head>
 <body class="app-initializing">
   <a class="skip-link" href="#main-content">本文へ移動</a>
@@ -86,7 +86,7 @@
       </div>
 
       <main id="main-content" class="shell" tabindex="-1">
-        <section id="error-panel" class="error-panel hidden" aria-live="assertive"><div><strong id="error-title"></strong><p id="error-summary"></p><ul id="error-list"></ul></div></section>
+        <section id="error-panel" class="error-panel hidden" aria-live="assertive"><div class="error-panel-body"><strong id="error-title"></strong><p id="error-summary"></p><ul id="error-list"></ul><div id="error-actions" class="error-actions"></div></div><button id="error-close" class="icon-btn" type="button" aria-label="閉じる"><svg class="icon"><use href="#i-close"/></svg></button></section>
 
         <section data-view-panel="dashboard" class="view-panel">
           <div class="page-head dashboard-purpose"><div><span class="eyebrow">ReportBinderでできること</span><h2>複数の原稿を、必要な順番で1つのPDFにまとめる</h2><p>Excel・Word・PowerPoint・PDFを集め、更新前後の違いも確認できます。</p></div></div>
@@ -121,7 +121,8 @@
             </section>
             <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済み原稿</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div></div><div id="source-requirement-status" class="source-requirement-status hidden"></div><div id="workbook-context-bar" class="list-action-bar contextual-action-bar" aria-label="登録済み原稿の操作"><div class="toolbar"><span id="workbook-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-workbooks-btn" class="btn ghost selection-only" type="button">選択解除</button></div><div class="toolbar"><button id="render-selected-btn" class="btn primary" type="button" disabled>変換PDFを作成</button><details class="action-menu selection-only"><summary class="btn ghost">その他</summary><div class="action-menu-popover"><button id="unregister-selected-btn" class="btn danger" type="button">登録解除</button></div></details></div></div><div id="workbook-list"></div></section>
           </div>
-          <section id="progress-panel" class="progress-panel hidden" aria-live="polite"><div class="progress-meta"><strong id="progress-title">PDF作成中</strong><span id="progress-percent">0%</span></div><div class="progress-track"><span id="progress-fill"></span></div><div class="progress-detail"><p><span id="progress-count-label"></span><span id="progress-message"></span></p><button id="progress-cancel" class="btn secondary compact" type="button" hidden>PDF作成を中止</button></div></section>
+          <section id="progress-panel" class="progress-panel hidden"><div class="progress-meta"><strong id="progress-title">PDF作成中</strong><span id="progress-percent">0%</span></div><div class="progress-track" role="progressbar" aria-labelledby="progress-title" aria-valuemin="0" aria-valuemax="100"><span id="progress-fill"></span></div><div class="progress-detail"><p><span id="progress-count-label"></span><span id="progress-message"></span></p><button id="progress-cancel" class="btn secondary compact" type="button" hidden>PDF作成を中止</button></div></section>
+        <p id="progress-announce" class="sr-only" aria-live="polite"></p>
           <section id="auto-status" class="auto-status hidden"></section>
         </section>
 
@@ -259,6 +260,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260808_v144"></script>
+  <script src="app.js?v=20260808_v150"></script>
 </body>
 </html>

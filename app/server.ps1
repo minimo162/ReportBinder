@@ -5,6 +5,7 @@
     [string]$Token = '',
     [switch]$NoOpen,
     [string]$RenderJobPath = '',
+    [string]$FinalJobPath = '',
     [string]$DiffJobPath = '',
     [string]$AutoSchedulerPath = '',
     [int]$ParentProcessId = 0
@@ -2492,15 +2493,82 @@ function Get-Structure([string]$Language) {
     return $structure
 }
 
-function Update-StructureLocked([string]$Language, [scriptblock]$Mutation) {
+# ページ構成の楽観ロック。並べ替えAPIは画面全体の並びを絶対値で送るため、
+# これが無いと後から保存した側が相手の変更を無言で巻き戻す。
+#
+# 判定材料は「配置そのものの指紋」にする。structure全体の版番号だと、5分ごとの
+# 更新スキャンやPDF作成のように配置を変えない書き込みでも増えてしまい、
+# 実際には衝突していない操作を拒否してしまう。
+function Get-PageLayoutFingerprint($Structure, [string]$PackId) {
+    # /api/state がパックごとに毎回呼ぶ。Sort-Object とパイプラインは
+    # PowerShell 5.1 では固定コストが大きく（20ページでも十数ms）、
+    # 状態取得のたびに積み上がる。素のループと配列ソートで組み立てる。
+    $workbookIds = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks)) {
+        if (Test-WorkbookPack $wb $PackId) { $workbookIds[[string]$wb.workbookId] = $true }
+    }
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($page in @(Get-Array $Structure.pages)) {
+        if (-not $workbookIds.ContainsKey([string]$page.workbookId)) { continue }
+        $parts.Add(('{0}~{1}~{2}~{3}' -f (Resolve-PageId $page),
+            [string](Get-DataProperty $page 'volume' 'none'),
+            ([double](Get-DataProperty $page 'order' 0)),
+            ([bool](Get-DataProperty $page 'enabled' $false))))
+    }
+    if ($parts.Count -eq 0) { return 'empty' }
+    # 先頭が pageId なので、合成文字列の序数ソートは pageId 順と同じ並びを与える。
+    $sorted = $parts.ToArray()
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $bytes = [Text.Encoding]::UTF8.GetBytes([string]::Join('|', $sorted))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function New-StructureConflictError([string]$Expected, [string]$Actual) {
+    $conflict = [System.InvalidOperationException]::new('他の画面でページ構成が変更されました。最新の状態を読み込み直してから操作してください。')
+    $conflict.Data['reportBinderConflict'] = $true
+    $conflict.Data['expectedLayout'] = $Expected
+    $conflict.Data['actualLayout'] = $Actual
+    return $conflict
+}
+
+function Test-StructureConflictError($Exception) {
+    if ($null -eq $Exception -or $null -eq $Exception.Data) { return $false }
+    try { return [bool]$Exception.Data['reportBinderConflict'] } catch { return $false }
+}
+
+function Get-RequestedBaseLayout($Body) {
+    $raw = [string](Get-DataProperty $Body 'baseLayout' '')
+    if ([string]::IsNullOrWhiteSpace($raw)) { return '' }
+    if ($raw -notmatch '^[a-z0-9]{1,128}$') { return '' }
+    return $raw
+}
+
+# $LayoutScope を渡した呼び出しだけが、ページ配置の衝突判定と指紋の返却を行う。
+# パックIDの解決には structure が要るため、ロックを取った中で解決する。
+function Update-StructureLocked([string]$Language, [scriptblock]$Mutation, [string]$BaseLayout = '', [string]$LayoutScope = $null) {
     $workspace = Get-WorkspacePath $Language
     $structureLock = Join-Path $workspace 'locks\structure.lock'
+    $layoutAware = ($null -ne $LayoutScope)
     return Invoke-WithLock $structureLock {
         $structure = Read-StructureUnlocked $Language
+        $layoutPackId = ''
+        if ($layoutAware) {
+            try { $layoutPackId = [string](Resolve-DocumentPackScope $structure ([string]$LayoutScope) $false).packId } catch { $layoutPackId = '' }
+        }
+        if ($layoutAware -and -not [string]::IsNullOrWhiteSpace($BaseLayout)) {
+            $currentLayout = Get-PageLayoutFingerprint $structure $layoutPackId
+            if ($BaseLayout -ne $currentLayout) { throw (New-StructureConflictError $BaseLayout $currentLayout) }
+        }
         $result = & $Mutation $structure
         Write-StructureUnlocked $Language $structure
         # 同一ファイルシステム時刻内の連続更新でも古い読取結果を返さない。
         $Script:StructureReadCache.Clear()
+        # 保存後の指紋を返す。画面はこれを次回の baseLayout として使う。
+        if ($layoutAware -and $result -is [System.Collections.IDictionary]) {
+            $result['layoutFingerprint'] = Get-PageLayoutFingerprint $structure $layoutPackId
+        }
         return $result
     }
 }
@@ -3769,7 +3837,10 @@ function Remove-ContentPdfFileSafe([string]$Workspace, [string]$RelativePdf) {
 }
 
 
-function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets) {
+# $Sheets には「今回描画できるシート」（Excelでは表示中のもの）が入る。
+# $PresentSheetNames には非表示を含む「原稿に存在するシート名」を渡す。省略時は
+# $Sheets と同じとみなす（Word/PowerPoint/PDFのように非表示の概念がない経路）。
+function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets, $PresentSheetNames = $null) {
     $workbookId = [string](Get-DataProperty $Workbook 'workbookId' '')
     $packId = Get-WorkbookPackId $Workbook
     [void](Resolve-DocumentPackScope $Structure $packId $true)
@@ -3781,13 +3852,35 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         $name = [string](Get-DataProperty $sheetInfo 'sheetName' '')
         if (-not [string]::IsNullOrWhiteSpace($name)) { $current[$name.ToLowerInvariant()] = $true }
     }
+    $present = @{}
+    if ($null -eq $PresentSheetNames) { foreach ($key in $current.Keys) { $present[$key] = $true } }
+    else {
+        foreach ($name in @($PresentSheetNames)) {
+            $text = [string]$name
+            if (-not [string]::IsNullOrWhiteSpace($text)) { $present[$text.ToLowerInvariant()] = $true }
+        }
+    }
 
     $removed = @()
     $kept = @()
+    $hidden = @()
     foreach ($page in $pages) {
         $belongs = ([string]$page.workbookId -eq $workbookId)
         $sheetKey = ([string]$page.sheetName).ToLowerInvariant()
-        if ($belongs -and (-not $current.ContainsKey($sheetKey))) { $removed += $page } else { $kept += $page }
+        if (-not $belongs -or $current.ContainsKey($sheetKey)) { $kept += $page; continue }
+        # 非表示にしただけのシートは原稿から消えていない。ページを削除すると配置・
+        # ページ名・使用範囲・番号設定が失われ、再表示しても未振り分けに戻るだけになる。
+        if ($present.ContainsKey($sheetKey)) {
+            Set-NoteProperty $page 'sheetHidden' $true
+            $hidden += (Resolve-PageId $page)
+            $kept += $page
+            continue
+        }
+        $removed += $page
+    }
+    if ($removed.Count -gt 0) {
+        # 削除は取り消せないため、確定前に必ず復元ポイントを残す。
+        [void](Save-LayoutSnapshot $Language $packId 'source-sheets-changed' $Structure)
     }
     $pages = @($kept)
     $Structure.pages = $pages
@@ -3801,8 +3894,43 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         if (-not [string]::IsNullOrWhiteSpace($sheetKey)) { $knownBySheet[$sheetKey] = $page }
     }
 
+    # シート名の変更は「旧シートの消滅＋新シートの出現」として現れる。位置(sheetIndex)で
+    # 対応付け、旧ページを作り直さずに引き継ぐ。pageId を保つことで、レイアウト履歴と
+    # Ctrl+Z からの復元経路も生き残る。
+    $renameBySheetKey = @{}
+    if ($removed.Count -gt 0) {
+        $newSheets = @($sortedSheets | Where-Object {
+            $name = [string](Get-DataProperty $_ 'sheetName' '')
+            $name -and (-not $knownBySheet.ContainsKey($name.ToLowerInvariant()))
+        })
+        $pool = New-Object System.Collections.ArrayList
+        foreach ($page in $removed) { [void]$pool.Add($page) }
+        foreach ($sheetInfo in $newSheets) {
+            if ($pool.Count -eq 0) { break }
+            $sheetIndex = [int](Get-DataProperty $sheetInfo 'sheetIndex' 999999)
+            $match = @($pool | Where-Object { [int](Get-DataProperty $_ 'sheetIndex' -1) -eq $sheetIndex } | Select-Object -First 1)
+            if ($match.Count -eq 0) {
+                # 位置も変わった場合は、A1から拾った見出しが完全一致するときだけ同一視する。
+                # 手掛かりなしで対応付けると、無関係な新規シートに前のページの配置と
+                # 使用ページ範囲を引き継いでしまい、削除より分かりにくい誤りになる。
+                $detected = [string](Get-DataProperty $sheetInfo 'detectedTitle' '')
+                if (-not [string]::IsNullOrWhiteSpace($detected)) {
+                    $match = @($pool | Where-Object { [string](Get-DataProperty $_ 'detectedTitle' '') -eq $detected } | Select-Object -First 1)
+                }
+            }
+            if ($match.Count -eq 0) { continue }
+            $name = [string](Get-DataProperty $sheetInfo 'sheetName' '')
+            $renameBySheetKey[$name.ToLowerInvariant()] = $match[0]
+            [void]$pool.Remove($match[0])
+        }
+        # 引き継いだページは「削除された」扱いにしない。
+        $reattached = @($renameBySheetKey.Values)
+        if ($reattached.Count -gt 0) { $removed = @($pool) }
+    }
+
     $added = @()
     $updated = @()
+    $renamed = @()
     $atEnd = @()
     $inOrder = 0
     $newTargetId = Get-NewItemTargetId $Structure $Language $Workbook
@@ -3822,8 +3950,32 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
             Set-NoteProperty $page 'sheetName' $sheet
             Set-NoteProperty $page 'sheetIndex' $sheetIndex
             Set-NoteProperty $page 'detectedTitle' $title
+            Set-NoteProperty $page 'sheetHidden' $false
             if ([string]::IsNullOrWhiteSpace([string]$page.title)) { Set-NoteProperty $page 'title' $title }
             $updated += $pageId
+            continue
+        }
+
+        if ($renameBySheetKey.ContainsKey($sheetKey)) {
+            $page = $renameBySheetKey[$sheetKey]
+            $previousSheet = [string]$page.sheetName
+            # pageId は据え置く。差し替えるとレイアウト履歴の復元が対象を見失う。
+            $pageId = Resolve-PageId $page
+            Set-NoteProperty $page 'pageId' $pageId
+            Set-NoteProperty $page 'sheetName' $sheet
+            Set-NoteProperty $page 'sheetIndex' $sheetIndex
+            Set-NoteProperty $page 'detectedTitle' $title
+            Set-NoteProperty $page 'sheetHidden' $false
+            Set-NoteProperty $page 'renamedFromSheetName' $previousSheet
+            # 参照先のPDFは旧シート名で作られている。中身は作り直しになる。
+            Set-NoteProperty $page 'contentPdf' $null
+            Set-NoteProperty $page 'status' 'not-rendered'
+            Set-NoteProperty $page 'updatedAt' (New-NowIso)
+            if ([string]::IsNullOrWhiteSpace([string]$page.title)) { Set-NoteProperty $page 'title' $title }
+            $Structure.pages = @(Get-Array $Structure.pages) + @($page)
+            $knownBySheet[$sheetKey] = $page
+            $updated += $pageId
+            $renamed += [ordered]@{ pageId=$pageId; fromSheetName=$previousSheet; toSheetName=$sheet }
             continue
         }
 
@@ -3854,6 +4006,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
     $names = @($sortedSheets | ForEach-Object { [string]$_.sheetName })
     return [ordered]@{
         addedPageIds=@($added); updatedPageIds=@($updated); removedPages=@($removed)
+        renamedPages=@($renamed); hiddenSheetPageIds=@($hidden)
         sheetNames=$names; sheetFingerprint=(Get-SheetFingerprintFromNames $names)
         addedCount=$added.Count; insertedInOrderCount=$inOrder; insertedAtEndCount=$atEnd.Count
         insertedAtEndPageIds=@($atEnd); newPagesAreUnassigned=($newVolume -eq 'none'); newItemTargetId=$newTargetId
@@ -4213,12 +4366,27 @@ function Export-WorksheetToPdfSafe($Excel, $Workbook, $Worksheet, [string]$OutPd
     }
 }
 
+$Script:PdfPageCountCache = @{}
+$Script:PdfPageCountCacheLimit = 4096
+
+# 変換PDFのページ数は /api/state のたびに全ページ分が必要になる。毎回ファイル全体を
+# 読み直すとdataDir全量の読み込みになるため、パスとサイズ・更新時刻でメモ化する。
 function Get-PdfPageCount([string]$PdfPath) {
+    $key = ''
+    try {
+        $item = Get-Item -LiteralPath $PdfPath -ErrorAction Stop
+        $key = "$($item.FullName)|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
+        if ($Script:PdfPageCountCache.ContainsKey($key)) { return [int]$Script:PdfPageCountCache[$key] }
+    } catch { $key = '' }
     try {
         $bytes = [IO.File]::ReadAllBytes($PdfPath)
         $text = [Text.Encoding]::ASCII.GetString($bytes)
         $count = ([regex]::Matches($text, '/Type\s*/Page(?!s)\b')).Count
-        if ($count -lt 1) { return 1 }
+        if ($count -lt 1) { $count = 1 }
+        if ($key) {
+            if ($Script:PdfPageCountCache.Count -ge $Script:PdfPageCountCacheLimit) { $Script:PdfPageCountCache.Clear() }
+            $Script:PdfPageCountCache[$key] = $count
+        }
         return $count
     } catch { return 1 }
 }
@@ -5171,6 +5339,9 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             $sheetSetupTimer = [Diagnostics.Stopwatch]::StartNew()
             $inspected = @()
             $targetSheetNames = @()
+            # 非表示シートも「原稿に存在する」として記録する。表示中のものだけを渡すと、
+            # 一時的に非表示にしただけでページ設定が削除されてしまう。
+            $allSheetNames = @()
             $sheetRenderInfos = @()
             $sheetCount = 0
             try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
@@ -5185,6 +5356,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                         $ws = $book.Worksheets.Item($i)
                         $sheetName = [string]$ws.Name
                         $visible = ([int]$ws.Visible -eq -1)
+                        $allSheetNames += $sheetName
                         if ($visible) {
                             $targetSheetNames += $sheetName
                             $a1 = ''
@@ -5212,11 +5384,11 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             }
             $timingsMs.sheetInspectionAndSetup = [int64]$sheetSetupTimer.ElapsedMilliseconds
             if ($targetSheetNames.Count -eq 0) {
-                $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @()
+                $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @() $allSheetNames
                 # V5-§3.7: 旧世代の個別削除は廃止。世代単位の掃除(Remove-WorkbookContentPdfs)に一本化する。
                 # 個別に消すと、保持しているはずの世代フォルダの中身が欠損する。
                 Set-WorkbookRenderedSheetSnapshot $wb @()
-                Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @());Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
+                Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @() $allSheetNames);Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
                 throw 'PDF化対象の表示シートがありません。Excelで少なくとも1つのワークシートを表示してください。'
             }
 
@@ -5269,15 +5441,28 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 throw 'PDFを作成できませんでした。Excelの印刷設定または対象シートを確認してください。'
             }
 
-            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $inspected
+            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $inspected $allSheetNames
             $removedPages = @(Get-Array (Get-DataProperty $pageSync 'removedPages' @()))
             if ($removedPages.Count -gt 0) {
                 $removedNames = @($removedPages | ForEach-Object { [string](Get-DataProperty $_ 'sheetName' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                 $removedLabel = [string]::Join('、', $removedNames)
                 if ([string]::IsNullOrWhiteSpace($removedLabel)) { $removedLabel = "$($removedPages.Count) ページ" }
-                $warnings += "現在のExcelに存在しないシートをページ構成から外しました: $removedLabel"
+                $warnings += "現在のExcelに存在しないシートをページ構成から外しました: $removedLabel（ページ構成の履歴から元に戻せます）"
                 $steps += "存在しないシートの古いページを削除: $removedLabel"
                 # V5-§3.7: 旧世代の個別削除は廃止(上記と同じ理由)。
+            }
+            $renamedPages = @(Get-Array (Get-DataProperty $pageSync 'renamedPages' @()))
+            if ($renamedPages.Count -gt 0) {
+                $renameLabel = [string]::Join('、', @($renamedPages | ForEach-Object {
+                    "{0}→{1}" -f [string](Get-DataProperty $_ 'fromSheetName' ''), [string](Get-DataProperty $_ 'toSheetName' '')
+                }))
+                $warnings += "シート名の変更を引き継ぎました: $renameLabel（配置とページ設定はそのままです）"
+                $steps += "シート名変更の引き継ぎ: $renameLabel"
+            }
+            $hiddenPageIds = @(Get-Array (Get-DataProperty $pageSync 'hiddenSheetPageIds' @()))
+            if ($hiddenPageIds.Count -gt 0) {
+                $warnings += "非表示のシートが $($hiddenPageIds.Count) 件あります。ページ構成は保持していますが、PDFは作り直されません。提出物に含める場合はシートを再表示してからPDFを作成してください。"
+                $steps += "非表示シートのページを保持: $($hiddenPageIds.Count) 件"
             }
             Set-WorkbookRenderedSheetSnapshot $wb (Get-DataProperty $pageSync 'sheetNames' @())
             $pages = @(Get-Array $structure.pages)
@@ -5319,7 +5504,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 param($st)
                 $latest=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1)
                 if(-not $latest.Count){throw "Workbookが見つかりません: $WorkbookId"}
-                $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected
+                $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected $allSheetNames
                 foreach ($r in $rendered) {
                     $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
                     # Unrestricted worksheet names use stable hashed page IDs. The legacy
@@ -5439,9 +5624,14 @@ function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null,
             $lastRendered = [string](Get-DataProperty $w 'lastRenderedExcelHash' '')
             $updatedStatus = Get-SourceUpdatedStatus $w
             Set-NoteProperty $w 'currentExcelModifiedAt' $modified
-            Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
-            Set-NoteProperty $w 'currentExcelSize' $size
-            if (-not [string]::IsNullOrWhiteSpace($hash)) { Set-NoteProperty $w 'currentExcelHash' $hash }
+            # ハッシュを取得できなかった回は、更新時刻とサイズも据え置く。
+            # 新しいメタデータと古いハッシュを組にして保存すると、次回のスキャンが
+            # 「メタデータ一致」で再ハッシュを省略し、更新済みの原稿を最新と誤判定する。
+            if (-not [string]::IsNullOrWhiteSpace($hash)) {
+                Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
+                Set-NoteProperty $w 'currentExcelSize' $size
+                Set-NoteProperty $w 'currentExcelHash' $hash
+            }
             $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $w))
             $stale = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and (([string]::IsNullOrWhiteSpace($hash)) -or $hash -ne $lastRendered -or $profileOld)
             if ($stale) {
@@ -5768,6 +5958,269 @@ function Start-HiddenPowerShellChild([string]$PowerShellExe, [string]$Command, [
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         return [System.Diagnostics.Process]::Start($psi)
     }
+}
+
+# ---- 提出用PDFの出力ジョブ -------------------------------------------------
+# HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると
+# その間の進捗ポーリングも中止要求も受け付けられない。変換PDFと同じく子プロセスへ
+# 出し、状態ファイルをブラウザが読む方式に揃える。
+$Script:FinalBuildProgress = $null
+
+function Report-FinalBuildPhase([string]$Message) {
+    if ($null -eq $Script:FinalBuildProgress) { return }
+    try { & $Script:FinalBuildProgress $Message } catch { }
+}
+
+function Normalize-FinalJobId([string]$JobId) {
+    $value = ([string]$JobId).Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
+    try { $value = [Uri]::UnescapeDataString($value).Trim() } catch { }
+    if ($value -match '(?i)(final_[0-9]{8}_[0-9]{6}_[0-9a-f]{8})') { return $matches[1].ToLowerInvariant() }
+    return ''
+}
+
+function Get-FinalJobStatusPath([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw '提出用PDFの出力ジョブを確認できませんでした。' }
+    return (Join-Path (Get-RenderJobDir $Language) "$normalized.status.json")
+}
+
+function Get-FinalJobCancellationPath([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw '中止する出力ジョブを確認できませんでした。' }
+    return (Join-Path (Get-RenderJobDir $Language) "$normalized.cancel.json")
+}
+
+function Test-FinalJobCancellationRequested([string]$Language, [string]$JobId) {
+    try { return (Test-Path -LiteralPath (Get-FinalJobCancellationPath $Language $JobId) -PathType Leaf) } catch { return $false }
+}
+
+function Request-FinalJobCancellation([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    $statusPath = Get-FinalJobStatusPath $Language $normalized
+    $status = Read-JsonFile $statusPath $null
+    if ($null -eq $status) { throw '中止する出力ジョブが見つかりません。' }
+    $statusText = ([string](Get-DataProperty $status 'status' '')).ToLowerInvariant()
+    if (@('completed','completed-with-errors','failed','cancelled') -contains $statusText) {
+        return [pscustomobject][ordered]@{ ok=$true; jobId=$normalized; accepted=$false; alreadyFinished=$true; status=$statusText; message='提出用PDFの出力はすでに終了しています。' }
+    }
+    Write-JsonFile (Get-FinalJobCancellationPath $Language $normalized) ([ordered]@{ schemaVersion=1; jobId=$normalized; requestedAt=(New-NowIso) })
+    return [pscustomobject][ordered]@{ ok=$true; jobId=$normalized; accepted=$true; alreadyFinished=$false; status=$statusText; cancelRequested=$true
+        message='中止を受け付けました。作成中の1冊は最後まで書き上げてから停止します。' }
+}
+
+function Read-FinalJobStatus([string]$Language, [string]$JobId) {
+    $normalized = Normalize-FinalJobId $JobId
+    $statusPath = Get-FinalJobStatusPath $Language $normalized
+    $status = Read-JsonFile $statusPath $null
+    if ($null -eq $status) {
+        return [pscustomobject][ordered]@{ ok=$true; jobId=$normalized; status='missing'; percent=0; total=0; completed=0; failed=0; message='出力の状態を読み取れませんでした。' }
+    }
+    $statusText = ([string](Get-DataProperty $status 'status' '')).ToLowerInvariant()
+    if (@('completed','completed-with-errors','failed','cancelled') -notcontains $statusText) {
+        # 子プロセスが落ちたまま「実行中」で残ると、以後の出力が永久に始められない。
+        $processId = Get-IntDataProperty $status 'processId' 0
+        $alive = $false
+        if ($processId -gt 0) { try { $alive = ($null -ne (Get-Process -Id $processId -ErrorAction Stop)) } catch { $alive = $false } }
+        if (-not $alive -and $processId -gt 0) {
+            Set-NoteProperty $status 'status' 'failed'
+            Set-NoteProperty $status 'percent' 100
+            Set-NoteProperty $status 'message' '出力プロセスが予期せず終了しました。もう一度出力してください。'
+            Write-RenderJobStatus $statusPath $status
+        }
+    }
+    if ($null -eq $status.PSObject.Properties['ok']) { Set-NoteProperty $status 'ok' $true }
+    return ([pscustomobject]$status)
+}
+
+function Get-ActiveFinalJobStatus([string]$Language) {
+    $dir = Get-RenderJobDir $Language
+    $cutoff = (Get-Date).ToUniversalTime().AddHours(-4)
+    foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter 'final_*.status.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
+        if ($file.LastWriteTimeUtc -lt $cutoff) { continue }
+        $status = Read-JsonFile $file.FullName $null
+        if ($null -eq $status) { continue }
+        $statusText = ([string](Get-DataProperty $status 'status' '')).ToLowerInvariant()
+        if (@('completed','completed-with-errors','failed','cancelled') -contains $statusText) { continue }
+        $refreshed = Read-FinalJobStatus $Language ([string](Get-DataProperty $status 'jobId' ''))
+        $refreshedText = ([string](Get-DataProperty $refreshed 'status' '')).ToLowerInvariant()
+        if (@('completed','completed-with-errors','failed','cancelled','missing') -contains $refreshedText) { continue }
+        return $refreshed
+    }
+    return $null
+}
+
+function Start-FinalBuildJob([string]$Language, [string]$PackId, [string[]]$TargetIds) {
+    $active = Get-ActiveFinalJobStatus $Language
+    if ($null -ne $active) {
+        Set-NoteProperty $active 'message' ('提出用PDFを作成中です。 ' + [string]$active.message)
+        return $active
+    }
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackId $false
+    $allowed = @(Get-PackTargetIds $Language $scope.pack)
+    $requested = @($TargetIds | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($requested.Count -eq 0) { $requested = @($allowed[0]) }
+    foreach ($targetId in $requested) {
+        if ($allowed -notcontains $targetId) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
+    }
+    $jobId = 'final_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
+    $jobDir = Get-RenderJobDir $Language
+    $inputPath = Join-Path $jobDir "$jobId.input.json"
+    $statusPath = Join-Path $jobDir "$jobId.status.json"
+    $stdoutPath = Join-Path $jobDir "$jobId.out.log"
+    $stderrPath = Join-Path $jobDir "$jobId.err.log"
+    $initial = [pscustomobject][ordered]@{
+        ok=$true; jobId=$jobId; kind='final-build'; status='launching'; total=$requested.Count; completed=0; failed=0; percent=1
+        message='提出用PDFの作成を開始します。'; currentTargetId=''; currentTargetName=''; phase=''
+        packId=[string]$scope.packId; targetIds=@($requested); built=@(); skipped=@(); errors=@()
+        processId=0; stdoutPath=$stdoutPath; stderrPath=$stderrPath; startedAt=(New-NowIso); updatedAt=(New-NowIso)
+    }
+    Write-JsonFile $statusPath $initial
+    Write-JsonFile $inputPath ([ordered]@{ jobId=$jobId; mode=$Language; packId=[string]$scope.packId; targetIds=@($requested); statusPath=$statusPath; stdoutPath=$stdoutPath; stderrPath=$stderrPath })
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+    $script = Join-Path $Script:AppRoot 'server.ps1'
+    $jobCommand = "& '$($script.Replace("'", "''"))' -Mode '$($Language.Replace("'", "''"))' -FinalJobPath '$($inputPath.Replace("'", "''"))'"
+    try {
+        $proc = Start-HiddenPowerShellChild $psExe $jobCommand $stdoutPath $stderrPath
+        if ($proc -and $proc.Id) {
+            Set-NoteProperty $initial 'processId' ([int]$proc.Id)
+            Set-NoteProperty $initial 'message' '出力プロセスを起動しました。準備しています。'
+            Set-NoteProperty $initial 'percent' 2
+            Write-RenderJobStatus $statusPath $initial
+        }
+    } catch {
+        Set-NoteProperty $initial 'status' 'failed'
+        Set-NoteProperty $initial 'percent' 100
+        Set-NoteProperty $initial 'message' ("出力プロセスを起動できませんでした: " + $_.Exception.Message)
+        Write-RenderJobStatus $statusPath $initial
+        throw
+    }
+    return $initial
+}
+
+function Invoke-FinalBuildJobFromFile([string]$JobPath) {
+    $job = Read-JsonFile $JobPath $null
+    if ($null -eq $job) { throw "Final build job file is not readable: $JobPath" }
+    $language = [string]$job.mode
+    if ([string]::IsNullOrWhiteSpace($language)) { $language = $Mode }
+    $jobId = [string]$job.jobId
+    $packId = [string]$job.packId
+    $statusPath = [string]$job.statusPath
+    $targetIds = @(Get-Array $job.targetIds | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $processId = 0
+    try { $processId = [System.Diagnostics.Process]::GetCurrentProcess().Id } catch { $processId = 0 }
+    $status = Read-JsonFile $statusPath $null
+    if ($null -eq $status) { $status = [pscustomobject][ordered]@{ ok=$true; jobId=$jobId; kind='final-build' } }
+    Set-NoteProperty $status 'status' 'running'
+    Set-NoteProperty $status 'processId' $processId
+    Set-NoteProperty $status 'total' $targetIds.Count
+    Set-NoteProperty $status 'completed' 0
+    Set-NoteProperty $status 'failed' 0
+    Set-NoteProperty $status 'percent' 3
+    Set-NoteProperty $status 'message' '出力条件を確認しています。'
+    Write-RenderJobStatus $statusPath $status
+
+    $structure = Get-Structure $language
+    $scope = Resolve-DocumentPackScope $structure $packId $false
+    $built = @(); $skipped = @(); $errors = @()
+    $index = 0
+    $cancelled = $false
+
+    # 組み込みパックの一括出力は準トランザクションAPIが「本体だけ成功する」状態を防ぐ。
+    # 進捗のために1冊ずつのループへ置き換えると、その保証が失われる。
+    $allTargets = @(Get-PackTargetIds $language $scope.pack)
+    $isTransactionalAll = ([bool]$scope.builtIn) -and ($targetIds.Count -gt 1) -and
+        (@($allTargets | Where-Object { $targetIds -notcontains $_ }).Count -eq 0)
+    if ($isTransactionalAll) {
+        Set-NoteProperty $status 'phase' '一括出力'
+        Set-NoteProperty $status 'percent' 10
+        Set-NoteProperty $status 'message' 'すべての提出用PDFをまとめて作成しています。途中で分かれた状態にならないよう、一度に書き出します。'
+        Write-RenderJobStatus $statusPath $status
+        $Script:FinalBuildProgress = {
+            param($phaseMessage)
+            Set-NoteProperty $status 'phase' ([string]$phaseMessage)
+            Set-NoteProperty $status 'message' ('まとめて出力中 : ' + [string]$phaseMessage)
+            Write-RenderJobStatus $statusPath $status
+        }.GetNewClosure()
+        try {
+            $volumes = @($targetIds | ForEach-Object { Get-LegacyVolumeFromTargetId $language $_ })
+            $result = Invoke-FinalBuildTransaction $language ([string]$scope.category) $volumes
+            $built = @(Get-Array (Get-DataProperty $result 'built' @()))
+            $skipped = @(Get-Array (Get-DataProperty $result 'skipped' @()))
+            Set-NoteProperty $status 'completed' $targetIds.Count
+        } catch {
+            $message = [string]$_.Exception.Message
+            $errors += [ordered]@{ targetId=''; targetName='まとめて出力'; error=$message; userError=(ConvertTo-UserRenderError $message) }
+            Set-NoteProperty $status 'failed' $targetIds.Count
+        } finally {
+            $Script:FinalBuildProgress = $null
+        }
+        $index = $targetIds.Count
+        $targetIds = @()
+    }
+
+    foreach ($targetId in $targetIds) {
+        if (Test-FinalJobCancellationRequested $language $jobId) { $cancelled = $true; break }
+        $displayName = [string](Get-PackTargetDisplayName $language $scope.pack $targetId)
+        if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $targetId }
+        $basePercent = if ($targetIds.Count -le 0) { 100 } else { [int](3 + [Math]::Floor(($index / [double]$targetIds.Count) * 94)) }
+        Set-NoteProperty $status 'currentTargetId' $targetId
+        Set-NoteProperty $status 'currentTargetName' $displayName
+        Set-NoteProperty $status 'percent' $basePercent
+        Set-NoteProperty $status 'phase' '準備'
+        Set-NoteProperty $status 'message' "$displayName を準備しています。"
+        Write-RenderJobStatus $statusPath $status
+        # 出力の各段階を画面へ返す。1冊の作成でも無反応な時間が生まれないようにする。
+        $Script:FinalBuildProgress = {
+            param($phaseMessage)
+            Set-NoteProperty $status 'phase' ([string]$phaseMessage)
+            Set-NoteProperty $status 'message' ("$displayName : " + [string]$phaseMessage)
+            Write-RenderJobStatus $statusPath $status
+        }.GetNewClosure()
+        try {
+            $readiness = Get-FinalBuildReadiness (Get-Structure $language) $language (Get-LegacyVolumeFromTargetId $language $targetId) $packId
+            if ([int]$readiness.pageCount -le 0) { $skipped += $targetId }
+            else { $built += @(Build-DocumentPackPdf $language $packId $targetId) }
+            Set-NoteProperty $status 'completed' ([int](Get-IntDataProperty $status 'completed' 0) + 1)
+        } catch {
+            $message = [string]$_.Exception.Message
+            $errors += [ordered]@{ targetId=$targetId; targetName=$displayName; error=$message; userError=(ConvertTo-UserRenderError $message) }
+            Set-NoteProperty $status 'failed' ([int](Get-IntDataProperty $status 'failed' 0) + 1)
+        } finally {
+            $Script:FinalBuildProgress = $null
+        }
+        Set-NoteProperty $status 'built' @($built)
+        Set-NoteProperty $status 'skipped' @($skipped)
+        Set-NoteProperty $status 'errors' @($errors)
+        Write-RenderJobStatus $statusPath $status
+        $index++
+    }
+    $remaining = @($targetIds | Select-Object -Skip $index)
+    Set-NoteProperty $status 'currentTargetId' ''
+    Set-NoteProperty $status 'currentTargetName' ''
+    Set-NoteProperty $status 'phase' ''
+    Set-NoteProperty $status 'percent' 100
+    Set-NoteProperty $status 'built' @($built)
+    Set-NoteProperty $status 'skipped' @($skipped)
+    Set-NoteProperty $status 'errors' @($errors)
+    if ($cancelled) {
+        Set-NoteProperty $status 'status' 'cancelled'
+        Set-NoteProperty $status 'cancelRequested' $true
+        Set-NoteProperty $status 'message' ("$($built.Count) 冊を出力した時点で中止しました。残り $($remaining.Count) 冊は作成していません。")
+    } elseif ($errors.Count -gt 0) {
+        Set-NoteProperty $status 'status' 'completed-with-errors'
+        Set-NoteProperty $status 'message' ("$($built.Count) 冊を出力しました。$($errors.Count) 冊は出力できませんでした。")
+    } else {
+        Set-NoteProperty $status 'status' 'completed'
+        $summary = if ($built.Count -gt 0) { "$($built.Count) 冊の提出用PDFを出力しました。" } else { '出力対象のページがありませんでした。' }
+        if ($skipped.Count -gt 0) { $summary += " $($skipped.Count) 冊はページが無いため作成していません。" }
+        Set-NoteProperty $status 'message' $summary
+    }
+    Set-NoteProperty $status 'finishedAt' (New-NowIso)
+    Write-RenderJobStatus $statusPath $status
+    try { Remove-Item -LiteralPath (Get-FinalJobCancellationPath $language $jobId) -Force -ErrorAction SilentlyContinue } catch { }
 }
 
 function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyUpdated, [string]$Category = '', $SnapshotPins = $null) {
@@ -6100,6 +6553,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
 
 function Reorder-Pages([string]$Language, $Body) {
     $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
+    $baseLayout = Get-RequestedBaseLayout $Body
     return Update-StructureLocked $Language {
         param($structure)
         $cat = [string](Resolve-DocumentPackScope $structure $requestedScope $false).packId
@@ -6143,12 +6597,13 @@ function Reorder-Pages([string]$Language, $Body) {
         Apply-DefaultNumberingPerVolume $Language $structure $cat
         if ($affected.Count -gt 0) { Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました' }
         return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; affectedVolumes=@($affected); layoutSnapshotId=$layoutSnapshotId; updatedAt=(New-NowIso) }
-    }
+    } $baseLayout $requestedScope
 }
 
 
 function Update-Page([string]$Language, $Body) {
     $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
+    $baseLayout = Get-RequestedBaseLayout $Body
     return Update-StructureLocked $Language {
         param($structure)
         $cat = [string](Resolve-DocumentPackScope $structure $requestedScope $false).packId
@@ -6207,7 +6662,7 @@ function Update-Page([string]$Language, $Body) {
             Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました'
         }
         return [ordered]@{ page=$p; volumes=$structure.volumes; layoutSnapshotId=$layoutSnapshotId }
-    }
+    } $baseLayout $requestedScope
 }
 function Confirm-Page([string]$Language, $Body) {
     $cat=Require-WorkbookCategory ([string]$Body.category)
@@ -6892,6 +7347,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
 
     $paths = Get-Paths
     $workspace = Get-WorkspacePath $Language
+    Report-FinalBuildPhase '元原稿の更新を確認しています'
     try { [void](Scan-Updates $Language $null $false) } catch { }
     $lockPath = Join-Path $workspace ("locks\pack-output_{0}_{1}.lock" -f ([string]$scope.packId), $TargetId)
     return Invoke-WithLock $lockPath {
@@ -6925,10 +7381,12 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         }
         $manifestPath = Join-Path $workspace ("exports\manifest_{0}_{1}.json" -f ([string]$scope.packId), $TargetId)
         Write-JsonFile $manifestPath $manifest
+        Report-FinalBuildPhase ('ページを結合しています（' + [string]$snapshotBefore.pageCount + 'ページ）')
         $java = Resolve-JavaExe
         $run = Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath)
         if ([int]$run.exitCode -ne 0) { throw "PDFBox組版に失敗しました。exit=$([int]$run.exitCode)`n$([string]$run.text)" }
         if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '最終PDFを作成できませんでした。' }
+        Report-FinalBuildPhase '出力先へ保存しています'
         $buildId = New-RbId
         $commit = Update-StructureLocked $Language {
             param($st)
@@ -7020,6 +7478,12 @@ function Get-StatePayload([string]$Language) {
     $publicPacks = @(Get-PublicPackList $structure $Language)
     $packProgress = [pscustomobject][ordered]@{ packs=@(); totalCount=0; completeCount=0; attentionCount=0; missingRequiredCount=0; overdueRequiredCount=0; dueSoonRequiredCount=0; needsRenderCount=0; unassignedPageCount=0 }
     if ($configured -and -not $structureLoadError) { try { $packProgress = Get-PackProgressDashboard $structure $Language } catch { Write-Warning ('資料パック進捗を集計できません: ' + $_.Exception.Message) } }
+    # ページ構成の楽観ロック用。画面はこれを baseLayout として送り返す。
+    $layoutFingerprints = [ordered]@{}
+    if ($configured -and -not $structureLoadError) {
+        try { foreach ($pack in $publicPacks) { $layoutFingerprints[[string]$pack.packId] = Get-PageLayoutFingerprint $structure ([string]$pack.packId) } }
+        catch { Write-Warning ('ページ構成の指紋を計算できません: ' + $_.Exception.Message) }
+    }
     return [ordered]@{
         ok = $true
         token = $Script:Token
@@ -7028,6 +7492,7 @@ function Get-StatePayload([string]$Language) {
         packTemplates = $packTemplates
         packs = $publicPacks
         structure = ConvertTo-V4StructureCompatibilityView $structure
+        layoutFingerprints = $layoutFingerprints
         structureLoadError = $structureLoadError
         finalReadiness = $(if ($configured -and -not $structureLoadError) { Get-AllFinalReadiness $structure $Language $false } else { [ordered]@{} })
         packProgress = $packProgress
@@ -7231,6 +7696,19 @@ function Test-FixedTimeTokenEquals([string]$Candidate, [string]$Expected) {
         $difference = $difference -bor ($candidateHash[$i] -bxor $expectedHash[$i])
     }
     return ($difference -eq 0 -and $Candidate.Length -eq $Expected.Length)
+}
+
+# ループバックのcookieはポートで分離されない。127.0.0.1の別ポートで動く任意のページが
+# ReportBinderTokenを読み、同一サイト扱いのままAPIを実行できてしまう。
+# Host/Originを検証して、自分のオリジン以外からのAPI呼び出しを拒否する。
+function Test-RequestOrigin($Request) {
+    $allowed = @("127.0.0.1:$($Script:Port)", "localhost:$($Script:Port)")
+    $hostHeader = [string]$Request.Headers['Host']
+    if (-not [string]::IsNullOrWhiteSpace($hostHeader) -and ($allowed -notcontains $hostHeader)) { return $false }
+    $origin = [string]$Request.Headers['Origin']
+    if ([string]::IsNullOrWhiteSpace($origin)) { return $true }
+    foreach ($a in $allowed) { if ($origin -eq "http://$a") { return $true } }
+    return $false
 }
 
 function Test-Token($Request) {
@@ -7507,6 +7985,7 @@ function Handle-Api($Context) {
         if ($method -eq 'GET' -and $path -eq '/api/ping') {
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; runtimeVersion = $Script:RuntimeVersion; at = New-NowIso }) $true; return
         }
+        if (-not (Test-RequestOrigin $Context.Request)) { Write-JsonResponse $Context 403 ([ordered]@{ ok = $false; error = 'invalid origin' }); return }
         if (-not (Test-Token $Context.Request)) { Write-JsonResponse $Context 403 ([ordered]@{ ok = $false; error = 'invalid token' }); return }
         Touch-ClientActivity '' | Out-Null
         if ($method -eq 'POST' -and $path -eq '/api/heartbeat') {
@@ -7706,14 +8185,18 @@ function Handle-Api($Context) {
             $scope = Resolve-DocumentPackScope $structure $packId $false
             $allowedTargetIds = @(Get-PackTargetIds $language $scope.pack)
             if ($targetIds.Count -eq 0) { $targetIds = @([string](Get-DataProperty $body 'targetId' $allowedTargetIds[0])) }
-            $built = @(); $skipped = @()
-            foreach ($targetId in @($targetIds | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Select-Object -Unique)) {
-                if ($allowedTargetIds -notcontains $targetId) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
-                $readiness = Get-FinalBuildReadiness (Get-Structure $language) $language (Get-LegacyVolumeFromTargetId $language $targetId) $packId
-                if ([int]$readiness.pageCount -le 0) { $skipped += $targetId; continue }
-                $built += @(Build-DocumentPackPdf $language $packId $targetId)
-            }
-            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=[ordered]@{ built=@($built); skipped=@($skipped) }; state=(Get-V2StatePayload $language) }); return
+            # 出力は数十秒かかることがある。サーバーはリクエストを直列に処理するため、
+            # ここで完結させると進捗ポーリングも中止も受け付けられない。ジョブとして返す。
+            $job = Start-FinalBuildJob $language ([string]$scope.packId) @($targetIds | ForEach-Object { [string]$_ })
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=$job }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/build/status') {
+            $jobId = [string]$Context.Request.QueryString['jobId']
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=(Read-FinalJobStatus $language $jobId); state=(Get-V2StatePayload $language) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/build/cancel') {
+            $body = Read-BodyJson $Context.Request
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=(Request-FinalJobCancellation $language ([string](Get-DataProperty $body 'jobId' ''))) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/file') {
             $body = Read-BodyJson $Context.Request
@@ -8029,6 +8512,14 @@ function Handle-Api($Context) {
     } catch [System.ArgumentException] {
         Write-JsonResponse $Context 400 ([ordered]@{ ok = $false; error = $_.Exception.Message })
     } catch {
+        # 楽観ロックの衝突は、利用者側で解決できる状態ずれ。サーバー障害と区別する。
+        if (Test-StructureConflictError $_.Exception) {
+            Write-JsonResponse $Context 409 ([ordered]@{
+                ok = $false; code = 'structure-conflict'; error = $_.Exception.Message
+                currentLayout = [string]$_.Exception.Data['actualLayout']
+            })
+            return
+        }
         Write-JsonResponse $Context 500 ([ordered]@{ ok = $false; error = $_.Exception.Message; detail = (Get-ErrorDetail $_) })
     }
 }
@@ -8383,7 +8874,9 @@ function Start-LocalTcpServer([int]$ListenPort, [string]$OpenUrl, [bool]$SkipOpe
                 try {
                     $ctx = [pscustomobject]@{ IsTcp = $true; TcpClient = $client; TcpStream = $client.GetStream(); Request = $null; Response = [pscustomobject]@{} }
                     $err = [ordered]@{ ok = $false; error = $_.Exception.Message }
-                    $status = $(if ($_.Exception -is [System.ArgumentException]) { 400 } else { 500 })
+                    $status = 500
+                    if ($_.Exception -is [System.ArgumentException]) { $status = 400 }
+                    elseif (Test-StructureConflictError $_.Exception) { $status = 409; $err['code'] = 'structure-conflict' }
                     Write-JsonResponse $ctx $status $err
                 } catch {
                     try { $client.Close() } catch {}
@@ -12876,6 +13369,11 @@ if (-not [string]::IsNullOrWhiteSpace($DiffJobPath)) {
 
 if (-not [string]::IsNullOrWhiteSpace($RenderJobPath)) {
     Invoke-RenderJobFromFile $RenderJobPath
+    return
+}
+
+if (-not [string]::IsNullOrWhiteSpace($FinalJobPath)) {
+    Invoke-FinalBuildJobFromFile $FinalJobPath
     return
 }
 

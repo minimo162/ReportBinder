@@ -120,6 +120,49 @@ function Remove-ReleaseDevelopmentFiles([string]$StageRoot) {
     )) { Remove-PathIfExists (Join-Path $StageRoot $relativePath) }
 }
 
+# 完全性マニフェストの除外規則。launch.ps1 に同じ関数があり、両者が一致していることを
+# selfcheck.py が検査する。片方だけを変えると検証が素通りするため、必ず同時に直すこと。
+function Test-IntegrityExcludedPath([string]$RelativePath) {
+    if ($RelativePath -eq 'integrity-manifest.json') { return $true }
+    if ($RelativePath -eq 'config.json') { return $true }
+    $top = ($RelativePath -split '/')[0]
+    return ($top -in @('logs', 'thirdparty-cache'))
+}
+
+# 共有フォルダーの配布ツリーは、各利用者のPCへそのままコピーされてから実行される。
+# コピー前に照合できるよう、app配下の全ファイルのSHA-256とサイズを記録する。
+# launch.ps1 側の検証と対になっているため、除外規則を両者で一致させること。
+function Write-IntegrityManifest([string]$StageRoot) {
+    $appRoot = Join-Path $StageRoot 'app'
+    $prefix = [IO.Path]::GetFullPath($appRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $manifestPath = Join-Path $appRoot 'integrity-manifest.json'
+    Remove-PathIfExists $manifestPath
+    $runtimeVersion = 'legacy'
+    try { $runtimeVersion = [string]((Get-Content -LiteralPath (Join-Path $appRoot 'runtime-version.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version) } catch { }
+    $files = [ordered]@{}
+    $count = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $appRoot -Recurse -File -Force | Sort-Object FullName)) {
+        $relative = $file.FullName.Substring($prefix.Length) -replace '\\', '/'
+        if (Test-IntegrityExcludedPath $relative) { continue }
+        $files[$relative] = [ordered]@{
+            sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            size = [int64]$file.Length
+        }
+        $count++
+    }
+    if ($count -lt 1) { throw '完全性マニフェストの対象ファイルが見つかりません。' }
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        product = 'ReportBinder'
+        runtimeVersion = $runtimeVersion
+        createdAt = (Get-Date).ToString('o')
+        fileCount = $count
+        files = $files
+    }
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    Write-Output ("integrity manifest: {0} files" -f $count)
+}
+
 function Write-ReleaseManifest([string]$StageRoot, [string]$Flavor, [bool]$IncludeJava) {
     $runtimeVersion = 'legacy'
     $runtimePath = Join-Path $StageRoot 'app\runtime-version.json'
@@ -326,6 +369,9 @@ function New-SharedFolderRelease {
         Remove-ReleaseDevelopmentFiles $stage
         Remove-SharedFolderDevelopmentFiles $stage
         Write-ReleaseManifest $stage 'shared-folder-offline' $true
+        # マニフェストは全ファイル削除が終わった後に作る。順序を変えると、削除済みの
+        # ファイルが記録されて利用者側の検証が必ず失敗する。
+        Write-IntegrityManifest $stage
         Assert-StagedDependencies -StageRoot $stage -IncludeJava $true
         Assert-SharedFolderLayout $stage
 
@@ -352,6 +398,7 @@ function New-ReleaseZip([string]$Suffix, [bool]$IncludeJava) {
             if (Test-Path -LiteralPath $java) { Remove-Item -LiteralPath $java -Recurse -Force }
         }
         Write-ReleaseManifest $stage $Suffix $IncludeJava
+        Write-IntegrityManifest $stage
         Assert-StagedDependencies -StageRoot $stage -IncludeJava $IncludeJava
         $zip = Join-Path $OutputDir "ReportBinder_V5_${Suffix}_${stamp}.zip"
         if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }

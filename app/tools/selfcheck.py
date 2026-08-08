@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import json, os, re, shutil, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[2]
@@ -1153,7 +1153,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'app.js?v=20260808_v144', 'style.css?v=20260808_v90']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v150', 'style.css?v=20260808_v93']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1208,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260808_v144' not in html:
+if 'app.js?v=20260808_v150' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1234,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260808_v144' not in html:
+if 'app.js?v=20260808_v150' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1340,7 +1340,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.08.30':
+if str(runtime_info.get('version','')) != '2026.08.08.36':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
@@ -1655,7 +1655,9 @@ if "if(data.state)state=normalizeStatePayload(data.state)" in appjs:
     raise SystemExit('source registration incorrectly applies the V2 domain state to the legacy UI view')
 if "selectedFiles.clear();lastFileRangeAnchor='';await refresh();" not in appjs:
     raise SystemExit('source registration does not refresh the compatibility UI state')
-if "packId:String(pack?.packId||activePackId||'')" not in appjs:
+# pageApiBody は packId を必ず載せる。楽観ロックの baseLayout も同じ関数で付ける。
+_page_body = appjs.split('function pageApiBody(', 1)[1].split('\nfunction ', 1)[0]
+if "const packId=String(pack?.packId||activePackId||'')" not in _page_body or 'Object.assign({packId}' not in _page_body:
     raise SystemExit('page V2 requests do not consistently identify the active document pack')
 for needed in [
     "packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); volumes=$volumes",
@@ -1766,5 +1768,254 @@ for needed in ['function renderDiagnosticsResult', 'async function runSystemDiag
 for needed in ['.diagnostic-list', '.diagnostic-row', '.diagnostics-summary']:
     if needed not in css:
         raise SystemExit(f'environment diagnostics styling missing: {needed}')
+
+
+# 2026-08-09 error panel actions and dismissal ------------------------------
+for needed in ['id="error-actions"', 'id="error-close"', 'class="error-panel-body"']:
+    if needed not in html:
+        raise SystemExit(f'error panel action/dismiss markup missing: {needed}')
+for needed in ['function showErrorPanel(title, summary, detail, actions=[])',
+               'showErrorPanel(title, message, detail || message, actions)',
+               "const actionBox = $('error-actions')",
+               "bind('error-close','click',hideErrorPanel)"]:
+    if needed not in appjs:
+        raise SystemExit(f'error panel action/dismiss behavior missing: {needed}')
+for needed in ['.error-actions{', '.error-panel-body{']:
+    if needed not in css:
+        raise SystemExit(f'error panel action/dismiss styling missing: {needed}')
+
+
+# 2026-08-09 multi-perspective audit fixes ----------------------------------
+# 更新検知: ハッシュを取得できなかった回に更新時刻/サイズを保存すると、次回スキャンが
+# 再ハッシュを省略して更新済み原稿を最新と誤判定し、古い内容で提出用PDFが出る。
+_scan_updates = server.split('function Scan-Updates', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["if (-not [string]::IsNullOrWhiteSpace($hash)) {", "Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks"]:
+    if needed not in _scan_updates:
+        raise SystemExit(f'scan-updates must not persist metadata without a hash: {needed}')
+if "Set-NoteProperty $w 'currentExcelModifiedAt' $modified\n            Set-NoteProperty $w 'currentExcelLastWriteUtcTicks'" in _scan_updates:
+    raise SystemExit('scan-updates still writes ticks unconditionally after a failed hash')
+# ローカルAPIのオリジン検証（別ポートのローカルページからのトークン悪用を防ぐ）
+for needed in ['function Test-RequestOrigin', "Test-RequestOrigin $Context.Request", "invalid origin"]:
+    if needed not in server:
+        raise SystemExit(f'local API origin check missing: {needed}')
+# 変換PDFのページ数メモ化（/api/state ごとの全PDF読み込みを防ぐ）
+for needed in ['$Script:PdfPageCountCache', 'LastWriteTimeUtc.Ticks)"']:
+    if needed not in server:
+        raise SystemExit(f'pdf page count memoization missing: {needed}')
+for needed in ['DIFF_TEXT_ROW_ITEM_LIMIT', 'const unique=[],buckets=new Map()',
+               'function announceProgressMilestone', "history.replaceState(null, '', location.pathname)",
+               "if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail({status:'failed'",
+               'if(!activePackRecord())', 'let scanError = null']:
+    if needed not in appjs:
+        raise SystemExit(f'audit fix behavior missing: {needed}')
+if 'if (hasJapanese && !isTechnical) return raw;' in appjs:
+    raise SystemExit('userFriendlyError must reach the hint table for Japanese OS errors')
+for needed in ['id="progress-announce"', 'role="progressbar"']:
+    if needed not in html:
+        raise SystemExit(f'progress accessibility markup missing: {needed}')
+if 'id="progress-panel" class="progress-panel hidden" aria-live' in html:
+    raise SystemExit('the progress panel must not be a live region (850ms polling floods the queue)')
+if '.page-thumb-card.selected-row::after' not in css:
+    raise SystemExit('thumbnail selection needs a non-color cue')
+
+
+# 2026-08-09 distribution integrity manifest --------------------------------
+launcher = (root/'app/launch.ps1').read_text(encoding='utf-8-sig')
+packager = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
+
+def _ps_function(text, name, where):
+    # 引数のない関数は `function Name {`、あるものは `function Name(` と書かれる。
+    start = -1
+    for marker in (f'function {name}(', f'function {name} {{', f'function {name}\n'):
+        start = text.find(marker)
+        if start >= 0:
+            break
+    if start < 0:
+        raise SystemExit(f'{name} is missing from {where}')
+    depth, brace = 0, text.index('{', start)
+    for index in range(brace, len(text)):
+        if text[index] == '{':
+            depth += 1
+        elif text[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:index+1]
+    raise SystemExit(f'{name} is unterminated in {where}')
+
+# 除外規則が片方だけ変わると、検証対象から外れたファイルが素通りする。
+_excl_launcher = _ps_function(launcher, 'Test-IntegrityExcludedPath', 'launch.ps1')
+_excl_packager = _ps_function(packager, 'Test-IntegrityExcludedPath', 'package-release.ps1')
+if _excl_launcher.split() != _excl_packager.split():
+    raise SystemExit('Test-IntegrityExcludedPath must stay identical in launch.ps1 and package-release.ps1')
+for needed in ['function Test-StagedTreeIntegrity', "'hash-mismatch'", "'size-mismatch'",
+               "'missing-file'", "'unexpected-file'", "'no-manifest'",
+               'Test-StagedTreeIntegrity $stageApp', '$script:IntegrityFailure']:
+    if needed not in launcher:
+        raise SystemExit(f'staged tree integrity verification missing: {needed}')
+# 完全性の不一致で共有コピーへフォールバックすると、改変されたツリーをそのまま実行する。
+_catch = launcher.split('# Availability wins over speed', 1)[1].split('} finally {', 1)[0]
+if 'exit 1' not in _catch or '$script:IntegrityFailure' not in _catch:
+    raise SystemExit('integrity failure must abort the launch instead of falling back to the shared copy')
+for needed in ['function Write-IntegrityManifest', 'integrity-manifest.json', 'Write-IntegrityManifest $stage']:
+    if needed not in packager:
+        raise SystemExit(f'integrity manifest generation missing: {needed}')
+# マニフェストは削除処理の後に作らないと、削除済みファイルを記録して必ず検証が失敗する。
+for flavor in ('New-SharedFolderRelease', 'New-ReleaseZip'):
+    _body = _ps_function(packager, flavor, 'package-release.ps1')
+    if 'Write-IntegrityManifest' not in _body:
+        raise SystemExit(f'{flavor} must write an integrity manifest')
+    if _body.index('Write-IntegrityManifest') < _body.index('Remove-ReleaseDevelopmentFiles'):
+        raise SystemExit(f'{flavor} must write the manifest after the removal steps')
+if '配布用の共有フォルダーは、発行者以外に対して読み取り専用' not in (root/'README.md').read_text(encoding='utf-8-sig'):
+    raise SystemExit('README must state the read-only share requirement (the manifest cannot stop a full-share writer)')
+
+
+# 2026-08-09 sheet rename / hide must not drop page settings ----------------
+_sync = _ps_function(server, 'Update-WorkbookPagesFromInspection', 'server.ps1')
+if '$PresentSheetNames = $null' not in _sync:
+    raise SystemExit('page sync must accept the hidden-inclusive sheet list')
+for needed in ["Set-NoteProperty $page 'sheetHidden' $true", '$renameBySheetKey',
+               "Set-NoteProperty $page 'renamedFromSheetName' $previousSheet",
+               "Save-LayoutSnapshot $Language $packId 'source-sheets-changed' $Structure"]:
+    if needed not in _sync:
+        raise SystemExit(f'sheet rename/hide handling missing: {needed}')
+# 復元ポイントは pages を差し替える前に取らないと、消えた状態が保存される。
+if _sync.index('Save-LayoutSnapshot') > _sync.index('$Structure.pages = $pages'):
+    raise SystemExit('the layout snapshot must be taken before the removal is committed')
+# 位置もA1見出しも一致しない新規シートを引き継ぎ扱いにすると、無関係なページへ
+# 配置と使用ページ範囲が移る。手掛かりなしの1対1対応付けを許さない。
+if '$pool.Count -eq 1 -and $newSheets.Count -eq 1' in _sync:
+    raise SystemExit('rename re-matching must require a sheetIndex or detectedTitle match')
+# Excel経路の呼び出しは、非表示を含む全シート名を渡すこと。
+_excel_calls = [line for line in server.splitlines() if 'Update-WorkbookPagesFromInspection' in line and 'function ' not in line]
+for line in _excel_calls:
+    if '$inspected' in line or '$wb @()' in line or '$x[0] @()' in line:
+        if '$allSheetNames' not in line:
+            raise SystemExit(f'Excel page sync must pass the hidden-inclusive sheet list: {line.strip()[:90]}')
+
+
+# 2026-08-09 optimistic locking for the page board --------------------------
+for needed in ['function Get-PageLayoutFingerprint', 'function New-StructureConflictError',
+               'function Test-StructureConflictError', 'function Get-RequestedBaseLayout',
+               "'reportBinderConflict'", 'layoutFingerprints = $layoutFingerprints']:
+    if needed not in server:
+        raise SystemExit(f'page layout optimistic locking missing: {needed}')
+_locked = _ps_function(server, 'Update-StructureLocked', 'server.ps1')
+for needed in ['$BaseLayout', '$LayoutScope', "$result['layoutFingerprint']"]:
+    if needed not in _locked:
+        raise SystemExit(f'Update-StructureLocked must support layout-scoped conflicts: {needed}')
+# 配置を変えない書き込み（更新スキャン等）で指紋が動くと、衝突していない操作まで拒否する。
+_fingerprint = _ps_function(server, 'Get-PageLayoutFingerprint', 'server.ps1')
+for forbidden in ("'status'", "'title'", "'contentPdf'", 'updatedAt'):
+    if forbidden in _fingerprint:
+        raise SystemExit(f'the layout fingerprint must not depend on {forbidden} (background writes would false-conflict)')
+for needed in ("'volume'", "'order'", "'enabled'", 'Resolve-PageId'):
+    if needed not in _fingerprint:
+        raise SystemExit(f'the layout fingerprint must cover {needed}')
+for flavor in ('Reorder-Pages', 'Update-Page'):
+    _body = _ps_function(server, flavor, 'server.ps1')
+    if 'Get-RequestedBaseLayout' not in _body or '$baseLayout $requestedScope' not in _body:
+        raise SystemExit(f'{flavor} must forward the caller layout fingerprint')
+if '409' not in server or "code = 'structure-conflict'" not in server:
+    raise SystemExit('a layout conflict must answer 409 with a structure-conflict code')
+for needed in ['function activeLayoutFingerprint', 'function rememberLayoutFingerprint',
+               'function handlePageLayoutConflict', 'function handlePageSettingsConflict',
+               "err.code = String(data.code || '')", 'body.baseLayout=base']:
+    if needed not in appjs:
+        raise SystemExit(f'client-side conflict handling missing: {needed}')
+# 保存成功後に指紋を進めないと、自分の直前の変更を他タブの変更と誤認して2回目が必ず失敗する。
+_apply = appjs.split('function applyPageMutationResult', 1)[1].split('\nfunction ', 1)[0]
+if 'rememberLayoutFingerprint' not in _apply:
+    raise SystemExit('applyPageMutationResult must advance the stored layout fingerprint')
+if appjs.count("e.code==='structure-conflict'") + appjs.count("error.code==='structure-conflict'") < 4:
+    raise SystemExit('every page-mutating call site must handle the conflict response')
+
+
+# 2026-08-09 changing the source folder is a workspace switch ---------------
+_choose = appjs.split('async function chooseSubmissionFolder(', 1)[1].split('\nasync function ', 1)[0]
+for needed in ['confirmAction({', '原稿フォルダを変更しますか？', 'danger:true', 'if(!accepted)return;',
+               'const previousFolder=', '前のフォルダに戻す']:
+    if needed not in _choose:
+        raise SystemExit(f'source folder change guard missing: {needed}')
+# 初回設定は既存の一式が無いので、確認を挟むと最初の一歩が増えるだけになる。
+if 'if (replacingExistingFolder) {' not in _choose:
+    raise SystemExit('the confirmation must apply only when an existing folder is being replaced')
+if 'function restorePreviousSubmissionFolder' not in appjs:
+    raise SystemExit('the previous source folder must remain reachable after the switch')
+
+
+# 2026-08-09 final PDF output runs as a cancellable job ---------------------
+for needed in ['function Start-FinalBuildJob', 'function Invoke-FinalBuildJobFromFile',
+               'function Read-FinalJobStatus', 'function Request-FinalJobCancellation',
+               'function Get-ActiveFinalJobStatus', 'function Report-FinalBuildPhase',
+               "'/api/v2/outputs/build/status'", "'/api/v2/outputs/build/cancel'",
+               '[string]$FinalJobPath', 'Invoke-FinalBuildJobFromFile $FinalJobPath']:
+    if needed not in server:
+        raise SystemExit(f'final build job plumbing missing: {needed}')
+# 出力を要求の中で完結させると、直列処理のサーバーでは進捗も中止も受け取れない。
+_build_route = server.split("$path -eq '/api/v2/outputs/build') {", 1)[1].split('if ($method', 1)[0]
+if 'Start-FinalBuildJob' not in _build_route or 'Build-DocumentPackPdf' in _build_route:
+    raise SystemExit('/api/v2/outputs/build must hand off to a background job, not build inline')
+# 組み込みパックの一括出力は準トランザクションのまま。1冊ずつのループに落とすと
+# 「本体だけ成功する」状態が復活する。
+_job_runner = _ps_function(server, 'Invoke-FinalBuildJobFromFile', 'server.ps1')
+if 'Invoke-FinalBuildTransaction' not in _job_runner or '$isTransactionalAll' not in _job_runner:
+    raise SystemExit('the built-in all-targets build must stay transactional inside the job')
+if 'Test-FinalJobCancellationRequested' not in _job_runner:
+    raise SystemExit('the job runner must honour a cancellation request')
+for needed in ['async function runFinalBuildJob', 'function updateFinalProgressPanel',
+               'async function cancelActiveFinalJob', 'let activeFinalJobId',
+               '/api/v2/outputs/build/status?jobId=']:
+    if needed not in appjs:
+        raise SystemExit(f'final build progress UI missing: {needed}')
+if 'if(activeFinalJobId)return void cancelActiveFinalJob();' not in appjs:
+    raise SystemExit('the shared cancel button must route to whichever job is running')
+# 進捗パネルを出す以上、runBusy の4秒で消えるトーストと二重に出さない。
+for fn in ('buildVolume', 'buildAllVolumes'):
+    _body = appjs.split(f'async function {fn}(', 1)[1].split('\nasync function ', 1)[0]
+    if 'runFinalBuildJob' not in _body:
+        raise SystemExit(f'{fn} must go through the job flow')
+    if '}, false);' not in _body and '},false);' not in _body:
+        raise SystemExit(f'{fn} must suppress the generic processing toast while the progress panel is shown')
+if '/api/v2/outputs/build/status' not in (root/'docs/API.md').read_text(encoding='utf-8-sig'):
+    raise SystemExit('the new output job endpoints must be documented')
+
+
+# 2026-08-09 page board delegation / render cost ----------------------------
+_attach = appjs.split('function attachBoardEvents() {', 1)[1].split('\n}', 1)[0]
+# 行ごとにリスナーを張り直すと、174ページで1描画あたり約1,400個のクロージャになる。
+for forbidden in ("addEventListener('pointerdown'", "addEventListener('keydown'", "addEventListener('click'"):
+    if forbidden in _attach:
+        raise SystemExit(f'attachBoardEvents must not bind per row/element: {forbidden}')
+for needed in ['function delegateBoardEvents', 'let boardEventsDelegated', 'function handleBoardRowKeydown']:
+    if needed not in appjs:
+        raise SystemExit(f'page board event delegation missing: {needed}')
+# blur は伝播しないので、委譲では focusout を使う必要がある。
+if "box.addEventListener('focusout'" not in appjs:
+    raise SystemExit('delegated page-title saving must use focusout (blur does not bubble)')
+# 検索のたびに盤面を作り直すと、描画キューごと捨てて進行中のPDF描画を巻き戻す。
+if 'pageSearchDebounceTimer' not in appjs:
+    raise SystemExit('the page search input must be debounced')
+# 絞り込みで隠れるページも data-page-id は DOM に残す。collectBoardVolumes が
+# 並び順をDOMから絶対値で読むため、消すと隠れたページを欠いた並びを保存してしまう。
+for needed in ['function filteredOutPageHtml', 'if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),true);',
+               'if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),false);']:
+    if needed not in appjs:
+        raise SystemExit(f'filtered-out pages must collapse to an id-only carrier: {needed}')
+if 'data-page-id="${escapeAttr(pid)}"' not in appjs.split('function filteredOutPageHtml', 1)[1].split('\n}', 1)[0]:
+    raise SystemExit('the filtered-out carrier must keep data-page-id so the saved order stays complete')
+# ドラッグ中の pointermove は1フレーム1回に束ねる。
+_drag = appjs.split('function beginPointerPageDrag(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['requestAnimationFrame(applyMove)', 'cancelAnimationFrame(moveFrame)']:
+    if needed not in _drag:
+        raise SystemExit(f'the drag move handler must be rAF-throttled: {needed}')
+# 画面外のサムネイルcanvasを解放する（A4縦1枚で約1.09MB）。
+if 'function releasePageThumbnailCanvas' not in appjs:
+    raise SystemExit('off-screen thumbnail canvases must be released')
+_release = appjs.split('function releasePageThumbnailCanvas(', 1)[1].split('\n}', 1)[0]
+if "!=='ready'" not in _release:
+    raise SystemExit('an in-flight thumbnail render must not be discarded by the release path')
+if 'pageThumbnailObserver.unobserve' in appjs:
+    raise SystemExit('the thumbnail observer must keep watching so re-entry redraws released canvases')
 
 print('selfcheck ok')
