@@ -9,6 +9,7 @@ $script:AppRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($SharedAppRoot)) { $SharedAppRoot = $script:AppRoot }
 $script:SharedAppRoot = [IO.Path]::GetFullPath($SharedAppRoot)
 $script:BootstrapWarning = ''
+$script:IntegrityFailure = ''
 $runtimeInfoPath = Join-Path $script:AppRoot 'runtime-version.json'
 $script:RuntimeVersion = 'legacy'
 try {
@@ -18,6 +19,57 @@ try {
         if ($candidateVersion -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { $script:RuntimeVersion = $candidateVersion }
     }
 } catch { }
+
+# 完全性マニフェストの除外規則。package-release.ps1 に同じ関数があり、両者が一致して
+# いることを selfcheck.py が検査する。片方だけを変えると検証が素通りする。
+function Test-IntegrityExcludedPath([string]$RelativePath) {
+    if ($RelativePath -eq 'integrity-manifest.json') { return $true }
+    if ($RelativePath -eq 'config.json') { return $true }
+    $top = ($RelativePath -split '/')[0]
+    return ($top -in @('logs', 'thirdparty-cache'))
+}
+
+# 共有フォルダーからコピーしたツリーを、%LOCALAPPDATA% へ確定する前に照合する。
+# SMB越しのコピー欠落・切り詰めと、ツリーの一部だけを書き換えられた場合を検出する。
+# 共有全体を書き換えられる相手はこの検証自体を無効化できるため、配布用共有は
+# 発行者以外を読み取り専用にすること（docs/OPERATIONS_GUIDE.md に記載）。
+function Test-StagedTreeIntegrity([string]$StageAppRoot) {
+    $manifestPath = Join-Path $StageAppRoot 'integrity-manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        return [pscustomobject]@{ Verified = $false; Reason = 'no-manifest'; Message = '完全性マニフェストがない配布物です。' }
+    }
+    $manifest = $null
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    if ($null -eq $manifest -or $null -eq $manifest.files) {
+        return [pscustomobject]@{ Verified = $false; Reason = 'broken-manifest'; Message = '完全性マニフェストを読み取れません。' }
+    }
+    $expected = @{}
+    foreach ($entry in $manifest.files.PSObject.Properties) { $expected[[string]$entry.Name] = $entry.Value }
+    $prefix = [IO.Path]::GetFullPath($StageAppRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($file in @(Get-ChildItem -LiteralPath $StageAppRoot -Recurse -File -Force)) {
+        $relative = $file.FullName.Substring($prefix.Length) -replace '\\', '/'
+        if (Test-IntegrityExcludedPath $relative) { continue }
+        if (-not $expected.ContainsKey($relative)) {
+            return [pscustomobject]@{ Verified = $false; Reason = 'unexpected-file'; Message = "配布物にない余分なファイルがあります: $relative" }
+        }
+        [void]$seen.Add($relative)
+        # サイズ照合で先に落とすと、改変されたファイルのハッシュ計算を省ける。
+        if ([int64]$expected[$relative].size -ne [int64]$file.Length) {
+            return [pscustomobject]@{ Verified = $false; Reason = 'size-mismatch'; Message = "ファイルのサイズが配布物と一致しません: $relative" }
+        }
+        $actual = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne ([string]$expected[$relative].sha256).ToLowerInvariant()) {
+            return [pscustomobject]@{ Verified = $false; Reason = 'hash-mismatch'; Message = "ファイルの内容が配布物と一致しません: $relative" }
+        }
+    }
+    foreach ($relative in $expected.Keys) {
+        if (-not $seen.Contains($relative)) {
+            return [pscustomobject]@{ Verified = $false; Reason = 'missing-file'; Message = "配布物のファイルがコピーされていません: $relative" }
+        }
+    }
+    return [pscustomobject]@{ Verified = $true; Reason = 'ok'; Message = ("{0} ファイルを照合しました。" -f $seen.Count); FileCount = $seen.Count }
+}
 
 # The shared launcher is intentionally thin. It reads one small version file, installs
 # that immutable app version under LocalAppData when necessary, then restarts this
@@ -60,10 +112,26 @@ if (-not $LocalRuntime -and $script:RuntimeVersion -ne 'legacy') {
                         throw "ローカル版アプリのコピーが不完全です: $required"
                     }
                 }
+                # 改変・破損したツリーを %LOCALAPPDATA% へ確定してしまうと、以後の起動は
+                # そちらを使い続ける。確定の前に照合し、一致しない場合は staging を捨てる。
+                $integrity = Test-StagedTreeIntegrity $stageApp
+                if (-not $integrity.Verified) {
+                    if ($integrity.Reason -eq 'no-manifest') {
+                        # 旧配布物と開発ツリーからの起動を壊さないため、警告に留める。
+                        $script:BootstrapWarning = '配布物の完全性を確認できませんでした（' + $integrity.Message + '）'
+                    } else {
+                        # 完全性の不一致は可用性より優先する。共有コピーへのフォールバックは
+                        # 改変されたツリーをそのまま実行することになるため、起動を止める。
+                        $script:IntegrityFailure = $integrity.Message
+                        throw ('配布物の内容が壊れているか、書き換えられています。' + $integrity.Message)
+                    }
+                }
                 [ordered]@{
                     version = $script:RuntimeVersion
                     source = $script:SharedAppRoot
                     installedAt = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+                    integrityVerified = [bool]$integrity.Verified
+                    integrityFileCount = [int]$integrity.FileCount
                 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stageRoot 'installed.json') -Encoding UTF8
                 Move-Item -LiteralPath $stageRoot -Destination $runtimeBase
                 $stageRoot = ''
@@ -83,6 +151,29 @@ if (-not $LocalRuntime -and $script:RuntimeVersion -ne 'legacy') {
         $script:BootstrapWarning = $_.Exception.Message
         # Availability wins over speed if the local install cannot be prepared.
         # Continue from the shared copy for this launch and leave a diagnostic locally.
+        # 完全性の不一致だけは例外。共有コピーで続行すると改変されたツリーを実行するため、
+        # 利用者に理由を提示して起動を中止する。
+        if (-not [string]::IsNullOrWhiteSpace($script:IntegrityFailure)) {
+            $stopMessage = "ReportBinderを起動できません。`n`n" +
+                "配布物の内容が、配布時の記録と一致しません。破損したコピー、または第三者による書き換えの可能性があります。`n`n" +
+                $script:IntegrityFailure + "`n`n" +
+                '共有フォルダーの管理者に連絡し、配布物を作り直してもらってください。'
+            # Add-LaunchLog はこの時点ではまだ定義・初期化されていないため、直接書く。
+            try {
+                $bootLogDir = Join-Path (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder') 'logs'
+                if (-not (Test-Path -LiteralPath $bootLogDir)) { New-Item -ItemType Directory -Path $bootLogDir -Force | Out-Null }
+                Add-Content -LiteralPath (Join-Path $bootLogDir 'integrity-latest.log') -Encoding UTF8 -Value (
+                    '{0} integrity check failed ({1}): {2} source={3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
+                    $integrity.Reason, $script:IntegrityFailure, $script:SharedAppRoot)
+            } catch { }
+            try {
+                Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+                [void][System.Windows.Forms.MessageBox]::Show($stopMessage, 'ReportBinder',
+                    [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            } catch { Write-Error $stopMessage }
+            if ($stageRoot -and (Test-Path -LiteralPath $stageRoot)) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            exit 1
+        }
     } finally {
         if ($stageRoot -and (Test-Path -LiteralPath $stageRoot)) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
         if ($installOwned -and $null -ne $installMutex) { try { $installMutex.ReleaseMutex() } catch { } }

@@ -1816,4 +1816,55 @@ if 'id="progress-panel" class="progress-panel hidden" aria-live' in html:
 if '.page-thumb-card.selected-row::after' not in css:
     raise SystemExit('thumbnail selection needs a non-color cue')
 
+
+# 2026-08-09 distribution integrity manifest --------------------------------
+launcher = (root/'app/launch.ps1').read_text(encoding='utf-8-sig')
+packager = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
+
+def _ps_function(text, name, where):
+    # 引数のない関数は `function Name {`、あるものは `function Name(` と書かれる。
+    start = -1
+    for marker in (f'function {name}(', f'function {name} {{', f'function {name}\n'):
+        start = text.find(marker)
+        if start >= 0:
+            break
+    if start < 0:
+        raise SystemExit(f'{name} is missing from {where}')
+    depth, brace = 0, text.index('{', start)
+    for index in range(brace, len(text)):
+        if text[index] == '{':
+            depth += 1
+        elif text[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:index+1]
+    raise SystemExit(f'{name} is unterminated in {where}')
+
+# 除外規則が片方だけ変わると、検証対象から外れたファイルが素通りする。
+_excl_launcher = _ps_function(launcher, 'Test-IntegrityExcludedPath', 'launch.ps1')
+_excl_packager = _ps_function(packager, 'Test-IntegrityExcludedPath', 'package-release.ps1')
+if _excl_launcher.split() != _excl_packager.split():
+    raise SystemExit('Test-IntegrityExcludedPath must stay identical in launch.ps1 and package-release.ps1')
+for needed in ['function Test-StagedTreeIntegrity', "'hash-mismatch'", "'size-mismatch'",
+               "'missing-file'", "'unexpected-file'", "'no-manifest'",
+               'Test-StagedTreeIntegrity $stageApp', '$script:IntegrityFailure']:
+    if needed not in launcher:
+        raise SystemExit(f'staged tree integrity verification missing: {needed}')
+# 完全性の不一致で共有コピーへフォールバックすると、改変されたツリーをそのまま実行する。
+_catch = launcher.split('# Availability wins over speed', 1)[1].split('} finally {', 1)[0]
+if 'exit 1' not in _catch or '$script:IntegrityFailure' not in _catch:
+    raise SystemExit('integrity failure must abort the launch instead of falling back to the shared copy')
+for needed in ['function Write-IntegrityManifest', 'integrity-manifest.json', 'Write-IntegrityManifest $stage']:
+    if needed not in packager:
+        raise SystemExit(f'integrity manifest generation missing: {needed}')
+# マニフェストは削除処理の後に作らないと、削除済みファイルを記録して必ず検証が失敗する。
+for flavor in ('New-SharedFolderRelease', 'New-ReleaseZip'):
+    _body = _ps_function(packager, flavor, 'package-release.ps1')
+    if 'Write-IntegrityManifest' not in _body:
+        raise SystemExit(f'{flavor} must write an integrity manifest')
+    if _body.index('Write-IntegrityManifest') < _body.index('Remove-ReleaseDevelopmentFiles'):
+        raise SystemExit(f'{flavor} must write the manifest after the removal steps')
+if '配布用の共有フォルダーは、発行者以外に対して読み取り専用' not in (root/'README.md').read_text(encoding='utf-8-sig'):
+    raise SystemExit('README must state the read-only share requirement (the manifest cannot stop a full-share writer)')
+
 print('selfcheck ok')
