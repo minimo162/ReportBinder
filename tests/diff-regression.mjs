@@ -16,6 +16,14 @@ function functionSource(code,name){
   }
   throw new Error(`unterminated function: ${name}`);
 }
+// 抽出した関数が参照するトップレベル定数も実ソースから取り込む。
+// テスト側に値を複製すると、しきい値を変えたときに黙って乖離する。
+function constantSource(code,name){
+  const match=code.match(new RegExp(`^const ${name} = .*$`,'m'));
+  if(!match)throw new Error(`missing constant: ${name}`);
+  return match[0];
+}
+const constants=['DIFF_TEXT_ROW_ITEM_LIMIT'];
 const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTemplate','diffPdfTextTemplatesMatch',
   'diffPdfNonNumericFingerprint','diffPdfNumericItems','diffPdfNumericCenterDistance','unmatchedDiffPdfNumericItems',
   'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
@@ -25,7 +33,7 @@ const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTempla
   'diffPdfTextItemsInBand','buildLocalizedTextRowStructureDiffResult','mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
   'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise','diffKindMeta','diffCsvCell','buildDiffSummaryCsv'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
-vm.runInContext(names.map(name=>functionSource(appCode,name)).join('\n'),app);
+vm.runInContext(constants.map(name=>constantSource(appCode,name)).concat(names.map(name=>functionSource(appCode,name))).join('\n'),app);
 const item=(text,x,y,width=60,height=12)=>({text,x,y,width,height});
 
 app.asArray=value=>Array.isArray(value)?value:[];

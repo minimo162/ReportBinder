@@ -11,6 +11,9 @@ const urlToken = qs.get('token') || '';
 if (urlToken) {
   try { sessionStorage.setItem('ReportBinderToken', urlToken); } catch {}
   try { document.cookie = `ReportBinderToken=${encodeURIComponent(urlToken)}; Path=/; SameSite=Lax`; } catch {}
+  // トークンはAPI全体に対する資格情報。アドレスバーとブラウザ履歴に残すと、
+  // 履歴同期や拡張機能経由で漏れる。保存した直後にURLから取り除く。
+  try { history.replaceState(null, '', location.pathname); } catch {}
 }
 const token = urlToken || (() => { try { return sessionStorage.getItem('ReportBinderToken') || ''; } catch { return ''; } })() || readCookie('ReportBinderToken') || '';
 function withToken(path) {
@@ -106,6 +109,9 @@ const DIFF_RENDER_SCALE = 120 / 72;
 const DIFF_PAGE_CACHE_LIMIT = 6;
 const DIFF_PDF_CACHE_LIMIT = 16;
 const DIFF_DETAIL_CACHE_LIMIT = 12;
+// 行構造の比較に渡すテキスト項目数の上限。巻全体を平坦化した配列も通るため、
+// 上限が無いとページ数×1ページの項目数だけ膨らんで実用時間を超える。
+const DIFF_TEXT_ROW_ITEM_LIMIT = 4000;
 const DIFF_DETAIL_TIMEOUT_MS = 15000;
 const SNAPSHOT_HISTORY_CACHE_MS = 60000;
 let historyPanelsInitialized = false;
@@ -415,7 +421,6 @@ function userFriendlyError(message) {
   // 技術的なエラー(例外・スタックトレース等)のときだけ、対処ヒントを付けて原文も併記する。
   const isTechnical = /Exception|StackTrace|HRESULT|at\s+java|COMException|System\./i.test(text);
   const hasJapanese = /[ぁ-んァ-ヶ一-龠]/.test(text);
-  if (hasJapanese && !isTechnical) return raw;
   let hint = '';
   if (/用語 'java'|'java'\s*は.*認識され|java\.exe が見つかりません|Java Runtimeが(見つかり|あり)ません/i.test(text)) {
     hint = '最終PDF作成用のJava Runtimeが見つかりません。app\\tools\\install-thirdparty.cmd を実行してください。';
@@ -430,7 +435,11 @@ function userFriendlyError(message) {
   } else if (/OutOfMemory/i.test(text)) {
     hint = 'メモリ不足で処理できませんでした。他のアプリを閉じてから再試行してください。';
   }
+  // 対処ヒントが取れたら必ず付ける。ヒント表の分岐は「別のプロセスが使用中」
+  // 「アクセスが拒否」など日本語のOS/PowerShellエラーを狙って書かれているので、
+  // 日本語を理由にここより手前で打ち切ってはいけない。
   if (!hint) return raw;
+  if (hasJapanese && !isTechnical) return hint + '\n(' + raw + ')';
   return hint + '\n(元のエラー: ' + raw + ')';
 }
 
@@ -582,6 +591,30 @@ async function api(path, options = {}) {
 
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+// 進捗パネル全体をライブ領域にすると、0.85秒ごとのポーリング更新が読み上げキューを
+// 埋め尽くし、他の要素を読めなくする。節目だけを専用のライブ領域へ流す。
+let lastProgressAnnounceKey = '';
+function announceProgressMilestone(pct, status, terminal, total, done) {
+  const box = $('progress-announce');
+  if (!box) return;
+  let key = '', text = '';
+  if (terminal) {
+    key = `terminal:${status}`;
+    text = status === 'cancelled' ? 'PDF作成を中止しました。'
+      : status === 'completed' ? 'PDF作成が完了しました。'
+      : (status === 'completed-with-errors' || status === 'failed') ? 'PDF作成が終わりました。確認が必要な項目があります。'
+      : 'PDF作成が完了しました。';
+  } else {
+    const step = Math.floor(Math.max(0, pct) / 25) * 25;
+    key = `step:${step}`;
+    text = step <= 0
+      ? 'PDF作成を開始しました。'
+      : (total ? `PDF作成中、${step}パーセント。${Math.min(done, total)} / ${total}件。` : `PDF作成中、${step}パーセント。`);
+  }
+  if (key === lastProgressAnnounceKey) return;
+  lastProgressAnnounceKey = key;
+  box.textContent = text;
+}
 function updateProgressPanel(job) {
   const panel = $('progress-panel');
   if (!panel || !job) return;
@@ -608,8 +641,15 @@ function updateProgressPanel(job) {
   const currentSource = getWorkbook(job.currentWorkbookId);
   const target = job.currentSheet ? `${job.currentWorkbookName || ''} / ${sourceUnitReference(currentSource, job.currentSheet)}` : (job.currentWorkbookName || '');
   $('progress-message').textContent = job.message || (target ? `${target} を処理しています。` : '処理しています。');
-  panel.querySelector('.progress-track')?.setAttribute('aria-valuenow', String(pct));
+  const track = panel.querySelector('.progress-track');
   const terminal = pct >= 100 || ['completed','completed-with-errors','failed','cancelled'].includes(status);
+  if (track) {
+    // 不定状態では値を公開しない（支援技術は「進行中」として扱う）。
+    if ((checking || pct <= 0) && !terminal) track.removeAttribute('aria-valuenow');
+    else track.setAttribute('aria-valuenow', String(pct));
+    track.setAttribute('aria-valuetext', total ? `${Math.min(done, total)} / ${total}件 (${pct}%)` : `${pct}%`);
+  }
+  announceProgressMilestone(pct, status, terminal, total, done);
   const cancelButton = $('progress-cancel');
   if (cancelButton) {
     const requested = activeRenderCancelRequested || !!job.cancelRequested;
@@ -623,6 +663,9 @@ function updateProgressPanel(job) {
 function hideProgressPanel() {
   const panel = $('progress-panel');
   if (panel) panel.classList.add('hidden');
+  lastProgressAnnounceKey = '';
+  const box = $('progress-announce');
+  if (box) box.textContent = '';
 }
 function normalizeRenderJobFromStart(started) {
   if (!started) return null;
@@ -849,11 +892,21 @@ async function refresh() {
 }
 async function refreshAndLoad(btn) {
   await runBusy(btn, async () => {
+    // 更新検知の失敗を握りつぶして「更新しました」と言うと、実際には古い判定のままなのに
+    // 利用者は確認済みだと誤解する。読み込み自体は続けたうえで、確認できなかったことを伝える。
+    let scanError = null;
     if (configured()) {
-      try { await api('/api/scan-updates', {method:'POST', body:{force:false}}); } catch {}
+      try { await api('/api/scan-updates', {method:'POST', body:{force:false}}); }
+      catch (e) { scanError = e; }
     }
     await refresh();
     if (configured()) await loadFiles(null);
+    if (scanError) {
+      showMessage('warn', '元原稿の更新を確認できませんでした',
+        `${userFriendlyError(scanError.message)}\n登録状態は読み込み直しました。少し待ってからもう一度「更新」を押してください。`,
+        scanError.detail || scanError.stack || scanError.message);
+      return;
+    }
     showMessage('ok', '画面を更新しました', '提出フォルダと登録状態を読み込み直しました。');
   }, false);
 }
@@ -1775,6 +1828,8 @@ function syncPageSelectionUi() {
     const id = String(row.getAttribute('data-page-id') || '');
     const checked = selectedPages.has(id);
     row.classList.toggle('selected-row', checked);
+    // aria-selected は tr(role=row) でのみ有効。article のカードでは無視されるため付けない。
+    // カード側の選択状態は、同梱の sr-only チェックボックス(下の ch.checked)が公開する。
     if(row.matches('tr'))row.setAttribute('aria-selected',String(checked));
     else row.removeAttribute('aria-selected');
     const ch = row.querySelector('[data-page-check]');
@@ -1989,6 +2044,14 @@ async function applyPresetSelection(presetOrButton) {
 
 async function registerSelected(btn) {
   const rels=[...selectedFiles];if(!rels.length){showMessage('warn','原稿を選択してください','登録するExcel・Word・PowerPoint・PDFにチェックを入れてください。');return;}
+  // 資料パック未作成のまま送ると、サーバーが内部互換用の識別子(ecm/bod/dmm)を含む
+  // 例外を返し、対処のわからないエラーだけが残る。手前で必要な操作へ案内する。
+  if(!activePackRecord()){
+    showMessage('warn','先に「今回まとめる一式」に名前を付けてください',
+      '名前を付けると、選んだ原稿をそこへ登録できます。',null,
+      [{label:'名前を付ける',primary:true,handler:()=>openPackEditor('create')}],0);
+    return;
+  }
   await runBusy(btn,async()=>{
     const data=await api('/api/v2/sources/register-batch',{method:'POST',body:{relativePaths:rels,packId:activePackId}});const result=data.result||{},registered=asArray(result.registered),errors=asArray(result.errors);
     // 登録APIのstateは汎用V2ドメインで、旧UIが参照するworkbooks/pagesを含まない。
@@ -2501,18 +2564,29 @@ function mergeAdjacentDiffTextRegions(regions){
   }
   return merged;
 }
+// 同一テキストどうしだけが重複候補になるので、正規化文字列でバケットに分けてから
+// 近接判定する。総当たりだと巻全体の比較(数万項目)で数分単位のフリーズになる。
+// 正規化(NFKC)も項目ごとに1回だけ行う。
 function dedupeDiffPdfRowItems(items){
-  const unique=[];
-  for(const item of [...items].sort((a,b)=>Number(a.y||0)-Number(b.y||0)||Number(a.x||0)-Number(b.x||0))){
-    const text=normalizeDiffPdfText(item.text),centerX=Number(item.x||0)+Number(item.width||0)/2,centerY=Number(item.y||0)+Number(item.height||0)/2;
-    const duplicate=unique.some(previous=>{
-      if(normalizeDiffPdfText(previous.text)!==text)return false;
-      const previousX=Number(previous.x||0)+Number(previous.width||0)/2,previousY=Number(previous.y||0)+Number(previous.height||0)/2;
-      const height=Math.max(Number(previous.height||0),Number(item.height||0));
-      return Math.abs(centerX-previousX)<=Math.max(3,Math.min(Number(previous.width||0),Number(item.width||0))*.12)&&
-        Math.abs(centerY-previousY)<=Math.max(4,height*.9);
+  const unique=[],buckets=new Map();
+  const prepared=items.map(item=>({
+    item,
+    text:normalizeDiffPdfText(item.text),
+    centerX:Number(item.x||0)+Number(item.width||0)/2,
+    centerY:Number(item.y||0)+Number(item.height||0)/2,
+    width:Number(item.width||0),
+    height:Number(item.height||0)
+  }));
+  prepared.sort((a,b)=>Number(a.item.y||0)-Number(b.item.y||0)||Number(a.item.x||0)-Number(b.item.x||0));
+  for(const entry of prepared){
+    let bucket=buckets.get(entry.text);
+    if(!bucket){bucket=[];buckets.set(entry.text,bucket);}
+    const duplicate=bucket.some(previous=>{
+      const height=Math.max(previous.height,entry.height);
+      return Math.abs(entry.centerX-previous.centerX)<=Math.max(3,Math.min(previous.width,entry.width)*.12)&&
+        Math.abs(entry.centerY-previous.centerY)<=Math.max(4,height*.9);
     });
-    if(!duplicate)unique.push(item);
+    if(!duplicate){bucket.push(entry);unique.push(entry.item);}
   }
   return unique;
 }
@@ -2540,7 +2614,11 @@ function matchDiffPdfTextRows(beforeRows,afterRows){
   return matches;
 }
 function buildTextRowStructureDiffResult(beforeItems,afterItems,width,height){
-  const empty={regions:[],confident:false},beforeRows=groupDiffPdfTextRows(beforeItems),afterRows=groupDiffPdfTextRows(afterItems);
+  const empty={regions:[],confident:false};
+  // 兄弟の判定器と同じく規模で打ち切る。ここは巻全体を平坦化した配列も受け取るため、
+  // 上限が無いと行グループ化と行マッチングが実用時間を超える。
+  if(beforeItems.length>DIFF_TEXT_ROW_ITEM_LIMIT||afterItems.length>DIFF_TEXT_ROW_ITEM_LIMIT)return empty;
+  const beforeRows=groupDiffPdfTextRows(beforeItems),afterRows=groupDiffPdfTextRows(afterItems);
   const delta=afterRows.length-beforeRows.length;
   if(!delta||Math.abs(delta)>6||beforeRows.length<3||afterRows.length<3)return empty;
   const matches=matchDiffPdfTextRows(beforeRows,afterRows),beforeMatched=new Set(matches.map(pair=>pair[0])),afterMatched=new Set(matches.map(pair=>pair[1]));
@@ -3291,7 +3369,9 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   void ensureDiffPdfJs().catch(()=>{});
   try{getDiffAnalysisWorker();}catch{}
   try{const loaded=await detailRequest;if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail(loaded.detail);}
-  catch(error){renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
+  // 成功側と同じ古さガードを掛ける。これが無いと、閉じた後や別の原稿へ切り替えた後に
+  // 届いた失敗応答が、いま表示している比較画面を上書きしてしまう。
+  catch(error){if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
 }
 
 function closeDiffDetail(){
@@ -3898,6 +3978,16 @@ function saveBoardOrder() {
     }catch(e){
       showMessage('danger','並び替えを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);
       lastPageBoardRenderSignature='';
+      // 保存できなかった並びを画面に残すと、collectBoardVolumes() が次の操作でそれを一緒に
+      // 送ってしまい、拒否されたはずの移動が無言で確定する。サーバの状態へ戻す。
+      const newerBoardExists=requestRevision!==boardSaveRevision;
+      if(!newerBoardExists){
+        const failedUndo=pageLayoutUndoStack[pageLayoutUndoStack.length-1];
+        if(failedUndo&&pageVolumeSnapshotsEqual(failedUndo.after,volumes))pageLayoutUndoStack.pop();
+        selectedPages.clear();lastPageRangeAnchor='';
+        renderPages();
+        updateBulkSelectionLabel();
+      }
       return false;
     }
   };

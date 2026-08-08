@@ -1153,7 +1153,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v145', 'style.css?v=20260808_v91']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v146', 'style.css?v=20260808_v92']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1208,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260808_v145' not in html:
+if 'app.js?v=20260808_v146' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1234,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260808_v145' not in html:
+if 'app.js?v=20260808_v146' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1340,7 +1340,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.08.31':
+if str(runtime_info.get('version','')) != '2026.08.08.32':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
@@ -1781,5 +1781,39 @@ for needed in ['function showErrorPanel(title, summary, detail, actions=[])',
 for needed in ['.error-actions{', '.error-panel-body{']:
     if needed not in css:
         raise SystemExit(f'error panel action/dismiss styling missing: {needed}')
+
+
+# 2026-08-09 multi-perspective audit fixes ----------------------------------
+# 更新検知: ハッシュを取得できなかった回に更新時刻/サイズを保存すると、次回スキャンが
+# 再ハッシュを省略して更新済み原稿を最新と誤判定し、古い内容で提出用PDFが出る。
+_scan_updates = server.split('function Scan-Updates', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["if (-not [string]::IsNullOrWhiteSpace($hash)) {", "Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks"]:
+    if needed not in _scan_updates:
+        raise SystemExit(f'scan-updates must not persist metadata without a hash: {needed}')
+if "Set-NoteProperty $w 'currentExcelModifiedAt' $modified\n            Set-NoteProperty $w 'currentExcelLastWriteUtcTicks'" in _scan_updates:
+    raise SystemExit('scan-updates still writes ticks unconditionally after a failed hash')
+# ローカルAPIのオリジン検証（別ポートのローカルページからのトークン悪用を防ぐ）
+for needed in ['function Test-RequestOrigin', "Test-RequestOrigin $Context.Request", "invalid origin"]:
+    if needed not in server:
+        raise SystemExit(f'local API origin check missing: {needed}')
+# 変換PDFのページ数メモ化（/api/state ごとの全PDF読み込みを防ぐ）
+for needed in ['$Script:PdfPageCountCache', 'LastWriteTimeUtc.Ticks)"']:
+    if needed not in server:
+        raise SystemExit(f'pdf page count memoization missing: {needed}')
+for needed in ['DIFF_TEXT_ROW_ITEM_LIMIT', 'const unique=[],buckets=new Map()',
+               'function announceProgressMilestone', "history.replaceState(null, '', location.pathname)",
+               "if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail({status:'failed'",
+               'if(!activePackRecord())', 'let scanError = null']:
+    if needed not in appjs:
+        raise SystemExit(f'audit fix behavior missing: {needed}')
+if 'if (hasJapanese && !isTechnical) return raw;' in appjs:
+    raise SystemExit('userFriendlyError must reach the hint table for Japanese OS errors')
+for needed in ['id="progress-announce"', 'role="progressbar"']:
+    if needed not in html:
+        raise SystemExit(f'progress accessibility markup missing: {needed}')
+if 'id="progress-panel" class="progress-panel hidden" aria-live' in html:
+    raise SystemExit('the progress panel must not be a live region (850ms polling floods the queue)')
+if '.page-thumb-card.selected-row::after' not in css:
+    raise SystemExit('thumbnail selection needs a non-color cue')
 
 print('selfcheck ok')

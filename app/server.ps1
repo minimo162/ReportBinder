@@ -4213,12 +4213,27 @@ function Export-WorksheetToPdfSafe($Excel, $Workbook, $Worksheet, [string]$OutPd
     }
 }
 
+$Script:PdfPageCountCache = @{}
+$Script:PdfPageCountCacheLimit = 4096
+
+# 変換PDFのページ数は /api/state のたびに全ページ分が必要になる。毎回ファイル全体を
+# 読み直すとdataDir全量の読み込みになるため、パスとサイズ・更新時刻でメモ化する。
 function Get-PdfPageCount([string]$PdfPath) {
+    $key = ''
+    try {
+        $item = Get-Item -LiteralPath $PdfPath -ErrorAction Stop
+        $key = "$($item.FullName)|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)"
+        if ($Script:PdfPageCountCache.ContainsKey($key)) { return [int]$Script:PdfPageCountCache[$key] }
+    } catch { $key = '' }
     try {
         $bytes = [IO.File]::ReadAllBytes($PdfPath)
         $text = [Text.Encoding]::ASCII.GetString($bytes)
         $count = ([regex]::Matches($text, '/Type\s*/Page(?!s)\b')).Count
-        if ($count -lt 1) { return 1 }
+        if ($count -lt 1) { $count = 1 }
+        if ($key) {
+            if ($Script:PdfPageCountCache.Count -ge $Script:PdfPageCountCacheLimit) { $Script:PdfPageCountCache.Clear() }
+            $Script:PdfPageCountCache[$key] = $count
+        }
         return $count
     } catch { return 1 }
 }
@@ -5439,9 +5454,14 @@ function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null,
             $lastRendered = [string](Get-DataProperty $w 'lastRenderedExcelHash' '')
             $updatedStatus = Get-SourceUpdatedStatus $w
             Set-NoteProperty $w 'currentExcelModifiedAt' $modified
-            Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
-            Set-NoteProperty $w 'currentExcelSize' $size
-            if (-not [string]::IsNullOrWhiteSpace($hash)) { Set-NoteProperty $w 'currentExcelHash' $hash }
+            # ハッシュを取得できなかった回は、更新時刻とサイズも据え置く。
+            # 新しいメタデータと古いハッシュを組にして保存すると、次回のスキャンが
+            # 「メタデータ一致」で再ハッシュを省略し、更新済みの原稿を最新と誤判定する。
+            if (-not [string]::IsNullOrWhiteSpace($hash)) {
+                Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
+                Set-NoteProperty $w 'currentExcelSize' $size
+                Set-NoteProperty $w 'currentExcelHash' $hash
+            }
             $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $w))
             $stale = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and (([string]::IsNullOrWhiteSpace($hash)) -or $hash -ne $lastRendered -or $profileOld)
             if ($stale) {
@@ -7233,6 +7253,19 @@ function Test-FixedTimeTokenEquals([string]$Candidate, [string]$Expected) {
     return ($difference -eq 0 -and $Candidate.Length -eq $Expected.Length)
 }
 
+# ループバックのcookieはポートで分離されない。127.0.0.1の別ポートで動く任意のページが
+# ReportBinderTokenを読み、同一サイト扱いのままAPIを実行できてしまう。
+# Host/Originを検証して、自分のオリジン以外からのAPI呼び出しを拒否する。
+function Test-RequestOrigin($Request) {
+    $allowed = @("127.0.0.1:$($Script:Port)", "localhost:$($Script:Port)")
+    $hostHeader = [string]$Request.Headers['Host']
+    if (-not [string]::IsNullOrWhiteSpace($hostHeader) -and ($allowed -notcontains $hostHeader)) { return $false }
+    $origin = [string]$Request.Headers['Origin']
+    if ([string]::IsNullOrWhiteSpace($origin)) { return $true }
+    foreach ($a in $allowed) { if ($origin -eq "http://$a") { return $true } }
+    return $false
+}
+
 function Test-Token($Request) {
     $q = [string]$Request.QueryString['token']
     $t = [string]$Request.QueryString['t']
@@ -7507,6 +7540,7 @@ function Handle-Api($Context) {
         if ($method -eq 'GET' -and $path -eq '/api/ping') {
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; runtimeVersion = $Script:RuntimeVersion; at = New-NowIso }) $true; return
         }
+        if (-not (Test-RequestOrigin $Context.Request)) { Write-JsonResponse $Context 403 ([ordered]@{ ok = $false; error = 'invalid origin' }); return }
         if (-not (Test-Token $Context.Request)) { Write-JsonResponse $Context 403 ([ordered]@{ ok = $false; error = 'invalid token' }); return }
         Touch-ClientActivity '' | Out-Null
         if ($method -eq 'POST' -and $path -eq '/api/heartbeat') {
