@@ -1153,7 +1153,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v149', 'style.css?v=20260808_v93']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v150', 'style.css?v=20260808_v93']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1208,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260808_v149' not in html:
+if 'app.js?v=20260808_v150' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1234,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260808_v149' not in html:
+if 'app.js?v=20260808_v150' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1340,7 +1340,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.08.35':
+if str(runtime_info.get('version','')) != '2026.08.08.36':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
@@ -1979,5 +1979,43 @@ for fn in ('buildVolume', 'buildAllVolumes'):
         raise SystemExit(f'{fn} must suppress the generic processing toast while the progress panel is shown')
 if '/api/v2/outputs/build/status' not in (root/'docs/API.md').read_text(encoding='utf-8-sig'):
     raise SystemExit('the new output job endpoints must be documented')
+
+
+# 2026-08-09 page board delegation / render cost ----------------------------
+_attach = appjs.split('function attachBoardEvents() {', 1)[1].split('\n}', 1)[0]
+# 行ごとにリスナーを張り直すと、174ページで1描画あたり約1,400個のクロージャになる。
+for forbidden in ("addEventListener('pointerdown'", "addEventListener('keydown'", "addEventListener('click'"):
+    if forbidden in _attach:
+        raise SystemExit(f'attachBoardEvents must not bind per row/element: {forbidden}')
+for needed in ['function delegateBoardEvents', 'let boardEventsDelegated', 'function handleBoardRowKeydown']:
+    if needed not in appjs:
+        raise SystemExit(f'page board event delegation missing: {needed}')
+# blur は伝播しないので、委譲では focusout を使う必要がある。
+if "box.addEventListener('focusout'" not in appjs:
+    raise SystemExit('delegated page-title saving must use focusout (blur does not bubble)')
+# 検索のたびに盤面を作り直すと、描画キューごと捨てて進行中のPDF描画を巻き戻す。
+if 'pageSearchDebounceTimer' not in appjs:
+    raise SystemExit('the page search input must be debounced')
+# 絞り込みで隠れるページも data-page-id は DOM に残す。collectBoardVolumes が
+# 並び順をDOMから絶対値で読むため、消すと隠れたページを欠いた並びを保存してしまう。
+for needed in ['function filteredOutPageHtml', 'if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),true);',
+               'if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),false);']:
+    if needed not in appjs:
+        raise SystemExit(f'filtered-out pages must collapse to an id-only carrier: {needed}')
+if 'data-page-id="${escapeAttr(pid)}"' not in appjs.split('function filteredOutPageHtml', 1)[1].split('\n}', 1)[0]:
+    raise SystemExit('the filtered-out carrier must keep data-page-id so the saved order stays complete')
+# ドラッグ中の pointermove は1フレーム1回に束ねる。
+_drag = appjs.split('function beginPointerPageDrag(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['requestAnimationFrame(applyMove)', 'cancelAnimationFrame(moveFrame)']:
+    if needed not in _drag:
+        raise SystemExit(f'the drag move handler must be rAF-throttled: {needed}')
+# 画面外のサムネイルcanvasを解放する（A4縦1枚で約1.09MB）。
+if 'function releasePageThumbnailCanvas' not in appjs:
+    raise SystemExit('off-screen thumbnail canvases must be released')
+_release = appjs.split('function releasePageThumbnailCanvas(', 1)[1].split('\n}', 1)[0]
+if "!=='ready'" not in _release:
+    raise SystemExit('an in-flight thumbnail render must not be discarded by the release path')
+if 'pageThumbnailObserver.unobserve' in appjs:
+    raise SystemExit('the thumbnail observer must keep watching so re-entry redraws released canvases')
 
 print('selfcheck ok')
