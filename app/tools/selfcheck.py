@@ -1867,4 +1867,28 @@ for flavor in ('New-SharedFolderRelease', 'New-ReleaseZip'):
 if '配布用の共有フォルダーは、発行者以外に対して読み取り専用' not in (root/'README.md').read_text(encoding='utf-8-sig'):
     raise SystemExit('README must state the read-only share requirement (the manifest cannot stop a full-share writer)')
 
+
+# 2026-08-09 sheet rename / hide must not drop page settings ----------------
+_sync = _ps_function(server, 'Update-WorkbookPagesFromInspection', 'server.ps1')
+if '$PresentSheetNames = $null' not in _sync:
+    raise SystemExit('page sync must accept the hidden-inclusive sheet list')
+for needed in ["Set-NoteProperty $page 'sheetHidden' $true", '$renameBySheetKey',
+               "Set-NoteProperty $page 'renamedFromSheetName' $previousSheet",
+               "Save-LayoutSnapshot $Language $packId 'source-sheets-changed' $Structure"]:
+    if needed not in _sync:
+        raise SystemExit(f'sheet rename/hide handling missing: {needed}')
+# 復元ポイントは pages を差し替える前に取らないと、消えた状態が保存される。
+if _sync.index('Save-LayoutSnapshot') > _sync.index('$Structure.pages = $pages'):
+    raise SystemExit('the layout snapshot must be taken before the removal is committed')
+# 位置もA1見出しも一致しない新規シートを引き継ぎ扱いにすると、無関係なページへ
+# 配置と使用ページ範囲が移る。手掛かりなしの1対1対応付けを許さない。
+if '$pool.Count -eq 1 -and $newSheets.Count -eq 1' in _sync:
+    raise SystemExit('rename re-matching must require a sheetIndex or detectedTitle match')
+# Excel経路の呼び出しは、非表示を含む全シート名を渡すこと。
+_excel_calls = [line for line in server.splitlines() if 'Update-WorkbookPagesFromInspection' in line and 'function ' not in line]
+for line in _excel_calls:
+    if '$inspected' in line or '$wb @()' in line or '$x[0] @()' in line:
+        if '$allSheetNames' not in line:
+            raise SystemExit(f'Excel page sync must pass the hidden-inclusive sheet list: {line.strip()[:90]}')
+
 print('selfcheck ok')

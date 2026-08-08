@@ -3769,7 +3769,10 @@ function Remove-ContentPdfFileSafe([string]$Workspace, [string]$RelativePdf) {
 }
 
 
-function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets) {
+# $Sheets には「今回描画できるシート」（Excelでは表示中のもの）が入る。
+# $PresentSheetNames には非表示を含む「原稿に存在するシート名」を渡す。省略時は
+# $Sheets と同じとみなす（Word/PowerPoint/PDFのように非表示の概念がない経路）。
+function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets, $PresentSheetNames = $null) {
     $workbookId = [string](Get-DataProperty $Workbook 'workbookId' '')
     $packId = Get-WorkbookPackId $Workbook
     [void](Resolve-DocumentPackScope $Structure $packId $true)
@@ -3781,13 +3784,35 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         $name = [string](Get-DataProperty $sheetInfo 'sheetName' '')
         if (-not [string]::IsNullOrWhiteSpace($name)) { $current[$name.ToLowerInvariant()] = $true }
     }
+    $present = @{}
+    if ($null -eq $PresentSheetNames) { foreach ($key in $current.Keys) { $present[$key] = $true } }
+    else {
+        foreach ($name in @($PresentSheetNames)) {
+            $text = [string]$name
+            if (-not [string]::IsNullOrWhiteSpace($text)) { $present[$text.ToLowerInvariant()] = $true }
+        }
+    }
 
     $removed = @()
     $kept = @()
+    $hidden = @()
     foreach ($page in $pages) {
         $belongs = ([string]$page.workbookId -eq $workbookId)
         $sheetKey = ([string]$page.sheetName).ToLowerInvariant()
-        if ($belongs -and (-not $current.ContainsKey($sheetKey))) { $removed += $page } else { $kept += $page }
+        if (-not $belongs -or $current.ContainsKey($sheetKey)) { $kept += $page; continue }
+        # 非表示にしただけのシートは原稿から消えていない。ページを削除すると配置・
+        # ページ名・使用範囲・番号設定が失われ、再表示しても未振り分けに戻るだけになる。
+        if ($present.ContainsKey($sheetKey)) {
+            Set-NoteProperty $page 'sheetHidden' $true
+            $hidden += (Resolve-PageId $page)
+            $kept += $page
+            continue
+        }
+        $removed += $page
+    }
+    if ($removed.Count -gt 0) {
+        # 削除は取り消せないため、確定前に必ず復元ポイントを残す。
+        [void](Save-LayoutSnapshot $Language $packId 'source-sheets-changed' $Structure)
     }
     $pages = @($kept)
     $Structure.pages = $pages
@@ -3801,8 +3826,43 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         if (-not [string]::IsNullOrWhiteSpace($sheetKey)) { $knownBySheet[$sheetKey] = $page }
     }
 
+    # シート名の変更は「旧シートの消滅＋新シートの出現」として現れる。位置(sheetIndex)で
+    # 対応付け、旧ページを作り直さずに引き継ぐ。pageId を保つことで、レイアウト履歴と
+    # Ctrl+Z からの復元経路も生き残る。
+    $renameBySheetKey = @{}
+    if ($removed.Count -gt 0) {
+        $newSheets = @($sortedSheets | Where-Object {
+            $name = [string](Get-DataProperty $_ 'sheetName' '')
+            $name -and (-not $knownBySheet.ContainsKey($name.ToLowerInvariant()))
+        })
+        $pool = New-Object System.Collections.ArrayList
+        foreach ($page in $removed) { [void]$pool.Add($page) }
+        foreach ($sheetInfo in $newSheets) {
+            if ($pool.Count -eq 0) { break }
+            $sheetIndex = [int](Get-DataProperty $sheetInfo 'sheetIndex' 999999)
+            $match = @($pool | Where-Object { [int](Get-DataProperty $_ 'sheetIndex' -1) -eq $sheetIndex } | Select-Object -First 1)
+            if ($match.Count -eq 0) {
+                # 位置も変わった場合は、A1から拾った見出しが完全一致するときだけ同一視する。
+                # 手掛かりなしで対応付けると、無関係な新規シートに前のページの配置と
+                # 使用ページ範囲を引き継いでしまい、削除より分かりにくい誤りになる。
+                $detected = [string](Get-DataProperty $sheetInfo 'detectedTitle' '')
+                if (-not [string]::IsNullOrWhiteSpace($detected)) {
+                    $match = @($pool | Where-Object { [string](Get-DataProperty $_ 'detectedTitle' '') -eq $detected } | Select-Object -First 1)
+                }
+            }
+            if ($match.Count -eq 0) { continue }
+            $name = [string](Get-DataProperty $sheetInfo 'sheetName' '')
+            $renameBySheetKey[$name.ToLowerInvariant()] = $match[0]
+            [void]$pool.Remove($match[0])
+        }
+        # 引き継いだページは「削除された」扱いにしない。
+        $reattached = @($renameBySheetKey.Values)
+        if ($reattached.Count -gt 0) { $removed = @($pool) }
+    }
+
     $added = @()
     $updated = @()
+    $renamed = @()
     $atEnd = @()
     $inOrder = 0
     $newTargetId = Get-NewItemTargetId $Structure $Language $Workbook
@@ -3822,8 +3882,32 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
             Set-NoteProperty $page 'sheetName' $sheet
             Set-NoteProperty $page 'sheetIndex' $sheetIndex
             Set-NoteProperty $page 'detectedTitle' $title
+            Set-NoteProperty $page 'sheetHidden' $false
             if ([string]::IsNullOrWhiteSpace([string]$page.title)) { Set-NoteProperty $page 'title' $title }
             $updated += $pageId
+            continue
+        }
+
+        if ($renameBySheetKey.ContainsKey($sheetKey)) {
+            $page = $renameBySheetKey[$sheetKey]
+            $previousSheet = [string]$page.sheetName
+            # pageId は据え置く。差し替えるとレイアウト履歴の復元が対象を見失う。
+            $pageId = Resolve-PageId $page
+            Set-NoteProperty $page 'pageId' $pageId
+            Set-NoteProperty $page 'sheetName' $sheet
+            Set-NoteProperty $page 'sheetIndex' $sheetIndex
+            Set-NoteProperty $page 'detectedTitle' $title
+            Set-NoteProperty $page 'sheetHidden' $false
+            Set-NoteProperty $page 'renamedFromSheetName' $previousSheet
+            # 参照先のPDFは旧シート名で作られている。中身は作り直しになる。
+            Set-NoteProperty $page 'contentPdf' $null
+            Set-NoteProperty $page 'status' 'not-rendered'
+            Set-NoteProperty $page 'updatedAt' (New-NowIso)
+            if ([string]::IsNullOrWhiteSpace([string]$page.title)) { Set-NoteProperty $page 'title' $title }
+            $Structure.pages = @(Get-Array $Structure.pages) + @($page)
+            $knownBySheet[$sheetKey] = $page
+            $updated += $pageId
+            $renamed += [ordered]@{ pageId=$pageId; fromSheetName=$previousSheet; toSheetName=$sheet }
             continue
         }
 
@@ -3854,6 +3938,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
     $names = @($sortedSheets | ForEach-Object { [string]$_.sheetName })
     return [ordered]@{
         addedPageIds=@($added); updatedPageIds=@($updated); removedPages=@($removed)
+        renamedPages=@($renamed); hiddenSheetPageIds=@($hidden)
         sheetNames=$names; sheetFingerprint=(Get-SheetFingerprintFromNames $names)
         addedCount=$added.Count; insertedInOrderCount=$inOrder; insertedAtEndCount=$atEnd.Count
         insertedAtEndPageIds=@($atEnd); newPagesAreUnassigned=($newVolume -eq 'none'); newItemTargetId=$newTargetId
@@ -5186,6 +5271,9 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             $sheetSetupTimer = [Diagnostics.Stopwatch]::StartNew()
             $inspected = @()
             $targetSheetNames = @()
+            # 非表示シートも「原稿に存在する」として記録する。表示中のものだけを渡すと、
+            # 一時的に非表示にしただけでページ設定が削除されてしまう。
+            $allSheetNames = @()
             $sheetRenderInfos = @()
             $sheetCount = 0
             try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
@@ -5200,6 +5288,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                         $ws = $book.Worksheets.Item($i)
                         $sheetName = [string]$ws.Name
                         $visible = ([int]$ws.Visible -eq -1)
+                        $allSheetNames += $sheetName
                         if ($visible) {
                             $targetSheetNames += $sheetName
                             $a1 = ''
@@ -5227,11 +5316,11 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             }
             $timingsMs.sheetInspectionAndSetup = [int64]$sheetSetupTimer.ElapsedMilliseconds
             if ($targetSheetNames.Count -eq 0) {
-                $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @()
+                $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @() $allSheetNames
                 # V5-§3.7: 旧世代の個別削除は廃止。世代単位の掃除(Remove-WorkbookContentPdfs)に一本化する。
                 # 個別に消すと、保持しているはずの世代フォルダの中身が欠損する。
                 Set-WorkbookRenderedSheetSnapshot $wb @()
-                Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @());Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
+                Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @() $allSheetNames);Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
                 throw 'PDF化対象の表示シートがありません。Excelで少なくとも1つのワークシートを表示してください。'
             }
 
@@ -5284,15 +5373,28 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 throw 'PDFを作成できませんでした。Excelの印刷設定または対象シートを確認してください。'
             }
 
-            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $inspected
+            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $inspected $allSheetNames
             $removedPages = @(Get-Array (Get-DataProperty $pageSync 'removedPages' @()))
             if ($removedPages.Count -gt 0) {
                 $removedNames = @($removedPages | ForEach-Object { [string](Get-DataProperty $_ 'sheetName' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                 $removedLabel = [string]::Join('、', $removedNames)
                 if ([string]::IsNullOrWhiteSpace($removedLabel)) { $removedLabel = "$($removedPages.Count) ページ" }
-                $warnings += "現在のExcelに存在しないシートをページ構成から外しました: $removedLabel"
+                $warnings += "現在のExcelに存在しないシートをページ構成から外しました: $removedLabel（ページ構成の履歴から元に戻せます）"
                 $steps += "存在しないシートの古いページを削除: $removedLabel"
                 # V5-§3.7: 旧世代の個別削除は廃止(上記と同じ理由)。
+            }
+            $renamedPages = @(Get-Array (Get-DataProperty $pageSync 'renamedPages' @()))
+            if ($renamedPages.Count -gt 0) {
+                $renameLabel = [string]::Join('、', @($renamedPages | ForEach-Object {
+                    "{0}→{1}" -f [string](Get-DataProperty $_ 'fromSheetName' ''), [string](Get-DataProperty $_ 'toSheetName' '')
+                }))
+                $warnings += "シート名の変更を引き継ぎました: $renameLabel（配置とページ設定はそのままです）"
+                $steps += "シート名変更の引き継ぎ: $renameLabel"
+            }
+            $hiddenPageIds = @(Get-Array (Get-DataProperty $pageSync 'hiddenSheetPageIds' @()))
+            if ($hiddenPageIds.Count -gt 0) {
+                $warnings += "非表示のシートが $($hiddenPageIds.Count) 件あります。ページ構成は保持していますが、PDFは作り直されません。提出物に含める場合はシートを再表示してからPDFを作成してください。"
+                $steps += "非表示シートのページを保持: $($hiddenPageIds.Count) 件"
             }
             Set-WorkbookRenderedSheetSnapshot $wb (Get-DataProperty $pageSync 'sheetNames' @())
             $pages = @(Get-Array $structure.pages)
@@ -5334,7 +5436,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 param($st)
                 $latest=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1)
                 if(-not $latest.Count){throw "Workbookが見つかりません: $WorkbookId"}
-                $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected
+                $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected $allSheetNames
                 foreach ($r in $rendered) {
                     $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
                     # Unrestricted worksheet names use stable hashed page IDs. The legacy
