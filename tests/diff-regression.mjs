@@ -21,7 +21,7 @@ const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTempla
   'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
   'diffPdfTextBoxUnion','mergeAdjacentDiffTextRegions','buildTextRowStructureDiffResult','findDiffPdfTextColumnSplit',
   'buildColumnTextRowStructureDiffResult','buildDocumentTextRowStructureDiffResult','buildTextLayoutShiftDiffResult',
-  'buildNumericTextDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
+  'buildNumericTextDiffResult','diffPdfTextItemDistance','buildTextFragmentDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
   'diffPdfTextItemsInBand','buildLocalizedTextRowStructureDiffResult','mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
   'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise','diffKindMeta','diffCsvCell','buildDiffSummaryCsv'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
@@ -48,6 +48,18 @@ const numeric=app.selectDiffSemanticResult(beforeNumbers,afterNumbers,600,400,
 assert.equal(numeric.mode,'numeric');
 assert.equal(numeric.regions.length,2);
 assert.ok(numeric.regions.every(region=>region.source==='pdf-text'));
+
+const cumulativeTextBefore=[item('Resume',40,30,100),item('Name',40,80,90),item('Address',40,120,120),item('History',40,160,110)];
+const cumulativeTextAfter=[...cumulativeTextBefore.map(value=>({...value})),item('38',720,195,22),item('a',520,370,12),item('d',90,420,12),item('11',120,445,20)];
+const structuralColumnRegion={x:.38,y:.1,width:.14,height:.39,before:{x:.39,y:.1,width:.11,height:.39},after:{x:.38,y:.1,width:.13,height:.39},confidence:1,pixelCount:70000};
+const rasterNoiseRegion={x:.06,y:.03,width:.09,height:.08,confidence:.55,pixelCount:500};
+const cumulativeText=app.selectDiffSemanticResult(cumulativeTextBefore,cumulativeTextAfter,800,600,
+  {rowStructureAdjusted:false,alignmentAdjusted:true,fallbackUsed:false},[structuralColumnRegion,rasterNoiseRegion]);
+assert.equal(cumulativeText.mode,'text-fragment','mixed layout and text changes use exact PDF text fragments');
+assert.equal(cumulativeText.regions.length,5,'one structural marker and four cumulative text edits remain');
+assert.equal(cumulativeText.regions.filter(region=>region.source==='pdf-fragment').length,4);
+assert.ok(cumulativeText.regions.every(region=>region.source==='pdf-fragment'||region.confidence>=.9),
+  'low-confidence alignment fragments are omitted when exact text boxes exist');
 
 const beforeRows=[item('Report',40,20,80),item('Header',40,60,180),item('1 Finance Close 100',40,90,280),
   item('2 HR Recruit 200',40,120,280),item('Total 300',200,150,120)];
@@ -109,6 +121,14 @@ const docPage2=app.buildDocumentTextRowStructureDiffResult(docBefore,docAfter,60
 assert.equal(docPage2.confident,true);assert.equal(docPage2.regions.length,0,'repaginated unchanged text is not an edit on page 2');
 const docDeletePage1=app.buildDocumentTextRowStructureDiffResult(docAfter,docBefore,600,200,1);
 assert.equal(docDeletePage1.confident,true);assert.equal(docDeletePage1.regions.length,1);assert.equal(docDeletePage1.regions[0].kind,'removed');
+const insertedPhysicalPage=[item('X1',40,40),item('X2',40,60),item('X3',40,80),item('X4',40,100),item('X5',40,120),item('X6',40,140)];
+const shiftedDocument=[insertedPhysicalPage,...docBefore];
+const mappedAfterInsertion=app.buildDocumentTextRowStructureDiffResult(docBefore,shiftedDocument,600,200,1,2);
+assert.equal(mappedAfterInsertion.confident,true);assert.equal(mappedAfterInsertion.regions.length,0,
+  'page text comparison uses separate before/after physical page numbers after an insertion');
+const mappedAfterRemoval=app.buildDocumentTextRowStructureDiffResult(shiftedDocument,docBefore,600,200,2,1);
+assert.equal(mappedAfterRemoval.confident,true);assert.equal(mappedAfterRemoval.regions.length,0,
+  'reverse page text comparison preserves the shifted physical page mapping');
 
 // A local line-spacing/border change shifts all following rows. Highlight the
 // transition band once instead of every downstream text line.
@@ -276,6 +296,59 @@ assert.equal(richWidthRaster.regions.length,1,'rich report column resize remains
 assert.ok(richWidthRaster.regions[0].before&&richWidthRaster.regions[0].after,'rich report column resize preserves side-specific boxes');
 assert.ok(richWidthRaster.regions[0].before.height>.3&&richWidthRaster.regions[0].after.height>.3,
   'rich report column resize highlights the complete table column');
+
+// Six history generations can accumulate independent cell edits around a column
+// structure change. Every arbitrary pair, in either direction, must retain the edits
+// introduced between those generations instead of collapsing to the nearest change.
+const cumulativeA=richReport(),cumulativeB=richReport({mainColumns:[40,100,280,370,460,510]});
+fill(cumulativeB,84,177,90,183,35);fill(cumulativeB,716,296,722,302,35);
+const cumulativeC=new Uint8ClampedArray(cumulativeB);fill(cumulativeC,696,366,702,372,35);
+const cumulativeD=new Uint8ClampedArray(cumulativeC);fill(cumulativeD,316,397,322,403,35);
+const cumulativeE=new Uint8ClampedArray(cumulativeD);fill(cumulativeE,606,407,612,413,35);
+const cumulativeF=new Uint8ClampedArray(cumulativeE);fill(cumulativeF,146,573,152,579,35);
+const cumulativeAB=analyze(cumulativeA,cumulativeB,WIDTH,HEIGHT),cumulativeBC=analyze(cumulativeB,cumulativeC,WIDTH,HEIGHT),
+  cumulativeAC=analyze(cumulativeA,cumulativeC,WIDTH,HEIGHT),cumulativeAF=analyze(cumulativeA,cumulativeF,WIDTH,HEIGHT);
+function diffRegionsCoverPoint(regions,x,y){
+  const nx=x/WIDTH,ny=y/HEIGHT;
+  return regions.some(region=>[region,region.before,region.after].filter(Boolean).some(box=>
+    nx>=box.x&&nx<=box.x+box.width&&ny>=box.y&&ny<=box.y+box.height));
+}
+assert.ok(cumulativeAB.regions.length>=3,'column resize keeps both earlier independent cell edits');
+assert.ok(diffRegionsCoverPoint(cumulativeAB.regions,87,180)&&diffRegionsCoverPoint(cumulativeAB.regions,719,299),
+  'A-to-B comparison covers every earlier edit outside the resized column');
+assert.ok(diffRegionsCoverPoint(cumulativeBC.regions,699,369),'B-to-C comparison covers the latest edit');
+assert.ok(cumulativeAC.regions.length>=4,'A-to-C comparison keeps the structural marker and all cumulative edits');
+assert.ok([[87,180],[719,299],[699,369]].every(([x,y])=>diffRegionsCoverPoint(cumulativeAC.regions,x,y)),
+  'A-to-C comparison covers edits introduced in every generation');
+assert.ok([[87,180],[719,299],[699,369],[319,400],[609,410],[149,576]].every(([x,y])=>diffRegionsCoverPoint(cumulativeAF.regions,x,y)),
+  'oldest-to-latest comparison covers edits introduced across six generations');
+
+const cumulativeGenerations=[cumulativeA,cumulativeB,cumulativeC,cumulativeD,cumulativeE,cumulativeF];
+const cumulativeEdits=[
+  {generation:1,points:[[87,180],[719,299]]},
+  {generation:2,points:[[699,369]]},
+  {generation:3,points:[[319,400]]},
+  {generation:4,points:[[609,410]]},
+  {generation:5,points:[[149,576]]}
+];
+const cumulativeAnalysisCache=new Map([
+  ['0:1',cumulativeAB],['1:2',cumulativeBC],['0:2',cumulativeAC],['0:5',cumulativeAF]
+]);
+function analyzeCumulativePair(from,to){
+  const key=`${from}:${to}`;
+  if(!cumulativeAnalysisCache.has(key))cumulativeAnalysisCache.set(key,analyze(cumulativeGenerations[from],cumulativeGenerations[to],WIDTH,HEIGHT));
+  return cumulativeAnalysisCache.get(key);
+}
+for(let from=0;from<cumulativeGenerations.length-1;from++)for(let to=from+1;to<cumulativeGenerations.length;to++){
+  const expected=cumulativeEdits.filter(edit=>edit.generation>from&&edit.generation<=to).flatMap(edit=>edit.points);
+  const forward=analyzeCumulativePair(from,to);
+  assert.ok(expected.every(([x,y])=>diffRegionsCoverPoint(forward.regions,x,y)),`generation ${from}-to-${to} forward comparison keeps every intervening edit`);
+}
+for(const [from,to] of [[5,0],[4,1],[3,2]]){
+  const expected=cumulativeEdits.filter(edit=>edit.generation>to&&edit.generation<=from).flatMap(edit=>edit.points);
+  const reverse=analyzeCumulativePair(from,to);
+  assert.ok(expected.every(([x,y])=>diffRegionsCoverPoint(reverse.regions,x,y)),`generation ${from}-to-${to} reverse comparison keeps every intervening edit`);
+}
 
 const richStableText=richTextRows(false),manySparseTextNoise=Array.from({length:12},(_,index)=>({
   x:(48+(index%6)*38)/WIDTH,y:(58+Math.floor(index/6)*14)/HEIGHT,width:7/WIDTH,height:7/HEIGHT,pixelCount:1

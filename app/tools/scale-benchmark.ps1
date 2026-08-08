@@ -213,9 +213,6 @@ try {
         documentTitle="Scale benchmark $Tier"
         documentSubtitle='Synthetic mixed-source acceptance workload'
         outputFileNamePattern='{projectId}_{packName}_{targetName}_{yyyyMMdd}.pdf'
-        includeCover=$true
-        includeToc=$true
-        includeSectionDividers=$true
     })
 
     $timer = [Diagnostics.Stopwatch]::StartNew()

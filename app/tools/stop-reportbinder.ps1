@@ -26,6 +26,16 @@ function CommandLine-ContainsPath([string]$CommandLine, [string]$Path) {
 }
 
 $targets = @($server, $launch)
+$runtimeVersionsRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ReportBinder\runtime\versions'
+if (Test-Path -LiteralPath $runtimeVersionsRoot -PathType Container) {
+    foreach ($versionDir in @(Get-ChildItem -LiteralPath $runtimeVersionsRoot -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($relativeScript in @('app\server.ps1','app\launch.ps1')) {
+            $runtimeScript = Join-Path $versionDir.FullName $relativeScript
+            if (Test-Path -LiteralPath $runtimeScript -PathType Leaf) { $targets += [IO.Path]::GetFullPath($runtimeScript) }
+        }
+    }
+}
+$targets = @($targets | Sort-Object -Unique)
 $processes = @()
 try {
     $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {

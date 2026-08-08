@@ -4,9 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260807_v73">
+  <link rel="stylesheet" href="style.css?v=20260808_v90">
 </head>
-<body>
+<body class="app-initializing">
+  <a class="skip-link" href="#main-content">本文へ移動</a>
+  <section id="app-loading-screen" class="app-loading-screen" role="status" aria-live="polite" aria-labelledby="app-loading-title">
+    <div class="app-loading-card">
+      <span class="app-loading-mark" aria-hidden="true"></span>
+      <strong id="app-loading-title">ReportBinderを準備しています</strong>
+      <p id="app-loading-message">原稿やページの状態を読み込んでいます。</p>
+      <span class="app-loading-spinner" aria-hidden="true"></span>
+      <button id="app-load-retry" class="btn primary hidden" type="button">もう一度読み込む</button>
+    </div>
+  </section>
   <svg class="svg-sprite" aria-hidden="true">
     <symbol id="i-home" viewBox="0 0 16 16"><path d="M2.5 7 8 2.5 13.5 7v6.5h-4V9h-3v4.5h-4Z"/></symbol>
     <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.75 4.25h5l1.25 1.5h6.25v7.5H1.75Z"/><path d="M1.75 5.75v-3h4.5l1.25 1.5"/></symbol>
@@ -31,16 +41,16 @@
     <symbol id="i-external" viewBox="0 0 16 16"><path d="M9 2.5h4.5V7M13.25 2.75 7.5 8.5"/><path d="M12 9v4H2.5V3.5h4"/></symbol>
   </svg>
 
-  <div class="app-layout">
+  <div class="app-layout" aria-hidden="true" inert>
     <aside class="sidebar" aria-label="メインメニュー">
       <div class="brand"><span class="brand-mark" aria-hidden="true"></span><strong>ReportBinder</strong></div>
       <nav class="nav-menu">
-        <button class="nav-item active" type="button" data-view-nav="dashboard"><svg class="icon"><use href="#i-home"/></svg><span>ダッシュボード</span></button>
-        <button class="nav-item" type="button" data-view-nav="folders"><svg class="icon"><use href="#i-folder"/></svg><span>提出フォルダ</span></button>
-        <button class="nav-item" type="button" data-view-nav="excel"><svg class="icon"><use href="#i-grid"/></svg><span>原稿・変換PDF</span><span id="nav-excel-count" class="nav-count hidden"></span></button>
-        <button class="nav-item" type="button" data-view-nav="history"><svg class="icon"><use href="#i-history"/></svg><span>履歴・比較</span></button>
+        <span class="nav-group-label">PDFを作る</span>
+        <button class="nav-item active" type="button" data-view-nav="excel"><svg class="icon"><use href="#i-grid"/></svg><span>原稿を登録・PDF化</span><span id="nav-excel-count" class="nav-count hidden"></span></button>
         <button class="nav-item" type="button" data-view-nav="pages"><svg class="icon"><use href="#i-list"/></svg><span>ページ構成</span><span id="nav-pages-count" class="nav-count hidden"></span></button>
-        <button class="nav-item" type="button" data-view-nav="final"><svg class="icon"><use href="#i-file-pdf"/></svg><span>提出用PDF</span><span id="nav-final-dot" class="nav-dot hidden"></span></button>
+        <button class="nav-item" type="button" data-view-nav="final"><svg class="icon"><use href="#i-file-pdf"/></svg><span>最終PDF</span><span id="nav-final-dot" class="nav-dot hidden"></span></button>
+        <span class="nav-group-label nav-group-secondary">確認する</span>
+        <button class="nav-item" type="button" data-view-nav="history"><svg class="icon"><use href="#i-history"/></svg><span>変更履歴・比較</span></button>
       </nav>
     </aside>
 
@@ -48,10 +58,10 @@
       <header class="workspace-top">
         <h1 id="app-title" class="sr-only">ReportBinder</h1>
         <div class="pack-switcher">
-          <span class="pack-switcher-label">資料パック</span>
-          <div class="pack-select-wrap" role="group" aria-label="資料パック">
+          <span class="pack-switcher-label">今回まとめる一式</span>
+          <div class="pack-select-wrap" role="group" aria-label="今回まとめる一式">
             <button id="pack-menu-button" class="pack-select-button" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="pack-menu">
-              <span id="active-pack-name">ECM</span><svg class="icon"><use href="#i-chevron-down"/></svg>
+              <span id="active-pack-name">未作成</span><svg class="icon"><use href="#i-chevron-down"/></svg>
             </button>
             <div id="pack-menu" class="pack-menu hidden" role="dialog" aria-label="資料パックの選択と管理">
               <div class="pack-menu-head"><div><strong>資料パック</strong><span>使用するパックを選択します</span></div><div class="pack-menu-head-actions"><button id="manage-pack-templates-btn" class="btn secondary compact" type="button">ひな形管理</button><button id="create-pack-btn" class="btn primary compact" type="button">新規作成</button></div></div>
@@ -62,80 +72,78 @@
           </div>
         </div>
         <button id="global-final-status" class="global-status" type="button" data-view-shortcut="final"></button>
-        <div class="language-wrap">
-          <button id="mode-badge" class="language-select" type="button" aria-haspopup="true" aria-expanded="false">日本語 <svg class="icon"><use href="#i-chevron-down"/></svg></button>
-          <div id="language-popover" class="popover hidden" role="dialog"><strong id="language-current">日本語管理</strong><p>言語ごとに別のワークスペースで動作します。</p><p id="language-guide">英語管理.vbs を起動してください。</p></div>
+        <div class="app-menu-wrap language-wrap">
+          <button id="app-menu-button" class="app-menu-button language-select" type="button" aria-haspopup="true" aria-expanded="false">メニュー <svg class="icon"><use href="#i-chevron-down"/></svg></button>
+          <div id="app-menu-popover" class="popover hidden" role="dialog" aria-label="アプリメニュー"><strong>ReportBinder</strong><p>作業する資料パックは画面上部で切り替えます。</p><div class="popover-actions"><button id="app-exit-button" class="popover-action danger" type="button"><svg class="icon"><use href="#i-close"/></svg><span>ReportBinderを終了</span></button></div></div>
         </div>
       </header>
       <div class="step-bar" aria-label="作成の進捗">
-        <span class="step-item" data-progress-view="folders"><span id="step-folders-state" class="step-state">1</span><span>提出フォルダ</span></span>
+        <span class="step-item" data-progress-view="excel"><span id="step-excel-state" class="step-state">1</span><span>原稿を登録・PDF化</span></span>
         <span class="step-line"></span>
-        <span class="step-item" data-progress-view="excel"><span id="step-excel-state" class="step-state">2</span><span>原稿・変換PDF</span></span>
+        <span class="step-item" data-progress-view="pages"><span id="step-pages-state" class="step-state">2</span><span>順番を整える</span></span>
         <span class="step-line"></span>
-        <span class="step-item" data-progress-view="pages"><span id="step-pages-state" class="step-state">3</span><span>ページ構成</span></span>
-        <span class="step-line"></span>
-        <span class="step-item" data-progress-view="final"><span id="step-final-state" class="step-state">4</span><span>提出用PDF</span></span>
+        <span class="step-item" data-progress-view="final"><span id="step-final-state" class="step-state">3</span><span>1つのPDFを出力</span></span>
       </div>
 
-      <main class="shell">
+      <main id="main-content" class="shell" tabindex="-1">
         <section id="error-panel" class="error-panel hidden" aria-live="assertive"><div><strong id="error-title"></strong><p id="error-summary"></p><ul id="error-list"></ul></div></section>
 
-        <section data-view-panel="dashboard" class="view-panel active">
-          <div class="page-head"><div><h2>ダッシュボード</h2><p>現在の作業状況と次の操作を確認します。</p></div></div>
+        <section data-view-panel="dashboard" class="view-panel">
+          <div class="page-head dashboard-purpose"><div><span class="eyebrow">ReportBinderでできること</span><h2>複数の原稿を、必要な順番で1つのPDFにまとめる</h2><p>Excel・Word・PowerPoint・PDFを集め、更新前後の違いも確認できます。</p></div></div>
+          <section id="dashboard-onboarding" class="onboarding-guide" aria-labelledby="onboarding-title">
+            <h3 id="onboarding-title" class="sr-only">提出用PDFを作る流れ</h3>
+            <div><span class="onboarding-number">1</span><strong>原稿を集める</strong><small>フォルダから選びます</small></div>
+            <span class="onboarding-arrow" aria-hidden="true">→</span>
+            <div><span class="onboarding-number">2</span><strong>順番を整える</strong><small>ページを見て並べます</small></div>
+            <span class="onboarding-arrow" aria-hidden="true">→</span>
+            <div><span class="onboarding-number">3</span><strong>1つのPDFにする</strong><small>確認して保存します</small></div>
+          </section>
           <section class="card next-action"><div><span class="eyebrow">次にやること</span><h3 id="dashboard-next-title"></h3><p id="dashboard-next-caption"></p></div><button id="dashboard-action-btn" class="btn primary" type="button"></button></section>
           <div id="summary" class="stats-grid"></div>
-          <section class="card pack-progress-card"><div class="card-head"><div><h3>資料パック全体の進捗</h3><p id="pack-progress-summary" class="caption">各部署・用途の資料を横断して確認します。</p></div><label class="check-inline"><input id="pack-progress-attention-only" type="checkbox"> 要対応のみ</label></div><div id="pack-progress-list" class="pack-progress-list"></div></section>
-          <section class="card"><div class="card-head"><div><h3>最近の状況</h3><p id="dashboard-category-summary" class="caption"></p></div></div><div id="dashboard-activity" class="activity-list"></div></section>
+          <section id="dashboard-pack-progress" class="card pack-progress-card"><div class="card-head"><div><h3>作成中の一式</h3><p id="pack-progress-summary" class="caption">会議や提出先ごとの進み具合を確認します。</p></div><label class="check-inline"><input id="pack-progress-attention-only" type="checkbox"> 要対応のみ</label></div><div id="pack-progress-list" class="pack-progress-list"></div></section>
+          <section id="dashboard-recent" class="card"><div class="card-head"><div><h3>最近の状況</h3><p id="dashboard-category-summary" class="caption"></p></div></div><div id="dashboard-activity" class="activity-list"></div></section>
         </section>
 
-        <section data-view-panel="folders" class="view-panel">
-          <div class="page-head"><div><h2>提出フォルダ</h2><p>提出する原稿だけを共有し、管理データと通常出力は利用者ごとのローカルへ保存します。</p></div><button id="scan-folder-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button></div>
-          <section class="card path-card">
-            <div class="path-row"><div><label for="submissionDir">提出フォルダ</label><p>提出する原稿を置くフォルダです。選択画面が開かない場合はパスを直接入力できます。</p></div><input id="submissionDir" type="text" autocomplete="off" spellcheck="false" placeholder="例: C:\共有\提出"><div class="path-actions"><button id="choose-submission-btn" class="btn primary" type="button">フォルダを選ぶ</button><button id="use-submission-path-btn" class="btn secondary" type="button">入力したパスを使用</button></div></div>
-            <div class="path-row static"><div><span class="field-label">ローカル出力先</span><p>利用者専用フォルダーへ自動設定されます。「共有発行」時だけ、提出フォルダー直下へ日時・言語・利用者名付きフォルダーを作成します。</p></div><span id="outputDir" class="path-value"></span></div>
-            <div class="path-row static"><div><span class="field-label">ローカル管理データ</span><p>ページ構成・履歴・比較PDFは利用者ごとに独立して保存されます。</p></div><span id="dataDir" class="path-value"></span></div>
+        <section data-view-panel="excel" class="view-panel active">
+          <section id="source-first-run" class="first-run-intro">
+            <strong>複数の原稿を、必要な順番で1つのPDFにまとめます。</strong>
+            <span>まず、Excel・Word・PowerPoint・PDFが入ったフォルダを選んでください。</span>
           </section>
-          <section class="card"><div class="card-head"><h3>フォルダの状況</h3></div><div class="folder-status-grid"><div><span>検出原稿</span><strong id="folder-file-count">0 件</strong></div><div><span>最終確認</span><strong id="folder-scan-time">—</strong></div><div><span>状態</span><span id="folder-scan-result" class="badge neutral">未設定</span></div></div></section>
-          <section class="card environment-card"><div class="card-head"><div><h3>動作環境の診断</h3><p>Excel・Word・PowerPoint・PDF処理と保存先の利用可否を確認します。</p></div><button id="run-diagnostics-btn" class="btn secondary" type="button">診断を実行</button></div><div id="diagnostics-result" class="diagnostics-result"><div class="empty-state">未診断です。初回利用時やPC更新後に実行してください。</div></div></section>
-        </section>
-
-        <section data-view-panel="excel" class="view-panel">
-          <section id="auto-status" class="card hidden"></section>
-          <div class="page-head"><div><h2>原稿・変換PDF</h2><p>Excel・Word・PowerPoint・PDF原稿を登録し、ページ構成に使うPDFへ変換します。</p></div><div class="toolbar"><button id="scan-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button><button id="render-all-btn" class="btn secondary" type="button">すべての変換PDFを再作成</button></div></div>
+          <div class="page-head"><div><h2>原稿を登録・PDF化</h2><p>まとめる原稿を登録し、ページの順番を整えるためのPDFを作ります。</p></div><div class="toolbar"><button id="scan-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>更新確認</button><details class="action-menu header-action-menu"><summary class="btn ghost">その他</summary><div class="action-menu-popover"><button id="render-all-btn" class="btn ghost" type="button">すべてのPDFを再作成</button></div></details></div></div>
+          <section class="source-folder-bar" aria-label="現在の原稿フォルダ"><div><span>原稿フォルダ</span><strong id="source-folder-path">—</strong></div><button id="change-source-folder-btn" class="btn secondary" type="button">変更</button></section>
+          <details class="secondary-disclosure source-folder-options"><summary><span>フォルダを選べない場合</span></summary><div class="secondary-disclosure-body"><div class="source-folder-direct"><label for="submissionDir">フォルダのパス</label><input id="submissionDir" type="text" autocomplete="off" spellcheck="false" placeholder="例: C:\共有\提出"><button id="use-submission-path-btn" class="btn secondary" type="button">入力した場所を使う</button></div><details class="storage-details"><summary>保存先の詳しい説明</summary><div class="path-row static"><div><span class="field-label">作成したPDFの保存先</span><p>このPCの利用者専用フォルダへ自動保存します。</p></div><span id="outputDir" class="path-value"></span></div><div class="path-row static"><div><span class="field-label">作業内容の保存先</span><p>ページの順番や更新履歴を、このPCの利用者専用フォルダへ保存します。</p></div><span id="dataDir" class="path-value"></span></div></details><div class="disclosure-actions source-diagnostics-action"><p>OfficeとPDF処理の利用可否を確認できます。</p><button id="run-diagnostics-btn" class="btn secondary" type="button">動作環境を診断</button></div><div id="diagnostics-result" class="diagnostics-result"><div class="empty-state">未診断です。必要なときに実行してください。</div></div></div></details>
+          <section id="source-next-action" class="workflow-next hidden"><div><strong>変換PDFは最新です</strong><span>次に、使うページと順番を確認します。</span></div><button id="source-next-pages" class="btn primary" type="button">ページ構成へ</button></section>
           <div class="excel-grid">
             <section class="card table-card unregistered-card">
-              <div class="card-head"><div><h3>未登録原稿</h3><p id="file-selection-summary" class="caption">0件中 0件を選択</p></div><label class="search-field"><svg class="icon"><use href="#i-search"/></svg><input id="file-filter" type="search" placeholder="ファイル名で検索"></label></div>
-              <div id="file-context-bar" class="list-action-bar contextual-action-bar" aria-label="未登録原稿の操作"><div class="toolbar"><button id="select-visible-files-btn" class="btn secondary" type="button">表示分を選択</button><span id="file-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-files-btn" class="btn ghost selection-only" type="button">選択解除</button></div><button id="register-selected-btn" class="btn primary selection-only" type="button" disabled>選択した原稿を登録</button></div>
+              <div class="card-head"><div><h3>未登録原稿</h3><p id="file-selection-summary" class="caption">0件中 0件を選択</p></div></div>
+              <div id="file-context-bar" class="list-action-bar contextual-action-bar" aria-label="未登録原稿の操作"><div class="toolbar"><span id="file-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-files-btn" class="btn ghost selection-only" type="button">選択解除</button></div><button id="register-selected-btn" class="btn primary selection-only" type="button" disabled>選択した原稿を登録</button></div>
               <div id="file-list"></div>
             </section>
-            <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済み原稿</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div></div><div id="source-requirement-status" class="source-requirement-status hidden"></div><div id="workbook-context-bar" class="list-action-bar contextual-action-bar" aria-label="登録済み原稿の操作"><div class="toolbar"><button id="select-render-needed-btn" class="btn secondary" type="button">作成が必要な分を選択</button><span id="workbook-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-workbooks-btn" class="btn ghost selection-only" type="button">選択解除</button></div><div class="toolbar selection-only"><button id="render-selected-btn" class="btn primary" type="button" disabled>選択分の変換PDFを作成</button><details class="action-menu"><summary class="btn ghost">その他</summary><div class="action-menu-popover"><button id="unregister-selected-btn" class="btn danger" type="button">登録解除</button></div></details></div></div><div id="workbook-list"></div></section>
+            <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済み原稿</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div></div><div id="source-requirement-status" class="source-requirement-status hidden"></div><div id="workbook-context-bar" class="list-action-bar contextual-action-bar" aria-label="登録済み原稿の操作"><div class="toolbar"><span id="workbook-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-workbooks-btn" class="btn ghost selection-only" type="button">選択解除</button></div><div class="toolbar"><button id="render-selected-btn" class="btn primary" type="button" disabled>変換PDFを作成</button><details class="action-menu selection-only"><summary class="btn ghost">その他</summary><div class="action-menu-popover"><button id="unregister-selected-btn" class="btn danger" type="button">登録解除</button></div></details></div></div><div id="workbook-list"></div></section>
           </div>
           <section id="progress-panel" class="progress-panel hidden" aria-live="polite"><div class="progress-meta"><strong id="progress-title">PDF作成中</strong><span id="progress-percent">0%</span></div><div class="progress-track"><span id="progress-fill"></span></div><div class="progress-detail"><p><span id="progress-count-label"></span><span id="progress-message"></span></p><button id="progress-cancel" class="btn secondary compact" type="button" hidden>PDF作成を中止</button></div></section>
+          <section id="auto-status" class="auto-status hidden"></section>
         </section>
 
         <section data-view-panel="pages" class="view-panel">
-          <div class="page-head"><div><h2>ページ構成</h2><p>ページを見ながら、未振り分け・本体・補足へ直感的に整理できます。</p></div><div class="page-head-actions"><div class="segmented page-view-switch" aria-label="ページ表示"><button id="page-view-thumbnail-btn" class="active" type="button" aria-pressed="true"><svg class="icon"><use href="#i-grid"/></svg>サムネイル</button><button id="page-view-detail-btn" type="button" aria-pressed="false"><svg class="icon"><use href="#i-list"/></svg>詳細</button></div><label id="page-thumbnail-size-control" class="page-thumbnail-size">表示サイズ<input id="page-thumbnail-size" type="range" min="150" max="260" step="10" value="190" aria-label="サムネイルの表示サイズ"><output id="page-thumbnail-size-label" for="page-thumbnail-size">標準</output></label><div class="page-history-actions" aria-label="ページ構成の操作履歴"><button id="page-layout-undo-btn" class="btn ghost" type="button" disabled><svg class="icon"><use href="#i-undo"/></svg>元に戻す</button><button id="page-layout-redo-btn" class="btn ghost" type="button" disabled><svg class="icon"><use href="#i-redo"/></svg>やり直す</button><button id="page-layout-revisions-btn" class="btn ghost" type="button">保存履歴</button></div><div class="sort-control"><span>並び順：<strong id="sort-state-label">原稿内の順序</strong></span><button id="sort-by-sheet-btn" class="btn secondary" type="button">原稿内の順序に整える</button></div></div></div>
+          <div class="page-head"><div><h2>ページ構成</h2><p>ページを選び、最終PDFのどこに入れるかを決めます。</p></div></div>
           <div id="page-summary-strip" class="summary-strip"></div>
-          <div class="assignment-guide" aria-label="ページ振り分けの流れ"><strong>1. カードを直接ドラッグ</strong><span aria-hidden="true">→</span><strong>2. 本体・補足へドロップ</strong><span aria-hidden="true">→</span><strong>3. 複数選択もまとめて移動</strong></div>
-          <div class="page-keyboard-hint" aria-label="キーボード操作"><span>キーボード</span><kbd>矢印</kbd>カード移動 <kbd>Space</kbd>選択 <kbd>Ctrl+A</kbd>表示分を選択 <kbd>Alt+矢印</kbd>並べ替え</div>
-          <section class="card page-card"><div id="page-command-bar" class="card-head page-command-bar"><div class="toolbar page-selection-tools"><strong id="bulk-selected-count" class="page-selection-count">カードをドラッグして移動</strong><div class="page-search"><label class="sr-only" for="page-search-input">ページを検索</label><input id="page-search-input" type="search" placeholder="ページ名・原稿・項目を検索" autocomplete="off"><button id="page-search-clear" class="btn ghost compact hidden" type="button">クリア</button></div><button id="select-all-pages-btn" class="btn ghost" type="button">表示分を選択</button><button id="clear-selected-pages-btn" class="btn ghost" type="button" disabled>選択解除</button><label class="check-inline"><input type="checkbox" id="changed-only-toggle"> 変更分のみ</label></div><div class="toolbar page-destination-actions" aria-label="選択ページの移動先"><span class="caption">選択時の移動先</span><span id="bulk-target-buttons"></span><button id="bulk-none-btn" class="btn secondary" type="button" disabled>未振り分けへ戻す</button></div></div><div id="page-board"></div></section>
+          <div class="assignment-guide" aria-label="ページ振り分けの流れ"><span class="assignment-guide-label">まず行うこと</span><strong>1. ページをクリックして選ぶ</strong><span class="assignment-guide-arrow" aria-hidden="true">→</span><strong>2. 移動先を押す</strong><small>選んだページをまとめて移動できます。慣れたら直接ドラッグも使えます。</small></div>
+          <details class="page-tools-details"><summary>表示・検索・履歴</summary><div class="page-tools-panel"><div class="page-tools-group"><span class="page-tools-label">表示</span><div class="segmented page-view-switch" aria-label="ページ表示"><button id="page-view-thumbnail-btn" class="active" type="button" aria-pressed="true"><svg class="icon"><use href="#i-grid"/></svg>サムネイル</button><button id="page-view-detail-btn" type="button" aria-pressed="false"><svg class="icon"><use href="#i-list"/></svg>詳細</button></div><label id="page-thumbnail-size-control" class="page-thumbnail-size">大きさ<input id="page-thumbnail-size" type="range" min="150" max="260" step="10" value="190" aria-label="サムネイルの表示サイズ"><output id="page-thumbnail-size-label" for="page-thumbnail-size">標準</output></label></div><div class="page-tools-group page-find-tools"><span class="page-tools-label">絞り込み</span><div class="page-search"><label class="sr-only" for="page-search-input">ページを検索</label><input id="page-search-input" type="search" placeholder="ページ名・原稿で検索" autocomplete="off"><button id="page-search-clear" class="btn ghost compact hidden" type="button">クリア</button></div><button id="select-all-pages-btn" class="btn ghost" type="button">表示分をすべて選択</button><label class="check-inline"><input type="checkbox" id="changed-only-toggle"> 変更分のみ</label></div><div class="page-tools-group"><span class="page-tools-label">並び・履歴</span><div class="sort-control"><span>現在：<strong id="sort-state-label">原稿内の順序</strong></span><button id="sort-by-sheet-btn" class="btn secondary" type="button">原稿内の順序に整える</button></div><div class="page-history-actions" aria-label="ページ構成の操作履歴"><button id="page-layout-undo-btn" class="btn ghost" type="button" disabled><svg class="icon"><use href="#i-undo"/></svg>元に戻す</button><button id="page-layout-redo-btn" class="btn ghost" type="button" disabled><svg class="icon"><use href="#i-redo"/></svg>やり直す</button><button id="page-layout-revisions-btn" class="btn ghost" type="button">保存履歴</button></div></div><div class="page-keyboard-hint" aria-label="キーボード操作"><span>キーボード操作</span><kbd>矢印</kbd>カード移動 <kbd>Space</kbd>選択 <kbd>Ctrl+A</kbd>表示分を選択 <kbd>Alt+矢印</kbd>並べ替え</div></div></details>
+          <section class="card page-card"><div id="page-command-bar" class="card-head page-command-bar"><div class="toolbar page-selection-tools"><strong id="bulk-selected-count" class="page-selection-count">ページをクリックして選択</strong><button id="clear-selected-pages-btn" class="btn ghost" type="button" disabled>選択解除</button></div><div class="toolbar page-destination-actions" aria-label="選択ページの移動先"><span class="caption">移動先</span><span id="bulk-target-buttons"></span><button id="bulk-none-btn" class="btn secondary" type="button" disabled>未振り分けへ戻す</button></div></div><div id="page-volume-tabs" class="page-volume-tabs" role="tablist" aria-label="表示するページの置き場所"></div><div id="page-board"></div></section>
         </section>
 
         <section data-view-panel="final" class="view-panel">
-          <div class="page-head"><div><h2>提出用PDF</h2><p>最新状態を確認して、提出用の本体・補足PDFを出力します。</p></div><button id="build-all-btn" class="btn primary" type="button">提出用PDFをまとめて出力</button></div>
+          <div class="page-head"><div><h2>最終PDFを作る</h2><p>内容を確認して、提出できるPDFとして保存します。</p></div><button id="build-all-btn" class="btn primary" type="button">最終PDFをまとめて作る</button></div>
+          <details class="secondary-disclosure final-settings-disclosure">
+            <summary><span>出力ファイル名の設定</span><small>必要な場合だけ変更</small></summary>
           <section class="card final-finish-card">
-            <div class="card-head"><div><h3>資料の仕上げ</h3><p>表紙・目次・原稿ごとの区切りと、出力ファイル名を設定します。</p></div><button id="save-pack-settings-btn" class="btn secondary" type="button">設定を保存</button></div>
+            <div class="card-head"><div><h3>資料の仕上げ</h3><p>PDFの資料名と出力ファイル名を設定します。表紙・目次・区切りページは原稿として登録し、ページ構成で配置してください。</p></div><button id="save-pack-settings-btn" class="btn secondary" type="button">設定を保存</button></div>
             <div class="final-finish-fields">
-              <label><span>資料タイトル</span><input id="pack-document-title" type="text" maxlength="120"></label>
-              <label><span>サブタイトル（任意）</span><input id="pack-document-subtitle" type="text" maxlength="160"></label>
-              <label class="filename-pattern-field"><span>出力ファイル名</span><input id="pack-output-pattern" type="text" maxlength="180" spellcheck="false"><small>{projectId}・{packName}・{targetName}・{yyyyMMdd} を使用できます。</small></label>
-            </div>
-            <div class="final-finish-toggles">
-              <label><input id="pack-include-cover" type="checkbox"> 表紙を付ける</label>
-              <label><input id="pack-include-toc" type="checkbox"> 目次を付ける</label>
-              <label><input id="pack-include-section-dividers" type="checkbox"> 原稿ごとの区切りページを付ける</label>
+              <label class="filename-pattern-field"><span>出力ファイル名</span><input id="pack-output-pattern" type="text" maxlength="180" spellcheck="false"><small>{packName}・{targetName}・{yyyyMMdd} を使用できます。</small></label>
             </div>
           </section>
+          </details>
           <section class="card final-preflight-card" aria-labelledby="final-preflight-title">
             <div class="card-head"><div><h3 id="final-preflight-title">出力前チェック</h3><p>提出漏れ・変換待ち・未振り分け・出力設定をまとめて確認します。</p></div><button id="final-preflight-refresh" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>最新状態を再確認</button></div>
             <div id="final-preflight-summary" class="final-preflight-summary" aria-live="polite"></div>
@@ -143,13 +151,23 @@
           </section>
           <div id="final-target-grid" class="final-grid"></div>
           <p class="caption final-numbering-caption">ページ番号：- 2 - 形式／先頭ページは番号なし</p>
-          <section class="card"><div class="card-head"><h3>出力履歴</h3></div><div id="final-history"></div><div class="final-archive-block"><h4>保存済み出力</h4><p class="caption">出力時点のPDFを自動保存しています。</p><div id="final-archive-history"></div></div></section>
+          <details class="secondary-disclosure final-review-disclosure">
+            <summary><span>レビュー・承認</span><small id="pack-review-summary-label">提出や承認を記録する場合</small></summary>
+          <section class="card pack-review-card" aria-labelledby="pack-review-title">
+            <div class="card-head"><div><h3 id="pack-review-title">レビュー・承認</h3><p>最新の提出用PDFをレビューへ提出し、承認または差し戻しを記録します。</p></div><span id="pack-review-status" class="badge neutral">下書き</span></div>
+            <div id="pack-review-summary" class="pack-review-summary"></div>
+            <label class="pack-review-note"><span>コメント</span><textarea id="pack-review-note" rows="3" maxlength="1000" placeholder="提出メモ、承認コメント、差し戻し理由を入力"></textarea></label>
+            <div class="pack-review-actions"><button id="pack-review-submit" class="btn primary" type="button">レビューへ提出</button><button id="pack-review-approve" class="btn primary" type="button">承認</button><button id="pack-review-request-changes" class="btn danger" type="button">差し戻し</button><button id="pack-review-reopen" class="btn secondary" type="button">下書きへ戻す</button></div>
+            <div><h4>監査履歴</h4><div id="pack-review-events" class="pack-review-events"></div></div>
+          </section>
+          </details>
+          <details class="secondary-disclosure final-history-disclosure"><summary><span>出力履歴</span><small>過去の出力を確認</small></summary><section class="card"><div id="final-history"></div><div class="final-archive-block"><h4>保存済み出力</h4><p class="caption">出力時点のPDFを自動保存しています。</p><div id="final-archive-history"></div></div></section></details>
         </section>
 
         <section data-view-panel="history" class="view-panel">
-          <div class="page-head"><div><h2>履歴・比較</h2><p>同じ原稿の任意の2時点を選び、左右比較・重ね合わせ・差分強調で確認します。</p></div><button id="history-refresh-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>履歴を更新</button></div>
-          <section class="card history-primary-card"><div class="card-head"><div><span class="eyebrow">主要機能</span><h3>任意の2時点を視覚比較</h3><p class="caption">対象原稿を選び、古い版を「比較元」、新しい版を「比較先」に指定してください。</p></div></div>
-            <div class="snapshot-history-controls"><label>対象原稿：<select id="snapshot-history-workbook"></select></label></div>
+          <div class="page-head"><div><h2>変更履歴・比較</h2><p>原稿と見比べたい2時点を選び、どこがどう変わったかを詳しく確認します。</p></div><button id="history-refresh-btn" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"/></svg>履歴を更新</button></div>
+          <section class="card history-primary-card">
+            <div class="snapshot-history-controls"><label><span>比較する原稿</span><select id="snapshot-history-workbook"></select></label><p>古い版を「比較元」、新しい版を「比較先」に指定してください。</p></div>
             <div id="snapshot-history" class="history-table"></div>
             <div id="snapshot-history-diff" class="history-table"></div>
           </section>
@@ -164,9 +182,9 @@
 
   <div id="pack-editor-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pack-editor-title" aria-describedby="pack-editor-description">
     <form id="pack-editor-form" class="modal-card pack-editor-dialog">
-      <div class="modal-head"><div><span class="eyebrow">資料パック</span><h2 id="pack-editor-title">新しい資料パック</h2><p id="pack-editor-description">用途が分かる名前を付けてください。</p></div></div>
+      <div class="modal-head"><div><span class="eyebrow">今回まとめる一式</span><h2 id="pack-editor-title">一式に名前を付ける</h2><p id="pack-editor-description">会議名や提出先など、あとで見つけやすい名前を付けます。</p></div></div>
       <div class="pack-editor-body">
-        <label><span>資料パック名</span><input id="pack-editor-name" type="text" maxlength="120" autocomplete="off" required><small>例：月次部門報告、取締役会資料、監査提出資料</small></label>
+        <label><span>今回まとめる一式の名前</span><input id="pack-editor-name" type="text" maxlength="120" autocomplete="off" required><small>例：8月の月次報告、取締役会資料、監査提出資料</small></label>
         <label id="pack-editor-template-field"><span>ひな形</span><select id="pack-editor-template"></select><small id="pack-editor-template-description"></small></label>
       </div>
       <div class="confirm-actions"><button id="pack-editor-cancel" class="btn secondary" type="button">キャンセル</button><button id="pack-editor-save" class="btn primary" type="submit">作成</button></div>
@@ -182,11 +200,13 @@
         <fieldset><legend>扱う原稿</legend><div class="template-inline-options"><label><input id="template-source-excel" type="checkbox"> Excel</label><label><input id="template-source-word" type="checkbox"> Word</label><label><input id="template-source-powerpoint" type="checkbox"> PowerPoint</label><label><input id="template-source-pdf" type="checkbox"> PDF</label></div></fieldset>
         <fieldset><legend>必要原稿リスト</legend><p class="template-field-help">部署から集める原稿を先に定義すると、未提出の必須原稿も最終出力前に検出できます。</p><div id="template-requirements-list" class="template-requirements-list"></div><button id="template-add-requirement" class="btn secondary compact" type="button">必要原稿を追加</button></fieldset>
         <fieldset><legend>出力先</legend><div id="template-targets-list" class="template-target-list"></div><button id="template-add-target" class="btn ghost compact" type="button">＋ 出力先を追加</button></fieldset>
-        <fieldset><legend>新規ページと出力条件</legend><div class="template-manager-grid"><label><span>新しいページの既定先</span><select id="template-new-destination"><option value="unassigned">未振り分け</option><option value="main">本体側</option><option value="appendix">補足側</option></select></label><label><span>出力ファイル名</span><input id="template-output-pattern" type="text" maxlength="180" spellcheck="false"></label></div><div class="template-inline-options"><label><input id="template-block-stale" type="checkbox"> 必須原稿が更新中なら出力を止める</label><label><input id="template-block-failed" type="checkbox"> 必須原稿の変換失敗時は出力を止める</label><label><input id="template-include-toc" type="checkbox"> 目次を既定で付ける</label></div></fieldset>
+        <fieldset><legend>新規ページと出力条件</legend><div class="template-manager-grid"><label><span>新しいページの既定先</span><select id="template-new-destination"><option value="unassigned">未振り分け</option><option value="main">本体側</option><option value="appendix">補足側</option></select></label><label><span>出力ファイル名</span><input id="template-output-pattern" type="text" maxlength="180" spellcheck="false"></label></div><div class="template-inline-options"><label><input id="template-block-stale" type="checkbox"> 必須原稿が更新中なら出力を止める</label><label><input id="template-block-failed" type="checkbox"> 必須原稿の変換失敗時は出力を止める</label></div></fieldset>
       </div>
       <div class="confirm-actions template-manager-actions"><button id="template-manager-delete" class="btn danger hidden" type="button">削除</button><button id="template-manager-duplicate" class="btn secondary hidden" type="button">複製</button><button id="template-manager-export" class="btn secondary hidden" type="button">JSON出力</button><button id="template-manager-import" class="btn secondary" type="button">JSON読込</button><input id="template-manager-import-file" class="hidden" type="file" accept="application/json,.json"><span></span><button id="template-manager-cancel" class="btn secondary" type="button">閉じる</button><button id="template-manager-save" class="btn primary" type="submit">作成</button></div>
     </form>
   </div>
+
+  <div id="shutdown-screen" class="shutdown-screen hidden" role="status" tabindex="-1" aria-live="polite"><div class="shutdown-card"><span class="shutdown-mark"><svg class="icon"><use href="#i-check"/></svg></span><h2>ReportBinderを終了しました</h2><p>このタブを閉じてください。</p></div></div>
 
   <div id="confirm-modal" class="modal hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <div class="modal-card confirm-dialog"><div class="modal-head"><div><span class="eyebrow">確認</span><h2 id="confirm-title"></h2></div></div><div class="confirm-body"><p id="confirm-message"></p><div id="confirm-detail" class="confirm-detail hidden"></div></div><div class="confirm-actions"><button id="confirm-cancel" class="btn secondary" type="button">キャンセル</button><button id="confirm-accept" class="btn primary" type="button">実行する</button></div></div>
@@ -200,13 +220,17 @@
       </header>
       <div class="diff-toolbar">
         <div id="diff-summary" class="diff-summary" aria-label="ページ項目の絞り込み"></div>
-        <div class="diff-controls">
+        <details class="diff-display-settings">
+          <summary>表示設定・書き出し</summary>
+          <div class="diff-controls">
           <div class="segmented" aria-label="表示モード"><button id="diff-mode-side" class="active" type="button">左右比較</button><button id="diff-mode-overlay" type="button">重ね合わせ</button></div>
           <label class="check-inline"><input id="diff-highlight" type="checkbox" checked> 強調</label>
+          <label class="check-inline"><input id="diff-unreviewed-only" type="checkbox"> 未確認のみ</label>
           <label>濃度 <select id="diff-density"><option value="0">0%</option><option value="0.25" selected>25%</option><option value="0.5">50%</option></select></label>
           <label>倍率 <select id="diff-zoom"><option value="fit-width" selected>幅に合わせる</option><option value="fit-page">全体表示</option><option value="0.75">75%</option><option value="1">100%</option><option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option></select></label>
           <label id="diff-opacity-wrap" class="hidden">現在版 <input id="diff-opacity" type="range" min="0" max="100" value="50"><span id="diff-opacity-value">50%</span></label>
-        </div>
+          </div>
+        </details>
       </div>
       <div id="diff-progress" class="diff-progress hidden" aria-live="polite"><span id="diff-progress-text">表示ページを比較しています。</span><div class="progress-track"><span id="diff-progress-fill"></span></div></div>
       <div class="diff-content">
@@ -220,7 +244,7 @@
           </div>
           <footer class="diff-footer">
             <div class="diff-pager"><button id="diff-prev-page" class="btn ghost compact" type="button">前のページ</button><span id="diff-page-count">1 / 1ページ</span><button id="diff-next-page" class="btn ghost compact" type="button">次のページ</button></div>
-            <div class="diff-region-nav"><button id="diff-prev-region" class="btn ghost compact" type="button">前の変更</button><span id="diff-region-count">0件</span><button id="diff-next-region" class="btn ghost compact" type="button">次の変更</button></div>
+            <div class="diff-region-nav"><button id="diff-prev-region" class="btn ghost compact" type="button">前の変更</button><span id="diff-region-count">0件</span><button id="diff-next-region" class="btn ghost compact" type="button">次の変更</button><button id="diff-confirm-sheet" class="btn secondary compact" type="button" disabled>この項目を確認済みにする</button></div>
             <div class="diff-legend" aria-label="差分の凡例"><span class="modified"><b>M</b>変更</span><span class="added"><b>A</b>追加</span><span class="removed"><b>D</b>削除</span><span class="unknown"><b>?</b>判定不能</span></div>
           </footer>
         </section>
@@ -235,6 +259,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260807_v117"></script>
+  <script src="app.js?v=20260808_v144"></script>
 </body>
 </html>

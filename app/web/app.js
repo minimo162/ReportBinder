@@ -24,7 +24,7 @@ const clientId = (globalThis.crypto && globalThis.crypto.randomUUID)
 let state = null;
 let availableFiles = [];
 let availableFilesScannedAt = '';
-let activePreset = (() => { try { const v = sessionStorage.getItem('ReportBinderCategory'); return ['ecm','bod','dmm'].includes(v) ? v : 'ecm'; } catch { return 'ecm'; } })();
+let activePreset = '';
 let activePackId = (() => { try { return sessionStorage.getItem('ReportBinderPackId') || ''; } catch { return ''; } })();
 let packAdminPacks = [];
 let archivedPacksExpanded = false;
@@ -40,8 +40,10 @@ let boardSaveRevision = 0;
 let pendingBoardSaveVolumes = null;
 let selectedFiles = new Set();
 let selectedWorkbooks = new Set();
+let expandedSourceSettings = new Set();
 let selectedPages = new Set();
 let pageBoardView = (() => { try { return sessionStorage.getItem('ReportBinderPageBoardView') === 'detail' ? 'detail' : 'thumbnail'; } catch { return 'thumbnail'; } })();
+let activePageVolume = (() => { try { return sessionStorage.getItem('ReportBinderActivePageVolume') || 'none'; } catch { return 'none'; } })();
 let pageFilterText = '';
 let pageThumbnailSize = (() => { try { const value=Number(sessionStorage.getItem('ReportBinderPageThumbnailSize'));return Number.isFinite(value)?Math.min(260,Math.max(150,value)):190; } catch { return 190; } })();
 let pageLayoutUndoStack = [];
@@ -75,9 +77,11 @@ let folderPickerBusy = false;
 let diagnosticsResult = null;
 let packProgressAttentionOnly = false;
 let finalPreflightCheckedAt = '';
+let packReviewState = null;
+let packReviewInFlight = null;
 let autoStateInFlight = null;
 const seenAutoNotificationIds = new Set();
-let activeView = (() => { try { return sessionStorage.getItem('ReportBinderView') || 'dashboard'; } catch { return 'dashboard'; } })();
+let activeView = (() => { try { const stored=sessionStorage.getItem('ReportBinderView')||'excel'; return stored==='folders'?'excel':stored; } catch { return 'excel'; } })();
 let fileFilterText = '';
 const pdfObjectUrls = new Set();
 let noticeTimer = null;
@@ -118,6 +122,7 @@ const diffViewState = {
   pageIndex: 0,
   regionIndex: -1,
   filter: 'all',
+  unreviewedOnly: false,
   mode: 'side',
   mobileTab: 'before'
 };
@@ -137,16 +142,14 @@ function currentRenderProfileVersion() {
 const $ = (id) => document.getElementById(id);
 
 const VIEW_NAMES = {
-  dashboard: 'ダッシュボード',
-  folders: '提出フォルダ',
-  excel: '原稿・変換PDF',
-  history: '履歴・比較',
+  excel: '原稿を登録・PDF化',
+  history: '変更履歴・比較',
   pages: 'ページ構成',
-  final: '提出用PDF'
+  final: '最終PDF'
 };
 
 function setActiveView(view, options = {}) {
-  const next = VIEW_NAMES[view] ? view : 'dashboard';
+  const next = VIEW_NAMES[view] ? view : 'excel';
   const viewChanged = next !== activeView;
   activeView = next;
   try { sessionStorage.setItem('ReportBinderView', activeView); } catch {}
@@ -158,7 +161,17 @@ function setActiveView(view, options = {}) {
     btn.classList.toggle('active', on);
     if (on) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
   });
-  if (!options.noScroll) window.scrollTo({top: 0, behavior: options.instant ? 'auto' : 'smooth'});
+  if (!options.noScroll) {
+    hideMessage();
+    window.scrollTo({top: 0, behavior: options.instant ? 'auto' : 'smooth'});
+    requestAnimationFrame(() => {
+      const heading=document.querySelector(`[data-view-panel="${CSS.escape(activeView)}"] h2`);
+      if(!heading)return;
+      heading.setAttribute('tabindex','-1');
+      heading.focus({preventScroll:true});
+      heading.addEventListener('blur',()=>heading.removeAttribute('tabindex'),{once:true});
+    });
+  }
   // renderAll also reapplies the active tab. Do not turn that DOM refresh into another
   // shared-folder request; load only on first initialization, actual tab entry, or explicit refresh.
   if (activeView === 'history' && state && (viewChanged || !historyPanelsInitialized || options.reloadPanels)) {
@@ -167,6 +180,7 @@ function setActiveView(view, options = {}) {
   if (activeView === 'final' && state) {
     void loadFinalReadiness();
     void loadFinalArchives();
+    void loadPackReview();
   }
   if (activeView === 'excel' && state?.configured) void loadAutoStateDetail();
 }
@@ -253,17 +267,25 @@ function escapeHtml(s) {
 function normPath(s) { return String(s || '').replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase(); }
 function pathJoin(base, child) { return String(base || '').replace(/[\\/]+$/,'') + '\\' + child; }
 function badge(text, cls='') { return `<span class="badge ${cls}">${escapeHtml(text)}</span>`; }
-function modeTitle(mode) { return ({ja:'日本語管理', en:'英語管理'})[mode] || mode; }
-function mainVolume() { return state?.language === 'en' ? 'en-main' : 'ja-main'; }
-function appendixVolume() { return state?.language === 'en' ? 'en-appendix' : 'ja-appendix'; }
-function targetVolume(targetId) { return `${state?.language === 'en' ? 'en' : 'ja'}-${String(targetId || '').trim().toLowerCase()}`; }
+// Volume IDs retain a private compatibility prefix. Language belongs to a
+// document pack/template and never selects another application workspace.
+const INTERNAL_VOLUME_PREFIX = 'ja';
+function mainVolume() { return `${INTERNAL_VOLUME_PREFIX}-main`; }
+function appendixVolume() { return `${INTERNAL_VOLUME_PREFIX}-appendix`; }
+function targetVolume(targetId) { return `${INTERNAL_VOLUME_PREFIX}-${String(targetId || '').trim().toLowerCase()}`; }
 function targetIdFromVolume(volume) {
   const match=String(volume||'').toLowerCase().match(/^(?:ja|en)-([a-z0-9][a-z0-9_-]{0,47})$/);
   return match?match[1]:String(volume||'').toLowerCase()==='none'?'unassigned':'';
 }
 function activeTargetDefinitions() {
   const targets=asArray(activePackRecord()?.targets).filter(target=>String(target?.targetId||'').trim());
-  return targets.length?targets:[{targetId:'main',displayName:state?.language==='en'?'Main':'本体',required:true},{targetId:'appendix',displayName:state?.language==='en'?'Appendix':'補足',required:false}];
+  return targets;
+}
+function activePackDefaultTargetLabel() {
+  const targetId=String(activePackRecord()?.rules?.newItemDestination||'unassigned');
+  if(!targetId||targetId==='unassigned')return '未振り分け（ページ構成で確認）';
+  const target=activeTargetDefinitions().find(item=>String(item?.targetId||'')===targetId);
+  return String(target?.displayName||targetId);
 }
 function activeTargetVolumes() { return activeTargetDefinitions().map(target=>targetVolume(target.targetId)); }
 
@@ -386,6 +408,9 @@ function pagePdfSubtext(p) {
 function userFriendlyError(message) {
   const text = String(message || '');
   const raw = text.length > 300 ? text.slice(0, 300) + '…' : text;
+  if (/structure\.json|登録情報を安全に読み込めません|不完全な登録情報/i.test(text)) {
+    return '作業データを読み込めませんでした。原稿ファイルは変更されていません。別の原稿フォルダを選ぶか、ReportBinderを終了してもう一度開いてください。';
+  }
   // サーバーが日本語で説明しているメッセージは、そのまま表示するのが最も正確。
   // 技術的なエラー(例外・スタックトレース等)のときだけ、対処ヒントを付けて原文も併記する。
   const isTechnical = /Exception|StackTrace|HRESULT|at\s+java|COMException|System\./i.test(text);
@@ -488,12 +513,13 @@ function extractErrorItems(detail, fallbackMessage='') {
 function showErrorPanel(title, summary, detail) {
   const panel = $('error-panel');
   if (!panel) return;
-  const items = extractErrorItems(detail, summary);
+  const friendlySummary=userFriendlyError(summary);
+  const items = extractErrorItems(detail, summary).filter(item=>String(item.message||'').trim()!==String(friendlySummary||'').trim());
   $('error-title').textContent = title || 'エラーがあります';
-  $('error-summary').textContent = summary || '内容を確認してください。';
-  $('error-list').innerHTML = items.length
-    ? items.map(i => `<li>${i.label ? `<strong>${escapeHtml(i.label)}</strong>：` : ''}${escapeHtml(i.message)}</li>`).join('')
-    : `<li>${escapeHtml(summary || '内容を確認してください。')}</li>`;
+  $('error-summary').textContent = friendlySummary || '内容を確認してください。';
+  const list=$('error-list');
+  list.innerHTML = items.map(i => `<li>${i.label ? `<strong>${escapeHtml(i.label)}</strong>：` : ''}${escapeHtml(i.message)}</li>`).join('');
+  list.classList.toggle('hidden',items.length===0);
   panel.classList.remove('hidden');
 }
 function hideErrorPanel() {
@@ -564,7 +590,7 @@ function updateProgressPanel(job) {
   const target = job.currentSheet ? `${job.currentWorkbookName || ''} / ${sourceUnitReference(currentSource, job.currentSheet)}` : (job.currentWorkbookName || '');
   $('progress-message').textContent = job.message || (target ? `${target} を処理しています。` : '処理しています。');
   panel.querySelector('.progress-track')?.setAttribute('aria-valuenow', String(pct));
-  const terminal = ['completed','completed-with-errors','failed','cancelled'].includes(status);
+  const terminal = pct >= 100 || ['completed','completed-with-errors','failed','cancelled'].includes(status);
   const cancelButton = $('progress-cancel');
   if (cancelButton) {
     const requested = activeRenderCancelRequested || !!job.cancelRequested;
@@ -776,6 +802,7 @@ let finalReadinessInFlight = null;
 async function loadFinalReadiness(){
   if(!state||!configured())return;
   const pack=activePackRecord(),preset=activePreset,key=pack?.category?preset:String(pack?.packId||activePackId);
+  if(!pack?.packId)return;
   if(finalReadinessInFlight)return finalReadinessInFlight;
   const request=pack?.category?api(`/api/final/readiness?category=${encodeURIComponent(preset)}`):api(`/api/v2/outputs/readiness?packId=${encodeURIComponent(key)}`);
   finalReadinessInFlight=request.then(r=>{
@@ -827,6 +854,8 @@ async function scanAndRefresh(btn) {
     const r = await api('/api/scan-updates', {method:'POST', body:{force:true}});
     state = normalizeStatePayload(await api('/api/state'));
     if (configured()) await loadFiles(null);
+    selectedWorkbooks.clear();
+    lastWorkbookRangeAnchor = '';
     renderAll();
     const n = r.result?.changedWorkbookIds?.length || 0;
     const scanned = Number(r.result?.scanned || 0);
@@ -840,13 +869,10 @@ async function scanAndRefresh(btn) {
 function renderAll(options={}) {
   const preserve = !!options.preserveEditors && shouldPreserveEditorDom();
   const appTitle = $('app-title');
-  if (appTitle) appTitle.textContent = modeTitle(state?.mode || 'ja');
-  const modeBadge = $('mode-badge');
-  if (modeBadge) modeBadge.firstChild.textContent = state?.language === 'en' ? 'English ' : '日本語 ';
-  const current = $('language-current'); if (current) current.textContent = modeTitle(state?.mode || 'ja');
-  const guide = $('language-guide'); if (guide) guide.textContent = state?.language === 'en' ? '日本語管理.vbs を起動してください。' : '英語管理.vbs を起動してください。';
+  if (appTitle) appTitle.textContent = 'ReportBinder';
   setActiveView(activeView, {noScroll:true});
   updatePresetTabs();
+  renderPackRequiredState();
   renderPathInputs();
   renderGlobalHeader();
   renderStepBar();
@@ -879,6 +905,9 @@ function renderAll(options={}) {
 
 function renderPathInputs() {
   const submission = $('submissionDir'); if (submission) submission.value = state?.paths?.submissionDir || '';
+  const sourceFolder = $('source-folder-path'); if (sourceFolder) { sourceFolder.textContent=state?.paths?.submissionDir||'—';sourceFolder.title=state?.paths?.submissionDir||''; }
+  const choose=$('change-source-folder-btn');if(choose){const ready=configured();choose.className=`btn ${ready?'secondary':'primary'}`;choose.textContent=ready?'変更':'フォルダを選ぶ';}
+  const scan=$('scan-btn');if(scan)scan.disabled=!configured();
   const data = $('dataDir'); if (data) data.textContent = state?.paths?.dataDir || '—';
   const output = $('outputDir'); if (output) output.textContent = state?.paths?.outputDir || '—';
 }
@@ -887,12 +916,33 @@ function renderPathInputs() {
 function renderGlobalHeader() {
   const agg = aggregateFinalState();
   const el = $('global-final-status');
+  const hasPack=!!activePackRecord();
+  document.body.classList.toggle('has-active-pack',hasPack);
+  document.body.classList.toggle('is-configured',configured());
+  $('source-first-run')?.classList.toggle('hidden',configured());
   if (!el) return;
+  el.classList.toggle('hidden',!hasPack);
+  if(!hasPack){el.innerHTML='';el.removeAttribute('aria-label');return;}
+  const unresolved=unresolvedPageCount();
+  const statusText=unresolved?`要確認（未振り分け ${unresolved}ページ）`:agg.text;
   el.className = 'global-status';
   if (agg.state === 'blocked') el.classList.add('danger');
-  else if (['needs-rebuild','output-missing'].includes(agg.state)) el.classList.add('attention');
-  const dot = ['blocked','needs-rebuild','output-missing'].includes(agg.state) ? '<span class="status-dot"></span>' : '';
-  el.innerHTML = `${dot}${escapeHtml(agg.text)}`;
+  else if (unresolved || ['needs-rebuild','output-missing'].includes(agg.state)) el.classList.add('attention');
+  const dot = unresolved || ['blocked','needs-rebuild','output-missing'].includes(agg.state) ? '<span class="status-dot"></span>' : '';
+  el.innerHTML = `${dot}<span class="global-status-label">提出用PDF</span>${escapeHtml(statusText.replace(/^提出用PDF(?:は|の)?/,'').trim())}`;
+  el.setAttribute('aria-label',statusText);
+}
+function renderPackRequiredState(){
+  const hasPack=!!activePackRecord();
+  document.querySelectorAll('[data-view-nav]').forEach(button=>{
+    const view=String(button.dataset.viewNav||'');
+    if(!['excel','pages','history','final'].includes(view))return;
+    const disabled=view!=='excel'&&!hasPack;
+    button.disabled=disabled;
+    button.setAttribute('aria-disabled',String(disabled));
+    button.title=disabled?'先に原稿フォルダを設定し、資料パックを作成してください':'';
+  });
+  if(!hasPack&&activeView!=='excel')setActiveView('excel',{noScroll:true});
 }
 function setStepState(id, kind, fallback) {
   const el=$(id); if(!el) return;
@@ -902,11 +952,10 @@ function setStepState(id, kind, fallback) {
 function renderStepBar() {
   const workbooks=workbooksForActivePreset(); const pages=pagesForActivePreset();
   const needs=workbooks.filter(w=>!isLatestPdfWorkbook(w)).length;
-  const currentMap={folders:'step-folders-state',excel:'step-excel-state',pages:'step-pages-state',final:'step-final-state'};
-  setStepState('step-folders-state', configured()?'complete':'attention','1');
-  setStepState('step-excel-state', workbooks.length && needs===0?'complete':(workbooks.length?'attention':''),'2');
-  setStepState('step-pages-state', pages.some(p=>p.enabled!==false && String(p.volume||'none')!=='none')?'complete':(pages.length?'attention':''),'3');
-  setStepState('step-final-state', finalIsComplete()?'complete':(activeReadinessItems().length?'attention':''),'4');
+  const currentMap={excel:'step-excel-state',pages:'step-pages-state',final:'step-final-state'};
+  setStepState('step-excel-state', configured()&&workbooks.length&&needs===0?'complete':'attention','1');
+  setStepState('step-pages-state', pages.some(p=>p.enabled!==false && String(p.volume||'none')!=='none')?'complete':(pages.length?'attention':''),'2');
+  setStepState('step-final-state', finalIsComplete()?'complete':(activeReadinessItems().length?'attention':''),'3');
   document.querySelectorAll('[data-progress-view]').forEach(btn=>{
     const view=btn.dataset.progressView; btn.classList.toggle('current',view===activeView);
     if(view===activeView)btn.setAttribute('aria-current','step');else btn.removeAttribute('aria-current');
@@ -917,7 +966,7 @@ function renderNavBadges() {
   const needs=workbooksForActivePreset().filter(w=>!isLatestPdfWorkbook(w)).length;
   const unresolved=unresolvedPageCount();
   const excel=$('nav-excel-count'); if(excel){excel.textContent=needs;excel.classList.toggle('hidden',needs===0);}
-  const pages=$('nav-pages-count'); if(pages){pages.textContent=unresolved;pages.classList.toggle('hidden',unresolved===0);}
+  const pages=$('nav-pages-count'); if(pages){pages.textContent=`未振分 ${unresolved}`;pages.classList.toggle('hidden',unresolved===0);}
   const agg=aggregateFinalState(); const dot=$('nav-final-dot'); if(dot) dot.classList.toggle('hidden',!['blocked','needs-rebuild','output-missing'].includes(agg.state));
 }
 
@@ -931,7 +980,8 @@ function renderSummary() {
     {label:'変換PDF作成が必要',value:needsPdf,unit:'件'},
     {label:'総ページ数',value:pages.length,unit:'ページ'}
   ];
-  summaryEl.innerHTML=cards.map(c=>`<article class="stat-card"><div class="stat-label">${escapeHtml(c.label)}</div><div class="stat-value">${c.value}<span class="stat-unit">${escapeHtml(c.unit)}</span></div><div class="stat-sub">${escapeHtml(presetLabel())} 資料パック</div></article>`).join('');
+  const scopeLabel=activePackRecord()?presetLabel():'今回まとめる一式の作成前';
+  summaryEl.innerHTML=cards.map(c=>`<article class="stat-card"><div class="stat-label">${escapeHtml(c.label)}</div><div class="stat-value">${c.value}<span class="stat-unit">${escapeHtml(c.unit)}</span></div><div class="stat-sub">${escapeHtml(scopeLabel)}</div></article>`).join('');
 }
 
 
@@ -941,34 +991,40 @@ function renderDashboardOverview() {
   const readiness=activeReadinessItems();
   const blockers=readiness.flatMap(x=>asArray(x.ready.blockers));
   const unassigned=unresolvedPageCount(); const agg=aggregateFinalState();
+  const onboarding=$('dashboard-onboarding');if(onboarding)onboarding.classList.toggle('hidden',configured()&&!!activePackRecord()&&workbooks.length>0);
+  const hasPack=!!activePackRecord();
+  $('summary')?.classList.toggle('hidden',!hasPack);
+  $('dashboard-pack-progress')?.classList.toggle('hidden',!hasPack);
+  $('dashboard-recent')?.classList.toggle('hidden',!hasPack);
   const title=$('dashboard-next-title'), caption=$('dashboard-next-caption'), action=$('dashboard-action-btn');
   if(title&&caption&&action){
-    if(!configured()){title.textContent='提出フォルダを設定してください';caption.textContent='提出原稿が入っているフォルダを選びます。';action.textContent='提出フォルダを選ぶ';action.dataset.dashboardAction='folder';}
-    else if(workbooks.length===0){title.textContent='原稿を登録してください';caption.textContent=`${presetLabel()}の原稿を選んで登録します。`;action.textContent='原稿登録へ進む';action.dataset.dashboardAction='excel';}
+    if(!configured()){title.textContent='はじめる：原稿が入ったフォルダを選ぶ';caption.textContent='フォルダ内のExcel・Word・PowerPoint・PDFを見つけます。原稿は移動・削除しません。';action.textContent='はじめる';action.dataset.dashboardAction='folder';}
+    else if(!activePackRecord()){title.textContent='今回まとめる一式に名前を付ける';caption.textContent='会議名や提出先など、あとで見つけやすい名前を付けます。';action.textContent='名前を付ける';action.dataset.dashboardAction='create-pack';}
+    else if(workbooks.length===0){title.textContent='まとめる原稿を登録する';caption.textContent=`「${presetLabel()}」に入れる原稿を選びます。`;action.textContent='原稿を選ぶ';action.dataset.dashboardAction='excel';}
     else if(needsPdf>0){title.textContent=`変換PDFを作成してください（${needsPdf}件）`;caption.textContent='原稿の最新内容をページ構成用のPDFへ変換します。';action.textContent='PDF変換へ';action.dataset.dashboardAction='excel';}
     else if(blockers.length>0){title.textContent='提出用PDFを出力できません';caption.textContent=blockers[0]?.message||'原稿・変換PDFを確認してください。';action.textContent='原稿・変換PDFへ';action.dataset.dashboardAction='excel';}
     else if(unassigned>0){title.textContent=`ページ構成を確認してください（${unassigned}ページ）`;caption.textContent='出力先が未設定のページがあります。';action.textContent='ページ構成へ進む';action.dataset.dashboardAction='pages';}
     else if(['needs-rebuild','output-missing','not-built'].includes(agg.state)){title.textContent=agg.text;caption.textContent='各出力先の状態を確認して出力してください。';action.textContent='提出用PDFへ進む';action.dataset.dashboardAction='final';}
     else{title.textContent='最新の状態です';caption.textContent='提出用PDFとページ構成は最新です。';action.textContent='出力フォルダを確認';action.dataset.dashboardAction='final';}
   }
-  const cat=$('dashboard-category-summary');if(cat)cat.textContent=`${presetLabel()} 資料パック / 登録済み原稿：${workbooks.length}件 / 変換PDF作成が必要：${needsPdf}件`;
+  const cat=$('dashboard-category-summary');if(cat)cat.textContent=activePackRecord()?`${presetLabel()} / 登録済み原稿：${workbooks.length}件 / PDF作成が必要：${needsPdf}件`:'「今回まとめる一式」に、原稿・ページの順番・更新履歴をまとめて保存します。';
   const activity=$('dashboard-activity');if(!activity)return;
   const rows=[...workbooks].sort((a,b)=>String(latestWorkbookStamp(b)).localeCompare(String(latestWorkbookStamp(a)))).slice(0,5).map(w=>{
     if(String(w.status||'')==='render-error')return{text:`${workbookDisplayName(w)} のPDF変換でエラーがあります`,badge:'作成エラー',cls:'danger',time:latestWorkbookStamp(w)};
     if(isLatestPdfWorkbook(w))return{text:`${workbookDisplayName(w)} の変換PDFを作成しました`,badge:'作成済み',cls:'neutral',time:w.lastRenderedAt||latestWorkbookStamp(w)};
     return{text:`${workbookDisplayName(w)} は変換PDF作成が必要です`,badge:'作成が必要',cls:'attention',time:latestWorkbookStamp(w)};
   });
-  if(!rows.length)rows.push({text:configured()?`${presetLabel()}の原稿を登録してください`:'ReportBinderへようこそ',badge:configured()?'原稿登録':'お知らせ',cls:'neutral',time:''});
+  if(!rows.length)rows.push({text:configured()?(activePackRecord()?`「${presetLabel()}」へ原稿を登録してください`:'今回まとめる一式に名前を付けてください'):'上の「はじめる」から原稿フォルダを選んでください',badge:'はじめに',cls:'neutral',time:''});
   activity.innerHTML=rows.map(r=>`<div class="activity-row"><span class="activity-text">${escapeHtml(r.text)}</span>${badge(r.badge,r.cls)}<span class="activity-time">${escapeHtml(formatDateTime(r.time))}</span></div>`).join('');
   renderPackProgressDashboard();
 }
 
 function renderPackProgressDashboard(){
   const progress=state?.packProgress||{},summary=$('pack-progress-summary'),box=$('pack-progress-list'),toggle=$('pack-progress-attention-only');if(!box)return;if(toggle)toggle.checked=packProgressAttentionOnly;
-  if(summary)summary.textContent=`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`;
-  const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'no-pages':6,'not-started':7,complete:8};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??9)-(priority[String(b.state)]??9)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
-  const stateInfo=value=>({complete:['完了','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention']}[String(value)]||['要確認','attention']);
-  if(!rows.length){box.innerHTML=`<div class="empty-state">${packProgressAttentionOnly?'対応が必要な資料パックはありません。':'資料パックはまだありません。'}</div>`;return;}
+  if(summary)summary.textContent=Number(progress.totalCount||0)?`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`:'作成中の一式がここに表示されます。';
+  const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'review-stale':6,'review-changes':7,'review-draft':8,'in-review':9,'no-pages':10,'not-started':11,complete:12};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??13)-(priority[String(b.state)]??13)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
+  const stateInfo=value=>({complete:['承認済み','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['レビュー未提出','attention'],'in-review':['レビュー中','neutral'],'review-changes':['差し戻し','danger'],'review-stale':['承認対象が更新','danger']}[String(value)]||['要確認','attention']);
+  if(!rows.length){box.innerHTML=packProgressAttentionOnly?'<div class="empty-state">対応が必要な一式はありません。</div>':`<div class="pack-progress-empty"><div><strong>${configured()?'今回まとめる一式はまだありません':'まだ作業は始まっていません'}</strong><span>${configured()?'上の「次にやること」から名前を付けます。':'上の「はじめる」から原稿フォルダを選びます。'}</span></div></div>`;return;}
   box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${nearestDue}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}p</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
   box.querySelectorAll('[data-pack-progress-open]').forEach(button=>button.addEventListener('click',async()=>{await applyPresetSelection(String(button.dataset.packProgressOpen||''));setActiveView(String(button.dataset.packProgressAction||'excel'));}));
 }
@@ -1008,11 +1064,12 @@ function renderFinalOverview() {
   const settings=packForPreset()?.settings||{};
   const setValue=(id,value)=>{const el=$(id);if(el)el.value=String(value??'');};
   const setChecked=(id,value)=>{const el=$(id);if(el)el.checked=!!value;};
-  setValue('pack-document-title',settings.documentTitle||presetLabel());setValue('pack-document-subtitle',settings.documentSubtitle||'');setValue('pack-output-pattern',settings.outputFileNamePattern||(state?.language==='en'?'{projectId}_E_{targetName}.pdf':'{projectId}_J_{targetName}.pdf'));
-  setChecked('pack-include-cover',settings.includeCover);setChecked('pack-include-toc',settings.includeToc);setChecked('pack-include-section-dividers',settings.includeSectionDividers);
+  setValue('pack-output-pattern',settings.outputFileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');
   const entries=activeTargetDefinitions().map(target=>({target,volume:targetVolume(target.targetId),ready:volumeReadiness(targetVolume(target.targetId))}));
-  renderFinalPreflight(entries);
-  const grid=$('final-target-grid');if(grid)grid.innerHTML=entries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${escapeHtml(target.displayName||target.targetId)}だけ出力</button><button class="btn secondary hidden" type="button" data-final-publish>共有発行</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const preflight=renderFinalPreflight(entries);
+  const unassigned=Number(preflight?.unassigned||0);
+  const visibleEntries=entries.filter(entry=>entry.target?.required!==false||Number(entry.ready?.pageCount||0)>0);
+  const grid=$('final-target-grid');if(grid)grid.innerHTML=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
   const renderFreshness=(ready,card)=>{
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
     const blockers=asArray(ready.blockers),reasons=asArray(ready.staleReasons).slice(0,3);const display=String(ready.displayState||'not-built');
@@ -1021,39 +1078,91 @@ function renderFinalOverview() {
     else if(display==='blocked'){title='提出用PDFを出力できません';cls='danger';body=`<ul class="blocker-list">${blockers.slice(0,3).map(b=>`<li>${escapeHtml(b.message||'出力条件を確認してください。')}</li>`).join('')}</ul>`;}
     else if(display==='needs-rebuild'){title='再出力が必要';cls='attention';body=reasons.length?`<ul class="reason-list">${reasons.map(r=>`<li><span>${escapeHtml(r.detail||'入力が変更されました')}</span><time>${escapeHtml(formatDateTime(r.at))}</time></li>`).join('')}</ul>`:'入力が変更されています。';}
     else if(display==='output-missing'){title='前回出力が見つかりません';cls='attention';body='ファイルが削除または移動されています。もう一度出力してください。';}
+    else if(unassigned){title=`要確認：未振り分け ${unassigned}ページ`;cls='attention';body='このまま出力すると、未振り分けページはPDFに入りません。';}
     else if(display==='built'){title='提出用PDFは最新です';body=`最終出力 ${escapeHtml(formatDateTime(ready.lastBuiltAt))}`;}
     const dot=cls==='neutral'?'':'<span class="status-dot"></span>';
     box.innerHTML=`<div class="freshness-title ${cls}">${dot}${escapeHtml(title)}</div>${typeof body==='string'&&body.startsWith('<')?body:`<p class="caption">${escapeHtml(body)}</p>`}`;
     if(btn)btn.disabled=Number(ready.pageCount||0)===0||blockers.length>0;
     if(fix)fix.classList.toggle('hidden',blockers.length===0||Number(ready.pageCount||0)===0);
   };
-  for(const entry of entries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
-  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn)allBtn.disabled=(buildable.length===0||buildable.some(ready=>asArray(ready.blockers).filter(blocker=>String(blocker.code||'')!=='no-pages').length>0));
+  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
+  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0;allBtn.className=`btn ${unassigned&&!hardProblems?'secondary':'primary'}`;allBtn.textContent=hardProblems?`先に${hardProblems}項目を確認`:unassigned?`未振り分け ${unassigned}ページを確認`:'最終PDFをまとめて作る';}
   const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)} ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力履歴はありません。</div>';}
+  renderPackReview();
   renderVolumeLinks();
 }
 
 function renderFinalPreflight(entries=[]) {
-  const summary=$('final-preflight-summary'),list=$('final-preflight-list');if(!summary||!list)return;
+  const summary=$('final-preflight-summary'),list=$('final-preflight-list');if(!summary||!list)return {ready:false,problemCount:0,hardProblemCount:0,unassigned:0};
   const workbooks=workbooksForActivePreset(),requirements=activeSourceRequirements(),requiredRequirements=requirements.filter(item=>item?.required!==false);
+  const requiredWorkbooks=workbooks.filter(workbook=>workbook?.required!==false);
   const missingRequired=requiredRequirements.filter(requirement=>!workbooks.some(workbook=>String(workbook?.requirementId||'')===String(requirement?.requirementId||'')&&String(workbook?.status||'')!=='missing'));
   const conversionPending=workbooks.filter(workbook=>!isLatestPdfWorkbook(workbook));
   const unassigned=unresolvedPageCount();
   const requiredTargets=entries.filter(entry=>entry.target?.required!==false),emptyRequiredTargets=requiredTargets.filter(entry=>Number(entry.ready?.pageCount||0)===0);
   const blockedTargets=entries.filter(entry=>Number(entry.ready?.pageCount||0)>0&&asArray(entry.ready?.blockers).filter(blocker=>String(blocker?.code||'')!=='no-pages').length>0);
-  const settings=packForPreset()?.settings||{},title=String(settings.documentTitle||presetLabel()).trim(),pattern=String(settings.outputFileNamePattern||(state?.language==='en'?'{projectId}_E_{targetName}.pdf':'{projectId}_J_{targetName}.pdf')).trim();
+  const settings=packForPreset()?.settings||{},pattern=String(settings.outputFileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf').trim();
   const checks=[];
-  checks.push({label:'必須原稿',state:missingRequired.length?'danger':'ok',detail:requiredRequirements.length?(missingRequired.length?`${missingRequired.length}件が未提出です`:`${requiredRequirements.length}件すべて提出済みです`):'必須原稿の指定はありません',view:'excel'});
+  checks.push({label:'必須原稿',state:missingRequired.length?'danger':'ok',detail:requiredRequirements.length?(missingRequired.length?`${missingRequired.length}件が未提出です`:`必要原稿 ${requiredRequirements.length}件を提出済みです`):(requiredWorkbooks.length?`${requiredWorkbooks.length}件を必須原稿として管理しています`:'必須原稿の指定はありません'),view:'excel'});
   checks.push({label:'変換PDF',state:workbooks.length===0||conversionPending.length?'danger':'ok',detail:workbooks.length===0?'原稿がまだ登録されていません':conversionPending.length?`${conversionPending.length}件の作成・更新が必要です`:`${workbooks.length}件すべて最新です`,view:'excel'});
   checks.push({label:'ページ構成',state:unassigned?'attention':'ok',detail:unassigned?`${unassigned}ページが未振り分けです`:'未振り分けページはありません',view:'pages'});
   const targetProblems=emptyRequiredTargets.length+blockedTargets.length;
   checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':'excel'});
-  checks.push({label:'仕上げ設定',state:title&&pattern?'ok':'danger',detail:title&&pattern?`資料名「${title}」・出力名を設定済み`:'資料タイトルと出力ファイル名を設定してください',view:'final'});
-  const problemCount=checks.filter(check=>check.state!=='ok').length,ready=problemCount===0;
+  checks.push({label:'出力ファイル名',state:pattern?'ok':'danger',detail:pattern?'出力名を設定済み':'出力ファイル名を設定してください',view:'final'});
+  const problems=checks.filter(check=>check.state!=='ok'),completed=checks.filter(check=>check.state==='ok');
+  const problemCount=problems.length,hardProblemCount=problems.filter(check=>check.label!=='ページ構成').length,ready=problemCount===0;
   summary.className=`final-preflight-summary ${ready?'ready':'attention'}`;
   summary.innerHTML=`<div><strong>${ready?'出力準備が整っています':'出力前に確認が必要です'}</strong><span>${ready?'すべての確認項目を満たしています。':`${problemCount}項目を確認してください。`}</span></div>${badge(ready?'準備完了':`${problemCount}項目`,ready?'ok':'attention')}<time>確認 ${escapeHtml(finalPreflightCheckedAt?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`;
-  list.innerHTML=checks.map(check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ghost compact" type="button" data-preflight-view="${escapeAttr(check.view)}">確認する</button>`}</div>`).join('');
+  const row=check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ${check.label==='ページ構成'?'primary':'secondary'} compact" type="button" data-preflight-view="${escapeAttr(check.view)}" aria-label="${escapeAttr(`${check.label}を確認する`)}">${check.label==='ページ構成'?`${unassigned}ページを確認`:`${check.label}を確認`}</button>`}</div>`;
+  list.innerHTML=problems.map(row).join('')+(completed.length?`<details class="preflight-complete" ${ready?'open':''}><summary>確認済み ${completed.length}項目</summary><div>${completed.map(row).join('')}</div></details>`:'');
   list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>setActiveView(String(button.dataset.preflightView||'final'))));
+  return {ready,problemCount,hardProblemCount,unassigned,checks};
+}
+
+function renderPackReview(){
+  const review=packReviewState,summary=$('pack-review-summary'),eventsBox=$('pack-review-events'),statusBadge=$('pack-review-status'),summaryLabel=$('pack-review-summary-label');
+  const buttons={submit:$('pack-review-submit'),approve:$('pack-review-approve'),changes:$('pack-review-request-changes'),reopen:$('pack-review-reopen')};
+  if(!summary||!eventsBox||!statusBadge)return;
+  if(!review||String(review.packId||'')!==String(activePackRecord()?.packId||'')){
+    if(summaryLabel)summaryLabel.textContent='状態を確認中';
+    statusBadge.className='badge neutral';statusBadge.textContent='状態取得中';summary.innerHTML='<p class="caption">レビュー状態を確認しています。</p>';eventsBox.innerHTML='<div class="empty-state">読み込んでいます。</div>';
+    Object.values(buttons).forEach(button=>{if(button)button.disabled=true;});return;
+  }
+  const labels={draft:'下書き','in-review':'レビュー中',approved:'承認済み','changes-requested':'差し戻し',stale:'提出後に更新あり'};
+  const classes={draft:'neutral','in-review':'attention',approved:'ok','changes-requested':'danger',stale:'danger'};
+  const status=String(review.status||'draft');statusBadge.className=`badge ${classes[status]||'neutral'}`;statusBadge.textContent=labels[status]||status;
+  if(summaryLabel)summaryLabel.textContent=status==='draft'?'提出や承認を記録する場合':labels[status]||status;
+  const targets=asArray(review.targetStates),readyCount=targets.filter(target=>target.ready).length;
+  const details=[];
+  if(status==='in-review')details.push(`${formatDateTime(review.submittedAt)} に ${review.submittedBy||'利用者'} が提出`);
+  if(status==='approved')details.push(`${formatDateTime(review.approvedAt)} に ${review.approvedBy||'利用者'} が承認`);
+  if(status==='stale')details.push('レビュー提出後に原稿・ページ構成・出力が変わりました。再出力して再提出してください。');
+  if(status==='changes-requested')details.push('差し戻し内容を反映し、提出用PDFを最新にして再提出してください。');
+  if(review.note)details.push(`最新コメント：${review.note}`);
+  const draftGuidance=review.canSubmit?'レビュー提出の準備ができています。コメントは任意です。':'最新の提出用PDFを作成するとレビューへ提出できます。';
+  summary.innerHTML=`<div><strong>必須出力 ${readyCount} / ${targets.length}件が最新</strong><span>${escapeHtml(details.join(' ')||draftGuidance)}</span></div>`;
+  if(buttons.submit)buttons.submit.disabled=!review.canSubmit||status==='in-review'||status==='approved';
+  if(buttons.approve)buttons.approve.disabled=status!=='in-review';
+  if(buttons.changes)buttons.changes.disabled=!['in-review','approved'].includes(status);
+  if(buttons.reopen)buttons.reopen.disabled=status==='draft';
+  const actionLabels={submit:'レビュー提出',approve:'承認','request-changes':'差し戻し',reopen:'下書きへ戻す'};
+  const rows=asArray(review.events).slice().reverse();
+  eventsBox.innerHTML=rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${escapeHtml(event.actor||'利用者')}${event.note?`・${escapeHtml(event.note)}`:''}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">レビュー操作はまだありません。</div>';
+}
+
+async function performPackReviewAction(action,button){
+  const pack=activePackRecord();if(!pack?.packId)return;
+  const note=String($('pack-review-note')?.value||'').trim();
+  if(action==='request-changes'&&!note){showMessage('warn','差し戻し理由を入力してください','コメント欄へ修正が必要な内容を入力してください。');$('pack-review-note')?.focus();return;}
+  await runBusy(button,async()=>{
+    const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}/review`,{method:'POST',body:{action,note}});
+    if(response.state)state=normalizeStatePayload(response.state);
+    packReviewState=response.review||null;
+    if($('pack-review-note'))$('pack-review-note').value='';
+    renderAll();renderPackReview();
+    const labels={submit:'レビューへ提出しました',approve:'資料パックを承認しました','request-changes':'修正を依頼しました',reopen:'下書きへ戻しました'};
+    showMessage(action==='request-changes'?'warn':'ok',labels[action]||'レビュー状態を更新しました',pack.displayName||'資料パック');
+  },false);
 }
 
 async function refreshFinalPreflight(btn) {
@@ -1072,10 +1181,13 @@ async function refreshFinalPreflight(btn) {
 function updateBulkSelectionLabel() {
   const count = selectedPages.size;
   const el = $('bulk-selected-count');
-  if (el) el.textContent = count ? `${count}ページ選択・ドラッグでまとめて移動` : 'カードをドラッグして移動';
+  if (el) el.textContent = count ? `${count}ページ選択中。移動先を押してください` : 'ページをクリックして選択';
   const bar = $('page-command-bar');
   if (bar) bar.classList.toggle('has-selection', count > 0);
-  document.querySelectorAll('[data-bulk-target],#bulk-none-btn,#clear-selected-pages-btn').forEach(button=>button.disabled=count===0);
+  document.querySelectorAll('[data-bulk-target],#bulk-none-btn,#clear-selected-pages-btn').forEach(button=>{
+    const destination=button.matches('#bulk-none-btn')?'none':String(button.dataset.bulkTarget||'');
+    button.disabled=count===0||(destination&&destination===activePageVolume);
+  });
   const undoEntry=pageLayoutUndoStack[pageLayoutUndoStack.length-1],redoEntry=pageLayoutRedoStack[pageLayoutRedoStack.length-1],undo=$('page-layout-undo-btn'),redo=$('page-layout-redo-btn');
   if(undo){undo.disabled=pageLayoutHistoryBusy||!undoEntry;undo.title=undoEntry?`${undoEntry.label}を元に戻す（Ctrl+Z）`:'元に戻せるページ構成変更はありません';undo.setAttribute('aria-label',undo.title);}
   if(redo){redo.disabled=pageLayoutHistoryBusy||!redoEntry;redo.title=redoEntry?`${redoEntry.label}をやり直す（Ctrl+Shift+Z）`:'やり直せるページ構成変更はありません';redo.setAttribute('aria-label',redo.title);}
@@ -1083,8 +1195,8 @@ function updateBulkSelectionLabel() {
 
 async function savePackSettings(btn){
   const pack=packForPreset();if(!pack?.packId){showMessage('danger','資料パック設定を保存できません','対象の資料パックが見つかりません。');return;}
-  const body={documentTitle:String($('pack-document-title')?.value||'').trim(),documentSubtitle:String($('pack-document-subtitle')?.value||'').trim(),outputFileNamePattern:String($('pack-output-pattern')?.value||'').trim(),includeCover:!!$('pack-include-cover')?.checked,includeToc:!!$('pack-include-toc')?.checked,includeSectionDividers:!!$('pack-include-section-dividers')?.checked};
-  if(!body.documentTitle){showMessage('warn','資料タイトルを入力してください','表紙を付けない場合も、PDFの資料名として使用します。');$('pack-document-title')?.focus();return;}
+  const body={outputFileNamePattern:String($('pack-output-pattern')?.value||'').trim()};
+  if(!body.outputFileNamePattern){showMessage('warn','出力ファイル名を入力してください','使用できる変数は {packName}・{targetName}・{yyyyMMdd} です。');$('pack-output-pattern')?.focus();return;}
   await runBusy(btn,async()=>{try{const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}`,{method:'PATCH',body});state=normalizeStatePayload(response.state||await api('/api/state'));renderAll();showMessage('ok','資料の仕上げ設定を保存しました','次回の提出用PDF出力から反映されます。');}catch(error){showMessage('danger','資料の仕上げ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
 }
 function requiredRenderProfileVersion(source) {
@@ -1128,6 +1240,38 @@ function confirmAction({title='操作を実行しますか？',message='',detail
   return new Promise(resolve=>{confirmResolver=resolve;});
 }
 
+function closeAppMenu(focusButton=false){
+  const popover=$('app-menu-popover'),button=$('app-menu-button');
+  if(!popover||popover.classList.contains('hidden'))return;
+  popover.classList.add('hidden');button?.setAttribute('aria-expanded','false');
+  if(focusButton)button?.focus();
+}
+function appHasActiveWork(){
+  return renderJobActive||!!activeRenderJobId||!!document.querySelector('.btn.busy');
+}
+async function requestAppShutdown(button){
+  closeAppMenu();
+  if(appHasActiveWork()){
+    showMessage('warn','処理中は終了できません','実行中の処理が完了するか、PDF作成を中止してから終了してください。');
+    return;
+  }
+  const accepted=await confirmAction({title:'ReportBinderを終了しますか？',message:'アプリのバックグラウンド処理を終了します。',detail:'編集中の入力内容を確認してから終了してください。作成済みのPDFや保存済みのページ構成は保持されます。',confirmLabel:'終了する',danger:true});
+  if(!accepted)return;
+  if(appHasActiveWork()){
+    showMessage('warn','処理が開始されたため終了できません','実行中の処理が完了してから、もう一度終了してください。');
+    return;
+  }
+  if(button){button.disabled=true;button.classList.add('busy');}
+  try{
+    await api('/api/shutdown',{method:'POST',body:{reason:'user-menu'},keepalive:true});
+    document.body.classList.add('app-ended');
+    const screen=$('shutdown-screen');screen?.classList.remove('hidden');screen?.focus();
+  }catch(error){
+    showMessage('danger','ReportBinderを終了できませんでした',userFriendlyError(error.message),error.detail||error.message);
+    if(button){button.disabled=false;button.classList.remove('busy');}
+  }
+}
+
 function findPackForManagement(packId) {
   const id=String(packId||'');
   return packAdminPacks.find(pack=>String(pack?.packId||'')===id)
@@ -1141,16 +1285,23 @@ function updatePackTemplateDescription() {
 }
 function openPackEditor(mode='create',packId='') {
   const modal=$('pack-editor-modal');if(!modal)return;
+  if(mode!=='rename'&&!configured()){
+    setActiveView('excel');
+    showMessage('warn','先に原稿フォルダを選んでください','フォルダを選ぶと、続けて今回まとめる一式に名前を付けられます。');
+    setTimeout(()=>$('change-source-folder-btn')?.focus(),0);
+    return;
+  }
   const pack=findPackForManagement(packId);
   if(mode==='rename'&&!pack){showMessage('warn','資料パックが見つかりません','一覧を読み込み直してください。');return;}
   packEditorMode=mode==='rename'?'rename':'create';packEditorPackId=packEditorMode==='rename'?String(pack.packId||''):'';packEditorReturnFocus=$('pack-menu-button')||document.activeElement;
-  $('pack-editor-title').textContent=packEditorMode==='rename'?'資料パック名を変更':'新しい資料パック';
-  $('pack-editor-description').textContent=packEditorMode==='rename'?'packIdや登録情報を変えず、画面に表示する名前だけを変更します。':'用途が分かる名前を付けてください。';
+  $('pack-editor-title').textContent=packEditorMode==='rename'?'一式の名前を変更':'今回まとめる一式に名前を付ける';
+  $('pack-editor-description').textContent=packEditorMode==='rename'?'登録した原稿やページの順番はそのまま、表示する名前だけを変更します。':'会議名や提出先など、あとで見つけやすい名前を付けます。';
   const name=$('pack-editor-name');if(name)name.value=packEditorMode==='rename'?String(pack.displayName||''):'';
-  const field=$('pack-editor-template-field');field?.classList.toggle('hidden',packEditorMode==='rename');
   const select=$('pack-editor-template');
+  const templates=asArray(state?.packTemplates);
+  const field=$('pack-editor-template-field');field?.classList.toggle('hidden',packEditorMode==='rename'||templates.length<=1);
   if(select){
-    const templates=asArray(state?.packTemplates);select.innerHTML=templates.map(template=>`<option value="${escapeAttr(template.templateId||'')}">${escapeHtml(template.displayName||template.templateId||'ひな形')}</option>`).join('');
+    select.innerHTML=templates.map(template=>`<option value="${escapeAttr(template.templateId||'')}">${escapeHtml(template.displayName||template.templateId||'ひな形')}</option>`).join('');
     select.value=packEditorMode==='rename'?String(pack?.templateId||''):String(templates.find(template=>String(template.templateId)==='builtin-generic-department-pack')?.templateId||templates[0]?.templateId||'');
   }
   $('pack-editor-save').textContent=packEditorMode==='rename'?'名前を変更':'作成';updatePackTemplateDescription();
@@ -1174,15 +1325,16 @@ async function submitPackEditor(btn) {
     const createdName=String(response?.result?.displayName||name),wasRename=packEditorMode==='rename';
     closePackEditor(false);await refreshPacksAfterMutation();
     if(!wasRename&&response?.result?.packId)await applyPresetSelection(String(response.result.packId));
-    showMessage('ok',wasRename?'資料パック名を変更しました':'資料パックを作成しました',wasRename?`${createdName}として表示します。`:`${createdName}へ切り替えました。続けて原稿を登録できます。`);
+    if(!wasRename){setActiveView('excel');if(!availableFiles.length)await loadFilesSilently();}
+    showMessage('ok',wasRename?'名前を変更しました':'今回まとめる一式を作成しました',wasRename?`${createdName}として表示します。`:`「${createdName}」にまとめる原稿を選んでください。`);
   },false);
 }
-const templateManagerFieldIds=['template-name','template-description','template-source-excel','template-source-word','template-source-powerpoint','template-source-pdf','template-new-destination','template-output-pattern','template-block-stale','template-block-failed','template-include-toc'];
+const templateManagerFieldIds=['template-name','template-description','template-source-excel','template-source-word','template-source-powerpoint','template-source-pdf','template-new-destination','template-output-pattern','template-block-stale','template-block-failed'];
 function newTemplateTarget(){return {targetId:`output_${Date.now().toString(16).slice(-8)}`,displayName:'',required:false};}
 function collectTemplateTargets(){return [...document.querySelectorAll('[data-template-target]')].map(row=>({targetId:String(row.querySelector('[data-target-id]')?.value||'').trim().toLowerCase(),displayName:String(row.querySelector('[data-target-name]')?.value||'').trim(),required:!!row.querySelector('[data-target-required]')?.checked}));}
 function templateTargetOptions(selected='unassigned'){return `<option value="unassigned" ${selected==='unassigned'?'selected':''}>未振り分け</option>${collectTemplateTargets().filter(target=>target.targetId).map(target=>`<option value="${escapeAttr(target.targetId)}" ${selected===target.targetId?'selected':''}>${escapeHtml(target.displayName||target.targetId)}</option>`).join('')}`;}
 function renderTemplateTargets(targets=[],readOnly=false){
-  const box=$('template-targets-list');if(!box)return;const items=asArray(targets).length?asArray(targets):[{targetId:'main',displayName:state?.language==='en'?'Main':'本体',required:true},{targetId:'appendix',displayName:state?.language==='en'?'Appendix':'補足',required:false}];box.innerHTML=items.map((target,index)=>`<div class="template-target-row" data-template-target><label><span>出力先ID</span><input data-target-id type="text" maxlength="48" pattern="[a-z0-9][a-z0-9_-]*" value="${escapeAttr(target.targetId||'')}" ${readOnly?'disabled':''}></label><label><span>表示名</span><input data-target-name type="text" maxlength="60" value="${escapeAttr(target.displayName||'')}" ${readOnly?'disabled':''}></label><label class="template-check"><input data-target-required type="checkbox" ${target.required?'checked':''} ${readOnly?'disabled':''}> 必須</label><button class="btn ghost compact" type="button" data-remove-target ${readOnly||items.length<=1?'disabled':''}>削除</button></div>`).join('');
+  const box=$('template-targets-list');if(!box)return;const items=asArray(targets).length?asArray(targets):[{targetId:'main',displayName:'本体',required:true},{targetId:'appendix',displayName:'補足',required:false}];box.innerHTML=items.map((target,index)=>`<div class="template-target-row" data-template-target><label><span>出力先ID</span><input data-target-id type="text" maxlength="48" pattern="[a-z0-9][a-z0-9_-]*" value="${escapeAttr(target.targetId||'')}" ${readOnly?'disabled':''}></label><label><span>表示名</span><input data-target-name type="text" maxlength="60" value="${escapeAttr(target.displayName||'')}" ${readOnly?'disabled':''}></label><label class="template-check"><input data-target-required type="checkbox" ${target.required?'checked':''} ${readOnly?'disabled':''}> 必須</label><button class="btn ghost compact" type="button" data-remove-target ${readOnly||items.length<=1?'disabled':''}>削除</button></div>`).join('');
   box.querySelectorAll('[data-remove-target]').forEach((button,index)=>button.addEventListener('click',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned'),next=collectTemplateTargets().filter((_,itemIndex)=>itemIndex!==index);renderTemplateTargets(next,false);renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,false);}));
   box.querySelectorAll('[data-target-id],[data-target-name]').forEach(input=>input.addEventListener('change',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned');renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,readOnly);}));
 }
@@ -1203,7 +1355,7 @@ function populateTemplateManager(){
   const t=templateManagerSelected(),builtIn=!!t?.builtIn,targets=asArray(t?.targets),rules=t?.rules||{},output=t?.output||{},sourceTypes=asArray(t?.acceptedSourceTypes).map(String);
   const setValue=(id,value)=>{const el=$(id);if(el)el.value=String(value??'');},setChecked=(id,value)=>{const el=$(id);if(el)el.checked=!!value;};
   setValue('template-name',t?.displayName||'');setValue('template-description',t?.description||'');setChecked('template-source-excel',t?sourceTypes.includes('excel'):true);setChecked('template-source-word',t?sourceTypes.includes('word'):true);setChecked('template-source-powerpoint',t?sourceTypes.includes('powerpoint'):true);setChecked('template-source-pdf',t?sourceTypes.includes('pdf'):true);
-  renderTemplateTargets(targets,builtIn);renderTemplateDestinationOptions(rules.newItemDestination||'unassigned');setValue('template-output-pattern',output.fileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');setChecked('template-block-stale',t?rules.blockBuildWhenRequiredSourceIsStale:true);setChecked('template-block-failed',t?rules.blockBuildWhenRequiredSourceFailed:true);setChecked('template-include-toc',output.tableOfContents);
+  renderTemplateTargets(targets,builtIn);renderTemplateDestinationOptions(rules.newItemDestination||'unassigned');setValue('template-output-pattern',output.fileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');setChecked('template-block-stale',t?rules.blockBuildWhenRequiredSourceIsStale:true);setChecked('template-block-failed',t?rules.blockBuildWhenRequiredSourceFailed:true);
   renderTemplateRequirements(t?.sourceRequirements||[],builtIn);
   templateManagerFieldIds.forEach(id=>{const el=$(id);if(el)el.disabled=builtIn;});const save=$('template-manager-save'),remove=$('template-manager-delete'),duplicate=$('template-manager-duplicate'),exportButton=$('template-manager-export'),stateText=$('template-manager-state'),usageCount=t?asArray(packAdminPacks.length?packAdminPacks:state?.packs).filter(pack=>String(pack?.templateId||'')===String(t.templateId||'')).length:0;if(save){save.disabled=builtIn;save.textContent=t?'変更を保存':'作成';}if(remove)remove.classList.toggle('hidden',!t||builtIn);if(duplicate)duplicate.classList.toggle('hidden',!t);if(exportButton)exportButton.classList.toggle('hidden',!t);if(stateText)stateText.textContent=builtIn?`組み込みひな形・使用中 ${usageCount}件。内容を基にする場合は「複製」を選んでください。`:(t?`バージョン ${Number(t.templateVersion||1)}・使用中 ${usageCount}件・変更は新しく作る資料パックから反映されます。`:'新しいひな形を作成します。');
   const addRequirement=$('template-add-requirement'),addTarget=$('template-add-target');if(addRequirement)addRequirement.disabled=builtIn;if(addTarget)addTarget.disabled=builtIn;
@@ -1212,7 +1364,7 @@ function openTemplateManager(){const modal=$('template-manager-modal');if(!modal
 function closeTemplateManager(returnFocus=true){const modal=$('template-manager-modal');if(!modal||modal.classList.contains('hidden'))return;modal.classList.add('hidden');const focus=templateManagerReturnFocus;templateManagerReturnFocus=null;if(returnFocus&&focus?.isConnected&&typeof focus.focus==='function')focus.focus();}
 function templateManagerRequest(){
   const acceptedSourceTypes=[['template-source-excel','excel'],['template-source-word','word'],['template-source-powerpoint','powerpoint'],['template-source-pdf','pdf']].filter(([id])=>!!$(id)?.checked).map(([,type])=>type);
-  return {displayName:String($('template-name')?.value||'').trim(),description:String($('template-description')?.value||'').trim(),acceptedSourceTypes,sourceRequirements:collectTemplateRequirements(),targets:collectTemplateTargets(),rules:{newItemDestination:String($('template-new-destination')?.value||'unassigned'),retainManualOrder:true,blockBuildWhenRequiredSourceIsStale:!!$('template-block-stale')?.checked,blockBuildWhenRequiredSourceFailed:!!$('template-block-failed')?.checked},output:{fileNamePattern:String($('template-output-pattern')?.value||'').trim(),pageNumbering:'continuous',bookmarks:'from-items',tableOfContents:!!$('template-include-toc')?.checked}};
+  return {displayName:String($('template-name')?.value||'').trim(),description:String($('template-description')?.value||'').trim(),acceptedSourceTypes,sourceRequirements:collectTemplateRequirements(),targets:collectTemplateTargets(),rules:{newItemDestination:String($('template-new-destination')?.value||'unassigned'),retainManualOrder:true,blockBuildWhenRequiredSourceIsStale:!!$('template-block-stale')?.checked,blockBuildWhenRequiredSourceFailed:!!$('template-block-failed')?.checked},output:{fileNamePattern:String($('template-output-pattern')?.value||'').trim(),pageNumbering:'continuous',bookmarks:'from-items'}};
 }
 async function submitTemplateManager(btn){
   const body=templateManagerRequest(),selected=templateManagerSelected();if(!body.displayName){showMessage('warn','ひな形名を入力してください','用途が分かる名前を入力してください。');$('template-name')?.focus();return;}if(!body.acceptedSourceTypes.length){showMessage('warn','原稿形式を選んでください','Excel・Word・PowerPoint・PDFから1つ以上選択してください。');return;}
@@ -1393,9 +1545,13 @@ function reconcileActivePackSelection() {
     || workflowPacks.find(pack => String(pack?.category || '').toLowerCase() === String(activePreset || '').toLowerCase())
     || workflowPacks[0]
     || null;
-  if (!selected) return null;
+  if (!selected) {
+    activePackId='';activePreset='';
+    try { sessionStorage.removeItem('ReportBinderPackId');sessionStorage.removeItem('ReportBinderCategory'); } catch {}
+    return null;
+  }
   activePackId = String(selected.packId || '');
-  if(String(selected.category||''))activePreset = String(selected.category).toLowerCase();
+  activePreset = String(selected.category||'').toLowerCase();
   try {
     sessionStorage.setItem('ReportBinderPackId', activePackId);
     sessionStorage.setItem('ReportBinderCategory', activePreset);
@@ -1403,7 +1559,7 @@ function reconcileActivePackSelection() {
   return selected;
 }
 function presetLabel(preset = activePreset) {
-  return String(packForPreset(preset)?.displayName || ({ecm:'ECM', bod:'BOD', dmm:'DMM'})[preset] || 'ECM');
+  return String(packForPreset(preset)?.displayName || '資料パック未作成');
 }
 function sourceTypeValue(source) {
   const explicit = String(source?.sourceType || '').trim().toLowerCase();
@@ -1467,7 +1623,9 @@ function packMenuRow(pack, archived=false) {
 }
 function renderPackSwitcher() {
   const selected=activePackRecord();
-  const label=$('active-pack-name');if(label)label.textContent=String(selected?.displayName||presetLabel());
+  const label=$('active-pack-name'),button=$('pack-menu-button');
+  if(label)label.textContent=String(selected?.displayName||(configured()?'名前を付ける':'未作成'));
+  if(button){button.disabled=!configured()&&!selected;button.classList.toggle('empty',!selected);button.setAttribute('aria-label',selected?`資料パック「${String(selected.displayName||'名称未設定')}」を切り替え・管理`:(configured()?'今回まとめる資料パックに名前を付ける':'原稿フォルダを設定すると資料パックを作成できます'));button.setAttribute('aria-haspopup',selected?'dialog':'true');}
   const all=packAdminPacks.length?packAdminPacks:asArray(state?.packs);
   const active=all.filter(pack=>!pack?.archived),archived=all.filter(pack=>!!pack?.archived);
   const list=$('pack-menu-list');if(list)list.innerHTML=active.length?active.map(pack=>packMenuRow(pack,false)).join(''):'<div class="pack-menu-empty">使用できる資料パックがありません。</div>';
@@ -1489,6 +1647,8 @@ async function loadPackAdminPacks() {
 }
 async function togglePackMenu() {
   const menu=$('pack-menu'),button=$('pack-menu-button');if(!menu||!button)return;
+  if(!configured()){setActiveView('excel');setTimeout(()=>$('change-source-folder-btn')?.focus(),0);return;}
+  if(!activePackRecord()&&!asArray(state?.packs).length){openPackEditor('create');return;}
   if(!menu.classList.contains('hidden')){closePackMenu(true);return;}
   menu.classList.remove('hidden');button.setAttribute('aria-expanded','true');renderPackSwitcher();
   try{await loadPackAdminPacks();}catch(error){showMessage('danger','資料パック一覧を読み込めません',userFriendlyError(error.message),error.detail||error.message);}
@@ -1635,14 +1795,6 @@ function clearVisibleFilesSelection() {
   syncFileSelectionUi();
   renderFileList(availableFiles);
 }
-function selectRenderNeededWorkbooks() {
-  const ids = defaultPdfTargetWorkbookIds();
-  selectedWorkbooks = new Set(ids.map(id => String(id || '')).filter(Boolean));
-  lastWorkbookRangeAnchor = ids[ids.length - 1] || '';
-  syncWorkbookSelectionUi();
-  if (ids.length) showMessage('ok', '作成が必要な原稿を選択しました', `${presetLabel()}で変換PDF作成が必要な${ids.length}件を選択しました。`);
-  else showMessage('ok', '変換PDF作成が必要な原稿はありません', '登録済み原稿の変換PDFは最新です。');
-}
 function clearWorkbookSelection() {
   selectedWorkbooks.clear();
   lastWorkbookRangeAnchor = '';
@@ -1695,7 +1847,7 @@ async function moveSelectedPagesToVolume(volume, btn) {
 
 async function loadFiles(btn) {
   if (!configured()) {
-    showMessage('warn', '提出フォルダを選んでください', '提出フォルダを選ぶと原稿を表示できます。');
+    showMessage('warn', '原稿フォルダを選んでください', 'フォルダを選ぶと原稿を表示できます。');
     return [];
   }
   await runBusy(btn, async () => {
@@ -1706,17 +1858,31 @@ async function loadFiles(btn) {
     renderFileList(availableFiles);
     renderFolderOverview();
     renderDashboardOverview();
-    showMessage(availableFiles.length ? 'ok' : 'warn', availableFiles.length ? '原稿一覧を更新しました' : '対応する原稿が見つかりません', '提出フォルダ直下の対応形式だけを表示しています。');
+    showMessage(availableFiles.length ? 'ok' : 'warn', availableFiles.length ? '原稿一覧を更新しました' : '対応する原稿が見つかりません', '原稿フォルダ直下の対応形式だけを表示しています。');
   }, false);
   return availableFiles;
 }
+function syncSourcePanelDensity() {
+  const grid=document.querySelector('.excel-grid'),unregisteredCard=document.querySelector('.unregistered-card'),registeredCard=document.querySelector('.registered-card');
+  if(!grid||!unregisteredCard||!registeredCard)return;
+  const unregisteredCount=configured()?visibleUnregisteredFiles(availableFiles).length:0;
+  const registeredCount=workbooksForActivePreset().length;
+  const showUnregistered=unregisteredCount>0||registeredCount===0;
+  const showRegistered=registeredCount>0;
+  unregisteredCard.classList.toggle('hidden',!showUnregistered);
+  registeredCard.classList.toggle('hidden',!showRegistered);
+  grid.classList.toggle('single-panel',showUnregistered!==showRegistered);
+  const next=$('source-next-action'),needsPdf=workbooksForActivePreset().filter(workbook=>!isLatestPdfWorkbook(workbook)).length;
+  if(next)next.classList.toggle('hidden',registeredCount===0||needsPdf>0);
+}
 function renderFileList(files) {
+  queueMicrotask(syncSourcePanelDensity);
   const box = $('file-list');
   if (!box) return;
   updatePresetTabs();
   if (!configured()) {
     box.className = 'table-shell empty-state';
-    box.textContent = '提出フォルダを選んでください。';
+    box.textContent = '上の「フォルダを選ぶ」から原稿フォルダを設定してください。';
     setFileSelectionSummary(0, 0);
     return;
   }
@@ -1787,7 +1953,7 @@ async function applyPresetSelection(presetOrButton) {
   const pack=asArray(state?.packs).find(item=>String(item?.packId||'')===String(requested))
     || asArray(state?.packs).find(item=>String(item?.category||'').toLowerCase()===String(requested||'').toLowerCase());
   if(!pack?.workflowAvailable){showMessage('warn','この資料パックは利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
-  const preset=String(pack.category||activePreset||'ecm').toLowerCase();
+  const preset=String(pack.category||'').toLowerCase();
   const nextPackId=String(pack.packId||'');const presetChanged=preset!==activePreset||nextPackId!==activePackId;
   if(presetChanged&&pendingPageLayoutUndo){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}await saveBoardOrder();}
   activePreset=preset;activePackId=nextPackId;try{sessionStorage.setItem('ReportBinderCategory',activePreset);sessionStorage.setItem('ReportBinderPackId',activePackId);}catch{}
@@ -1798,6 +1964,7 @@ async function applyPresetSelection(presetOrButton) {
     historyPanelsInitialized=false;
     snapshotHistoryLoadSerial++;
   }
+  if(activeView==='final'&&presetChanged){packReviewState=null;void loadPackReview();}
   renderAll();
 }
 
@@ -1850,12 +2017,11 @@ function addedSheetSet(workbookId){
 function unknownSheetSet(workbookId){
   return new Set(asArray(changeSummaryFor(workbookId)?.unknownSheets).map(String));
 }
-function changeBadgeForWorkbook(w){
+function comparisonSummaryForWorkbook(w){
   if (!state?.inputHistoryEnabled) return '';
   const cs = changeSummaryFor(w?.workbookId);
   if (!cs) return '';
-  const actionBadge=(text,cls='neutral')=>`<button class="badge change-action ${cls}" type="button" data-open-diff="${escapeAttr(w?.workbookId||'')}" aria-label="${escapeAttr(`${workbookDisplayName(w)}、${text}、差分詳細を開く`)}">${escapeHtml(text)}</button>`;
-  if (String(cs.status||'') !== 'complete') return actionBadge('比較不能','neutral');
+  if (String(cs.status||'') !== 'complete') return '見た目を比較できません';
   const addedNames=new Set(asArray(cs.addedSheets).map(String));
   const removedNames=new Set(asArray(cs.removedSheets).map(String));
   const unknownNames=new Set(asArray(cs.unknownSheets).map(String));
@@ -1865,15 +2031,10 @@ function changeBadgeForWorkbook(w){
   // Added and removed sheets are changes too. Keep them visible in the workbook
   // summary even though only a current (added) sheet can have a page row.
   const removed = removedNames.size;
-  if (changed > 0 || added > 0 || removed > 0) {
-    const parts = [];
-    if (changed > 0) parts.push(`変更 ${changed}`);
-    if (added > 0) parts.push(`追加 ${added}`);
-    if (removed > 0) parts.push(`削除 ${removed}`);
-    return actionBadge(`${parts.join(' / ')}${sourceUnitLabel(w)}`,'attention');
-  }
-  if (unknown > 0) return actionBadge(`判定不能 ${unknown}`,'neutral');
-  return actionBadge('変更なし','neutral');
+  const affected=changed+added+removed;
+  if (affected > 0) return `見た目変更 ${affected}${sourceUnitLabel(w)}`;
+  if (unknown > 0) return `見た目を判定できません ${unknown}${sourceUnitLabel(w)}`;
+  return '見た目変更なし';
 }
 function workbookPdfStatusCell(w){
   const status = String(w?.status || '');
@@ -1885,10 +2046,22 @@ function workbookPdfStatusCell(w){
     return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('PDF作成中','attention')}</div><div class="pdf-status-detail">完了後に差分を判定します</div></div>`;
   }
   if (!isLatestPdfWorkbook(w)) {
-    return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('変換PDF作成が必要','attention')}</div><div class="pdf-status-detail">差分は作成後に確認します</div></div>`;
+    return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('原稿更新あり','attention')}</div><div class="pdf-status-detail">PDFを再作成して更新を反映してください</div></div>`;
   }
-  const change = changeBadgeForWorkbook(w);
-  return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('変換PDFは最新','neutral')}${change}</div>${change?'<div class="pdf-status-detail">前回の変換PDFとの差分</div>':''}</div>`;
+  const change = comparisonSummaryForWorkbook(w);
+  const canCompare=String(changeSummaryFor(w?.workbookId)?.status||'')==='complete';
+  const comparisonLine=change?(canCompare?`<button class="pdf-comparison-link" type="button" data-open-history="${escapeAttr(w?.workbookId||'')}" aria-label="${escapeAttr(`${workbookDisplayName(w)}、${change}、詳細を見る`)}"><span>${escapeHtml(change)}</span><strong>詳細を見る</strong></button>`:`<div class="pdf-status-detail">${escapeHtml(change)}</div>`):'';
+  return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('変換PDFは最新','neutral')}</div>${comparisonLine}</div>`;
+}
+
+function openWorkbookComparisonHistory(workbookId){
+  const id=String(workbookId||'');if(!id)return;
+  snapshotHistoryState.workbookId=id;
+  snapshotHistoryState.snapshots=[];
+  snapshotHistoryState.fromId='';
+  snapshotHistoryState.toId='';
+  try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',id);}catch{}
+  setActiveView('history',{reloadPanels:true});
 }
 function pageChangeBadge(p){
   if (!state?.inputHistoryEnabled) return '';
@@ -1924,8 +2097,20 @@ function diffKindMeta(kind){
 }
 function diffFilteredSheets(){
   const sheets=asArray(diffViewState.detail?.sheets);
-  if(diffViewState.filter==='all')return sheets;
-  return sheets.filter(s=>String(s.kind||'')===diffViewState.filter);
+  let filtered=diffViewState.filter==='all'?sheets:diffViewState.filter==='confirmed'?sheets.filter(s=>!!s.confirmed):sheets.filter(s=>String(s.kind||'')===diffViewState.filter);
+  if(diffViewState.unreviewedOnly)filtered=filtered.filter(s=>!s.confirmed);
+  return filtered;
+}
+
+async function loadPackReview(){
+  const pack=activePackRecord();if(!state||!configured()||!pack?.packId)return;
+  const packId=String(pack.packId);
+  if(packReviewInFlight)return packReviewInFlight;
+  packReviewInFlight=api(`/api/v2/packs/${encodeURIComponent(packId)}/review`).then(response=>{
+    if(String(activePackRecord()?.packId||'')!==packId)return;
+    packReviewState=response.review||null;renderPackReview();
+  }).catch(error=>{log('レビュー状態の確認でエラー',error.detail||error.message);}).finally(()=>{packReviewInFlight=null;});
+  return packReviewInFlight;
 }
 function diffCurrentSheet(){
   const sheets=asArray(diffViewState.detail?.sheets);
@@ -1957,10 +2142,10 @@ function diffCsvCell(value){
 }
 function buildDiffSummaryCsv(detail,workbookName){
   const cmp=detail?.comparison||{},scope=String(cmp.scope||'')==='history'?'任意2版':'自動比較';
-  const headers=['原稿','比較種別','比較元日時','比較先日時','比較元項目','比較先項目','判定','対応確信度','対応方法','比較元ページ数','比較先ページ数','詳細'];
+  const headers=['原稿','比較種別','比較元日時','比較先日時','比較元項目','比較先項目','判定','確認状態','対応確信度','対応方法','比較元ページ数','比較先ページ数','詳細'];
   const rows=asArray(detail?.sheets).map(sheet=>{
     const kind=String(sheet?.kind||'unknown'),confidence=(kind==='added'||kind==='removed')?'':`${Math.round(Math.max(0,Math.min(1,Number(sheet?.matchConfidence??1)))*100)}%`;
-    return [workbookName,scope,formatDateTime(cmp.baselineAt),formatDateTime(cmp.currentAt),String(sheet?.beforeSheetName||''),String(sheet?.afterSheetName||''),diffKindMeta(kind).label,confidence,String(sheet?.matchMethod||''),Number(sheet?.beforePages||0),Number(sheet?.afterPages||0),String(sheet?.message||'')];
+    return [workbookName,scope,formatDateTime(cmp.baselineAt),formatDateTime(cmp.currentAt),String(sheet?.beforeSheetName||''),String(sheet?.afterSheetName||''),diffKindMeta(kind).label,sheet?.confirmed?'確認済み':'未確認',confidence,String(sheet?.matchMethod||''),Number(sheet?.beforePages||0),Number(sheet?.afterPages||0),String(sheet?.message||'')];
   });
   return [headers,...rows].map(row=>row.map(diffCsvCell).join(',')).join('\r\n');
 }
@@ -2007,6 +2192,11 @@ function diffSheetPageCount(sheet){
 function preferredDiffPageIndex(sheet){
   const pageCount=diffSheetPageCount(sheet);
   if(String(sheet?.kind||'')!=='modified'||pageCount<=1)return 0;
+  const mappedPages=asArray(sheet?.pages);
+  if(mappedPages.length){
+    const changed=mappedPages.findIndex(page=>String(page?.comparisonKind||'modified')!=='unchanged');
+    if(changed>=0)return changed;
+  }
   const unchanged=new Set(asArray(sheet?.unchangedPageNumbers).map(Number).filter(Number.isFinite));
   for(let pageNumber=1;pageNumber<=pageCount;pageNumber++)if(!unchanged.has(pageNumber))return pageNumber-1;
   return 0;
@@ -2384,7 +2574,7 @@ function buildColumnTextRowStructureDiffResult(beforeItems,afterItems,width,heig
   }
   return results.length===1?results[0]:empty;
 }
-function buildDocumentTextRowStructureDiffResult(beforePages,afterPages,width,height,pageNumber){
+function buildDocumentTextRowStructureDiffResult(beforePages,afterPages,width,height,beforePageNumber,afterPageNumber=beforePageNumber){
   const empty={regions:[],confident:false,documentChanged:false};
   if(!Array.isArray(beforePages)||!Array.isArray(afterPages)||Math.max(beforePages.length,afterPages.length)<2)return empty;
   const stride=height+20,pageCount=Math.max(beforePages.length,afterPages.length),totalHeight=stride*pageCount;
@@ -2396,16 +2586,24 @@ function buildDocumentTextRowStructureDiffResult(beforePages,afterPages,width,he
   }).map(item=>({...item,y:Number(item.y||0)+index*stride})));
   const result=buildTextRowStructureDiffResult(flatten(beforePages),flatten(afterPages),width,totalHeight);
   if(!result.confident)return empty;
-  const target=Math.max(0,Number(pageNumber||1)-1);
-  const localBox=box=>{
+  const localBox=(box,pageNumber)=>{
     if(!box)return null;
+    const target=Math.max(0,Number(pageNumber||1)-1);
     const absoluteY=Number(box.y||0)*totalHeight,index=Math.max(0,Math.min(pageCount-1,Math.floor(absoluteY/stride)));
     if(index!==target)return null;
     return {...box,y:Math.max(0,(absoluteY-index*stride)/height),height:Math.min(1,Number(box.height||0)*totalHeight/height)};
   };
   const regions=[];
   for(const region of result.regions){
-    const before=localBox(region.before),after=localBox(region.after);if(!before&&!after)continue;
+    let before=localBox(region.before,beforePageNumber),after=localBox(region.after,afterPageNumber);
+    // Row diff gives an added/removed row a synthetic box on the opposite side
+    // for overlay display. That box has no document-page identity, so decide
+    // membership from the side on which the row actually exists.
+    if(region.kind==='added'&&!after)continue;
+    if(region.kind==='removed'&&!before)continue;
+    if(!before&&!after)continue;
+    if(region.kind==='added'&&!before)before=after;
+    if(region.kind==='removed'&&!after)after=before;
     const combined=diffPdfTextBoxUnion([before,after]);
     regions.push({...region,...combined,before:before||after||combined,after:after||before||combined,source:'pdf-document-row'});
   }
@@ -2463,6 +2661,54 @@ function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
 }
 function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
   return buildNumericTextDiffResult(beforeItems,afterItems,width,height).regions;
+}
+function diffPdfTextItemDistance(before,after,width,height){
+  const beforeX=Number(before.x||0)+Number(before.width||0)/2,afterX=Number(after.x||0)+Number(after.width||0)/2;
+  const beforeY=Number(before.y||0)+Number(before.height||0)/2,afterY=Number(after.y||0)+Number(after.height||0)/2;
+  const dx=Math.abs(beforeX-afterX)/Math.max(1,width),dy=Math.abs(beforeY-afterY)/Math.max(1,height);
+  return {dx,dy,score:dy*6+dx};
+}
+function buildTextFragmentDiffResult(beforeItems,afterItems,width,height){
+  const empty={regions:[],confident:false};
+  if(beforeItems.length>1500||afterItems.length>1500)return empty;
+  const clean=items=>dedupeDiffPdfRowItems(items).map(item=>({...item,signature:normalizeDiffPdfText(item.text)})).filter(item=>item.signature);
+  const before=clean(beforeItems),after=clean(afterItems),beforeUsed=new Uint8Array(before.length),afterUsed=new Uint8Array(after.length),exact=[];
+  for(let beforeIndex=0;beforeIndex<before.length;beforeIndex++)for(let afterIndex=0;afterIndex<after.length;afterIndex++){
+    if(before[beforeIndex].signature!==after[afterIndex].signature)continue;
+    exact.push({beforeIndex,afterIndex,...diffPdfTextItemDistance(before[beforeIndex],after[afterIndex],width,height)});
+  }
+  exact.sort((a,b)=>a.score-b.score);
+  for(const candidate of exact){
+    if(beforeUsed[candidate.beforeIndex]||afterUsed[candidate.afterIndex])continue;
+    beforeUsed[candidate.beforeIndex]=1;afterUsed[candidate.afterIndex]=1;
+  }
+  const unmatchedBefore=before.map((item,index)=>({item,index})).filter(entry=>!beforeUsed[entry.index]);
+  const unmatchedAfter=after.map((item,index)=>({item,index})).filter(entry=>!afterUsed[entry.index]);
+  if(!unmatchedBefore.length&&!unmatchedAfter.length)return empty;
+  if(unmatchedBefore.length+unmatchedAfter.length>24)return empty;
+  const changedCandidates=[];
+  for(let beforeIndex=0;beforeIndex<unmatchedBefore.length;beforeIndex++)for(let afterIndex=0;afterIndex<unmatchedAfter.length;afterIndex++){
+    const a=unmatchedBefore[beforeIndex].item,b=unmatchedAfter[afterIndex].item,distance=diffPdfTextItemDistance(a,b,width,height);
+    const rowTolerance=Math.max(.014,(Number(a.height||0)+Number(b.height||0))*1.6/Math.max(1,height));
+    const columnTolerance=Math.max(.035,(Number(a.width||0)+Number(b.width||0))*1.5/Math.max(1,width));
+    if(distance.dy<=rowTolerance&&distance.dx<=Math.min(.16,columnTolerance))changedCandidates.push({beforeIndex,afterIndex,...distance});
+  }
+  changedCandidates.sort((a,b)=>a.score-b.score);
+  const pairedBefore=new Uint8Array(unmatchedBefore.length),pairedAfter=new Uint8Array(unmatchedAfter.length),regions=[];
+  for(const candidate of changedCandidates){
+    if(pairedBefore[candidate.beforeIndex]||pairedAfter[candidate.afterIndex])continue;
+    pairedBefore[candidate.beforeIndex]=1;pairedAfter[candidate.afterIndex]=1;
+    const a=unmatchedBefore[candidate.beforeIndex].item,b=unmatchedAfter[candidate.afterIndex].item;
+    const beforeBox=diffPdfTextPixelBox([a],4,width,height),afterBox=diffPdfTextPixelBox([b],4,width,height),combined=diffPdfTextBoxUnion([beforeBox,afterBox]);
+    if(combined)regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||combined,after:afterBox||combined,confidence:1,pixelCount:0,source:'pdf-fragment'});
+  }
+  for(let index=0;index<unmatchedBefore.length;index++)if(!pairedBefore[index]){
+    const box=diffPdfTextPixelBox([unmatchedBefore[index].item],4,width,height);if(box)regions.push({regionId:'',kind:'removed',...box,before:box,after:box,confidence:1,pixelCount:0,source:'pdf-fragment'});
+  }
+  for(let index=0;index<unmatchedAfter.length;index++)if(!pairedAfter[index]){
+    const box=diffPdfTextPixelBox([unmatchedAfter[index].item],4,width,height);if(box)regions.push({regionId:'',kind:'added',...box,before:box,after:box,confidence:1,pixelCount:0,source:'pdf-fragment'});
+  }
+  return {regions,confident:regions.length>0&&regions.length<=12};
 }
 function diffRegionsOverlap(first,second){
   const a=first?.after||first?.before||first,b=second?.after||second?.before||second;
@@ -2528,6 +2774,14 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
   if(layoutDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,layoutDiff.regions)){
     return {mode:'layout',regions:mergeDiffRegionsWithText([],layoutDiff.regions),message:'PDF内の文字配置を照合し、行間や境界が変わった箇所だけを強調しました。'};
   }
+  const fragmentDiff=buildTextFragmentDiffResult(beforeItems,afterItems,width,height);
+  if(fragmentDiff.confident){
+    // Preserve high-confidence structural bands, but replace low-confidence raster
+    // fragments with exact PDF text boxes. This keeps cumulative cell edits visible
+    // without exposing every antialiasing fragment produced by a simultaneous resize.
+    const structuralRegions=imageRegions.filter(region=>region?.before&&region?.after||Number(region?.confidence||0)>=.9);
+    return {mode:'text-fragment',regions:mergeDiffRegionsWithText(structuralRegions,fragmentDiff.regions),message:'PDF内の文字情報を照合し、各世代で追加・削除・変更された箇所を補足しました。'};
+  }
   if(textRegions.length){
     return {mode:'numeric-supplement',regions:mergeDiffRegionsWithText(imageRegions,textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。'};
   }
@@ -2535,7 +2789,7 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
 }
 function getDiffAnalysisWorker(){
   if(diffAnalysisWorker)return diffAnalysisWorker;
-  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260805_v20',location.href));
+  diffAnalysisWorker=new Worker(new URL('diff-worker.js?v=20260808_v23',location.href));
   diffAnalysisWorker.onmessage=event=>{
     const payload=event.data||{},pending=diffAnalysisPending.get(payload.id);
     if(!pending)return;
@@ -2590,11 +2844,13 @@ function clearDiffBrowserResources(dropDocuments=false){
   for(const id of ['diff-before-base','diff-after-underlay','diff-after-base'])clearDiffCanvas(id);
 }
 async function buildDiffBrowserPage(sheet,pageIndex,serial){
-  const pageNumber=pageIndex+1,kind=String(sheet?.kind||'modified');
-  const needBefore=kind!=='added'&&pageNumber<=Math.max(Number(sheet?.beforePages||0),1);
-  const needAfter=kind!=='removed'&&pageNumber<=Math.max(Number(sheet?.afterPages||0),1);
+  const pageNumber=pageIndex+1,mappedPage=asArray(sheet?.pages)[pageIndex]||null,kind=String(mappedPage?.comparisonKind||sheet?.kind||'modified');
+  const beforePageNumber=mappedPage&&Object.hasOwn(mappedPage,'beforePageNumber')?Number(mappedPage.beforePageNumber||0):pageNumber;
+  const afterPageNumber=mappedPage&&Object.hasOwn(mappedPage,'afterPageNumber')?Number(mappedPage.afterPageNumber||0):pageNumber;
+  const needBefore=kind!=='added'&&beforePageNumber>0&&beforePageNumber<=Math.max(Number(sheet?.beforePages||0),1);
+  const needAfter=kind!=='removed'&&afterPageNumber>0&&afterPageNumber<=Math.max(Number(sheet?.afterPages||0),1);
   setDiffBrowserProgress(true,'PDFを表示用に描画しています。',25);
-  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,pageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,pageNumber,serial):Promise.resolve(null)]);
+  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,beforePageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,afterPageNumber,serial):Promise.resolve(null)]);
   if(serial!==diffBrowserRenderSerial)return null;
   const width=Math.max(beforeRaw?.canvas?.width||0,afterRaw?.canvas?.width||0),height=Math.max(beforeRaw?.canvas?.height||0,afterRaw?.canvas?.height||0);
   if(!width||!height)throw new Error('表示できるPDFページがありません。');
@@ -2608,11 +2864,11 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   // 通常は前後PDFが同じ寸法なので、描画済みCanvasをそのまま解析・表示し、
   // 同じ全面Canvasの再作成とdrawImageを2回分省略する。
   const beforeCanvas=normalizeCanvas(beforeRaw),afterCanvas=normalizeCanvas(afterRaw);
-  let regions=[],status='ready',message='',analysis=null,noiseSuppressed=false;
-  const exactSame=asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber);
+  let regions=[],status='ready',message=String(mappedPage?.mappingMessage||''),analysis=null,noiseSuppressed=false;
+  const exactSame=kind==='unchanged'||(!mappedPage&&asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber));
   if(kind==='added')regions=[fullDiffRegion('added',width,height)];
   else if(kind==='removed')regions=[fullDiffRegion('removed',width,height)];
-  else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message='信頼できる差分領域を判定できません。';}
+  else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=message||'信頼できる差分領域を判定できません。';}
   else if(kind!=='unchanged'&&!exactSame){
     setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
     try{
@@ -2632,7 +2888,7 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
       const documentTextPair=await documentTextPromise;
       if(serial!==diffBrowserRenderSerial)return null;
       if(textPair){
-        const documentRowDiff=documentTextPair?buildDocumentTextRowStructureDiffResult(documentTextPair[0],documentTextPair[1],width,height,pageNumber):null;
+        const documentRowDiff=documentTextPair?buildDocumentTextRowStructureDiffResult(documentTextPair[0],documentTextPair[1],width,height,beforePageNumber,afterPageNumber):null;
         const semantic=selectDiffSemanticResult(textPair[0],textPair[1],width,height,analysis,regions,documentRowDiff);
         regions=semantic.regions;
         if(semantic.message)message=semantic.message;
@@ -2645,7 +2901,7 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
     }
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
   }else if(kind==='modified'&&exactSame)message='このページに変更はありません。同じ原稿内の別ページに変更があります。';
-  const page={pageNumber,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.canvas.width!==afterRaw.canvas.width||beforeRaw.canvas.height!==afterRaw.canvas.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
+  const page={pageNumber,beforePageNumber:needBefore?beforePageNumber:0,afterPageNumber:needAfter?afterPageNumber:0,comparisonKind:kind,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.canvas.width!==afterRaw.canvas.width||beforeRaw.canvas.height!==afterRaw.canvas.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
   return {sheetKey:String(sheet?.sheetKey||''),pageIndex,page,beforeCanvas,afterCanvas};
 }
 function paintDiffBrowserPage(result){
@@ -2656,8 +2912,8 @@ function paintDiffBrowserPage(result){
   if(diffViewState.regionIndex>=page.regions.length)diffViewState.regionIndex=-1;
   if($('diff-region-count'))$('diff-region-count').textContent=page.regions.length?(diffViewState.regionIndex>=0?`${diffViewState.regionIndex+1} / ${page.regions.length}件`:`${page.regions.length}件`):'0件';
   $('diff-prev-region').disabled=!diffRegionTargets().length;$('diff-next-region').disabled=!diffRegionTargets().length;
-  setDiffPaneEmpty('before',diffCurrentSheet()?.kind==='added'?'前回版には存在しません':'');
-  setDiffPaneEmpty('after',diffCurrentSheet()?.kind==='removed'?'現在版では削除されています':'');
+  setDiffPaneEmpty('before',page.comparisonKind==='added'?'前回版には存在しません':'');
+  setDiffPaneEmpty('after',page.comparisonKind==='removed'?'現在版では削除されています':'');
   applyDiffHighlightSettings();applyDiffMode();updateDiffStageScale();
 }
 function diffDetailRequestPath(){
@@ -2726,11 +2982,16 @@ function renderDiffSummary(){
     ['added','追加',Number(summary.added||0)],
     ['removed','削除',Number(summary.removed||0)],
     ['unknown','判定不能',Number(summary.unknown||0)],
-    ['unchanged','変更なし',Number(summary.unchanged||0)]
+    ['unchanged','変更なし',Number(summary.unchanged||0)],
+    ['confirmed','確認済み',Number(summary.confirmed||0)]
   ];
   box.innerHTML=definitions.map(([key,label,count])=>`<button class="${escapeAttr(key)} ${diffViewState.filter===key?'active':''}" type="button" data-diff-filter="${escapeAttr(key)}">${escapeHtml(label)} ${count}</button>`).join('');
   box.querySelectorAll('[data-diff-filter]').forEach(btn=>btn.addEventListener('click',()=>{
     diffViewState.filter=btn.dataset.diffFilter||'all';
+    if(diffViewState.filter==='confirmed'){
+      diffViewState.unreviewedOnly=false;
+      if($('diff-unreviewed-only'))$('diff-unreviewed-only').checked=false;
+    }
     const visible=diffFilteredSheets();
     if(!visible.some(s=>String(s.sheetKey||'')===diffViewState.selectedSheetKey)){
       diffViewState.selectedSheetKey=String(visible[0]?.sheetKey||'');
@@ -2752,7 +3013,7 @@ function renderDiffSheetList(){
     const browserDetail=sourceTypeValue(diffSource())==='excel'?`${pages}ページ・ブラウザ比較${cached?`済 ${cached}`:'（表示時）'}`:`ブラウザ比較${cached?'済':'（表示時）'}`;
     const detail=sheetStatus==='unknown'?(sheet.message||'対応を確定できないため目視確認が必要です。'):browserDetail;
     const displayName=diffUnitDisplayName(sheet);
-    return `<button class="diff-sheet-item ${String(sheet.sheetKey||'')===diffViewState.selectedSheetKey?'active':''}" type="button" data-diff-sheet="${escapeAttr(sheet.sheetKey||'')}" title="${escapeAttr(`${displayName}・${confidence}`)}"><span class="diff-sheet-kind ${escapeAttr(sheet.kind||'unknown')}">${escapeHtml(meta.mark)}</span><span class="diff-sheet-copy"><strong>${escapeHtml(displayName)}</strong><small>${escapeHtml(meta.label)}・${escapeHtml(confidence)}・${escapeHtml(detail)}</small></span></button>`;
+    return `<button class="diff-sheet-item ${sheet.confirmed?'confirmed':''} ${String(sheet.sheetKey||'')===diffViewState.selectedSheetKey?'active':''}" type="button" data-diff-sheet="${escapeAttr(sheet.sheetKey||'')}" title="${escapeAttr(`${displayName}・${confidence}${sheet.confirmed?'・確認済み':''}`)}"><span class="diff-sheet-kind ${escapeAttr(sheet.kind||'unknown')}">${escapeHtml(meta.mark)}</span><span class="diff-sheet-copy"><strong>${escapeHtml(displayName)}</strong><small>${escapeHtml(meta.label)}・${escapeHtml(confidence)}・${escapeHtml(detail)}</small></span><span class="diff-sheet-reviewed" aria-label="${sheet.confirmed?'確認済み':'未確認'}">${sheet.confirmed?'✓':''}</span></button>`;
   }).join('');
   box.querySelectorAll('[data-diff-sheet]').forEach(btn=>{
     btn.addEventListener('click',()=>selectDiffSheet(btn.dataset.diffSheet||''));
@@ -2772,6 +3033,33 @@ function selectDiffSheet(sheetKey,focusList=true){
   diffViewState.selectedSheetKey=String(sheet.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(sheet);diffViewState.regionIndex=-1;
   renderDiffSheetList();renderDiffPage();
   if(focusList)$('diff-before-viewport')?.focus();
+}
+function renderDiffReviewControl(){
+  const button=$('diff-confirm-sheet'),sheet=diffCurrentSheet();if(!button)return;
+  button.disabled=!sheet;
+  button.classList.toggle('active',!!sheet?.confirmed);
+  button.textContent=sheet?.confirmed?'確認済みを解除':'この項目を確認済みにする';
+  button.setAttribute('aria-pressed',String(!!sheet?.confirmed));
+}
+async function toggleDiffSheetReviewed(button=$('diff-confirm-sheet')){
+  const sheet=diffCurrentSheet(),cmp=diffViewState.detail?.comparison||{};if(!sheet||!diffViewState.detail)return;
+  const confirmed=!sheet.confirmed;
+  await runBusy(button,async()=>{
+    const response=await api('/api/history/diff-review',{method:'POST',body:{
+      workbookId:diffViewState.workbookId,fromSnapshotId:diffViewState.fromSnapshotId,toSnapshotId:diffViewState.toSnapshotId,
+      baselineVersionId:String(cmp.baselineVersionId||''),currentVersionId:String(cmp.currentVersionId||''),sheetKey:String(sheet.sheetKey||''),confirmed
+    }});
+    const confirmedKeys=new Set(asArray(response.review?.confirmedSheetKeys).map(String));
+    for(const item of asArray(diffViewState.detail?.sheets))item.confirmed=confirmedKeys.has(String(item.sheetKey||''));
+    diffViewState.detail.review=response.review||null;
+    if(diffViewState.detail.summary)diffViewState.detail.summary.confirmed=confirmedKeys.size;
+    diffDetailResponseCache.clear();
+    const visible=diffFilteredSheets();
+    if(!visible.some(item=>String(item.sheetKey||'')===diffViewState.selectedSheetKey)){
+      diffViewState.selectedSheetKey=String(visible[0]?.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(visible[0]);diffViewState.regionIndex=-1;
+    }
+    renderDiffSummary();renderDiffSheetList();renderDiffPage();
+  },false);
 }
 function setDiffPaneEmpty(side,message){
   const stage=$(`diff-${side}-stage`),empty=$(`diff-${side}-empty`);
@@ -2854,6 +3142,7 @@ function applyDiffMode(){
 }
 function renderDiffPage(){
   const sheet=diffCurrentSheet();
+  renderDiffReviewControl();
   const historical=String(diffViewState.detail?.comparison?.scope||'')==='history';
   const beforeLabel=historical?'比較元':'前回版',afterLabel=historical?'比較先':'現在版';
   const messageBox=$('diff-state-message'),serial=beginDiffBrowserRender();
@@ -2866,10 +3155,12 @@ function renderDiffPage(){
   }
   const pageTotal=diffSheetPageCount(sheet);
   diffViewState.pageIndex=Math.max(0,Math.min(diffViewState.pageIndex,Math.max(0,pageTotal-1)));
-  const pageNumber=diffViewState.pageIndex+1;
-  if($('diff-before-page-label'))$('diff-before-page-label').textContent=`${pageNumber} / ${pageTotal}ページ`;
-  if($('diff-after-page-label'))$('diff-after-page-label').textContent=`${pageNumber} / ${pageTotal}ページ`;
-  if($('diff-page-count'))$('diff-page-count').textContent=`${pageNumber} / ${pageTotal}ページ`;
+  const pageNumber=diffViewState.pageIndex+1,mappedPage=asArray(sheet?.pages)[diffViewState.pageIndex]||null;
+  const beforePageNumber=mappedPage&&Object.hasOwn(mappedPage,'beforePageNumber')?Number(mappedPage.beforePageNumber||0):pageNumber;
+  const afterPageNumber=mappedPage&&Object.hasOwn(mappedPage,'afterPageNumber')?Number(mappedPage.afterPageNumber||0):pageNumber;
+  if($('diff-before-page-label'))$('diff-before-page-label').textContent=beforePageNumber?`${beforePageNumber} / ${Number(sheet?.beforePages||pageTotal)}ページ`:'—';
+  if($('diff-after-page-label'))$('diff-after-page-label').textContent=afterPageNumber?`${afterPageNumber} / ${Number(sheet?.afterPages||pageTotal)}ページ`:'—';
+  if($('diff-page-count'))$('diff-page-count').textContent=`${pageNumber} / ${pageTotal}件`;
   $('diff-prev-page').disabled=diffViewState.pageIndex<=0;$('diff-next-page').disabled=diffViewState.pageIndex>=pageTotal-1;
   diffViewState.regionIndex=-1;if($('diff-region-count'))$('diff-region-count').textContent='0件';
   $('diff-prev-region').disabled=true;$('diff-next-region').disabled=true;
@@ -2919,8 +3210,9 @@ function focusCurrentDiffRegion(){
 }
 function diffRegionTargets(){
   const order=new Map(asArray(diffViewState.detail?.sheets).map((sheet,index)=>[String(sheet.sheetKey||''),index]));
+  const visibleSheetKeys=new Set(diffFilteredSheets().map(sheet=>String(sheet.sheetKey||'')));
   const targets=[];
-  for(const item of diffBrowserPageCache.values())asArray(item.page?.regions).forEach((region,regionIndex)=>targets.push({sheetKey:item.sheetKey,pageIndex:item.pageIndex,regionIndex,region}));
+  for(const item of diffBrowserPageCache.values())if(visibleSheetKeys.has(String(item.sheetKey||'')))asArray(item.page?.regions).forEach((region,regionIndex)=>targets.push({sheetKey:item.sheetKey,pageIndex:item.pageIndex,regionIndex,region}));
   return targets.sort((x,y)=>(order.get(x.sheetKey)||0)-(order.get(y.sheetKey)||0)||x.pageIndex-y.pageIndex||x.regionIndex-y.regionIndex);
 }
 function moveDiffRegion(direction){
@@ -2966,7 +3258,8 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   const id=String(workbookId||'');if(!id)return;
   diffReturnFocus=opener||document.activeElement;clearDiffBrowserResources();
   diffViewState.workbookId=id;diffViewState.fromSnapshotId=String(historyRange?.fromSnapshotId||'');diffViewState.toSnapshotId=String(historyRange?.toSnapshotId||'');
-  diffViewState.detail=null;diffViewState.selectedSheetKey='';diffViewState.pageIndex=0;diffViewState.regionIndex=-1;diffViewState.filter='all';diffViewState.mode='side';diffViewState.mobileTab='before';
+  diffViewState.detail=null;diffViewState.selectedSheetKey='';diffViewState.pageIndex=0;diffViewState.regionIndex=-1;diffViewState.filter='all';diffViewState.unreviewedOnly=false;diffViewState.mode='side';diffViewState.mobileTab='before';
+  if($('diff-unreviewed-only'))$('diff-unreviewed-only').checked=false;
   if($('diff-export-summary'))$('diff-export-summary').disabled=true;
   $('diff-modal')?.classList.remove('hidden');document.body.style.overflow='hidden';
   if($('diff-title'))$('diff-title').textContent='差分詳細：'+workbookDisplayName(getWorkbook(id));
@@ -3016,7 +3309,7 @@ function sourceSettingsHtml(w){
   const sourceType=sourceTypeValue(w),requirements=activeSourceRequirements().filter(item=>asArray(item?.acceptedSourceTypes).map(String).includes(sourceType)),assignedElsewhere=new Map(workbooksForActivePreset().filter(item=>String(item?.workbookId||'')!==id&&item?.requirementId).map(item=>[String(item.requirementId),workbookDisplayName(item)])),requirementId=String(w?.requirementId||'');
   const requirementSelect=requirements.length?`<label class="source-requirement-label">必要原稿<select class="source-requirement-select" data-source-requirement="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の必要原稿"><option value="">割り当てなし</option>${requirements.map(item=>{const rid=String(item.requirementId||''),occupied=assignedElsewhere.get(rid);return `<option value="${escapeAttr(rid)}" ${rid===requirementId?'selected':''} ${occupied?'disabled':''}>${escapeHtml(item.displayName||'必要原稿')}${item.required===false?'（任意）':'（必須）'}${occupied?`・${escapeHtml(occupied)}へ割当済み`:''}</option>`;}).join('')}</select></label>`:'';
   const targetOptions=activeTargetDefinitions().map(target=>`<option value="${escapeAttr(target.targetId)}" ${defaultTarget===String(target.targetId)?'selected':''}>${escapeHtml(target.displayName||target.targetId)}</option>`).join('');
-  return `<div class="source-settings" aria-label="原稿設定">${requirementSelect}<label class="source-owner-label">担当部署<input class="source-owner-input" type="text" maxlength="120" value="${escapeAttr(owner)}" placeholder="未設定" data-source-owner="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の担当部署"></label><label class="source-required-label"><input type="checkbox" data-source-required="${escapeAttr(id)}" ${required?'checked':''}> 必須</label><label class="source-default-target-label">新規ページの配置<select class="source-default-target" data-source-default-target="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の新規ページ配置"><option value="unassigned" ${defaultTarget==='unassigned'?'selected':''}>ひな形に従う</option>${targetOptions}</select></label></div>`;
+  return `<details class="source-advanced-settings" data-source-settings-details="${escapeAttr(id)}" ${expandedSourceSettings.has(id)?'open':''}><summary>原稿の扱いを変更</summary><div class="source-settings" aria-label="原稿の詳細設定">${requirementSelect}<label class="source-owner-label"><span>担当部署（任意）<small>進捗一覧に表示する管理用メモです</small></span><input class="source-owner-input" type="text" maxlength="120" value="${escapeAttr(owner)}" placeholder="例：営業部" data-source-owner="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の担当部署"></label><label class="source-required-label"><input type="checkbox" data-source-required="${escapeAttr(id)}" ${required?'checked':''}><span>最終PDFに必須<small>未作成・更新あり・エラーの間は最終PDFを出力しません</small></span></label><label class="source-default-target-label"><span>更新で増えたページの追加先<small>既に並べたページは移動しません</small></span><select class="source-default-target" data-source-default-target="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の追加ページ配置"><option value="unassigned" ${defaultTarget==='unassigned'?'selected':''}>一式の既定：${escapeHtml(activePackDefaultTargetLabel())}</option>${targetOptions}</select></label></div></details>`;
 }
 function syncDiffScroll(source,target){
   if(diffSyncingScroll||diffViewState.mode!=='side'||!source||!target)return;
@@ -3029,22 +3322,20 @@ function syncDiffScroll(source,target){
 }
 
 function renderWorkbooks() {
+  queueMicrotask(syncSourcePanelDensity);
   const list=workbooksForActivePreset();const box=$('workbook-list');if(!box)return;const summary=$('workbook-selection-summary');
   renderSourceRequirementStatus(list);
   if(!list.length){box.className='table-shell empty-state';box.textContent=`${presetLabel()}の登録済み原稿はまだありません。`;selectedWorkbooks.clear();lastWorkbookRangeAnchor='';if(summary)summary.textContent='0件中 0件を選択';syncWorkbookSelectionUi();return;}
   selectedWorkbooks=new Set([...selectedWorkbooks].filter(id=>list.some(w=>String(w.workbookId)===String(id))));const allSelected=list.every(w=>selectedWorkbooks.has(String(w.workbookId||''))),someSelected=list.some(w=>selectedWorkbooks.has(String(w.workbookId||'')));
   box.className='table-shell';box.innerHTML=`<table class="data-table workbook-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-workbooks ${allSelected?'checked':''} aria-label="登録済み原稿をすべて選択"></th><th>原稿ファイル</th><th class="pdf-status-col">変換PDFの状態</th></tr></thead><tbody>${list.map(w=>{const id=String(w.workbookId||''),checked=selectedWorkbooks.has(id),renderedAt=formatDateTime(w.lastRenderedAt||'');return `<tr data-workbook-row class="${checked?'selected-row':''} ${w.status==='render-error'?'error-row':''}"><td class="check-col"><input type="checkbox" data-workbook-check value="${escapeAttr(id)}" ${checked?'checked':''} aria-label="${escapeAttr(workbookDisplayName(w))}を選択"></td><td><div class="file-name-cell"><span class="file-icon ${escapeAttr(sourceTypeValue(w))}">${iconUse(sourceIconId(w))}</span><div class="source-file-detail"><div class="source-name-line"><strong title="${escapeAttr(workbookDisplayName(w))}">${escapeHtml(workbookDisplayName(w))}</strong>${sourceTypeBadge(w)}</div><div class="file-meta" title="最後に変換PDFを作成した日時">変換PDF作成日時：${escapeHtml(renderedAt)}</div>${sourceSettingsHtml(w)}</div></div></td><td class="pdf-status-col">${workbookPdfStatusCell(w)}</td></tr>`;}).join('')}</tbody></table>`;
   if(summary)summary.textContent=`${list.length}件中 ${selectedWorkbooks.size}件を選択`;const selectAll=box.querySelector('[data-select-all-workbooks]');if(selectAll){selectAll.indeterminate=someSelected&&!allSelected;selectAll.addEventListener('change',e=>{selectedWorkbooks=e.target.checked?new Set(list.map(w=>String(w.workbookId||'')).filter(Boolean)):new Set();lastWorkbookRangeAnchor='';syncWorkbookSelectionUi();renderWorkbooks();});}
-  box.querySelectorAll('[data-workbook-check]').forEach(ch=>ch.addEventListener('click',e=>{e.stopPropagation();handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));box.querySelectorAll('[data-open-diff]').forEach(btn=>{
-    const warm=()=>prefetchAutomaticDiffDetail(btn.dataset.openDiff||'');
-    btn.addEventListener('pointerenter',warm,{once:true});btn.addEventListener('focus',warm,{once:true});
-    btn.addEventListener('click',e=>{e.stopPropagation();openDiffDetail(btn.dataset.openDiff||'',btn);});
-  });
+  box.querySelectorAll('[data-workbook-check]').forEach(ch=>ch.addEventListener('click',e=>{e.stopPropagation();handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));box.querySelectorAll('[data-open-history]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();openWorkbookComparisonHistory(btn.dataset.openHistory||'');}));
   box.querySelectorAll('[data-source-owner]').forEach(input=>input.addEventListener('change',()=>saveSourceMetadata(input.dataset.sourceOwner,{ownerDepartment:input.value},input)));
   box.querySelectorAll('[data-source-required]').forEach(input=>input.addEventListener('change',()=>saveSourceMetadata(input.dataset.sourceRequired,{required:input.checked},input)));
   box.querySelectorAll('[data-source-default-target]').forEach(select=>select.addEventListener('change',()=>saveSourceMetadata(select.dataset.sourceDefaultTarget,{defaultTargetId:select.value},select)));
   box.querySelectorAll('[data-source-requirement]').forEach(select=>select.addEventListener('change',()=>saveSourceMetadata(select.dataset.sourceRequirement,{requirementId:select.value},select)));
-  box.querySelectorAll('[data-workbook-row]').forEach(row=>row.addEventListener('click',e=>{if(e.target.closest('input,button,a,select,textarea,label'))return;const ch=row.querySelector('[data-workbook-check]');if(!ch)return;ch.checked=!ch.checked;handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));syncWorkbookSelectionUi();
+  box.querySelectorAll('[data-source-settings-details]').forEach(details=>details.addEventListener('toggle',()=>{const id=String(details.dataset.sourceSettingsDetails||'');if(!id)return;if(details.open)expandedSourceSettings.add(id);else expandedSourceSettings.delete(id);}));
+  box.querySelectorAll('[data-workbook-row]').forEach(row=>row.addEventListener('click',e=>{if(e.target.closest('input,button,a,select,textarea,label,summary,details'))return;const ch=row.querySelector('[data-workbook-check]');if(!ch)return;ch.checked=!ch.checked;handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));syncWorkbookSelectionUi();
 }
 
 function summarizeRenderResults(results) {
@@ -3077,7 +3368,7 @@ async function renderWorkbookIds(ids, btn, options={}) {
   renderJobActive=true;activeRenderJobId='';activeRenderCancelRequested=false;activeRenderJobStatus=null;const estimateTotal=workbookIds.length||defaultPdfTargetWorkbookIds().length||(onlyUpdated?activeWorkbooks.length:0);const startMessage=options.startMessage||(onlyUpdated?'PDF作成対象を確認しています。':`${workbookIds.length}件の原稿をPDF変換します。`);
   updateProgressPanel({status:'queued',total:estimateTotal,completed:0,failed:0,percent:0,message:startMessage});
   try{await runBusy(btn,async()=>{hideErrorPanel();showMessage('','PDF作成を開始しています',startMessage);const body={packId:activePackId};if(workbookIds.length)body.sourceIds=workbookIds;if(onlyUpdated)body.onlyUpdated=true;
-    const started=await api('/api/v2/sources/render/start',{method:'POST',body});const job=normalizeRenderJobFromStart(started);const jobId=assertJobId(job,started);activeRenderJobId=jobId;updateProgressPanel(Object.assign({total:estimateTotal,completed:0,failed:0},job));const finished=await waitForRenderJob(jobId);const appendedIds=asArray(finished.results).flatMap(r=>asArray(r?.sheetSync?.insertedAtEndPageIds)).map(String).filter(Boolean);setHighlightedPages(appendedIds);await refresh();renderAll();await loadFiles(null);
+    const started=await api('/api/v2/sources/render/start',{method:'POST',body});const job=normalizeRenderJobFromStart(started);const jobId=assertJobId(job,started);activeRenderJobId=jobId;updateProgressPanel(Object.assign({total:estimateTotal,completed:0,failed:0},job));const finished=await waitForRenderJob(jobId);const appendedIds=asArray(finished.results).flatMap(r=>asArray(r?.sheetSync?.insertedAtEndPageIds)).map(String).filter(Boolean);setHighlightedPages(appendedIds);await refresh();selectedWorkbooks.clear();lastWorkbookRangeAnchor='';renderAll();await loadFiles(null);
     const msg=summarizeRenderResults(finished.results||[]);const hasErrors=finished.status==='failed'||finished.status==='completed-with-errors'||asArray(finished.errors).length>0;
     if(finished.status==='cancelled'){showMessage('warn','PDF作成を中止しました',finished.message||'未処理の原稿を残して停止しました。',finished.results||finished);setTimeout(hideProgressPanel,2400);}
     else if(finished.status==='failed')showMessage('danger','PDF作成が停止しました',userFriendlyError(finished.message||'PDF作成を完了できませんでした。'),finished.errors||finished);
@@ -3115,15 +3406,16 @@ function updateRenderTargetUi() {
   const info = getWorkbookRenderTargetInfo();
   const activeCount = workbooksForActivePreset().filter(w => String(w.status || '') !== 'missing').length;
   if (btn) {
-    if (info.mode === 'selected') btn.textContent = '選択分の変換PDFを作成';
-    else if (info.mode === 'needed') btn.textContent = '必要分の変換PDFを作成';
+    btn.disabled = info.mode === 'none';
+    if (info.mode === 'selected') btn.textContent = `選択した${info.count}件の変換PDFを作成`;
+    else if (info.mode === 'needed') btn.textContent = `必要な${info.count}件の変換PDFを作成`;
     else btn.textContent = '変換PDFを作成';
   }
   if (hint) {
     hint.classList.remove('target-selected', 'target-needed', 'target-none');
     hint.classList.add(info.mode === 'selected' ? 'target-selected' : (info.mode === 'needed' ? 'target-needed' : 'target-none'));
     if (info.mode === 'selected') hint.textContent = `${presetLabel()}で選択中: ${info.count}件の変換PDFを作成します。`;
-    else if (info.mode === 'needed') hint.textContent = `${presetLabel()}で変換PDFの作成が必要な原稿は${info.count}件です。先に選択してください。`;
+    else if (info.mode === 'needed') hint.textContent = `${presetLabel()}で変換PDFの作成が必要な原稿は${info.count}件です。ボタンを押すと必要な分だけ作成します。`;
     else hint.textContent = activeCount ? 'すべての変換PDFは最新です。' : `${presetLabel()}の登録済み原稿はありません。`;
   }
 }
@@ -3223,7 +3515,7 @@ function renderPageTargetControls(){
 function renderPages() {
   const box=$('page-board');if(!box)return;renderPageTargetControls();const sourcePages=[...pagesForActivePreset()].sort(pageSort);const visiblePages=applyPageFilters(sourcePages);const visibleIds=new Set(visiblePages.map(resolvedPageId));const allPages=sourcePages;
   const needsPdf=workbooksForActivePreset().filter(w=>!isLatestPdfWorkbook(w));const agg=aggregateFinalState();
-  const signature=JSON.stringify([pageBoardView,pageFilterText,showChangedOnly,[...pageVolumeCollapseOverrides.entries()],allPages.map(p=>[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,pageRangeText(p),p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf,p.sheetIndex]),needsPdf.map(w=>w.workbookId),agg.state]);
+  const signature=JSON.stringify([pageBoardView,activePageVolume,pageFilterText,showChangedOnly,[...pageVolumeCollapseOverrides.entries()],allPages.map(p=>[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,pageRangeText(p),p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf,p.sheetIndex]),needsPdf.map(w=>w.workbookId),agg.state]);
   if(lastPageBoardRenderSignature===signature&&box.childElementCount)return;lastPageBoardRenderSignature=signature;
   const scrollSnap=capturePageBoardScroll();selectedPages=new Set([...selectedPages].filter(id=>allPages.some(p=>resolvedPageId(p)===id)));
   const banners=[];const unassigned=allPages.filter(p=>String(p.volume)==='none'||p.enabled===false).length;
@@ -3231,20 +3523,22 @@ function renderPages() {
   if(needsPdf.length)banners.push(`<div class="page-status-banner"><strong>変換PDF作成が必要な原稿があります</strong><span>${needsPdf.length}件。先に変換PDFを作成してください。</span></div>`);
   if(agg.state==='needs-rebuild')banners.push('<div class="page-status-banner"><strong>ページ構成または変換PDFが変更されています</strong><span>提出用PDFの再出力が必要です。</span></div>');
   const panels=[{volume:'none',title:'未振り分け（出力しない）',description:'新規ページはここに入ります。必要なページを選び、出力先へ移してください。'},...activeTargetDefinitions().map(target=>({volume:targetVolume(target.targetId),title:String(target.displayName||target.targetId),description:`ここへ入れたページが「${target.displayName||target.targetId}」PDFに含まれます。`}))];
+  if(!panels.some(panel=>panel.volume===activePageVolume))activePageVolume=panels[0]?.volume||'none';
+  const tabs=$('page-volume-tabs');if(tabs){tabs.innerHTML=panels.map(panel=>{const count=allPages.filter(page=>panel.volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||activeTargetVolumes()[0]||mainVolume())===panel.volume&&page.enabled!==false)).length;const selected=panel.volume===activePageVolume,target=panel.volume==='none'?null:activeTargetDefinitions().find(item=>targetVolume(item.targetId)===panel.volume),optionalEmpty=target?.required===false&&count===0&&!selected,label=panel.volume==='none'?'未振り分け':optionalEmpty?`＋ ${panel.title}を使う`:panel.title;return `<button class="page-volume-tab ${selected?'active':''} ${optionalEmpty?'optional-empty':''}" type="button" role="tab" aria-selected="${selected}" data-page-volume-tab="${escapeAttr(panel.volume)}"><span>${escapeHtml(label)}</span>${optionalEmpty?'':`<b>${count}</b>`}</button>`;}).join('');tabs.querySelectorAll('[data-page-volume-tab]').forEach(button=>button.addEventListener('click',()=>{activePageVolume=String(button.dataset.pageVolumeTab||'none');try{sessionStorage.setItem('ReportBinderActivePageVolume',activePageVolume);}catch{}lastPageBoardRenderSignature='';selectedPages.clear();renderPages();}));}
   if(sourcePages.length>0&&visiblePages.length===0){const searching=!!String(pageFilterText||'').trim();const title=searching?'一致するページがありません':'変更されたページはありません';const hint=searching?'検索語を短くするか、クリアしてください。':'「変更分のみ」を解除すると、すべてのページを表示できます。';banners.push(`<div class="page-filter-empty"><strong>${title}</strong><span>${hint}</span></div>`);}
   box.className=`board ${pageBoardView==='thumbnail'?'thumbnail-board':'detail-board'}`;box.innerHTML=banners.join('')+panels.map(panel=>dynamicVolumePanelHtml(panel,allPages,visibleIds)).join('');attachBoardEvents();preparePageThumbnails();restorePageBoardScroll(scrollSnap);syncPageBoardViewControls();syncPageSelectionUi();
 }
 function dynamicVolumePanelHtml(panel,allPages,visibleIds){
   const volume=panel.volume,first=activeTargetVolumes()[0]||mainVolume(),pages=allPages.filter(page=>volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||first)===volume&&page.enabled!==false)),visibleCount=pages.filter(page=>visibleIds.has(resolvedPageId(page))).length,collapsed=pageVolumeCollapseOverrides.has(volume)?!!pageVolumeCollapseOverrides.get(volume):(pageBoardView==='detail'&&pages.length===0),filtering=(showChangedOnly&&state?.inputHistoryEnabled)||!!String(pageFilterText||'').trim(),countText=filtering?`${visibleCount} / ${pages.length}ページ`:`${pages.length}ページ`;
   const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<div class="empty-row page-empty-drop">ここへドロップ</div>'}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-pages="${escapeAttr(volume)}" aria-label="${escapeAttr(panel.title)}をすべて選択"></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="6">ここへドロップ</td></tr>'}</tbody></table></div>`;
-  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
+  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${volume===activePageVolume?'active-volume':'inactive-volume'} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
 }
 function pageRowHtml(p, idx, filteredOut=false) {
   const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
   return `<tr tabindex="0" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="check-col"><input type="checkbox" data-page-check value="${escapeAttr(pid)}" ${checked?'checked':''}></td><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="drag-col"><span class="drag-handle" title="ドラッグして移動">${iconUse('i-drag')}</span></td><td class="page-main-cell"><input class="title-input" data-page-title value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
 }
 function pageThumbnailHtml(p,idx,filteredOut=false){
-  const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);const source=`${wb?.displayName||wb?.fileName||''} / ${sourceUnitReference(wb,p.sheetName)}`,numbering=numberingSelectValue(p),range=pageRangeText(p),displayTitle=p.title||p.sheetName||'ページ',editorId=`page-thumb-editor-${pid}`;return `<article tabindex="0" class="page-row page-thumb-card ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}" aria-label="${escapeAttr(`${idx+1}ページ目 ${displayTitle}。ドラッグして移動`)}" title="ドラッグして移動。クリックで選択"><div class="page-thumb-paper"><canvas data-page-thumbnail="${escapeAttr(pid)}" aria-hidden="true"></canvas><div class="page-thumb-placeholder">${hasPdf?'プレビューを読み込み中':'PDF未作成'}</div><span class="page-thumb-seq" data-seq-cell>${idx+1}</span><label class="page-thumb-check" title="選択"><input type="checkbox" data-page-check value="${escapeAttr(pid)}" ${checked?'checked':''}><span class="sr-only">${escapeHtml(displayTitle)}を選択</span></label><span class="drag-handle page-thumb-drag" title="ドラッグして移動（選択中はまとめて移動）">${iconUse('i-drag')}</span>${hasPdf?`<button class="page-thumb-open" type="button" data-preview-page="${escapeAttr(pid)}">開く</button>`:''}</div><div class="page-thumb-copy"><strong>${escapeHtml(displayTitle)}</strong><span>${escapeHtml(source)}</span>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</div><div class="page-thumb-meta"><span>${pageChangeBadge(p)||pdfStatusForPage(p)}</span><span class="page-thumb-settings-summary"><span title="ページ番号">${escapeHtml(range?`使用 ${range} / ${numberingText(p,idx)}`:numberingText(p,idx))}</span><button class="btn ghost compact page-thumb-edit" type="button" data-thumb-edit aria-label="${escapeAttr(`${displayTitle}の設定を編集`)}" aria-controls="${escapeAttr(editorId)}" aria-expanded="false">${iconUse('i-edit')}設定</button></span></div><div id="${escapeAttr(editorId)}" class="page-thumb-editor" data-thumb-editor hidden><label>ページ名<input data-thumb-page-title value="${escapeAttr(p.title||'')}" data-original-value="${escapeAttr(p.title||'')}"></label><label>使用するPDFページ<input data-thumb-page-range value="${escapeAttr(range)}" data-original-value="${escapeAttr(range)}" placeholder="すべて（例: 2-5）" inputmode="numeric"></label><label>ページ番号<select data-thumb-page-numbering data-original-value="${escapeAttr(numbering)}"><option value="auto" ${numbering==='auto'?'selected':''}>自動</option><option value="none" ${numbering==='none'?'selected':''}>表示なし</option><option value="visible" ${numbering==='visible'?'selected':''}>表示</option></select></label><div class="page-thumb-editor-actions"><button class="btn ghost compact" type="button" data-thumb-cancel>取消</button><button class="btn primary compact" type="button" data-thumb-save>保存</button></div></div></article>`;
+  const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);const source=`${wb?.displayName||wb?.fileName||''} / ${sourceUnitReference(wb,p.sheetName)}`,numbering=numberingSelectValue(p),range=pageRangeText(p),displayTitle=p.title||p.sheetName||'ページ',editorId=`page-thumb-editor-${pid}`,change=pageChangeBadge(p);return `<article tabindex="0" class="page-row page-thumb-card ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}" aria-label="${escapeAttr(`${idx+1}ページ目 ${displayTitle}。クリックで選択`)}" title="クリックで選択"><input class="sr-only" type="checkbox" data-page-check value="${escapeAttr(pid)}" aria-label="${escapeAttr(`${displayTitle}を選択`)}" ${checked?'checked':''}><div class="page-thumb-paper"><canvas data-page-thumbnail="${escapeAttr(pid)}" aria-hidden="true"></canvas><div class="page-thumb-placeholder">${hasPdf?'プレビューを読み込み中':'PDF未作成'}</div><span class="page-thumb-seq" data-seq-cell>${idx+1}</span></div><div class="page-thumb-copy"><strong>${escapeHtml(displayTitle)}</strong><span>${escapeHtml(source)}</span>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</div><div class="page-thumb-meta"><span>${change||(!hasPdf?pdfStatusForPage(p):'')}</span><span class="page-thumb-settings-summary">${hasPdf?`<button class="btn ghost compact page-thumb-preview" type="button" data-preview-page="${escapeAttr(pid)}">プレビュー</button>`:''}<button class="btn ghost compact page-thumb-edit" type="button" data-thumb-edit aria-label="${escapeAttr(`${displayTitle}の設定を編集`)}" aria-controls="${escapeAttr(editorId)}" aria-expanded="false">${iconUse('i-edit')}設定</button></span></div><div id="${escapeAttr(editorId)}" class="page-thumb-editor" data-thumb-editor hidden><label>ページ名<input data-thumb-page-title value="${escapeAttr(p.title||'')}" data-original-value="${escapeAttr(p.title||'')}"></label><label>元PDFから使う範囲（複数ページの場合）<input data-thumb-page-range value="${escapeAttr(range)}" data-original-value="${escapeAttr(range)}" placeholder="すべて（例: 2-5）" inputmode="numeric"></label><label>ページ番号<select data-thumb-page-numbering data-original-value="${escapeAttr(numbering)}"><option value="auto" ${numbering==='auto'?'selected':''}>自動</option><option value="none" ${numbering==='none'?'selected':''}>表示なし</option><option value="visible" ${numbering==='visible'?'selected':''}>表示</option></select></label><div class="page-thumb-editor-actions"><button class="btn ghost compact" type="button" data-thumb-cancel>取消</button><button class="btn primary compact" type="button" data-thumb-save>保存</button></div></div></article>`;
 }
 
 function pageThumbnailCacheKey(page){return `${resolvedPageId(page)}|${String(page?.contentPdf||'')}|${String(page?.updatedAt||'')}`;}
@@ -3434,7 +3728,7 @@ function finishPointerDrag(commit) {
 function beginPointerPageDrag(e, row) {
   if (!row || e.button !== 0) return;
   const fromHandle=!!e.target.closest('.drag-handle');
-  const directCardDrag=row.classList.contains('page-thumb-card')&&!e.target.closest('input, select, option, button, a, .preview-trigger, .page-thumb-editor');
+  const directCardDrag=row.classList.contains('page-thumb-card')&&!e.target.closest('input, select, option, button, a, .preview-trigger, .page-thumb-check, .page-thumb-editor');
   if (!fromHandle&&!directCardDrag) return;
   if (fromHandle) e.preventDefault();
   const captureTarget = e.currentTarget || row;
@@ -3507,7 +3801,7 @@ function attachBoardEvents() {
   document.querySelectorAll('.page-row').forEach(row=>{
     row.setAttribute('aria-keyshortcuts','Space Enter ArrowUp ArrowDown ArrowLeft ArrowRight Home End Alt+ArrowUp Alt+ArrowDown Alt+ArrowLeft Alt+ArrowRight Control+A');
     row.addEventListener('pointerdown',e=>beginPointerPageDrag(e,row));
-    if(row.classList.contains('page-thumb-card'))row.addEventListener('click',e=>{if(row.dataset.suppressClick==='true'){delete row.dataset.suppressClick;e.preventDefault();e.stopPropagation();return;}if(e.target.closest('input,button,a,select,.drag-handle,.badge,.page-thumb-editor'))return;const ch=row.querySelector('[data-page-check]');if(!ch)return;ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);});
+    if(row.classList.contains('page-thumb-card'))row.addEventListener('click',e=>{if(row.dataset.suppressClick==='true'){delete row.dataset.suppressClick;e.preventDefault();e.stopPropagation();return;}if(e.target.closest('input,button,a,select,.drag-handle,.badge,.page-thumb-check,.page-thumb-editor'))return;const ch=row.querySelector('[data-page-check]');if(!ch)return;ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);});
     row.addEventListener('keydown',e=>{
       if(e.target.matches('input,select,textarea,button,a,[contenteditable="true"]'))return;
       if(!e.altKey){if(e.key===' '||e.key==='Spacebar'){e.preventDefault();const ch=row.querySelector('[data-page-check]');if(ch){ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);}return;}if(e.key==='Enter'){const preview=row.querySelector('[data-preview-page]');if(preview){e.preventDefault();previewPage(preview.dataset.previewPage||row.dataset.pageId,pageFallbackFromRow(row));}return;}if(handlePageRowNavigation(row,e))return;return;}
@@ -3717,12 +4011,17 @@ async function applyDefaultChildPaths(force=false) {
     lastSubmissionDefaultBase=sub;
   } catch {}
 }
+function continueFirstRunAfterFolderSelection(){
+  if(activePackRecord()||asArray(state?.packs).length)return;
+  setTimeout(()=>openPackEditor('create'),120);
+}
 async function chooseSubmissionFolder(btn) {
   if (folderPickerBusy) return;
+  const replacingExistingFolder=!!activePackRecord()||asArray(state?.packs).length>0;
   folderPickerBusy = true;
   const old = btn?.textContent;
   if (btn) { btn.disabled = true; btn.textContent = '選択画面を開く'; }
-  showMessage('', '提出フォルダを選んでください', 'フォルダ選択画面を開いています。');
+  showMessage('', '原稿フォルダを選んでください', 'フォルダ選択画面を開いています。');
   try {
     await sleep(40); // Let the button/message repaint before the local server opens the native dialog.
     const data = await api('/api/submission/select-and-start', {
@@ -3745,9 +4044,10 @@ async function chooseSubmissionFolder(btn) {
     lastPageRangeAnchor = '';
     renderAll();
     if (!availableFiles.length) await loadFilesSilently(); else renderFileList(availableFiles);
-    showMessage('ok', '提出フォルダを設定しました', 'Excel・Word・PowerPoint・PDFを選んで登録してください。');
+    showMessage('ok', '原稿フォルダを設定しました', replacingExistingFolder?'新しいフォルダの原稿を確認しました。':'続けて、今回まとめる一式に名前を付けます。');
+    if(replacingExistingFolder)setActiveView('excel');else continueFirstRunAfterFolderSelection();
   } catch(e) {
-    showMessage('danger', '提出フォルダを選べません', userFriendlyError(e.message), e.detail || e.stack || e.message);
+    showMessage('danger', '原稿フォルダを選べません', userFriendlyError(e.message), e.detail || e.stack || e.message);
   } finally {
     folderPickerBusy = false;
     if (btn) { btn.disabled = false; btn.textContent = old; }
@@ -3758,7 +4058,7 @@ async function chooseSubmissionFolder(btn) {
 async function savePaths(btn) {
   const submissionDir = pathElementValue('submissionDir').trim();
   if (!submissionDir) {
-    showMessage('warn', '提出フォルダを入力してください', 'フォルダのパスを入力するか、「フォルダを選ぶ」を使用してください。');
+    showMessage('warn', '原稿フォルダを入力してください', 'フォルダのパスを入力するか、「フォルダを選ぶ」を使用してください。');
     $('submissionDir')?.focus();
     return;
   }
@@ -3767,7 +4067,8 @@ async function savePaths(btn) {
     await api('/api/paths', {method:'POST', body});
     await refresh();
     await loadFiles(null);
-    showMessage('ok', '提出フォルダを設定しました', 'Excel・Word・PowerPoint・PDFを選んで登録してください。');
+    showMessage('ok', '原稿フォルダを設定しました', '続けて、今回まとめる一式に名前を付けます。');
+    continueFirstRunAfterFolderSelection();
   });
 }
 function showPostBuildWarning(volume) {
@@ -3777,6 +4078,8 @@ function showPostBuildWarning(volume) {
 }
 async function buildVolume(volume, btn) {
   const ready=volumeReadiness(volume);if(asArray(ready.blockers).length){setActiveView('excel');showMessage('warn','先に原稿の変換PDFを作成してください',ready.blockers[0]?.message||'出力条件を確認してください。');return;}
+  const unassigned=unresolvedPageCount();
+  if(unassigned){const accepted=await confirmAction({title:`未振り分け ${unassigned}ページを除外しますか？`,message:'未振り分けのページは、今回の提出用PDFに入りません。',detail:'意図しない原稿落ちを防ぐため、通常は「キャンセル」してページ構成を確認してください。',confirmLabel:'除外して出力'});if(!accepted)return;}
   await runBusy(btn,async()=>{const custom=!activePackIsBuiltIn(),result=await api(custom?'/api/v2/outputs/build':'/api/final/build',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});await refresh();await loadFinalReadiness();const built=custom?asArray(result.result?.built)[0]:result.result;showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf||'出力フォルダを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);showPostBuildWarning(volume);});
 }
 
@@ -3785,13 +4088,15 @@ async function publishFinalVolume(volume,btn) {
     const custom=!activePackIsBuiltIn();
     const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
     const result=response.result||{};
-    showMessage('ok',`${volumeLabel(volume)}PDFを共有発行しました`,
+    showMessage('ok',`${volumeLabel(volume)}PDFを共有用フォルダにコピーしました`,
       `${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
       result,[],0);
   });
 }
 
 async function buildAllVolumes(btn) {
+  const unassigned=unresolvedPageCount();
+  if(unassigned){setActiveView('pages');showMessage('warn',`未振り分け ${unassigned}ページを確認してください`,'必要なページを提出用PDFへ移してから出力します。');return;}
   // V5: 本体だけ成功する状態を作らないよう、サーバー側の準トランザクションAPIを1回だけ呼ぶ。
   await runBusy(btn, async () => {
     const custom=!activePackIsBuiltIn();
@@ -3839,8 +4144,9 @@ document.querySelectorAll('[data-view-nav]').forEach(btn=>btn.addEventListener('
 document.querySelectorAll('[data-view-shortcut]').forEach(btn=>btn.addEventListener('click',()=>setActiveView(btn.dataset.viewShortcut)));
 setActiveView(activeView,{noScroll:true,instant:true});
 const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEventListener('input',()=>{fileFilterText=fileFilterInput.value||'';renderFileList(availableFiles);});
-bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('folders');setTimeout(()=>$('submissionDir')?.focus(),0);}else if(action==='render'){setActiveView('excel');selectRenderNeededWorkbooks();await renderSelectedWorkbooks($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
-bind('notice-close','click',hideMessage);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));bind('scan-folder-btn','click',()=>scanAndRefresh($('scan-folder-btn')));bind('choose-submission-btn','click',()=>chooseSubmissionFolder($('choose-submission-btn')));
+bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('excel');setTimeout(()=>$('change-source-folder-btn')?.focus(),0);}else if(action==='create-pack'){openPackEditor('create');}else if(action==='render'){setActiveView('excel');await renderUpdated($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
+bind('notice-close','click',hideMessage);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));
+bind('app-load-retry','click',()=>loadInitialAppState($('app-load-retry')));
 bind('progress-cancel','click',()=>cancelActiveRenderJob());
 bind('run-diagnostics-btn','click',()=>runSystemDiagnostics($('run-diagnostics-btn')));
 bind('template-add-target','click',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned');renderTemplateTargets([...collectTemplateTargets(),newTemplateTarget()],false);renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,false);});
@@ -3850,9 +4156,9 @@ bind('pack-menu-button','click',()=>togglePackMenu());bind('create-pack-btn','cl
 const packMenu=$('pack-menu');if(packMenu)packMenu.addEventListener('click',handlePackMenuAction);
 bind('pack-editor-cancel','click',()=>closePackEditor());bind('pack-editor-template','change',updatePackTemplateDescription);const packEditorForm=$('pack-editor-form');if(packEditorForm)packEditorForm.addEventListener('submit',event=>{event.preventDefault();void submitPackEditor($('pack-editor-save'));});const packEditorModal=$('pack-editor-modal');if(packEditorModal)packEditorModal.addEventListener('click',event=>{if(event.target===packEditorModal)closePackEditor();});
 bind('template-manager-cancel','click',()=>closeTemplateManager());bind('template-manager-select','change',populateTemplateManager);bind('template-add-requirement','click',()=>renderTemplateRequirements([...collectTemplateRequirements(),newTemplateRequirement()],false));bind('template-manager-delete','click',()=>deleteManagedTemplate($('template-manager-delete')));bind('template-manager-duplicate','click',()=>duplicateManagedTemplate($('template-manager-duplicate')));bind('template-manager-export','click',exportManagedTemplate);bind('template-manager-import','click',()=>$('template-manager-import-file')?.click());bind('template-manager-import-file','change',event=>importManagedTemplateFile(event.target.files?.[0],event.target));const templateManagerForm=$('template-manager-form');if(templateManagerForm)templateManagerForm.addEventListener('submit',event=>{event.preventDefault();void submitTemplateManager($('template-manager-save'));});const templateManagerModal=$('template-manager-modal');if(templateManagerModal)templateManagerModal.addEventListener('click',event=>{if(event.target===templateManagerModal)closeTemplateManager();});
-document.addEventListener('click',event=>{if(!$('pack-menu')?.classList.contains('hidden')&&!event.target.closest('.pack-select-wrap'))closePackMenu();});
+document.addEventListener('click',event=>{if(!$('pack-menu')?.classList.contains('hidden')&&!event.target.closest('.pack-select-wrap'))closePackMenu();if(!$('app-menu-popover')?.classList.contains('hidden')&&!event.target.closest('.app-menu-wrap'))closeAppMenu();});
 bind('use-submission-path-btn','click',()=>savePaths($('use-submission-path-btn')));bind('submissionDir','keydown',event=>{if(event.key==='Enter'){event.preventDefault();savePaths($('use-submission-path-btn'));}});
-bind('select-visible-files-btn','click',selectVisibleFiles);bind('clear-selected-files-btn','click',clearVisibleFilesSelection);bind('select-render-needed-btn','click',selectRenderNeededWorkbooks);bind('clear-selected-workbooks-btn','click',clearWorkbookSelection);bind('select-all-pages-btn','click',selectAllActivePages);bind('clear-selected-pages-btn','click',clearActivePageSelection);
+bind('clear-selected-files-btn','click',clearVisibleFilesSelection);bind('clear-selected-workbooks-btn','click',clearWorkbookSelection);bind('select-all-pages-btn','click',selectAllActivePages);bind('clear-selected-pages-btn','click',clearActivePageSelection);
 bind('page-view-thumbnail-btn','click',()=>setPageBoardView('thumbnail'));bind('page-view-detail-btn','click',()=>setPageBoardView('detail'));bind('page-layout-undo-btn','click',()=>undoLastPageLayout($('page-layout-undo-btn')));bind('page-layout-redo-btn','click',()=>redoLastPageLayout($('page-layout-redo-btn')));bind('page-layout-revisions-btn','click',()=>openPageLayoutRevisions());
 bind('page-layout-revisions-refresh','click',()=>loadLayoutSnapshots());bind('page-layout-revisions-close','click',()=>closePageLayoutRevisions());const pageLayoutRevisionsModal=$('page-layout-revisions-modal');if(pageLayoutRevisionsModal)pageLayoutRevisionsModal.addEventListener('click',event=>{if(event.target===pageLayoutRevisionsModal)closePageLayoutRevisions();});
 const pageSearchInput=$('page-search-input'),pageSearchClear=$('page-search-clear');
@@ -3862,14 +4168,20 @@ const pageThumbnailSizeInput=$('page-thumbnail-size');if(pageThumbnailSizeInput)
 bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
 bind('register-selected-btn','click',()=>registerSelected($('register-selected-btn')));bind('unregister-selected-btn','click',()=>unregisterSelected($('unregister-selected-btn')));bind('render-selected-btn','click',()=>renderSelectedWorkbooks($('render-selected-btn')));bind('render-all-btn','click',()=>renderAllWorkbooks($('render-all-btn')));bind('sort-by-sheet-btn','click',()=>sortPagesBySheet($('sort-by-sheet-btn')));
 bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
+bind('source-next-pages','click',()=>setActiveView('pages'));
+bind('change-source-folder-btn','click',()=>chooseSubmissionFolder($('change-source-folder-btn')));
 bind('save-pack-settings-btn','click',()=>savePackSettings($('save-pack-settings-btn')));
 bind('final-preflight-refresh','click',()=>refreshFinalPreflight($('final-preflight-refresh')));
+bind('pack-review-submit','click',()=>performPackReviewAction('submit',$('pack-review-submit')));
+bind('pack-review-approve','click',()=>performPackReviewAction('approve',$('pack-review-approve')));
+bind('pack-review-request-changes','click',()=>performPackReviewAction('request-changes',$('pack-review-request-changes')));
+bind('pack-review-reopen','click',()=>performPackReviewAction('reopen',$('pack-review-reopen')));
 const changedOnlyToggle=$('changed-only-toggle');
 if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 bind('history-refresh-btn','click',()=>loadHistoryPanels({force:true}));
 // V5-P1(#12): 版履歴パネルの対象Excel切り替え。
 bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',snapshotHistoryState.workbookId);}catch{}snapshotHistoryState.snapshots=[];snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';void loadSnapshotHistory();});
-bind('mode-badge','click',()=>{const pop=$('language-popover'),btn=$('mode-badge');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));});
+bind('app-menu-button','click',()=>{const pop=$('app-menu-popover'),btn=$('app-menu-button');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));});bind('app-exit-button','click',()=>requestAppShutdown($('app-exit-button')));
 bind('preview-close','click',closePreview);const previewModal=$('preview-modal');if(previewModal)previewModal.addEventListener('click',e=>{if(e.target===previewModal)closePreview();});
 bind('preview-prev-page','click',()=>navigatePreviewPage(-1));bind('preview-next-page','click',()=>navigatePreviewPage(1));bind('preview-move-none','click',()=>moveCurrentPreviewPageToVolume('none',$('preview-move-none')));
 bind('diff-close','click',closeDiffDetail);
@@ -3878,6 +4190,15 @@ const diffModal=$('diff-modal');if(diffModal)diffModal.addEventListener('click',
 bind('diff-mode-side','click',()=>{diffViewState.mode='side';applyDiffMode();});
 bind('diff-mode-overlay','click',()=>{diffViewState.mode='overlay';applyDiffMode();});
 bind('diff-highlight','change',applyDiffHighlightSettings);
+bind('diff-unreviewed-only','change',event=>{
+  diffViewState.unreviewedOnly=!!event.target.checked;
+  if(diffViewState.unreviewedOnly&&diffViewState.filter==='confirmed')diffViewState.filter='all';
+  const visible=diffFilteredSheets();
+  if(!visible.some(sheet=>String(sheet.sheetKey||'')===diffViewState.selectedSheetKey)){
+    diffViewState.selectedSheetKey=String(visible[0]?.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(visible[0]);diffViewState.regionIndex=-1;
+  }
+  renderDiffSummary();renderDiffSheetList();renderDiffPage();
+});
 bind('diff-density','change',applyDiffHighlightSettings);
 bind('diff-zoom','change',updateDiffStageScale);
 bind('diff-opacity','input',applyDiffMode);
@@ -3885,6 +4206,7 @@ bind('diff-prev-page','click',()=>setDiffPage(diffViewState.pageIndex-1));
 bind('diff-next-page','click',()=>setDiffPage(diffViewState.pageIndex+1));
 bind('diff-prev-region','click',()=>moveDiffRegion(-1));
 bind('diff-next-region','click',()=>moveDiffRegion(1));
+bind('diff-confirm-sheet','click',()=>toggleDiffSheetReviewed($('diff-confirm-sheet')));
 document.querySelectorAll('[data-diff-tab]').forEach(btn=>btn.addEventListener('click',()=>{
   diffViewState.mobileTab=btn.dataset.diffTab||'before';
   document.querySelectorAll('[data-diff-tab]').forEach(x=>x.classList.toggle('active',x===btn));
@@ -3897,10 +4219,11 @@ afterDiffViewport?.addEventListener('scroll',()=>syncDiffScroll(afterDiffViewpor
 window.addEventListener('resize',()=>{if(isDiffModalOpen())updateDiffStageScale();});
 window.addEventListener('keydown',e=>{
   const shortcutKey=String(e.key||'').toLowerCase(),editableTarget=e.target.matches('input,select,textarea,[contenteditable="true"]');
+  if(isDiffModalOpen()&&!editableTarget&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&shortcutKey==='r'){e.preventDefault();void toggleDiffSheetReviewed();return;}
   if(activeView==='pages'&&!isAnyModalOpen()&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!editableTarget&&shortcutKey==='a'){e.preventDefault();selectAllActivePages();return;}
   if(activeView==='pages'&&!isAnyModalOpen()&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!editableTarget){const wantsUndo=shortcutKey==='z'&&!e.shiftKey,wantsRedo=(shortcutKey==='z'&&e.shiftKey)||(shortcutKey==='y'&&!e.shiftKey),available=wantsUndo?(pageLayoutUndoStack.length>0||!!pendingPageLayoutUndo):(wantsRedo&&pageLayoutRedoStack.length>0);if(available){e.preventDefault();void(wantsUndo?undoLastPageLayout():redoLastPageLayout());return;}}
   if(e.key==='Escape'){
-    if(isConfirmModalOpen())closeConfirmModal(false);else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
+    if(isConfirmModalOpen())closeConfirmModal(false);else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('app-menu-popover')?.classList.contains('hidden'))closeAppMenu(true);else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
     return;
   }
   if(isModalOpen()&&!isDiffModalOpen()&&previewOrganizerMode&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!e.target.matches('input,select,textarea')&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();void navigatePreviewPage(e.key==='ArrowLeft'?-1:1);return;}
@@ -3914,21 +4237,44 @@ window.addEventListener('keydown',e=>{
   else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
 });
 
+let initialUpdateScanScheduled=false;
+async function loadInitialAppState(button=null) {
+  const screen=$('app-loading-screen'),title=$('app-loading-title'),message=$('app-loading-message'),layout=document.querySelector('.app-layout');
+  document.body.classList.add('app-initializing');
+  document.body.classList.remove('app-load-failed');
+  if(screen)screen.setAttribute('aria-live','polite');
+  if(title)title.textContent='ReportBinderを準備しています';
+  if(message)message.textContent='原稿やページの状態を読み込んでいます。';
+  if(button){button.classList.add('hidden');button.disabled=true;}
+  if(layout){layout.setAttribute('aria-hidden','true');layout.setAttribute('inert','');}
+  try {
+    state=normalizeStatePayload(await api('/api/state'));
+    if(configured()){
+      try{await loadFilesSilently();}
+      catch(e){log('原稿一覧の初期読み込みでエラー',e.detail||e.stack||e.message);}
+    }
+    renderAll();
+    if(layout){layout.removeAttribute('aria-hidden');layout.removeAttribute('inert');}
+    document.body.classList.remove('app-initializing','app-load-failed');
+    if(configured()&&!initialUpdateScanScheduled){
+      initialUpdateScanScheduled=true;
+      // Heavy update checks can make the first folder/dialog action feel unresponsive on a single local server thread.
+      // Run the first scan after the user has had time to interact; normal monitoring continues afterwards.
+      setTimeout(() => scanUpdatesSilently({withFiles:true}), 30000);
+    }
+  } catch(e) {
+    log('初期データを読み込めません',e.detail||e.stack||e.message);
+    document.body.classList.add('app-load-failed');
+    if(screen)screen.setAttribute('aria-live','assertive');
+    if(title)title.textContent='資料を読み込めませんでした';
+    if(message)message.textContent='接続を確認して、もう一度読み込んでください。';
+    if(button){button.classList.remove('hidden');button.disabled=false;}
+  }
+}
 (async function init() {
   startLifecycle();
   startUpdateMonitor();
-  await refresh();
-  if (configured()) {
-    try {
-      await loadFilesSilently();
-      renderFileList(availableFiles);
-    } catch (e) {
-      log('Excel一覧の初期読み込みでエラー', e.detail || e.stack || e.message);
-    }
-    // Heavy update checks can make the first folder/dialog action feel unresponsive on a single local server thread.
-    // Run the first scan after the user has had time to interact; normal monitoring continues afterwards.
-    setTimeout(() => scanUpdatesSilently({withFiles:true}), 30000);
-  }
+  await loadInitialAppState($('app-load-retry'));
 })();
 
 window.addEventListener('pagehide', () => { clearDiffBrowserResources(true); for (const u of [...pdfObjectUrls]) revokePdfObjectUrl(u); });
@@ -3960,9 +4306,12 @@ function renderAutoStatus(){
     const label={idle:it.lastResult==='completed'?'完了':'待機中',waiting:'変更を検知（静止待ち）',deferred:'保留中',rendering:'PDF作成中',ready:'実行待ち','retry-wait':'再試行待ち',failed:'自動処理失敗'}[String(it.state||'')]||String(it.state||'');
     const retryable=['deferred','retry-wait','failed'].includes(String(it.state||''));return `<div class="auto-row"><span>${escapeHtml(name)}</span><span>${escapeHtml(label)}</span><span class="subtext">${escapeHtml(reason||it.lastResultAt?`${reason}${reason?'・':''}${formatDateTime(it.lastResultAt)}`:'')}</span>${retryable?`<button class="btn ghost compact" type="button" data-auto-run="${escapeAttr(it.workbookId)}">今すぐ実行</button>`:''}</div>`;
   }).join('');
-  box.innerHTML=`<div class="card-head"><div><h3>自動PDF作成</h3><span class="caption">${auto.enabled?'有効':'無効'}${auto.enabled?`（変更後 ${Math.round(Number(auto.quietPeriodSeconds||180)/60)}分待機・最大${Number(auto.maxRetryCount||0)}回再試行）`:''}</span></div><button class="btn ghost compact" type="button" data-auto-settings-toggle>設定</button></div><div class="auto-settings" data-auto-settings hidden><label><input id="auto-enabled" type="checkbox" ${auto.enabled?'checked':''}> 自動PDF作成を有効にする</label><label>静止待ち<select id="auto-quiet-seconds">${[[60,'1分'],[180,'3分'],[300,'5分'],[600,'10分']].map(([value,label])=>`<option value="${value}" ${Number(auto.quietPeriodSeconds||180)===value?'selected':''}>${label}</option>`).join('')}</select></label><label>失敗時の再試行<select id="auto-max-retries">${[0,1,3,5].map(value=>`<option value="${value}" ${Number(auto.maxRetryCount||3)===value?'selected':''}>${value}回</option>`).join('')}</select></label><label>必要な空き容量<select id="auto-min-free">${[[512,'0.5 GB'],[1024,'1 GB'],[2048,'2 GB'],[5120,'5 GB']].map(([value,label])=>`<option value="${value}" ${Number(auto.minFreeMegabytes||1024)===value?'selected':''}>${label}</option>`).join('')}</select></label><label><input id="auto-notify-success" type="checkbox" ${auto.notifyOnCompletion!==false?'checked':''}> 完了を通知</label><label><input id="auto-notify-failure" type="checkbox" ${auto.notifyOnFailure!==false?'checked':''}> 失敗を通知</label><button class="btn primary compact" type="button" data-auto-settings-save>保存</button></div>`
+  const attentionCount=items.filter(item=>!['idle',''].includes(String(item.state||''))).length;
+  const statusText=attentionCount?`${attentionCount}件に対応が必要`:auto.enabled?`有効・変更後 ${Math.round(Number(auto.quietPeriodSeconds||180)/60)}分待機`:'無効';
+  box.innerHTML=`<details class="secondary-disclosure auto-disclosure"><summary><span>自動PDF作成</span><small>${escapeHtml(statusText)}</small></summary><div class="secondary-disclosure-body"><div class="disclosure-actions"><p>${attentionCount?'保留中または再試行待ちの原稿があります。':'原稿更新後のPDF作成を自動化できます。'}</p><button class="btn ghost compact" type="button" data-auto-settings-toggle>設定を変更</button></div><div class="auto-settings" data-auto-settings hidden><label><input id="auto-enabled" type="checkbox" ${auto.enabled?'checked':''}> 自動PDF作成を有効にする</label><label>静止待ち<select id="auto-quiet-seconds">${[[60,'1分'],[180,'3分'],[300,'5分'],[600,'10分']].map(([value,label])=>`<option value="${value}" ${Number(auto.quietPeriodSeconds||180)===value?'selected':''}>${label}</option>`).join('')}</select></label><label>失敗時の再試行<select id="auto-max-retries">${[0,1,3,5].map(value=>`<option value="${value}" ${Number(auto.maxRetryCount||3)===value?'selected':''}>${value}回</option>`).join('')}</select></label><label>必要な空き容量<select id="auto-min-free">${[[512,'0.5 GB'],[1024,'1 GB'],[2048,'2 GB'],[5120,'5 GB']].map(([value,label])=>`<option value="${value}" ${Number(auto.minFreeMegabytes||1024)===value?'selected':''}>${label}</option>`).join('')}</select></label><label><input id="auto-notify-success" type="checkbox" ${auto.notifyOnCompletion!==false?'checked':''}> 完了を通知</label><label><input id="auto-notify-failure" type="checkbox" ${auto.notifyOnFailure!==false?'checked':''}> 失敗を通知</label><button class="btn primary compact" type="button" data-auto-settings-save>保存</button></div>`
     +(items.length?`<div class="auto-list">${lines}</div>`:'<div class="caption">保留中の変更はありません。</div>')
-    +(overCap?`<p class="warn-strip">変更履歴の使用量が ${size}MB です（上限の目安 ${cap}MB）。</p>`:'');
+    +(overCap?`<p class="warn-strip">変更履歴の使用量が ${size}MB です（上限の目安 ${cap}MB）。</p>`:'')
+    +'</div></details>';
   box.querySelectorAll('[data-auto-run]').forEach(b=>b.addEventListener('click',async()=>{
     try{await api('/api/auto/run-now',{method:'POST',body:{workbookId:b.getAttribute('data-auto-run')}});await refresh();}
     catch(e){showMessage('danger','実行を要求できません',userFriendlyError(e.message));}
@@ -4047,6 +4396,7 @@ function volumeLabel(v){
 async function loadFinalArchives(){
   const box=$('final-archive-history');
   if(!box)return;
+  if(!activePackRecord()?.packId){box.innerHTML='<div class="caption">資料パックを作成すると出力履歴が表示されます。</div>';return;}
   try{
     const r=await api(activePackIsBuiltIn()?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(activePackId)}`);
     const list=asArray(r.archives);

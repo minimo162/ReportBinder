@@ -69,6 +69,15 @@ $secondIds = @($convertedAgain.items | ForEach-Object { [string]$_.itemId }) -jo
 Assert-SchemaTest ($firstIds -eq $secondIds) 'itemId changed during idempotence check.'
 $empty = New-EmptyStructure 'ja'
 Assert-SchemaTest ([int]$empty.schemaVersion -eq 3 -and (Test-StructureDocument $empty 'ja')) 'New schema v3 structure is invalid.'
+Assert-SchemaTest (Test-StructureDocument $empty 'en') 'Schema v3 shared workspace must not be rejected by display language.'
+$firstRunSubmission = Join-Path $Script:LocalConfigRoot 'first-run-submission'
+New-Item -ItemType Directory -Path $firstRunSubmission -Force | Out-Null
+$firstRunPaths = Get-DefaultChildPaths $firstRunSubmission
+$firstRunInitialization = Initialize-CleanLocalProject $firstRunPaths
+Ensure-Package $firstRunPaths
+$firstRunStructure = Read-StructureUnlocked 'ja' ([string]$firstRunPaths.dataDir)
+Assert-SchemaTest ([bool]$firstRunInitialization.initialized) 'First-run local project was not initialized.'
+Assert-SchemaTest (Test-StructureDocument $firstRunStructure 'ja') 'First-run package structure is invalid.'
 $convertedAgain.pages[0].volume = 'ja-appendix'
 $convertedAgain.pages[0].order = 90
 Sync-StructureV3FromLegacy $convertedAgain 'ja' | Out-Null
@@ -78,7 +87,7 @@ Assert-SchemaTest ($syncedItem.Count -eq 1 -and [string]$syncedItem[0].targetId 
 function Test-FileMigration([string]$FixturePath, [string[]]$ExpectedBackups) {
     $caseId = [IO.Path]::GetFileNameWithoutExtension($FixturePath)
     $dataDir = Join-Path $Script:LocalConfigRoot ('migration-' + $caseId)
-    $workspace = Join-Path $dataDir 'ja'
+    $workspace = Join-Path $dataDir 'workspace'
     New-Item -ItemType Directory -Path (Join-Path $workspace 'locks') -Force | Out-Null
     Copy-Item -LiteralPath $FixturePath -Destination (Join-Path $workspace 'structure.json') -Force
     $migration = Initialize-Or-MigrateStructure 'ja' $dataDir

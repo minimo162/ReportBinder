@@ -68,9 +68,6 @@ def main() -> int:
             "title": "実践資料パック",
             "subtitle": "PR 7 structured composition",
             "targetName": "本体",
-            "includeCover": True,
-            "includeToc": True,
-            "includeSectionDividers": True,
         },
         "pageNumber": {"fontSize": 8, "bottomPt": 18, "format": "hyphenated"},
         "pages": [
@@ -121,15 +118,15 @@ def main() -> int:
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
     reader = PdfReader(output)
-    assert len(reader.pages) == 7, f"expected 7 physical pages, got {len(reader.pages)}"
-    assert "Alpha page 2" in (reader.pages[3].extract_text() or "")
-    assert "Alpha page 3" in (reader.pages[4].extract_text() or "")
+    assert len(reader.pages) == 3, f"expected 3 source pages, got {len(reader.pages)}"
+    assert "Alpha page 2" in (reader.pages[0].extract_text() or "")
+    assert "Alpha page 3" in (reader.pages[1].extract_text() or "")
     assert "Alpha page 1" not in "\n".join((p.extract_text() or "") for p in reader.pages)
-    assert "Beta page 1" in (reader.pages[6].extract_text() or "")
+    assert "Beta page 1" in (reader.pages[2].extract_text() or "")
     assert outline_titles(reader) == ["営業部 / Alpha excerpt", "管理部 / Beta first page"]
     print(f"PASS structured composition: {output}")
     print("PASS pageRange selected Alpha 2-3 and Beta 1")
-    print("PASS cover, TOC, section dividers, physical page count=7")
+    print("PASS source-only composition without generated cover, TOC, or dividers")
     print("PASS item-derived PDF bookmarks")
     if not args.keep:
         shutil.rmtree(work)

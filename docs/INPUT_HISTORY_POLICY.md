@@ -4,13 +4,15 @@
 `_reportbinder\common\policy.json` は使用しません。ファイルが無い場合も機能制限はなく、
 既存の `policy.json` が残っていても値は参照されません。
 
-## 提出Excel現物の保存条件
+## 提出原稿現物の保存条件
 
-提出Excelの現物は、管理データ（`dataDir`）が提出フォルダ配下にある場合だけ保存します。
-標準構成の `提出フォルダ\_reportbinder` はこの条件を満たします。
+提出原稿（Excel・Word・PowerPoint・PDF）の現物は、利用者ごとのローカルプロジェクト領域に保存します。
+標準構成では管理データ（`dataDir`）は
+`%LOCALAPPDATA%\ReportBinder\projects\<projectKey>\data` にあり、提出フォルダには履歴・中間PDFを書きません。
 
-`dataDir` が提出フォルダの外にある場合、履歴・差分の記録は続けますが、提出Excelの現物は
-履歴フォルダへ複製しません。この制限は設定フラグではなく、実パスの検証で常に適用します。
+原稿現物を履歴へ複製できるのは、`dataDir` の実パスが
+`%LOCALAPPDATA%\ReportBinder\projects` 配下にある場合だけです。別の場所を手動設定した場合も履歴・差分の記録は続けますが、
+原稿現物は複製しません。この制限は設定フラグではなく、実パスの検証で常に適用します。
 
 ## 保持の仕組み（世代数と pin）
 
@@ -26,7 +28,7 @@
 
 正式版を出力した検知版はアプリが自動的に pin し、
 `exports\archive\<カテゴリ>\<巻>\<buildId>` に最終PDF・manifest・SHA-256とともに記録します。
-同じ内容のExcelは重複排除されるため、内容が変わらなければ同じ検知版を再利用します。
+同じ内容の原稿は重複排除されるため、内容が変わらなければ同じ検知版を再利用します。
 
 `retainSourceVersions` の枠から外れ、pin も無い版は、画像ハッシュや検知記録を含む
 検知版フォルダごと削除されます。差分を何版さかのぼる必要があるかに合わせて設定してください。
@@ -48,7 +50,7 @@
 ## 手動整理
 
 1. ReportBinder を終了します（`app\tools\stop-reportbinder.cmd`）。
-2. `_reportbinder\<言語>\input-history\<workbookId>\<snapshotId>` を古い順にフォルダごと削除します。
+2. `%LOCALAPPDATA%\ReportBinder\projects\<projectKey>\data\<言語>\input-history\<workbookId>\<snapshotId>` を古い順にフォルダごと削除します。
 3. フォルダ内の `pins` や `manifest.json` だけを削除しないでください。
 
 `pins` に `final-pdf_*` がある検知版は正式版の証跡です。正式版が不要になってから削除してください。

@@ -112,7 +112,9 @@ function Remove-ReleaseDevelopmentFiles([string]$StageRoot) {
         'app\tools\create-word-adapter-fixtures.py', 'app\tools\operational-readiness-selfcheck.ps1',
         'app\tools\create-scale-benchmark-fixtures.py', 'app\tools\create-scale-benchmark-workbooks.mjs',
         'app\tools\scale-benchmark.ps1', 'docs\SCALE_BENCHMARK.md', 'docs\benchmarks',
-        'app\tools\ci-selfcheck.ps1',
+        'app\tools\ci-selfcheck.ps1', 'app\tools\history-logic-selfcheck.ps1',
+        'app\tools\create-pdf-diff-corpus.py', 'app\tools\pdf-diff-corpus-selfcheck.ps1',
+        'tests\pdf-diff-corpus.mjs', 'docs\PDF_DIFF_CORPUS.md',
         'app\tools\ci-requirements.txt',
         'app\tools\package-release.ps1'
     )) { Remove-PathIfExists (Join-Path $StageRoot $relativePath) }
@@ -146,8 +148,6 @@ function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
         '.gitignore',
         'CHANGELOG_V4.md',
         'CHANGELOG_V5.md',
-        '日本語管理.vbs',
-        '英語管理.vbs',
         '共有フォルダー用フォルダー作成.cmd',
         'docs\API.md',
         'docs\ReportBinder_UIUX改修指示書_V4.md',
@@ -159,6 +159,11 @@ function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
         'app\tools\create-scale-benchmark-workbooks.mjs',
         'app\tools\scale-benchmark.ps1',
         'app\tools\ci-selfcheck.ps1',
+        'app\tools\history-logic-selfcheck.ps1',
+        'app\tools\create-pdf-diff-corpus.py',
+        'app\tools\pdf-diff-corpus-selfcheck.ps1',
+        'tests\pdf-diff-corpus.mjs',
+        'docs\PDF_DIFF_CORPUS.md',
         'app\tools\ci-requirements.txt',
         'docs\SCALE_BENCHMARK.md',
         'docs\benchmarks',
@@ -173,8 +178,7 @@ function Remove-SharedFolderDevelopmentFiles([string]$StageRoot) {
 
 function Assert-SharedFolderLayout([string]$StageRoot) {
     $required = @(
-        '日本語管理.cmd',
-        '英語管理.cmd',
+        '資料をPDFにまとめる.cmd',
         'README.md',
         'THIRD_PARTY_NOTICES.md',
         'release-manifest.json',
@@ -192,6 +196,8 @@ function Assert-SharedFolderLayout([string]$StageRoot) {
     }
 
     $forbidden = @(
+        '日本語管理.cmd',
+        '英語管理.cmd',
         '日本語管理.vbs',
         '英語管理.vbs',
         '共有フォルダー用フォルダー作成.cmd',
@@ -217,6 +223,11 @@ function Assert-SharedFolderLayout([string]$StageRoot) {
         'app\tools\create-scale-benchmark-workbooks.mjs',
         'app\tools\scale-benchmark.ps1',
         'app\tools\ci-selfcheck.ps1',
+        'app\tools\history-logic-selfcheck.ps1',
+        'app\tools\create-pdf-diff-corpus.py',
+        'app\tools\pdf-diff-corpus-selfcheck.ps1',
+        'tests\pdf-diff-corpus.mjs',
+        'docs\PDF_DIFF_CORPUS.md',
         'app\tools\ci-requirements.txt',
         'docs\SCALE_BENCHMARK.md',
         'docs\benchmarks'

@@ -50,7 +50,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyCon
 $pptxPath = Join-Path $submissionDir '02_ECM_presentation.pptx'
 [IO.Compression.ZipFile]::CreateFromDirectory($pptxSource, $pptxPath)
 Save-AppConfig ([pscustomobject][ordered]@{
-    schemaVersion = 2; lastSubmissionDir = $submissionDir; lastDataDir = $dataDir; lastOutputDir = $outputDir; lastMode = 'ja'
+    schemaVersion = 2; lastSubmissionDir = $submissionDir; lastDataDir = $dataDir; lastOutputDir = $outputDir
 })
 $paths = [pscustomobject][ordered]@{ submissionDir=$submissionDir; dataDir=$dataDir; outputDir=$outputDir }
 Ensure-Package $paths -Languages @('ja')
@@ -114,9 +114,9 @@ $structure = Get-Structure 'ja'
 $v4 = ConvertTo-V4StructureCompatibilityView $structure
 Assert-AdapterTest (@($v4.workbooks).Count -eq 2 -and @($v4.workbooks | Where-Object { [string]$_.workbookId -eq $sourceId }).Count -eq 1) 'V4 workbook compatibility was not preserved.'
 $templates = @(Get-PackTemplateCatalog 'ja')
-Assert-AdapterTest ($templates.Count -eq 4 -and [string]$templates[0].packId -eq 'pack_ecm' -and @($templates | Where-Object { [string]$_.templateId -eq 'builtin-generic-department-pack' }).Count -eq 1) 'Pack template catalog is invalid.'
+Assert-AdapterTest ($templates.Count -eq 1 -and [string]$templates[0].templateId -eq 'builtin-generic-department-pack' -and [string]$templates[0].packId -eq '') 'Pack template catalog must expose only the general-purpose starting template.'
 $packs = @(Get-PublicPackList $structure 'ja')
-Assert-AdapterTest ($packs.Count -ge 3 -and @($packs | Where-Object { [string]$_.category -eq 'ecm' -and [bool]$_.workflowAvailable }).Count -eq 1) 'Public pack catalog is invalid.'
+Assert-AdapterTest ($packs.Count -eq 0) 'Legacy category packs must not appear in the public pack catalog.'
 $updated = Update-SourceMetadata 'ja' $sourceId ([pscustomobject]@{ ownerDepartment='経理部'; required=$false; defaultTargetId='appendix' })
 Assert-AdapterTest ([string]$updated.ownerDepartment -eq '経理部' -and -not [bool]$updated.required -and [string]$updated.defaultTargetId -eq 'appendix') 'Source metadata update result is invalid.'
 $updatedStructure = Get-Structure 'ja'
@@ -125,7 +125,7 @@ Assert-AdapterTest ($updatedSource.Count -eq 1 -and [string]$updatedSource[0].ow
 $updatedV4 = ConvertTo-V4StructureCompatibilityView $updatedStructure
 Assert-AdapterTest ([string]$updatedV4.workbooks[0].ownerDepartment -eq '経理部' -and -not [bool]$updatedV4.workbooks[0].required) 'Source metadata was not mirrored to V4 compatibility.'
 $v2State = Get-V2StatePayload 'ja'
-Assert-AdapterTest ([int]$v2State.apiVersion -eq 2 -and [int]$v2State.domainSchemaVersion -eq 3 -and @($v2State.packs).Count -ge 3) 'V2 state payload is invalid.'
+Assert-AdapterTest ([int]$v2State.apiVersion -eq 2 -and [int]$v2State.domainSchemaVersion -eq 3 -and @($v2State.packs).Count -eq 0) 'V2 state payload is invalid.'
 Write-Output 'source-adapter selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

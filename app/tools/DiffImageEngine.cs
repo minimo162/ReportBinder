@@ -66,6 +66,14 @@ public static class ReportBinderDiffEngine
     private const int MaximumModifiedLabelsPerPage = 12;
     private const int MaximumAlignmentOffset = 4;
 
+    public static double MeanAbsoluteByteDistance(byte[] before, byte[] after)
+    {
+        if (before == null || after == null || before.Length == 0 || before.Length != after.Length) return 1.0;
+        long difference = 0;
+        for (int i = 0; i < before.Length; i++) difference += Math.Abs((int)before[i] - (int)after[i]);
+        return Math.Min(1.0, difference / (before.Length * 255.0));
+    }
+
     private sealed class PixelRegion
     {
         public int minX;

@@ -1,6 +1,4 @@
 ﻿param(
-    [ValidateSet('ja','en')]
-    [string]$Mode = 'ja',
     [switch]$Diagnostics,
     [switch]$LocalRuntime,
     [string]$SharedAppRoot = ''
@@ -77,7 +75,7 @@ if (-not $LocalRuntime -and $script:RuntimeVersion -ne 'legacy') {
         $localLauncher = Join-Path $localAppRoot 'launch.ps1'
         $qLauncher = '"' + ($localLauncher -replace '"','\"') + '"'
         $qShared = '"' + ($script:SharedAppRoot -replace '"','\"') + '"'
-        $bootstrapArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $qLauncher -Mode $Mode -LocalRuntime -SharedAppRoot $qShared"
+        $bootstrapArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $qLauncher -LocalRuntime -SharedAppRoot $qShared"
         if ($Diagnostics) { $bootstrapArgs += ' -Diagnostics' }
         Start-Process -FilePath $psExeBootstrap -ArgumentList $bootstrapArgs -WindowStyle Hidden | Out-Null
         exit 0
@@ -122,16 +120,16 @@ $localLaunchDir = Join-Path ([IO.Path]::GetTempPath()) ("ReportBinder-$appRootKe
 if (-not (Test-Path -LiteralPath $localLaunchDir)) { New-Item -ItemType Directory -Path $localLaunchDir -Force | Out-Null }
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$log = Join-Path $logDir ("startup-$Mode-$stamp.log")
-$latest = Join-Path $logDir ("startup-$Mode-latest.log")
-$serverOut = Join-Path $logDir ("server-$Mode-$stamp.out.log")
-$serverErr = Join-Path $logDir ("server-$Mode-$stamp.err.log")
-$urlFile = Join-Path $logDir ("open-$Mode-latest.url")
-$rootUrlFile = Join-Path $logDir ("ReportBinder-$Mode.url")
-$serverPidFile = Join-Path $logDir ("server-$Mode-latest.pid")
-$launchPidFile = Join-Path $logDir ("launch-$Mode-latest.pid")
-$waitPageFile = Join-Path $localLaunchDir ("startup-wait-$Mode-latest.html")
-$edgeCmdFile = Join-Path $logDir ("ReportBinder-$Mode-Edge.cmd")
+$log = Join-Path $logDir ("startup-workspace-$stamp.log")
+$latest = Join-Path $logDir 'startup-workspace-latest.log'
+$serverOut = Join-Path $logDir ("server-workspace-$stamp.out.log")
+$serverErr = Join-Path $logDir ("server-workspace-$stamp.err.log")
+$urlFile = Join-Path $logDir 'open-workspace-latest.url'
+$rootUrlFile = Join-Path $logDir 'ReportBinder-workspace.url'
+$serverPidFile = Join-Path $logDir 'server-workspace-latest.pid'
+$launchPidFile = Join-Path $logDir 'launch-workspace-latest.pid'
+$waitPageFile = Join-Path $localLaunchDir 'startup-wait-workspace-latest.html'
+$edgeCmdFile = Join-Path $logDir 'ReportBinder-workspace-Edge.cmd'
 $launchMutex = $null
 $launchMutexOwned = $false
 
@@ -393,11 +391,6 @@ function Wait-ReportBinderReady([string]$Url, $Process, [string]$StdOutPath, [in
     return $false
 }
 
-function ConvertTo-HtmlText([string]$Value) {
-    if ($null -eq $Value) { return '' }
-    return $Value.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;')
-}
-
 function ConvertTo-JsStringLiteral([string]$Value) {
     if ($null -eq $Value) { $Value = '' }
     $escaped = $Value.Replace('\','\\').Replace('"','\"').Replace("`r",'\r').Replace("`n",'\n').Replace('<','\u003c').Replace('>','\u003e').Replace('&','\u0026')
@@ -407,7 +400,6 @@ function ConvertTo-JsStringLiteral([string]$Value) {
 function Write-StartupWaitPage([string]$Path, [string]$AppUrl, [string]$ReadyImageUrl) {
     $appJs = ConvertTo-JsStringLiteral $AppUrl
     $readyJs = ConvertTo-JsStringLiteral $ReadyImageUrl
-    $appHref = ConvertTo-HtmlText $AppUrl
     $html = @"
 <!doctype html>
 <html lang="ja">
@@ -416,39 +408,44 @@ function Write-StartupWaitPage([string]$Path, [string]$AppUrl, [string]$ReadyIma
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ReportBinder 起動中</title>
 <style>
-body{font-family:"BIZ UDPGothic","Yu Gothic",Meiryo,sans-serif;margin:0;background:#f6f7f9;color:#1f2937;}
-main{max-width:720px;margin:12vh auto;padding:32px;border-radius:18px;background:white;box-shadow:0 12px 32px rgba(15,23,42,.12);}
-h1{font-size:24px;margin:0 0 12px;}p{font-size:16px;line-height:1.8;margin:8px 0;}.muted{color:#6b7280}.spinner{width:28px;height:28px;border:4px solid #e5e7eb;border-top-color:#6b7280;border-radius:50%;animation:spin 1s linear infinite;margin-bottom:16px;}@keyframes spin{to{transform:rotate(360deg)}}code{word-break:break-all;background:#f3f4f6;padding:2px 5px;border-radius:5px;}.late{display:none;margin-top:18px;padding:14px;border:1px solid #f59e0b;border-radius:12px;background:#fffbeb;}.late.show{display:block;}.actions{margin:16px 0 4px}.button{display:inline-block;padding:10px 16px;border-radius:10px;background:#111827;color:#fff;text-decoration:none;font-weight:700}.button:hover{background:#374151;}
+*{box-sizing:border-box}body{font-family:"Segoe UI","BIZ UDPGothic","BIZ UDPゴシック","Yu Gothic UI",Meiryo,sans-serif;font-size:16px;margin:0;background:#f6f7f8;color:#1b1c1e}
+.loading-screen{position:fixed;inset:0;display:grid;place-items:center;padding:24px}
+main{width:min(360px,calc(100vw - 48px));display:grid;justify-items:center;gap:8px;padding:30px 28px;border:1px solid #e6e7ea;border-radius:12px;background:#fff;box-shadow:0 4px 16px rgba(27,28,30,.10),0 0 0 1px rgba(27,28,30,.05);text-align:center}
+.mark{width:30px;height:30px;margin-bottom:4px;border-radius:9px;background:#5e6ad2;box-shadow:inset 0 0 0 8px #f1f2fb}
+h1{margin:0;font-size:18px;line-height:1.45}p{margin:0;color:#6b6f76;font-size:15px;line-height:1.55}
+.spinner{width:22px;height:22px;margin-top:10px;border:2px solid #d5d7dc;border-top-color:#5e6ad2;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+.late{display:none;margin-top:10px;padding-top:12px;border-top:1px solid #e6e7ea}.late.show{display:block}.late p{font-size:14px}
+@media(prefers-reduced-motion:reduce){.spinner{animation:none;border-top-color:#d5d7dc}}
 </style>
 </head>
 <body>
-<main>
-<div class="spinner"></div>
-<h1>ReportBinder を準備しています</h1>
-<p>準備ができたら、自動で画面に切り替わります。更新後の初回起動は少し時間がかかる場合があります。</p>
-<p class="muted">経過: <span id="elapsed">0</span> 秒</p>
-<div class="actions"><a class="button" href="$appHref">準備ができたら画面を開く</a></div>
-<div id="late" class="late">
-<p>準備を続けています。この画面は、準備が完了すると自動で切り替わります。</p>
-<p class="muted">しばらく待っても切り替わらない場合は、上のボタンを押してください。</p>
-</div>
+<section class="loading-screen">
+<main role="status" aria-live="polite" aria-labelledby="loading-title">
+<span class="mark" aria-hidden="true"></span>
+<h1 id="loading-title">ReportBinderを準備しています</h1>
+<p id="loading-message">アプリを起動しています。</p>
+<span class="spinner" aria-hidden="true"></span>
+<div id="late" class="late"><p>初回起動や更新後は時間がかかることがあります。このタブを閉じずにお待ちください。</p></div>
 </main>
+</section>
 <script>
 (function(){
   var appUrl = $appJs;
   var readyUrl = $readyJs;
   var started = Date.now();
-  var elapsedNode = document.getElementById('elapsed');
+  var statusNode = document.getElementById('loading-message');
   var lateNode = document.getElementById('late');
-  function updateElapsed(){
+  function updateStatus(){
     var elapsed = Math.floor((Date.now() - started) / 1000);
-    elapsedNode.textContent = String(elapsed);
-    if (elapsed >= 15) lateNode.className = 'late show';
+    if (elapsed >= 20) {
+      statusNode.textContent = '通常より時間がかかっています。';
+      lateNode.className = 'late show';
+    }
   }
   function go(){ window.location.replace(appUrl); }
   function retry(){ setTimeout(probe, 700); }
   function probe(){
-    updateElapsed();
+    updateStatus();
     var url = readyUrl + (readyUrl.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
     var settled = false;
     var done = function(ok){
@@ -549,13 +546,10 @@ function CommandLine-ContainsPath([string]$CommandLine, [string]$Path) {
     return ($cmd.Contains($p1) -or $cmd.Contains($p2))
 }
 
-function Stop-StaleUiServerProcesses([string]$ServerPath, [string]$TargetMode) {
-    # V5-P3: 以前は server.ps1 を含むプロセスを無条件に停止していたため、
-    # 日本語サーバーを起動すると稼働中の英語サーバーまで落ちていた(逆も同様)。
-    # 停止するのは「同じ -Mode の UI サーバー」だけに限定する。
+function Stop-StaleUiServerProcesses([string]$ServerPath) {
+    # 単一ワークスペースのUIサーバーだけを起動し直す。
     # -RenderJobPath(PDF作成の子)、-DiffJobPath(差分画像の子)、
     # -AutoSchedulerPath(自動処理の子) は対象外。
-    $modePattern = ('\s-mode\s+{0}(\s|$)' -f [regex]::Escape([string]$TargetMode))
     try {
         $stale = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $cmd = Get-ProcessCommandLineText $_
@@ -564,8 +558,7 @@ function Stop-StaleUiServerProcesses([string]$ServerPath, [string]$TargetMode) {
              ($cmdLower -match '[\\/]reportbinder[\\/]runtime[\\/]versions[\\/][^\\/]+[\\/]app[\\/]server\.ps1')) -and
             ($cmdLower -notmatch '\s-renderjobpath\b') -and
             ($cmdLower -notmatch '\s-diffjobpath\b') -and
-            ($cmdLower -notmatch '\s-autoschedulerpath\b') -and
-            ($cmdLower -match $modePattern)
+            ($cmdLower -notmatch '\s-autoschedulerpath\b')
         })
         foreach ($p in $stale) {
             try {
@@ -578,14 +571,14 @@ function Stop-StaleUiServerProcesses([string]$ServerPath, [string]$TargetMode) {
     }
 }
 
-function Open-ExistingIfRunning([string]$Mode, [string]$UrlFile, [string]$RootUrlFile) {
+function Open-ExistingIfRunning([string]$UrlFile, [string]$RootUrlFile) {
     foreach ($candidatePath in @($UrlFile, $RootUrlFile)) {
         $existingUrl = Read-UrlShortcut $candidatePath
         if (Test-ReportBinderUrl $existingUrl 1) {
             Add-LaunchLog "Existing ReportBinder server detected. Opening existing browser URL."
             Write-UrlShortcut $UrlFile $existingUrl
             Write-UrlShortcut $RootUrlFile $existingUrl
-            $existingEdgeCmdFile = Join-Path (Split-Path -Parent $RootUrlFile) ("ReportBinder-$Mode-Edge.cmd")
+            $existingEdgeCmdFile = Join-Path (Split-Path -Parent $RootUrlFile) 'ReportBinder-workspace-Edge.cmd'
             Write-EdgeOpenCommand $existingEdgeCmdFile $existingUrl
             if (-not (Open-EdgeBrowser $existingUrl)) {
                 Add-LaunchLog "Could not open Microsoft Edge automatically. Use Edge command: $existingEdgeCmdFile"
@@ -600,7 +593,6 @@ function Open-ExistingIfRunning([string]$Mode, [string]$UrlFile, [string]$RootUr
             Sync-LatestLog
             if ($Diagnostics) {
                 Write-Host "ReportBinder is already running."
-                Write-Host "Mode: $Mode"
                 Write-Host "URL: $existingUrl"
                 Write-Host "Shortcut: $RootUrlFile"
                 Write-Host "Log: $latest"
@@ -613,8 +605,8 @@ function Open-ExistingIfRunning([string]$Mode, [string]$UrlFile, [string]$RootUr
 try {
     # Windows can deliver two launcher invocations for one double-click, especially
     # when the shortcut lives on a shared folder. Only one launcher may decide
-    # whether to start/open the UI for this app root and language.
-    $mutexName = "Local\ReportBinder.Launch.$appRootKey.$Mode"
+    # whether to start/open the UI for this app root and workspace.
+    $mutexName = "Local\ReportBinder.Launch.$appRootKey.workspace"
     $createdNew = $false
     $launchMutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
     try {
@@ -628,7 +620,7 @@ try {
     }
 
     Set-Content -LiteralPath $launchPidFile -Value ([string]$PID) -Encoding ASCII
-    Add-LaunchLog "ReportBinder launcher start. Mode=$Mode"
+    Add-LaunchLog "ReportBinder launcher start. Workspace=default"
     Add-LaunchLog "AppRoot=$script:AppRoot"
     Add-LaunchLog "SharedAppRoot=$script:SharedAppRoot"
     Add-LaunchLog "RuntimeVersion=$script:RuntimeVersion LocalRuntime=$LocalRuntime"
@@ -643,15 +635,15 @@ try {
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
 
-    Open-ExistingIfRunning $Mode $urlFile $rootUrlFile
+    Open-ExistingIfRunning $urlFile $rootUrlFile
 
     # If the saved URL is dead, remove unusable UI server processes from this app before starting one clean instance.
     # Render-job processes are excluded so PDF creation can continue after the screen is closed.
-    Stop-StaleUiServerProcesses $server $Mode
+    Stop-StaleUiServerProcesses $server
 
     $port = Get-FreePort
     $token = New-SessionToken
-    $url = "http://127.0.0.1:$port/?token=$token&mode=$Mode"
+    $url = "http://127.0.0.1:$port/?token=$token"
     Write-UrlShortcut $urlFile $url
     Write-UrlShortcut $rootUrlFile $url
     Write-EdgeOpenCommand $edgeCmdFile $url
@@ -664,7 +656,7 @@ try {
     Add-LaunchLog "ServerStdErr=$serverErr"
 
     $serverQuoted = Quote-ProcessArgument $server
-    $argLine = "-NoProfile -ExecutionPolicy Bypass -File $serverQuoted -Mode $Mode -Port $port -Token $token -NoOpen"
+    $argLine = "-NoProfile -ExecutionPolicy Bypass -File $serverQuoted -Port $port -Token $token -NoOpen"
     Add-LaunchLog "Starting server.ps1 as a background process. Browser startup wait page will be opened immediately."
     # UIサーバーはバックグラウンドで動作する。診断情報はローカルログへ保存し、通常起動ではコンソールを表示しない。
     $proc = Start-Process -FilePath $psExe -ArgumentList $argLine -WindowStyle Hidden -PassThru -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
@@ -703,7 +695,6 @@ try {
         Sync-LatestLog
         if ($Diagnostics) {
             Write-Host "ReportBinder startup wait page opened."
-            Write-Host "Mode: $Mode"
             Write-Host "URL: $url"
             Write-Host "Wait page: $waitPageFile"
             Write-Host "Shortcut: $rootUrlFile"
@@ -724,7 +715,6 @@ try {
     Sync-LatestLog
     if ($Diagnostics) {
         Write-Host "ReportBinder started."
-        Write-Host "Mode: $Mode"
         Write-Host "URL: $url"
         Write-Host "Wait page: $waitPageFile"
         Write-Host "Shortcut: $rootUrlFile"

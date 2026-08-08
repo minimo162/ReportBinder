@@ -36,7 +36,7 @@ $dataDir = Join-Path $Script:LocalConfigRoot 'data'
 $outputDir = Join-Path $Script:LocalConfigRoot 'output'
 foreach ($dir in @($submissionDir,$dataDir,$outputDir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 Save-AppConfig ([pscustomobject][ordered]@{
-    schemaVersion = 2; lastSubmissionDir = $submissionDir; lastDataDir = $dataDir; lastOutputDir = $outputDir; lastMode = 'ja'
+    schemaVersion = 2; lastSubmissionDir = $submissionDir; lastDataDir = $dataDir; lastOutputDir = $outputDir
 })
 $paths = [pscustomobject][ordered]@{ submissionDir=$submissionDir; dataDir=$dataDir; outputDir=$outputDir }
 Ensure-Package $paths -Languages @('ja')

@@ -11,7 +11,7 @@ if not exist "%RB_LAUNCHER%" (
 )
 if not exist "%RB_POWERSHELL%" set "RB_POWERSHELL=powershell.exe"
 
-start "" /b "%RB_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%RB_LAUNCHER%" -Mode ja
+start "" /b "%RB_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%RB_LAUNCHER%"
 if errorlevel 1 (
   echo ReportBinder could not be started.
   pause

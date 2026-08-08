@@ -27,7 +27,7 @@ $dataDir = Join-Path $Script:LocalConfigRoot 'data'
 $outputDir = Join-Path $Script:LocalConfigRoot 'output'
 foreach ($dir in @($submissionDir,$dataDir,$outputDir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 Save-AppConfig ([pscustomobject][ordered]@{
-    schemaVersion = 2; lastSubmissionDir = $submissionDir; lastDataDir = $dataDir; lastOutputDir = $outputDir; lastMode = 'en'
+    schemaVersion = 2; lastSubmissionDir = $submissionDir; lastDataDir = $dataDir; lastOutputDir = $outputDir
 })
 $paths = [pscustomobject][ordered]@{ submissionDir=$submissionDir; dataDir=$dataDir; outputDir=$outputDir }
 Ensure-Package $paths -Languages @('en')
@@ -51,7 +51,7 @@ Assert-PackTest $invalidCancelRejected 'Unsafe render job cancellation ID was ac
 
 $templates = @(Get-PackTemplateCatalog 'en')
 $generic = @($templates | Where-Object { [string]$_.templateId -eq 'builtin-generic-department-pack' })
-Assert-PackTest ($templates.Count -eq 4 -and $generic.Count -eq 1) 'Generic pack template is missing.'
+Assert-PackTest ($templates.Count -eq 1 -and $generic.Count -eq 1) 'The public catalog must start with only the generic pack template.'
 Assert-PackTest ((@($generic[0].acceptedSourceTypes) -join '|') -eq 'excel|word|pdf|powerpoint') 'Generic template source types are invalid.'
 
 $userTemplate = Save-PackTemplate 'en' ([pscustomobject]@{
@@ -64,10 +64,10 @@ $userTemplate = Save-PackTemplate 'en' ([pscustomobject]@{
         [pscustomobject]@{ targetId='appendix'; displayName='Evidence'; required=$false }
     )
     rules = [pscustomobject]@{ newItemDestination='main'; retainManualOrder=$true; blockBuildWhenRequiredSourceIsStale=$true; blockBuildWhenRequiredSourceFailed=$true }
-    output = [pscustomobject]@{ fileNamePattern='{packName}_{targetName}_{yyyyMMdd}.pdf'; tableOfContents=$true }
+    output = [pscustomobject]@{ fileNamePattern='{packName}_{targetName}_{yyyyMMdd}.pdf' }
 })
 Assert-PackTest ([string]$userTemplate.templateId -match '^template_[0-9a-f]{16}$') 'User template ID is invalid.'
-Assert-PackTest ((@(Get-PackTemplateCatalog 'en')).Count -eq 5) 'User template was not added to the catalog.'
+Assert-PackTest ((@(Get-PackTemplateCatalog 'en')).Count -eq 2) 'User template was not added to the catalog.'
 $updatedTemplate = Save-PackTemplate 'en' ([pscustomobject]@{
     targets = @(
         [pscustomobject]@{ targetId='main'; displayName='Primary review'; required=$true },
@@ -79,7 +79,7 @@ Assert-PackTest ((Get-IntDataProperty $updatedTemplate 'templateVersion' 0) -eq 
 $templatePack = New-DocumentPack 'en' ([pscustomobject]@{ displayName='Finance Review Pack'; templateId=[string]$userTemplate.templateId })
 Assert-PackTest ([string]$templatePack.templateConfig.targets[0].displayName -eq 'Primary review') 'Pack did not store a template snapshot.'
 Assert-PackTest ([string]$templatePack.templateConfig.sourceRequirements[0].requirementId -eq 'requirement_finance') 'Pack did not store source requirements in the template snapshot.'
-Assert-PackTest ([bool]$templatePack.settings.includeToc -and [string]$templatePack.settings.outputFileNamePattern -eq '{packName}_{targetName}_{yyyyMMdd}.pdf') 'Template output defaults were not applied.'
+Assert-PackTest ([string]$templatePack.settings.outputFileNamePattern -eq '{packName}_{targetName}_{yyyyMMdd}.pdf') 'Template output defaults were not applied.'
 [void](Save-PackTemplate 'en' ([pscustomobject]@{
     targets = @(
         [pscustomobject]@{ targetId='main'; displayName='Changed later'; required=$true },
@@ -104,11 +104,11 @@ Assert-PackTest (@(Get-PackTemplateCatalog 'en' | Where-Object { [string]$_.temp
 
 $created = New-DocumentPack 'en' ([pscustomobject]@{
     displayName = 'Monthly Department Report'
-    settings = [pscustomobject]@{ includeCover=$true; documentTitle='Monthly Department Report'; outputFileNamePattern='{packName}_{yyyyMMdd}.pdf' }
+    settings = [pscustomobject]@{ documentTitle='Monthly Department Report'; outputFileNamePattern='{packName}_{yyyyMMdd}.pdf' }
 })
 Assert-PackTest ([string]$created.packId -match '^pack_[0-9a-f]{16}$') 'Custom packId is invalid.'
 Assert-PackTest ([string]$created.templateId -eq 'builtin-generic-department-pack') 'Default template was not assigned.'
-Assert-PackTest ([bool]$created.settings.includeCover -and [string]$created.settings.documentTitle -eq 'Monthly Department Report') 'Create settings were not applied.'
+Assert-PackTest ([string]$created.settings.documentTitle -eq 'Monthly Department Report') 'Create settings were not applied.'
 
 $structure = Get-Structure 'en'
 $createdPublic = @(Get-PublicPackList $structure 'en' | Where-Object { [string]$_.packId -eq [string]$created.packId })

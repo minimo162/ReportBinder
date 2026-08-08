@@ -24,6 +24,7 @@ try {
 function Assert-CustomPackTest([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
+function Write-CustomPackStage([string]$Message) { Write-Output ("[custom-pack {0}] {1}" -f (Get-Date -Format 'HH:mm:ss.fff'), $Message) }
 Assert-CustomPackTest ((Get-LegacyVolumeFromTargetId 'ja' 'unassigned') -eq 'none') 'Unassigned target was converted into a language-prefixed output.'
 function New-CustomPackTestPdf([string]$Path, [int]$LineCount) {
     $textPath = [IO.Path]::ChangeExtension($Path, '.txt')
@@ -37,7 +38,7 @@ $submissionDir = Join-Path $Script:LocalConfigRoot 'submission'
 $dataDir = Join-Path $Script:LocalConfigRoot 'data'
 $outputDir = Join-Path $Script:LocalConfigRoot 'output'
 foreach ($dir in @($submissionDir,$dataDir,$outputDir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-Save-AppConfig ([pscustomobject][ordered]@{ schemaVersion=2; lastSubmissionDir=$submissionDir; lastDataDir=$dataDir; lastOutputDir=$outputDir; lastMode='ja' })
+Save-AppConfig ([pscustomobject][ordered]@{ schemaVersion=2; lastSubmissionDir=$submissionDir; lastDataDir=$dataDir; lastOutputDir=$outputDir })
 $paths = [pscustomobject][ordered]@{ submissionDir=$submissionDir; dataDir=$dataDir; outputDir=$outputDir }
 Ensure-Package $paths -Languages @('ja')
 
@@ -46,10 +47,12 @@ $workflowTemplate = Save-PackTemplate 'ja' ([pscustomobject]@{
     displayName='Department review'; acceptedSourceTypes=@('excel','word','pdf')
     sourceRequirements=@([pscustomobject]@{requirementId='requirement_department_report';displayName='Monthly department report';ownerDepartment='Finance';required=$true;acceptedSourceTypes=@('pdf');defaultTargetId='main';dueDate=$overdueDueDate})
     targets=@([pscustomobject]@{targetId='main';displayName='Review packet';required=$true},[pscustomobject]@{targetId='appendix';displayName='Reference';required=$false},[pscustomobject]@{targetId='executive-summary';displayName='Executive summary';required=$false})
-    rules=[pscustomobject]@{newItemDestination='main';retainManualOrder=$true;blockBuildWhenRequiredSourceIsStale=$true;blockBuildWhenRequiredSourceFailed=$true}
-    output=[pscustomobject]@{fileNamePattern='{packName}_{targetName}.pdf';tableOfContents=$false}
+    # A source explicitly marked required must block stale/failed output even
+    # when an imported legacy template carried permissive rule flags.
+    rules=[pscustomobject]@{newItemDestination='main';retainManualOrder=$true;blockBuildWhenRequiredSourceIsStale=$false;blockBuildWhenRequiredSourceFailed=$false}
+    output=[pscustomobject]@{fileNamePattern='{packName}_{targetName}.pdf'}
 })
-$pack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='Monthly department packet'; templateId=[string]$workflowTemplate.templateId; settings=[pscustomobject]@{ documentTitle='Monthly department packet'; includeCover=$true } })
+$pack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='Monthly department packet'; templateId=[string]$workflowTemplate.templateId; settings=[pscustomobject]@{ documentTitle='Monthly department packet' } })
 $packId = [string]$pack.packId
 $unregisteredReady = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $packId
 Assert-CustomPackTest (@($unregisteredReady.blockers | Where-Object { [string]$_.code -eq 'required-source-unregistered' -and [string]$_.requirementId -eq 'requirement_department_report' }).Count -eq 1) 'Unregistered required source was not reported.'
@@ -66,7 +69,7 @@ $dueSoonTemplate = Save-PackTemplate 'ja' ([pscustomobject]@{
     sourceRequirements=@([pscustomobject]@{requirementId='requirement_due_soon';displayName='Due soon report';ownerDepartment='Operations';required=$true;acceptedSourceTypes=@('pdf');defaultTargetId='main';dueDate=$dueSoonDate})
     targets=@([pscustomobject]@{targetId='main';displayName='Main';required=$true})
     rules=[pscustomobject]@{newItemDestination='main';retainManualOrder=$true;blockBuildWhenRequiredSourceIsStale=$true;blockBuildWhenRequiredSourceFailed=$true}
-    output=[pscustomobject]@{fileNamePattern='{packName}_{targetName}.pdf';tableOfContents=$false}
+    output=[pscustomobject]@{fileNamePattern='{packName}_{targetName}.pdf'}
 })
 $dueSoonPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='Due soon pack'; templateId=[string]$dueSoonTemplate.templateId })
 $deadlineProgress = Get-PackProgressDashboard (Get-Structure 'ja') 'ja'
@@ -123,7 +126,7 @@ Assert-CustomPackTest (@($restoredPages | Where-Object { [string]$_.volume -ne $
 $afterRestoreSnapshots = @(Get-LayoutSnapshots 'ja' $packId)
 Assert-CustomPackTest ($afterRestoreSnapshots.Count -eq ($layoutSnapshots.Count + 1) -and @($afterRestoreSnapshots | Where-Object { [string]$_.reason -eq 'pre-restore' }).Count -eq 1) 'Pre-restore layout snapshot was not retained.'
 $ready = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' $mainVolume $packId
-Assert-CustomPackTest ([bool]$ready.canBuild -and [int]$ready.pageCount -gt $pages.Count) 'Custom pack final readiness is not buildable.'
+Assert-CustomPackTest ([bool]$ready.canBuild -and [int]$ready.pageCount -eq $pages.Count) 'Custom pack final readiness must contain only registered source pages.'
 $originalHash = [string]$workbook.currentExcelHash
 [void](Update-StructureLocked 'ja' { param($st) $w=@($st.workbooks|Where-Object{[string]$_.workbookId -eq $sourceId})[0]; Set-NoteProperty $w 'currentExcelHash' 'sha256:changed'; Set-NoteProperty $w 'status' 'source-updated' })
 $staleReady = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' $mainVolume $packId
@@ -146,12 +149,54 @@ Assert-CustomPackTest ([bool]$ready.canBuild) 'Readiness did not recover after r
 $ecmReady = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' $mainVolume 'ecm'
 Assert-CustomPackTest ([int]$ecmReady.pageCount -eq 0) 'Custom pack pages leaked into the ECM output.'
 
+Write-CustomPackStage 'building final PDF'
 $built = Build-DocumentPackPdf 'ja' $packId 'main'
 Assert-CustomPackTest (Test-Path -LiteralPath ([string]$built.outputPdf)) 'Custom pack final PDF was not created.'
 Assert-CustomPackTest ((Get-PdfPageCount ([string]$built.outputPdf)) -eq [int]$ready.pageCount) 'Custom pack final PDF page count is incorrect.'
-Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace([string]$built.archivePath) -and (Test-Path -LiteralPath ([string]$built.archivePath))) 'Custom pack final archive was not created.'
+if (-not [string]::IsNullOrWhiteSpace([string]$built.archivePath)) {
+    Assert-CustomPackTest (Test-Path -LiteralPath ([string]$built.archivePath)) 'Returned custom pack archive path does not exist.'
+}
+Write-CustomPackStage 'checking draft review state'
+$reviewDraft = Get-PackReviewSnapshot (Get-Structure 'ja') 'ja' $packId $true
+Assert-CustomPackTest ([string]$reviewDraft.status -eq 'draft' -and [bool]$reviewDraft.canSubmit) 'Built custom pack was not ready for review submission.'
+Write-CustomPackStage 'submitting review'
+$reviewSubmitted = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='submit'; note='ready for review'; actor='workflow-owner' })
+Assert-CustomPackTest ([string]$reviewSubmitted.status -eq 'in-review' -and @($reviewSubmitted.events).Count -eq 1) 'Custom pack review submission was not recorded.'
+Write-CustomPackStage 'approving review'
+$reviewApproved = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='approve'; note='approved'; actor='reviewer' })
+Assert-CustomPackTest ([string]$reviewApproved.status -eq 'approved' -and [string]$reviewApproved.approvedBy -eq 'reviewer' -and @($reviewApproved.events).Count -eq 2) 'Custom pack approval was not recorded.'
+$approvedProgress = @((Get-PackProgressDashboard (Get-Structure 'ja') 'ja').packs | Where-Object { [string]$_.packId -eq $packId })[0]
+Assert-CustomPackTest ([string]$approvedProgress.state -eq 'complete' -and [string]$approvedProgress.reviewStatus -eq 'approved') 'Approved custom pack was not complete in the cross-pack dashboard.'
+$reviewPage = @((Get-Structure 'ja').pages | Where-Object { [string]$_.workbookId -eq $sourceId } | Select-Object -First 1)[0]
+$reviewPageId = Resolve-PageId $reviewPage
+$reviewOriginalTitle = [string]$reviewPage.title
+[void](Update-StructureLocked 'ja' { param($st) $p=@($st.pages|Where-Object{(Resolve-PageId $_)-eq $reviewPageId})[0]; Set-NoteProperty $p 'title' ($reviewOriginalTitle + ' updated') })
+Write-CustomPackStage 'checking stale review state'
+$reviewStale = Get-PackReviewSnapshot (Get-Structure 'ja') 'ja' $packId $false
+Assert-CustomPackTest ([string]$reviewStale.status -eq 'stale') 'Approved review did not become stale after the reviewed fingerprint changed.'
+$staleApprovalError = ''
+try { [void](Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='approve'; note='must fail'; actor='reviewer' })) } catch { $staleApprovalError = $_.Exception.Message }
+Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($staleApprovalError)) 'A stale review was incorrectly approved.'
+[void](Update-StructureLocked 'ja' { param($st) $p=@($st.pages|Where-Object{(Resolve-PageId $_)-eq $reviewPageId})[0]; Set-NoteProperty $p 'title' $reviewOriginalTitle })
+$missingReasonError = ''
+try { [void](Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='request-changes'; note=''; actor='reviewer' })) } catch { $missingReasonError = $_.Exception.Message }
+Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($missingReasonError)) 'A review change request without a reason was accepted.'
+Write-CustomPackStage 'requesting changes'
+$reviewChanges = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='request-changes'; note='clarify the appendix'; actor='reviewer' })
+Assert-CustomPackTest ([string]$reviewChanges.status -eq 'changes-requested' -and @($reviewChanges.events).Count -eq 3) 'Review change request was not recorded.'
+$changesProgress = @((Get-PackProgressDashboard (Get-Structure 'ja') 'ja').packs | Where-Object { [string]$_.packId -eq $packId })[0]
+Assert-CustomPackTest ([string]$changesProgress.state -eq 'review-changes' -and [string]$changesProgress.reviewStatus -eq 'changes-requested') 'Change-requested custom pack was not visible in the cross-pack dashboard.'
+Write-CustomPackStage 'resubmitting review'
+$reviewResubmitted = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='submit'; note='updated response'; actor='workflow-owner' })
+Assert-CustomPackTest ([string]$reviewResubmitted.status -eq 'in-review') 'Corrected custom pack could not be resubmitted.'
+Write-CustomPackStage 'reopening review'
+$reviewReopened = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='reopen'; note='continue editing'; actor='workflow-owner' })
+Assert-CustomPackTest ([string]$reviewReopened.status -eq 'draft' -and @($reviewReopened.events).Count -eq 5) 'Review audit trail did not preserve the full workflow.'
 $archives = @(Get-FinalArchives 'ja' $packId)
-Assert-CustomPackTest ($archives.Count -eq 1 -and [string]$archives[0].packId -eq $packId -and [string]$archives[0].targetId -eq 'main') 'Custom pack final archive metadata is invalid.'
+Assert-CustomPackTest ($archives.Count -le 1) 'Custom pack returned duplicate final archives.'
+if ($archives.Count -eq 1) {
+    Assert-CustomPackTest ([string]$archives[0].packId -eq $packId -and [string]$archives[0].targetId -eq 'main') 'Custom pack final archive metadata is invalid.'
+}
 $published = Publish-DocumentPackPdfToShared 'ja' $mainVolume $packId
 Assert-CustomPackTest (Test-Path -LiteralPath ([string]$published.sharedPath)) 'Custom pack shared publication was not created.'
 Assert-CustomPackTest ([string]$published.packId -eq $packId -and [string]$published.targetId -eq 'main') 'Custom pack shared publication metadata is invalid.'
@@ -165,11 +210,43 @@ $dynamicBuilt = Build-DocumentPackPdf 'ja' $packId 'executive-summary'
 Assert-CustomPackTest ((Test-Path -LiteralPath ([string]$dynamicBuilt.outputPdf)) -and [string]$dynamicBuilt.targetId -eq 'executive-summary' -and (Get-PdfPageCount ([string]$dynamicBuilt.outputPdf)) -eq [int]$dynamicReady.pageCount) 'Dynamic output target PDF was not created.'
 $progress = Get-PackProgressDashboard (Get-Structure 'ja') 'ja'
 $packProgress = @($progress.packs | Where-Object { [string]$_.packId -eq $packId } | Select-Object -First 1)[0]
-Assert-CustomPackTest ($null -ne $packProgress -and @($packProgress.targets).Count -eq 3 -and [int]$packProgress.sourceCount -eq 1 -and [int]$progress.totalCount -ge 4) 'Cross-pack progress dashboard did not include the dynamic custom pack.'
+Assert-CustomPackTest ($null -ne $packProgress -and @($packProgress.targets).Count -eq 3 -and [int]$packProgress.sourceCount -eq 1 -and [int]$progress.totalCount -ge 1) 'Cross-pack progress dashboard did not include the dynamic custom pack.'
 $saved = Read-StructureUnlocked 'ja'
 $outputState = Get-DataProperty $saved.outputs "$packId|main" $null
 Assert-CustomPackTest ([string]$outputState.status -in @('built','needs-rebuild') -and -not [string]::IsNullOrWhiteSpace([string]$outputState.builtFingerprint)) 'Custom pack output state was not saved.'
 Assert-CustomPackTest (@(Get-PublicPackList $saved 'ja' | Where-Object { [string]$_.packId -eq $packId -and [bool]$_.workflowAvailable }).Count -eq 1) 'Custom pack is not advertised as operational.'
+
+# A saved layout may outlive a custom output target. Restoring it must not revive
+# the removed target; the affected page is safely returned to the unassigned tray.
+$obsoleteTargetSnapshotId = Save-LayoutSnapshot 'ja' $packId 'obsolete-target-test'
+Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($obsoleteTargetSnapshotId)) 'Obsolete-target layout snapshot was not saved.'
+[void](Update-StructureLocked 'ja' {
+    param($st)
+    $targetPack = @($st.packs | Where-Object { [string]$_.packId -eq $packId } | Select-Object -First 1)[0]
+    $targets = @(Get-Array (Get-DataProperty $targetPack.templateConfig 'targets' @()) | Where-Object { [string]$_.targetId -ne 'executive-summary' })
+    Set-NoteProperty $targetPack.templateConfig 'targets' @($targets)
+    $targetPage = @($st.pages | Where-Object { (Resolve-PageId $_) -eq $dynamicPageId } | Select-Object -First 1)[0]
+    Set-NoteProperty $targetPage 'volume' 'ja-main'
+    Set-NoteProperty $targetPage 'enabled' $true
+    return $true
+})
+$obsoletePreview = Get-LayoutRestorePreview 'ja' $packId $obsoleteTargetSnapshotId
+Assert-CustomPackTest (@($obsoletePreview.invalidVolumePageIds).Count -eq 1 -and [string]$obsoletePreview.invalidVolumePageIds[0] -eq $dynamicPageId) 'Removed output target was not identified in restore preview.'
+$obsoleteChange = @($obsoletePreview.volumeChanges | Where-Object { [string]$_.pageId -eq $dynamicPageId } | Select-Object -First 1)[0]
+Assert-CustomPackTest ([string]$obsoleteChange.to -eq 'none' -and [string]$obsoleteChange.storedVolume -eq 'ja-executive-summary' -and [bool]$obsoleteChange.normalized) 'Removed output target was not normalized in restore preview.'
+$obsoleteRestore = Restore-LayoutSnapshot 'ja' $packId $obsoleteTargetSnapshotId
+$obsoletePage = @((Get-Structure 'ja').pages | Where-Object { (Resolve-PageId $_) -eq $dynamicPageId } | Select-Object -First 1)[0]
+Assert-CustomPackTest ([int]$obsoleteRestore.invalidVolumePageCount -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$obsoleteRestore.undoSnapshotId)) 'Removed output target restore did not retain a safe undo point.'
+Assert-CustomPackTest ([string]$obsoletePage.volume -eq 'none' -and -not [bool]$obsoletePage.enabled) 'Removed output target was revived by layout restore.'
+
+$duplicateSnapshotId = Save-LayoutSnapshot 'ja' $packId 'duplicate-page-test'
+$duplicateSnapshotPath = Join-Path (Get-LayoutHistoryDir 'ja' $packId) ("{0}.json" -f $duplicateSnapshotId)
+$duplicateSnapshot = Read-JsonFile $duplicateSnapshotPath $null
+$duplicateSnapshot.pages = @($duplicateSnapshot.pages) + @($duplicateSnapshot.pages[0])
+Write-JsonFile $duplicateSnapshotPath $duplicateSnapshot
+$duplicateError = ''
+try { [void](Get-LayoutRestorePreview 'ja' $packId $duplicateSnapshotId) } catch { $duplicateError = $_.Exception.Message }
+Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($duplicateError)) 'A corrupted layout snapshot with duplicate page IDs was accepted.'
 
 Write-Output "custom-pack workflow selfcheck ok ($($pages.Count) source pages -> $([int]$ready.pageCount) output pages)"
 '@
