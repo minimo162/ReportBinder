@@ -1239,8 +1239,22 @@ if 'app.js?v=20260809_v159' not in html:
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
 runtime_info=json.loads((root/'app/runtime-version.json').read_text(encoding='utf-8'))
-if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', str(runtime_info.get('version',''))):
+runtime_version=str(runtime_info.get('version',''))
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', runtime_version):
     raise SystemExit('runtime version must be a safe immutable directory name')
+# 資料をPDFにまとめる.cmd は -LocalRuntime なしで launch.ps1 を呼ぶため、
+# LOCALAPPDATA 配下の runtime/versions/<version> のコピーを再利用する。
+# app/web だけ直して runtime-version.json を据え置くと、利用者には古い画面が
+# 出続ける。両者の日付が一致していることを機械で担保する。
+_runtime_date=re.fullmatch(r'(\d{4})\.(\d{2})\.(\d{2})\.\d+', runtime_version)
+_asset_date=re.search(r'app\.js\?v=(\d{8})_', html)
+if _runtime_date and _asset_date:
+    if ''.join(_runtime_date.groups()) != _asset_date.group(1):
+        raise SystemExit(
+            'runtime version date %s must match the app.js cache-buster date %s; '
+            'bumping app/web without bumping app/runtime-version.json ships a stale UI '
+            'to anyone launching from 資料をPDFにまとめる.cmd'
+            % (''.join(_runtime_date.groups()), _asset_date.group(1)))
 launch=(root/'app/launch.ps1').read_text(encoding='utf-8-sig')
 for needed in ['[switch]$LocalRuntime', "'ReportBinder\\runtime\\versions'", 'installed.json',
                '$script:SharedAppRoot', 'runtimeVersion']:
@@ -1340,7 +1354,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if str(runtime_info.get('version','')) != '2026.08.08.36':
+if runtime_version != '2026.08.09.1':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
