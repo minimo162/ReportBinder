@@ -913,7 +913,7 @@ function startUpdateMonitor() {
 }
 
 let finalReadinessInFlight = null;
-async function loadFinalReadiness(){
+async function loadFinalReadiness(options = {}){
   if(!state||!configured())return;
   const pack=activePackRecord(),preset=activePreset,key=pack?.category?preset:String(pack?.packId||activePackId);
   if(!pack?.packId)return;
@@ -924,17 +924,18 @@ async function loadFinalReadiness(){
     const volumes=r.volumes||Object.fromEntries(Object.entries(r.targets||{}).map(([targetId,ready])=>[targetVolume(targetId),ready]));
     state.finalReadiness[key]={volumes};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
-    if(activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
+    if(options.render!==false&&activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
   }).catch(e=>log('提出用PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
   return finalReadinessInFlight;
 }
 
-async function refresh() {
+async function refresh(options = {}) {
   try {
     state = normalizeStatePayload(await api('/api/state'));
     const reloadHistory = activeView === 'history' && historyPanelsInitialized;
     snapshotHistoryResponseCache.clear();
-    renderAll();
+    // render:false lets a caller fold several sequential loads into one paint.
+    if (options.render !== false) renderAll();
     if (reloadHistory) void loadHistoryPanels({force:true});
     return state;
   } catch (e) {
@@ -1637,7 +1638,7 @@ function renderVolumeLinks() {
     const available=!!(r.outputPdf && r.outputPdfExists);
     const publishable=available&&String(r.displayState||'')==='built';
     if(a){
-      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;a.textContent=r.displayState==='built'?'PDFを開く':'前回出力を開く';a.classList.remove('hidden');}
+      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;const fresh=r.displayState==='built';a.textContent=fresh?'出力したPDFを開く':'前回出力を開く';a.className=fresh?'btn secondary':'btn ghost';a.classList.remove('hidden');}
       else{a.removeAttribute('href');a.classList.add('hidden');}
     }
     if(publish){publish.classList.toggle('hidden',!publishable);publish.disabled=!publishable;}
@@ -4436,6 +4437,15 @@ function closePreview() {
 }
 
 
+// Used by the success toast when more than one PDF was produced: put the cards
+// that carry the per-target "PDFを開く" buttons in front of the user.
+function focusFinalOutputs(){
+  const grid=$('final-target-grid');
+  if(!grid)return;
+  grid.scrollIntoView({block:'center',behavior:window.matchMedia?.('(prefers-reduced-motion:reduce)').matches?'auto':'smooth'});
+  const first=grid.querySelector('[data-final-open]:not(.hidden)');
+  if(first){first.setAttribute('tabindex','-1');first.focus({preventScroll:true});}
+}
 async function openFinalVolume(volume, category=activePreset) {
   let blank=null;try{blank=window.open('about:blank','_blank');}catch{}if(blank){try{blank.opener=null;}catch{}}
   try{const custom=!activePackIsBuiltIn(),path=custom?'/api/v2/outputs/file':'/api/final/file',body=custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category};const objectUrl=await fetchPdfObjectUrl(path,body);if(blank&&!blank.closed)blank.location.href=objectUrl;else window.open(objectUrl,'_blank');}
@@ -4601,7 +4611,16 @@ async function runFinalBuildJob(targetIds){
       const job=polled.job||{};
       updateFinalProgressPanel(job);
       if(['completed','completed-with-errors','failed','cancelled','missing'].includes(String(job.status||'')))
-        { await refresh(); await loadFinalReadiness(); return job; }
+        {
+          // Was: refresh() painted, then loadFinalReadiness() painted again a
+          // network round trip later, with the progress panel still up and then
+          // vanishing - three visual states in a row, seen as flicker.
+          await refresh({render:false});
+          await loadFinalReadiness({render:false});
+          hideProgressPanel();
+          renderAll();
+          return job;
+        }
     }
   } finally {
     activeFinalJobId='';activeFinalCancelRequested=false;
@@ -4680,8 +4699,16 @@ async function buildAllVolumes(btn) {
       return;
     }
     if (built.length) {
-      showMessage('ok','提出用PDFを出力しました', `${built.length}件を出力しました。`, {built, skipped},
-                  [{label:'出力したPDFを確認', view:'final'}], 0);
+      // The old action was {view:'final'} with no handler. You are already on the
+      // final screen when you press 出力, so it navigated to where you stood and
+      // looked like a dead button. Open the PDF instead.
+      const openable=built.filter(item=>item&&item.volume);
+      const names=built.map(item=>outputFileName(item?.outputPdf)).filter(Boolean);
+      const detailText=names.length?`${names.join('、')} を保存しました。`:`${built.length}件を出力しました。`;
+      const actions=openable.length===1
+        ? [{label:'出力したPDFを開く',primary:true,handler:()=>openFinalVolume(String(openable[0].volume))}]
+        : [{label:'出力したPDFを確認',primary:true,handler:()=>{setActiveView('final');focusFinalOutputs();}}];
+      showMessage('ok','提出用PDFを出力しました', detailText, {built, skipped}, actions, 0);
     } else {
       showMessage('warn','出力対象がありません','ページ構成で本体または補足にページを設定してください。');
     }
