@@ -7233,15 +7233,11 @@ function Get-PackProgressDashboard($Structure, [string]$Language) {
                 if ([string](Get-DataProperty $submittedFingerprints $reviewTargetId '') -ne [string]$targetFingerprints[$reviewTargetId]) { $reviewStatus = 'stale'; break }
             }
         }
-        if ($state -eq 'complete') {
-            switch ($reviewStatus) {
-                'approved' { $state='complete' }
-                'in-review' { $state='in-review'; $nextAction='final' }
-                'changes-requested' { $state='review-changes'; $nextAction='final' }
-                'stale' { $state='review-stale'; $nextAction='final' }
-                default { $state='review-draft'; $nextAction='final' }
-            }
-        }
+        # 確認の記録は %LOCALAPPDATA% 配下の利用者ごとのデータにしか残らず、他の
+        # 利用者からは参照できない。作業の進み具合(原稿・変換PDF・ページ構成・出力)
+        # とは別物なので、未確認を理由に complete から降格させない。確認の状態は
+        # reviewStatus として別に返し、画面側で個別に表示する。
+        if ($state -eq 'complete' -and $reviewStatus -eq 'stale') { $nextAction = 'final' }
         $rows += [pscustomobject][ordered]@{
             packId=$packId; displayName=[string](Get-DataProperty $pack 'displayName' ''); category=[string](Get-DataProperty $pack 'category' '')
             sourceCount=$workbooks.Count; requiredSourceCount=$required.Count; submittedRequiredSourceCount=$submittedRequired; overdueRequiredSourceCount=$overdueRequired; dueSoonRequiredSourceCount=$dueSoonRequired; nearestRequiredDueDate=$nearestDueDate; needsRenderCount=$needsRender

@@ -200,6 +200,13 @@ function setActiveView(view, options = {}) {
   if (activeView === 'history' && state && (viewChanged || !historyPanelsInitialized || options.reloadPanels)) {
     void loadHistoryPanels({force:!!options.reloadPanels});
   }
+  // aggregateFinalState() (header badge, nav dot, dashboard next-action) reads
+  // finalReadiness, which used to be fetched only when the final screen was
+  // opened - so a fresh launch showed "提出用PDF 未出力" for a pack that was
+  // already output. Fetch it once for the active pack whatever the view.
+  if (state && !finalReadinessLoaded()) {
+    void loadFinalReadiness({render:false}).then(()=>{renderGlobalHeader();renderNavBadges();renderDashboardOverview();});
+  }
   if (activeView === 'final' && state) {
     // These three used to be fired here unguarded. renderAll() calls
     // setActiveView(), so every repaint restarted all three, and each one
@@ -1213,13 +1220,21 @@ function renderDashboardOverview() {
   renderPackProgressDashboard();
 }
 
+// Progress and the personal confirmation record are independent now, so the row
+// carries both: 完了 says the work is done, this says whether it was eyeballed.
+function reviewChip(reviewStatus){
+  const status=String(reviewStatus||'draft');
+  if(status==='approved')return badge('確認済み','ok');
+  if(status==='stale')return badge('確認後に変更あり','attention');
+  return badge('未確認','neutral');
+}
 function renderPackProgressDashboard(){
   const progress=state?.packProgress||{},summary=$('pack-progress-summary'),box=$('pack-progress-list'),toggle=$('pack-progress-attention-only');if(!box)return;if(toggle)toggle.checked=packProgressAttentionOnly;
   if(summary)summary.textContent=Number(progress.totalCount||0)?`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・期限7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`:'作成中の一式がここに表示されます。';
   const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'review-stale':6,'review-changes':7,'review-draft':8,'in-review':9,'no-pages':10,'not-started':11,complete:12};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??13)-(priority[String(b.state)]??13)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
-  const stateInfo=value=>({complete:['承認済み','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['未確認','neutral'],'in-review':['未確認','neutral'],'review-changes':['未確認','neutral'],'review-stale':['確認後に変更あり','attention']}[String(value)]||['要確認','attention']);
+  const stateInfo=value=>({complete:['完了','ok'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['未確認','neutral'],'in-review':['未確認','neutral'],'review-changes':['未確認','neutral'],'review-stale':['確認後に変更あり','attention']}[String(value)]||['要確認','attention']);
   if(!rows.length){box.innerHTML=packProgressAttentionOnly?'<div class="empty-state">対応が必要な一式はありません。</div>':`<div class="pack-progress-empty"><div><strong>${configured()?'今回まとめる一式はまだありません':'まだ作業は始まっていません'}</strong><span>${configured()?'上の「次にやること」から名前を付けます。':'上の「はじめる」から原稿フォルダーを選びます。'}</span></div></div>`;return;}
-  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・期限7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${formatDateOnly(nearestDue)}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}ページ</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
+  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・期限7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${formatDateOnly(nearestDue)}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}${reviewChip(pack.reviewStatus)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}ページ</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
   box.querySelectorAll('[data-pack-progress-open]').forEach(button=>button.addEventListener('click',async()=>{await applyPresetSelection(String(button.dataset.packProgressOpen||''));setActiveView(String(button.dataset.packProgressAction||'excel'));}));
 }
 
