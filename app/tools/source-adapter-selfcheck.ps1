@@ -1,4 +1,4 @@
-param()
+﻿param()
 
 $ErrorActionPreference = 'Stop'
 $toolsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -21,17 +21,42 @@ try {
 function Assert-AdapterTest([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
+# 行数を10刻みで総当たりすると、そのたびにPDFBoxのJVMを起動することになり、
+# 目的のページ数に届くまで6〜7回、最悪23回まで伸びる。JVM起動が遅いマシンでは
+# ここだけで数十秒かかる。1ページあたりの行数を1回測ってから必要な行数を計算し、
+# 通常2回で決める。フォント寸法は決め打ちせず実測するので、PDFBoxの版が変わって
+# 行送りが変わっても追随する。
+$Script:FixtureLinesPerPage = 0
 function New-TestPresentationPdf([string]$Path, [int]$ExpectedPages) {
     $textPath = [IO.Path]::ChangeExtension($Path, '.txt')
     $java = Resolve-JavaExe
     $jar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-    foreach ($lineCount in 20..240 | Where-Object { $_ % 10 -eq 0 }) {
-        $lines = @(1..$lineCount | ForEach-Object { "Presentation fixture line $_" })
+    $render = {
+        param([int]$LineCount)
+        $lines = @(1..$LineCount | ForEach-Object { "Presentation fixture line $_" })
         [IO.File]::WriteAllLines($textPath, $lines, (New-Object Text.UTF8Encoding($false)))
         if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
         $run = Invoke-NativeCapture $java @('-jar', $jar, 'TextToPDF', '-standardFont', 'Helvetica', '-fontSize', '12', $Path, $textPath)
         if ([int]$run.exitCode -ne 0) { throw "Test presentation PDF creation failed: $($run.text)" }
-        if ([int](Get-PdfPageCount $Path) -eq $ExpectedPages) { return }
+        return [int](Get-PdfPageCount $Path)
+    }
+    if ($Script:FixtureLinesPerPage -le 0) {
+        $probeLines = 240
+        $probePages = [int](& $render $probeLines)
+        if ($probePages -lt 1) { throw 'Could not measure the fixture page capacity.' }
+        $Script:FixtureLinesPerPage = [Math]::Max(1, [int][Math]::Floor($probeLines / $probePages))
+        if ($probePages -eq $ExpectedPages) { return }
+    }
+    $perPage = [int]$Script:FixtureLinesPerPage
+    $step = [Math]::Max(1, [int][Math]::Ceiling($perPage / 2))
+    # 目的のページの中ほどを狙う。境界ちょうどを狙うと丸め誤差で隣のページへ落ちる。
+    $lineCount = [Math]::Max(1, ($perPage * ($ExpectedPages - 1)) + $step)
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        $pages = [int](& $render $lineCount)
+        if ($pages -eq $ExpectedPages) { return }
+        if ($pages -lt $ExpectedPages) { $lineCount += $step }
+        else { $lineCount -= $step }
+        if ($lineCount -lt 1) { break }
     }
     throw "Could not create a $ExpectedPages-page presentation PDF fixture."
 }
