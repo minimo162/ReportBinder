@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$TestRoot = '',
     [switch]$KeepTestData
 )
@@ -185,7 +185,7 @@ Write-CustomPackStage 'requesting changes'
 $reviewChanges = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='request-changes'; note='clarify the appendix'; actor='reviewer' })
 Assert-CustomPackTest ([string]$reviewChanges.status -eq 'changes-requested' -and @($reviewChanges.events).Count -eq 3) 'Review change request was not recorded.'
 $changesProgress = @((Get-PackProgressDashboard (Get-Structure 'ja') 'ja').packs | Where-Object { [string]$_.packId -eq $packId })[0]
-Assert-CustomPackTest ([string]$changesProgress.state -eq 'review-changes' -and [string]$changesProgress.reviewStatus -eq 'changes-requested') 'Change-requested custom pack was not visible in the cross-pack dashboard.'
+Assert-CustomPackTest ([string]$changesProgress.state -eq 'complete' -and [string]$changesProgress.reviewStatus -eq 'changes-requested') 'Cross-pack dashboard must report progress and the confirmation record independently.'
 Write-CustomPackStage 'resubmitting review'
 $reviewResubmitted = Invoke-PackReviewAction 'ja' $packId ([pscustomobject]@{ action='submit'; note='updated response'; actor='workflow-owner' })
 Assert-CustomPackTest ([string]$reviewResubmitted.status -eq 'in-review') 'Corrected custom pack could not be resubmitted.'
