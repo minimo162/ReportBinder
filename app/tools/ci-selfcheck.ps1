@@ -1,4 +1,8 @@
-﻿param(
+﻿# Scope=Fast は変更ごとの門。同梱JREもjarのビルドも要らない検査だけを並べる。
+# Scope=Full は受け入れスイート全部。手動実行とリリース前だけ回す。
+param(
+    [ValidateSet('Full','Fast')]
+    [string]$Scope = 'Full',
     [switch]$SkipPackageSmoke,
     [string]$PackageOutputDir = ''
 )
@@ -152,6 +156,17 @@ $node = (Get-Command node.exe -ErrorAction Stop).Source
 try {
     Assert-PowerShellSyntax
     Assert-VersionDocumented
+
+    if ($Scope -eq 'Fast') {
+        Remove-CiGeneratedFiles
+        Invoke-Checked 'Repository selfcheck (static)' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py'),'--static-only'))
+        Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
+        Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
+        # 何を見ていないかを結果に残す。通った表示だけが後から参照されるため。
+        Write-Output 'ReportBinder CI fast gate OK. (regression suites and package smoke tests were not run)'
+        return
+    }
+
     Invoke-Checked 'Third-party verification' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'verify-thirdparty.ps1'),'-RequirePdfJs','-RequirePortableJava')
     Remove-CiGeneratedFiles
     Invoke-Checked 'Repository selfcheck' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py')))

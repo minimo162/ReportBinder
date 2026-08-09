@@ -1,5 +1,12 @@
 name: ReportBinder CI
 
+# 変更ごとに回すのは fast-gate だけ。重い受け入れスイートは workflow_dispatch と、
+# release.yml が梱包前に走らせる検証に寄せてある。
+#
+# この配分の理由: 重いスイートは Office の入っていないランナーで動くため、利用者が
+# 毎日通る Excel/Word の変換経路をそもそも実行できない(source-adapter が変換を
+# 差し替えている)。一方 fast-gate に入っている版番号とCHANGELOGの整合、UI文字列の
+# 固定、サーバー実装への assertion は実際に取りこぼしを止めてきた。
 on:
   pull_request:
     branches:
@@ -17,7 +24,34 @@ permissions:
   contents: read
 
 jobs:
-  validate-windows-powershell-51:
+  # 変更ごとの門。同梱JREもjarのビルドも要らないので依存導入の段が丸ごと無い。
+  fast-gate:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Install Python test dependencies
+        run: python -m pip install --disable-pip-version-check -r .\app\tools\ci-requirements.txt
+
+      - name: Run fast gate
+        shell: powershell
+        run: .\app\tools\ci-selfcheck.ps1 -Scope Fast
+
+  # 手動実行のときだけ。所要は約10分。
+  full-suite:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 35
     steps:

@@ -1,5 +1,10 @@
 ﻿from pathlib import Path
-import json, os, re, shutil, subprocess, tempfile, time, zipfile
+import json, os, re, shutil, subprocess, sys, tempfile, time, zipfile
+
+# --static-only は PowerShell の下位セルフチェックを飛ばす。あれだけが同梱JREを
+# 必要とし、変更ごとの門はJREの導入(約93秒)ごと省きたいため。文字列の固定や
+# サーバー実装への assertion といった実際に鳴る検査は、すべて静的側にある。
+STATIC_ONLY = '--static-only' in sys.argv
 
 root = Path(__file__).resolve().parents[2]
 required = [
@@ -41,13 +46,38 @@ for needed in ['Assert-PowerShellSyntax', 'Assert-VersionDocumented', 'Diff regr
                'Final composition regression', 'Operational readiness regression',
                'History logic regression', 'ZIP release smoke test', 'Assert-PackageContents']:
     if needed not in ci_selfcheck: raise SystemExit(f'CI acceptance coverage missing: {needed}')
+for needed in ["Scope -eq 'Fast'", '--static-only', 'were not run']:
+    if needed not in ci_selfcheck: raise SystemExit(f'CI fast-gate wiring missing: {needed}')
+# 速い門は同梱JREを要らないことが値打ちなので、重い検査が紛れ込んでいないか見る。
+_fast = ci_selfcheck.split("if ($Scope -eq 'Fast') {", 1)[1].split(chr(10)+'    }', 1)[0]
+if '--static-only' not in _fast:
+    raise SystemExit('the fast gate must run selfcheck.py with --static-only')
+for forbidden in ['verify-thirdparty.ps1', 'Invoke-CheckedInParallel', 'final-composition-selfcheck.py',
+                  'operational-readiness-selfcheck.ps1', 'pdf-diff-corpus-selfcheck.ps1', 'package-release.ps1']:
+    if forbidden in _fast: raise SystemExit(f'the fast gate must not depend on bundled Java or packaging: {forbidden}')
+
 ci_workflow=(root/'.github/workflows/thirdparty-check.yml').read_text(encoding='utf-8')
 for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -Force',
-               'ci-requirements.txt', 'build.ps1', 'ci-selfcheck.ps1']:
+               'ci-requirements.txt', 'build.ps1', 'ci-selfcheck.ps1',
+               'fast-gate:', 'ci-selfcheck.ps1 -Scope Fast', 'full-suite:',
+               "if: github.event_name == 'workflow_dispatch'"]:
     if needed not in ci_workflow: raise SystemExit(f'GitHub CI workflow coverage missing: {needed}')
+# 変更ごとの門に依存導入が戻ると、狙いだった所要が元に戻る。
+_fast_job = ci_workflow.split('fast-gate:', 1)[1].split(chr(10)+'  full-suite:', 1)[0]
+for forbidden in ['install-thirdparty.ps1', 'build.ps1']:
+    if forbidden in _fast_job: raise SystemExit(f'the fast-gate job must not install bundled dependencies: {forbidden}')
+
 release_workflow=(root/'.github/workflows/release.yml').read_text(encoding='utf-8')
 for needed in ['workflow_dispatch:', 'package-release.ps1', '-SharedFolderOnly', 'actions/upload-artifact@v6']:
     if needed not in release_workflow: raise SystemExit(f'GitHub release workflow coverage missing: {needed}')
+# 変更ごとの検査を薄くした分、梱包前は受け入れスイート全部を通す必要がある。
+if '-Scope Fast' in release_workflow or '--static-only' in release_workflow:
+    raise SystemExit('the release workflow must run the complete acceptance suite, not the fast gate')
+if 'ci-selfcheck.ps1' not in release_workflow:
+    raise SystemExit('the release workflow must revalidate before packaging')
+# 配布物スモークは変更ごとには走らなくなったので、梱包前に飛ばしてはいけない。
+if '-SkipPackageSmoke' in release_workflow:
+    raise SystemExit('the release workflow must not skip the package smoke tests')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
 
@@ -446,7 +476,10 @@ def run_powershell_selfcheck(script_name, marker, label, timeout=240):
         pass
     return output
 
-if powershell:
+if STATIC_ONLY:
+    # 飛ばしたことは必ず出す。黙って範囲が狭まると、通った表示が実際より広く見える。
+    print('powershell subchecks skipped (--static-only)')
+elif powershell:
     run_powershell_selfcheck('schema-v3-selfcheck.ps1', 'schema-v3 selfcheck ok', 'schema v3 PowerShell selfcheck')
     run_powershell_selfcheck('source-adapter-selfcheck.ps1', 'source-adapter selfcheck ok', 'source adapter PowerShell selfcheck')
     run_powershell_selfcheck('operational-readiness-selfcheck.ps1', 'operational readiness selfcheck ok', 'operational readiness PowerShell selfcheck')
@@ -2107,4 +2140,4 @@ if "!=='ready'" not in _release:
 if 'pageThumbnailObserver.unobserve' in appjs:
     raise SystemExit('the thumbnail observer must keep watching so re-entry redraws released canvases')
 
-print('selfcheck ok')
+print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

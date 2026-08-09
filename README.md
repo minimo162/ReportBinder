@@ -254,13 +254,32 @@ app\tools\stop-reportbinder.cmd
 python app\tools\selfcheck.py
 ```
 
-PR前に第三者依存物、PowerShell構文、差分、最終組版、運用復旧、配布物までまとめて確認する場合:
+第三者依存物、PowerShell構文、差分、最終組版、運用復旧、配布物までまとめて確認する場合:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\ci-selfcheck.ps1
 ```
 
-同じ完全検査は、すべてのpull requestとmainへのpushで`.github/workflows/thirdparty-check.yml`（表示名: ReportBinder CI）から自動実行されます。Excel / Word COMを使う実機E2Eとlargeベンチマークは、対話Windowsセッションが必要なためリリース受け入れ時に別途実行します。
+同梱JREもjarのビルドも要らない速い門だけを回す場合（約2秒）:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\app\tools\ci-selfcheck.ps1 -Scope Fast
+```
+
+### 自動実行の配分
+
+`.github/workflows/thirdparty-check.yml`（表示名: ReportBinder CI）は2つのジョブに分かれています。
+
+| ジョブ | 走る時 | 内容 | 所要 |
+| --- | --- | --- | --- |
+| `fast-gate` | pull request / mainへのpush / 手動 | PowerShell構文、版番号とCHANGELOGの整合、`selfcheck.py --static-only`、JS構文 | 約1分 |
+| `full-suite` | 手動実行のみ | 受け入れスイート全部（差分回帰、PDFコーパス、最終組版、各種ライフサイクル、配布物スモーク） | 約10分 |
+
+重いスイートを変更ごとに回さないのは、それがOfficeの入っていないランナーで動くためです。利用者が毎日通るExcel / Wordの変換経路をランナー上では実行できず（`source-adapter-selfcheck.ps1`が変換を差し替えます）、変更ごとの費用に見合っていませんでした。実際に取りこぼしを止めてきた検査は`fast-gate`側にあります。
+
+重いスイートを通したいときは、GitHubのActionsタブから **ReportBinder CI** を`workflow_dispatch`で実行するか、手元で`-Scope Full`（既定）を回してください。リリース時は`release.yml`が梱包前に受け入れスイート全部を必ず走らせます。
+
+Excel / Word COMを使う実機E2Eとlargeベンチマークは、対話Windowsセッションが必要なためリリース受け入れ時に別途実行します。
 
 最終PDFの表紙・目次・区切り・ページ範囲・ブックマークを実PDFで確認する場合:
 
