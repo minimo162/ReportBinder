@@ -915,6 +915,23 @@ function startUpdateMonitor() {
 }
 
 let finalReadinessInFlight = null;
+// Repaint guards. Entering the final screen re-rendered every block even when
+// the data was identical, so the page visibly redrew ~250ms after it appeared.
+// Keep signatures off the DOM (a dataset attribute would carry the whole HTML).
+const renderSignatures=new WeakMap();
+function setHtmlIfChanged(el, html){
+  if(!el)return false;
+  if(renderSignatures.get(el)===html)return false;
+  el.innerHTML=html; renderSignatures.set(el,html); return true;
+}
+function setTextIfChanged(el, text){
+  if(!el||el.textContent===text)return false;
+  el.textContent=text; return true;
+}
+function setClassIfChanged(el, cls){
+  if(!el||el.className===cls)return false;
+  el.className=cls; return true;
+}
 let finalPanelsInFlight=null;
 function finalReadinessKey(){
   const pack=activePackRecord();
@@ -941,7 +958,7 @@ async function loadFinalPanels(options = {}){
   }
   await finalPanelsInFlight;
   if(options.render===false) return;
-  if(activeView==='final'){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();renderPackReview();}
+  if(activeView==='final'){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
 }
 async function loadFinalReadiness(options = {}){
   if(!state||!configured())return;
@@ -961,7 +978,13 @@ async function loadFinalReadiness(options = {}){
 
 async function refresh(options = {}) {
   try {
+    // finalReadiness is filled in by loadFinalReadiness(), not by /api/state.
+    // Replacing state wholesale dropped it, so the final screen painted
+    // "0ページ / 出力できません" and corrected itself once the refetch landed -
+    // a guaranteed wrong-then-right flash on every refresh.
+    const carriedReadiness = state?.finalReadiness;
     state = normalizeStatePayload(await api('/api/state'));
+    if (carriedReadiness) state.finalReadiness = Object.assign({}, carriedReadiness, state.finalReadiness || {});
     const reloadHistory = activeView === 'history' && historyPanelsInitialized;
     snapshotHistoryResponseCache.clear();
     // render:false lets a caller fold several sequential loads into one paint.
@@ -1253,8 +1276,7 @@ function renderFinalOverview() {
   // its fetch, and blowing away innerHTML for an identical result made the cards
   // blink for no reason. Same signature trick renderPages() uses.
   const gridHtml=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
-  const gridChanged=!grid||grid.dataset.signature!==gridHtml;
-  if(grid&&gridChanged){grid.innerHTML=gridHtml;grid.dataset.signature=gridHtml;}
+  const gridChanged=setHtmlIfChanged(grid,gridHtml);
   const renderFreshness=(ready,card)=>{
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
     const blockers=asArray(ready.blockers),reasons=asArray(ready.staleReasons).slice(0,3);const display=String(ready.displayState||'not-built');
@@ -1266,15 +1288,15 @@ function renderFinalOverview() {
     else if(unassigned){title=`要確認：未振り分け ${unassigned}ページ`;cls='attention';body='このまま出力すると、未振り分けページはPDFに入りません。';}
     else if(display==='built'){title='提出用PDFは最新です';body=`最終出力 ${escapeHtml(formatDateTime(ready.lastBuiltAt))}`;}
     const dot=cls==='neutral'?'':'<span class="status-dot"></span>';
-    box.innerHTML=`<div class="freshness-title ${cls}">${dot}${escapeHtml(title)}</div>${typeof body==='string'&&body.startsWith('<')?body:`<p class="caption">${escapeHtml(body)}</p>`}`;
+    setHtmlIfChanged(box,`<div class="freshness-title ${cls}">${dot}${escapeHtml(title)}</div>${typeof body==='string'&&body.startsWith('<')?body:`<p class="caption">${escapeHtml(body)}</p>`}`);
     if(btn)btn.disabled=Number(ready.pageCount||0)===0||blockers.length>0;
     if(fix)fix.classList.toggle('hidden',blockers.length===0||Number(ready.pageCount||0)===0);
   };
   // Bind only when the markup was actually replaced: re-running addEventListener
   // on surviving nodes would stack duplicate handlers and fire a second build.
   for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
-  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;allBtn.classList.toggle('busy',!!activeFinalJobId);allBtn.className=`btn ${activeFinalJobId?'primary busy':'primary'}`;allBtn.textContent=hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力';}
-  const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>';}
+  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;setClassIfChanged(allBtn,`btn ${activeFinalJobId?'primary busy':'primary'}`);setTextIfChanged(allBtn,hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力');}
+  const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));setHtmlIfChanged(history,rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>');}
   renderPackReview();
   renderVolumeLinks();
 }
@@ -1310,10 +1332,10 @@ function renderFinalPreflight(entries=[]) {
     }
   }
   summary.className=`final-preflight-summary ${ready?'ready':'attention'}`;
-  summary.innerHTML=`<div><strong>${ready?'出力準備が整っています':'出力前に確認が必要です'}</strong><span>${ready?'すべての確認項目を満たしています。':`${problemCount}項目を確認してください。`}</span></div>${badge(ready?'準備完了':`${problemCount}項目`,ready?'ok':'attention')}<time>確認 ${escapeHtml(finalPreflightCheckedAt?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`;
+  setHtmlIfChanged(summary,`<div><strong>${ready?'出力準備が整っています':'出力前に確認が必要です'}</strong><span>${ready?'すべての確認項目を満たしています。':`${problemCount}項目を確認してください。`}</span></div>${badge(ready?'準備完了':`${problemCount}項目`,ready?'ok':'attention')}<time>確認 ${escapeHtml(finalPreflightCheckedAt?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`);
   const row=check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ${check.label==='ページ構成'?'primary':'secondary'} compact" type="button" data-preflight-view="${escapeAttr(check.view)}"${check.focus?` data-preflight-focus="${escapeAttr(check.focus)}"`:''} aria-label="${escapeAttr(`${check.label}を確認する`)}">${check.label==='ページ構成'?`${unassigned}ページを確認`:`${check.label}を確認`}</button>`}</div>`;
-  list.innerHTML=problems.map(row).join('')+(completed.length?`<details class="preflight-complete" ${ready?'open':''}><summary>確認済み ${completed.length}項目</summary><div>${completed.map(row).join('')}</div></details>`:'');
-  list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>{
+  const listChanged=setHtmlIfChanged(list,problems.map(row).join('')+(completed.length?`<details class="preflight-complete" ${ready?'open':''}><summary>確認済み ${completed.length}項目</summary><div>${completed.map(row).join('')}</div></details>`:''));
+  if(listChanged)list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>{
     setActiveView(String(button.dataset.preflightView||'final'));
     // Without this the "出力ファイル名を確認" button only scrolled to the top of
     // the screen it was already on, leaving the field shut inside its <details>.
@@ -1339,8 +1361,8 @@ function renderPackReview(){
   }
   const labels={draft:'下書き','in-review':'レビュー中',approved:'承認済み','changes-requested':'差し戻し',stale:'提出後に更新あり'};
   const classes={draft:'neutral','in-review':'attention',approved:'ok','changes-requested':'danger',stale:'danger'};
-  const status=String(review.status||'draft');statusBadge.className=`badge ${classes[status]||'neutral'}`;statusBadge.textContent=labels[status]||status;
-  if(summaryLabel)summaryLabel.textContent=status==='draft'?'提出や承認を記録する場合':labels[status]||status;
+  const status=String(review.status||'draft');setClassIfChanged(statusBadge,`badge ${classes[status]||'neutral'}`);setTextIfChanged(statusBadge,labels[status]||status);
+  if(summaryLabel)setTextIfChanged(summaryLabel,status==='draft'?'提出や承認を記録する場合':labels[status]||status);
   const targets=asArray(review.targetStates),readyCount=targets.filter(target=>target.ready).length;
   const details=[];
   if(status==='in-review')details.push(`${formatDateTime(review.submittedAt)} に ${review.submittedBy||'利用者'} が提出`);
@@ -1349,14 +1371,14 @@ function renderPackReview(){
   if(status==='changes-requested')details.push('差し戻し内容を反映し、提出用PDFを最新にして再提出してください。');
   if(review.note)details.push(`最新コメント：${review.note}`);
   const draftGuidance=review.canSubmit?'レビュー提出の準備ができています。コメントは任意です。':'最新の提出用PDFを作成するとレビューへ提出できます。';
-  summary.innerHTML=`<div><strong>必須出力 ${readyCount} / ${targets.length}件が最新</strong><span>${escapeHtml(details.join(' ')||draftGuidance)}</span></div>`;
+  setHtmlIfChanged(summary,`<div><strong>必須出力 ${readyCount} / ${targets.length}件が最新</strong><span>${escapeHtml(details.join(' ')||draftGuidance)}</span></div>`);
   if(buttons.submit)buttons.submit.disabled=!review.canSubmit||status==='in-review'||status==='approved';
   if(buttons.approve)buttons.approve.disabled=status!=='in-review';
   if(buttons.changes)buttons.changes.disabled=!['in-review','approved'].includes(status);
   if(buttons.reopen)buttons.reopen.disabled=status==='draft';
   const actionLabels={submit:'レビュー提出',approve:'承認','request-changes':'差し戻し',reopen:'下書きへ戻す'};
   const rows=asArray(review.events).slice().reverse();
-  eventsBox.innerHTML=rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${escapeHtml(event.actor||'利用者')}${event.note?`・${escapeHtml(event.note)}`:''}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">レビューの記録はまだありません。「レビューへ提出」を押すと、提出・承認・差し戻しの記録がここに残ります。</div>';
+  setHtmlIfChanged(eventsBox,rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${escapeHtml(event.actor||'利用者')}${event.note?`・${escapeHtml(event.note)}`:''}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">レビューの記録はまだありません。「レビューへ提出」を押すと、提出・承認・差し戻しの記録がここに残ります。</div>');
 }
 
 async function performPackReviewAction(action,button){
@@ -1680,12 +1702,12 @@ function renderVolumeLinks() {
     // primary action and moves to the front; re-outputting drops to tertiary.
     const fresh=available&&String(r.displayState||'')==='built';
     if(a){
-      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;a.textContent=fresh?'出力したPDFを開く':'前回出力を開く';a.className=fresh?'btn primary':'btn secondary';a.classList.remove('hidden');}
+      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;setTextIfChanged(a,fresh?'出力したPDFを開く':'前回出力を開く');setClassIfChanged(a,fresh?'btn primary':'btn secondary');a.classList.remove('hidden');}
       else{a.removeAttribute('href');a.classList.add('hidden');}
     }
     const buildBtn=card.querySelector('[data-final-build]');
-    if(buildBtn)buildBtn.className=fresh?'btn ghost':'btn primary';
-    if(publish){publish.classList.toggle('hidden',!publishable);publish.disabled=!publishable;publish.className=`btn secondary${publishable?'':' hidden'}`;}
+    setClassIfChanged(buildBtn,fresh?'btn ghost':'btn primary');
+    if(publish){publish.disabled=!publishable;setClassIfChanged(publish,`btn secondary${publishable?'':' hidden'}`);}
     card.classList.toggle('has-output',fresh);
   });
 }
@@ -5088,8 +5110,8 @@ async function loadFinalArchives(){
   try{
     const r=await api(activePackIsBuiltIn()?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(activePackId)}`);
     const list=asArray(r.archives);
-    if(!list.length){box.innerHTML='<div class="caption">保存された出力はまだありません。提出用PDFを出力すると、その時点のPDFを自動で保存します。</div>';return;}
-    box.innerHTML=list.slice(0,20).map(a=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(a.builtAt))}</span><span>${escapeHtml(volumeLabel(a.volume))}</span><span class="subtext">${escapeHtml(String(a.outputFileName||''))}（${Number(a.pageCount||0)}ページ）</span></div>`).join('');
+    if(!list.length){setHtmlIfChanged(box,'<div class="caption">保存された出力はまだありません。提出用PDFを出力すると、その時点のPDFを自動で保存します。</div>');return;}
+    setHtmlIfChanged(box,list.slice(0,20).map(a=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(a.builtAt))}</span><span>${escapeHtml(volumeLabel(a.volume))}</span><span class="subtext">${escapeHtml(String(a.outputFileName||''))}（${Number(a.pageCount||0)}ページ）</span></div>`).join(''));
   }catch(e){box.innerHTML=`<div class="caption">読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
 }
 
