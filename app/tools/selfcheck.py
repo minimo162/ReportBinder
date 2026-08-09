@@ -198,11 +198,15 @@ for needed in ['/api/history/diff-review','function Get-DiffReviewStatePath','fu
                'confirmedSheetKeys','id="diff-unreviewed-only"','id="diff-confirm-sheet"','function toggleDiffSheetReviewed']:
     review_sources = server + (root/'app/web/index.html').read_text(encoding='utf-8') + (root/'app/web/app.js').read_text(encoding='utf-8-sig')
     if needed not in review_sources: raise SystemExit(f'diff review workflow missing: {needed}')
+# 記録の保存はサーバー側の review API のままだが、画面は「自分用の確認記録」に
+# 作り替えた。ローカル1利用者のデータに $env:USERNAME を承認者として書くだけで、
+# 提出・承認・差し戻しは相手が存在しない。UIは確認済み/取り消しの2操作だけを出す。
 for needed in ["^/api/v2/packs/([^/]+)/review$", 'function Get-PackReviewSnapshot', 'function Invoke-PackReviewAction',
-               'submittedFingerprints', "'review-stale'", 'id="pack-review-submit"', 'id="pack-review-approve"',
-               'id="pack-review-request-changes"', 'id="pack-review-events"', 'function performPackReviewAction']:
+               'submittedFingerprints', "'review-stale'", 'id="pack-review-approve"',
+               'id="pack-review-reopen"', 'id="pack-review-events"', 'function performPackReviewAction',
+               '確認済みにする', 'この記録はこのPCのあなたの環境にだけ残り']:
     review_sources = server + (root/'app/web/index.html').read_text(encoding='utf-8') + (root/'app/web/app.js').read_text(encoding='utf-8-sig')
-    if needed not in review_sources: raise SystemExit(f'pack approval workflow missing: {needed}')
+    if needed not in review_sources: raise SystemExit(f'personal confirmation record UI missing: {needed}')
 for needle in ['function New-DocumentPack', 'function Copy-DocumentPack', 'function Set-DocumentPackArchived',
                "^/api/v2/packs/([^/]+)/duplicate$", "^/api/v2/packs/([^/]+)/archive$", "^/api/v2/packs/([^/]+)/restore$"]:
     if needle not in server: raise SystemExit(f'pack lifecycle API missing: {needle}')
@@ -1153,7 +1157,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v166', 'style.css?v=20260809_v104']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v167', 'style.css?v=20260809_v104']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1212,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260809_v166' not in html:
+if 'app.js?v=20260809_v167' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1238,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260809_v166' not in html:
+if 'app.js?v=20260809_v167' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1354,7 +1358,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.09.8':
+if runtime_version != '2026.08.09.9':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:

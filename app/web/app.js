@@ -1217,7 +1217,7 @@ function renderPackProgressDashboard(){
   const progress=state?.packProgress||{},summary=$('pack-progress-summary'),box=$('pack-progress-list'),toggle=$('pack-progress-attention-only');if(!box)return;if(toggle)toggle.checked=packProgressAttentionOnly;
   if(summary)summary.textContent=Number(progress.totalCount||0)?`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・期限7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`:'作成中の一式がここに表示されます。';
   const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'review-stale':6,'review-changes':7,'review-draft':8,'in-review':9,'no-pages':10,'not-started':11,complete:12};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??13)-(priority[String(b.state)]??13)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
-  const stateInfo=value=>({complete:['承認済み','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['レビュー未提出','attention'],'in-review':['レビュー中','neutral'],'review-changes':['差し戻し','danger'],'review-stale':['承認対象が更新','danger']}[String(value)]||['要確認','attention']);
+  const stateInfo=value=>({complete:['承認済み','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['未確認','neutral'],'in-review':['未確認','neutral'],'review-changes':['未確認','neutral'],'review-stale':['確認後に変更あり','attention']}[String(value)]||['要確認','attention']);
   if(!rows.length){box.innerHTML=packProgressAttentionOnly?'<div class="empty-state">対応が必要な一式はありません。</div>':`<div class="pack-progress-empty"><div><strong>${configured()?'今回まとめる一式はまだありません':'まだ作業は始まっていません'}</strong><span>${configured()?'上の「次にやること」から名前を付けます。':'上の「はじめる」から原稿フォルダーを選びます。'}</span></div></div>`;return;}
   box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・期限7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${formatDateOnly(nearestDue)}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}ページ</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
   box.querySelectorAll('[data-pack-progress-open]').forEach(button=>button.addEventListener('click',async()=>{await applyPresetSelection(String(button.dataset.packProgressOpen||''));setActiveView(String(button.dataset.packProgressAction||'excel'));}));
@@ -1352,46 +1352,52 @@ function renderFinalPreflight(entries=[]) {
 
 function renderPackReview(){
   const review=packReviewState,summary=$('pack-review-summary'),eventsBox=$('pack-review-events'),statusBadge=$('pack-review-status'),summaryLabel=$('pack-review-summary-label');
-  const buttons={submit:$('pack-review-submit'),approve:$('pack-review-approve'),changes:$('pack-review-request-changes'),reopen:$('pack-review-reopen')};
+  const buttons={approve:$('pack-review-approve'),reopen:$('pack-review-reopen')};
   if(!summary||!eventsBox||!statusBadge)return;
   if(!review||String(review.packId||'')!==String(activePackRecord()?.packId||'')){
     if(summaryLabel)summaryLabel.textContent='状態を確認中';
-    statusBadge.className='badge neutral';statusBadge.textContent='状態取得中';summary.innerHTML='<p class="caption">レビュー状態を確認しています。</p>';eventsBox.innerHTML='<div class="empty-state">読み込んでいます。</div>';
+    statusBadge.className='badge neutral';statusBadge.textContent='状態取得中';summary.innerHTML='<p class="caption">確認の記録を読み込んでいます。</p>';eventsBox.innerHTML='<div class="empty-state">読み込んでいます。</div>';
     Object.values(buttons).forEach(button=>{if(button)button.disabled=true;});return;
   }
-  const labels={draft:'下書き','in-review':'レビュー中',approved:'承認済み','changes-requested':'差し戻し',stale:'提出後に更新あり'};
-  const classes={draft:'neutral','in-review':'attention',approved:'ok','changes-requested':'danger',stale:'danger'};
+  // This record lives only in the current user's local workspace and the actor is
+  // always $env:USERNAME, so a submit / approve / send-back workflow could never
+  // involve a second person. It is presented as a personal "checked it" note.
+  const labels={draft:'未確認','in-review':'未確認',approved:'確認済み','changes-requested':'未確認',stale:'確認後に変更あり'};
+  const classes={draft:'neutral','in-review':'neutral',approved:'ok','changes-requested':'neutral',stale:'attention'};
   const status=String(review.status||'draft');setClassIfChanged(statusBadge,`badge ${classes[status]||'neutral'}`);setTextIfChanged(statusBadge,labels[status]||status);
-  if(summaryLabel)setTextIfChanged(summaryLabel,status==='draft'?'提出や承認を記録する場合':labels[status]||status);
+  if(summaryLabel)setTextIfChanged(summaryLabel,status==='approved'?`確認済み ${formatDateTime(review.approvedAt)}`:(status==='stale'?'確認後に変更あり':'自分用の確認メモ'));
   const targets=asArray(review.targetStates),readyCount=targets.filter(target=>target.ready).length;
   const details=[];
-  if(status==='in-review')details.push(`${formatDateTime(review.submittedAt)} に ${review.submittedBy||'利用者'} が提出`);
-  if(status==='approved')details.push(`${formatDateTime(review.approvedAt)} に ${review.approvedBy||'利用者'} が承認`);
-  if(status==='stale')details.push('レビュー提出後に原稿・ページ構成・出力が変わりました。再出力して再提出してください。');
-  if(status==='changes-requested')details.push('差し戻し内容を反映し、提出用PDFを最新にして再提出してください。');
-  if(review.note)details.push(`最新コメント：${review.note}`);
-  const draftGuidance=review.canSubmit?'レビュー提出の準備ができています。コメントは任意です。':'最新の提出用PDFを作成するとレビューへ提出できます。';
+  if(status==='approved')details.push(`${formatDateTime(review.approvedAt)} に確認済みとして記録しました。`);
+  if(status==='stale')details.push('確認したあとに原稿・ページ構成・出力が変わりました。出力し直して、もう一度確認してください。');
+  if(review.note)details.push(`メモ：${review.note}`);
+  const draftGuidance=review.canSubmit?'提出用PDFを開いて内容を確かめたら、「確認済みにする」で記録できます。':'必須の提出用PDFを最新にすると、確認済みとして記録できます。';
   setHtmlIfChanged(summary,`<div><strong>必須出力 ${readyCount} / ${targets.length}件が最新</strong><span>${escapeHtml(details.join(' ')||draftGuidance)}</span></div>`);
-  if(buttons.submit)buttons.submit.disabled=!review.canSubmit||status==='in-review'||status==='approved';
-  if(buttons.approve)buttons.approve.disabled=status!=='in-review';
-  if(buttons.changes)buttons.changes.disabled=!['in-review','approved'].includes(status);
-  if(buttons.reopen)buttons.reopen.disabled=status==='draft';
-  const actionLabels={submit:'レビュー提出',approve:'承認','request-changes':'差し戻し',reopen:'下書きへ戻す'};
-  const rows=asArray(review.events).slice().reverse();
-  setHtmlIfChanged(eventsBox,rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${escapeHtml(event.actor||'利用者')}${event.note?`・${escapeHtml(event.note)}`:''}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">レビューの記録はまだありません。「レビューへ提出」を押すと、提出・承認・差し戻しの記録がここに残ります。</div>');
+  if(buttons.approve)buttons.approve.disabled=!review.canSubmit||status==='approved';
+  if(buttons.reopen)buttons.reopen.disabled=status!=='approved';
+  const actionLabels={approve:'確認済みにしました',reopen:'確認を取り消しました'};
+  // 'submit' is an internal step of 確認済みにする and 'request-changes' no longer
+  // has a sender; neither means anything in a single-user record.
+  const rows=asArray(review.events).filter(event=>['approve','reopen'].includes(String(event.action||''))).slice().reverse();
+  setHtmlIfChanged(eventsBox,rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${event.note?escapeHtml(event.note):'メモなし'}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">確認の記録はまだありません。「確認済みにする」を押すと、確認した日時がここに残ります。</div>');
 }
 
 async function performPackReviewAction(action,button){
   const pack=activePackRecord();if(!pack?.packId)return;
   const note=String($('pack-review-note')?.value||'').trim();
-  if(action==='request-changes'&&!note){showMessage('warn','差し戻し理由を入力してください','コメント欄へ修正が必要な内容を入力してください。');$('pack-review-note')?.focus();return;}
   await runBusy(button,async()=>{
+    // The stored workflow still goes draft -> in-review -> approved. One press
+    // means "I checked it", so walk both steps here rather than exposing a
+    // submission step that has no recipient.
+    if(action==='approve'&&String(packReviewState?.status||'draft')!=='in-review'){
+      await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}/review`,{method:'POST',body:{action:'submit',note:''}});
+    }
     const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}/review`,{method:'POST',body:{action,note}});
     if(response.state)state=normalizeStatePayload(response.state);
     packReviewState=response.review||null;
     if($('pack-review-note'))$('pack-review-note').value='';
     renderAll();renderPackReview();
-    const labels={submit:'レビューへ提出しました',approve:'資料パックを承認しました','request-changes':'修正を依頼しました',reopen:'下書きへ戻しました'};
+    const labels={approve:'確認済みとして記録しました',reopen:'確認の記録を取り消しました'};
     showMessage(action==='request-changes'?'warn':'ok',labels[action]||'レビュー状態を更新しました',pack.displayName||'資料パック');
   },false);
 }
@@ -4869,9 +4875,7 @@ bind('source-next-pages','click',()=>setActiveView('pages'));
 bind('change-source-folder-btn','click',()=>chooseSubmissionFolder($('change-source-folder-btn')));
 bind('save-pack-settings-btn','click',()=>savePackSettings($('save-pack-settings-btn')));
 bind('final-preflight-refresh','click',()=>refreshFinalPreflight($('final-preflight-refresh')));
-bind('pack-review-submit','click',()=>performPackReviewAction('submit',$('pack-review-submit')));
 bind('pack-review-approve','click',()=>performPackReviewAction('approve',$('pack-review-approve')));
-bind('pack-review-request-changes','click',()=>performPackReviewAction('request-changes',$('pack-review-request-changes')));
 bind('pack-review-reopen','click',()=>performPackReviewAction('reopen',$('pack-review-reopen')));
 const changedOnlyToggle=$('changed-only-toggle');
 if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});

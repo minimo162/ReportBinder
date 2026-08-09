@@ -159,12 +159,12 @@
           <div id="final-target-grid" class="final-grid"></div>
           <p class="caption final-numbering-caption">ページ番号は「- 2 -」の形式で入ります。先頭ページには番号を付けません。</p>
           <details class="secondary-disclosure final-review-disclosure">
-            <summary><span>レビュー・承認</span><small id="pack-review-summary-label">提出や承認を記録する場合</small></summary>
+            <summary><span>確認の記録</span><small id="pack-review-summary-label">自分用の確認メモ</small></summary>
           <section class="card pack-review-card" aria-labelledby="pack-review-title">
-            <div class="card-head"><div><h3 id="pack-review-title">レビュー・承認</h3><p>最新の提出用PDFをレビューへ提出し、承認または差し戻しを記録します。</p></div><span id="pack-review-status" class="badge neutral">下書き</span></div>
+            <div class="card-head"><div><h3 id="pack-review-title">確認の記録</h3><p>出力した提出用PDFを自分で確認したことを記録します。この記録はこのPCのあなたの環境にだけ残り、他の人には共有されません。</p></div><span id="pack-review-status" class="badge neutral">未確認</span></div>
             <div id="pack-review-summary" class="pack-review-summary"></div>
-            <label class="pack-review-note"><span>コメント</span><textarea id="pack-review-note" rows="3" maxlength="1000" placeholder="提出メモ、承認コメント、差し戻し理由を入力"></textarea></label>
-            <div class="pack-review-actions"><button id="pack-review-submit" class="btn primary" type="button">レビューへ提出</button><button id="pack-review-approve" class="btn primary" type="button">承認</button><button id="pack-review-request-changes" class="btn danger" type="button">差し戻し</button><button id="pack-review-reopen" class="btn secondary" type="button">下書きへ戻す</button></div>
+            <label class="pack-review-note"><span>メモ（任意）</span><textarea id="pack-review-note" rows="3" maxlength="1000" placeholder="確認した内容や気づいたことを残せます"></textarea></label>
+            <div class="pack-review-actions"><button id="pack-review-approve" class="btn primary" type="button">確認済みにする</button><button id="pack-review-reopen" class="btn secondary" type="button">確認を取り消す</button></div>
             <div><h4>監査履歴</h4><div id="pack-review-events" class="pack-review-events"></div></div>
           </section>
           </details>
@@ -266,6 +266,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" role="group" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" role="group" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260809_v166"></script>
+  <script src="app.js?v=20260809_v167"></script>
 </body>
 </html>
