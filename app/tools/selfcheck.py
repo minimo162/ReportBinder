@@ -362,7 +362,7 @@ for needed in ['function Get-SourceAdapterDescriptor','function Test-SourceCandi
                "adapterId = 'excel-com-v1'",'Render-Source $language $id $excel $true']:
     if needed not in server: raise SystemExit(f'source adapter feature missing: {needed}')
 powershell = shutil.which('powershell.exe') or shutil.which('powershell')
-def run_powershell_selfcheck(script_name, marker, label, timeout=90):
+def run_powershell_selfcheck(script_name, marker, label, timeout=240):
     # stdout=subprocess.PIPE を使わない。subprocess のタイムアウトはプロセスの終了
     # ではなくパイプの EOF を待つ。PowerShell が起動した java は CreateProcess の
     # ハンドル継承でこのパイプの書き込み端を受け取るため、PowerShell が終了しても
@@ -372,6 +372,11 @@ def run_powershell_selfcheck(script_name, marker, label, timeout=90):
     # 一致しない。ローカル実測では timeout=5 指定の例外が19.4秒後に発生した。
     # 一時ファイルへ落とせばリーダースレッドが不要になり、タイムアウトは素直に
     # 「プロセスが終わらないこと」だけに掛かる。
+    # 上限は内側 < 外側にする。server.ps1 の Invoke-NativeCapture が120秒で
+    # 外部コマンドを打ち切り NATIVE_TIMEOUT を返すので、ここはその後始末が
+    # 終わるのを待つ backstop でよい。逆順(内側300秒/外側90秒)にしていたときは、
+    # 製品側のタイムアウトが発火する前にハーネスがツリーごと殺してしまい、
+    # 何が固まったのか分からないまま終わっていた。
     script_path = root/'app/tools'/script_name
     started = time.monotonic()
     # 段階トレース。強制終了で標準出力のバッファは失われるため、どこまで進んだかは
@@ -392,18 +397,27 @@ def run_powershell_selfcheck(script_name, marker, label, timeout=90):
         try:
             returncode = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # 生きているプロセスは kill する前に採る。順序を逆にすると、自分で
+            # 殺しておいて「残っていない」と報告することになる(実際に一度そうした)。
+            survivors = ''
+            try:
+                survivors = subprocess.run(
+                    ['wmic','process','where',"name='java.exe'",'get','processid,commandline'],
+                    capture_output=True, text=True, timeout=30).stdout.strip()
+            except Exception:
+                pass
+            if not survivors:
+                try:
+                    survivors = subprocess.run(['tasklist','/FI','IMAGENAME eq java.exe'],
+                                               capture_output=True, text=True, timeout=30).stdout
+                except Exception:
+                    pass
             # proc.kill() は PowerShell だけを終了させ java を孤児にする。ツリーごと落とす。
             subprocess.run(['taskkill','/F','/T','/PID',str(proc.pid)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             proc.wait()
             sink.seek(0)
             partial = sink.read().decode('utf-8','replace')
-            survivors = ''
-            try:
-                survivors = subprocess.run(['tasklist','/FI','IMAGENAME eq java.exe'],
-                                           capture_output=True, text=True, timeout=30).stdout
-            except Exception:
-                pass
             trace = ''
             try:
                 with open(trace_path, encoding='utf-8', errors='replace') as handle:
@@ -1204,7 +1218,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v173', 'style.css?v=20260809_v105']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v174', 'style.css?v=20260809_v105']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1259,7 +1273,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260809_v173' not in html:
+if 'app.js?v=20260809_v174' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1285,7 +1299,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260809_v173' not in html:
+if 'app.js?v=20260809_v174' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1405,7 +1419,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.09.15':
+if runtime_version != '2026.08.09.16':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:

@@ -163,7 +163,7 @@ function ConvertTo-NativeArgumentString([string[]]$ArgumentList) {
     }
     return ($parts -join ' ')
 }
-function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSeconds = 300) {
+function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSeconds = 120) {
     # V5-P3: Windows PowerShell 5.1 では、ネイティブコマンドの stderr を 2>&1 で取り込むと
     # ErrorRecord としてパイプラインに流れ、$ErrorActionPreference='Stop' の下では
     # NativeCommandError の例外になる。
