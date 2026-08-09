@@ -35,7 +35,7 @@ jobs:
         shell: powershell
         run: |
           .\app\lib\pdfbox\build.ps1
-          .\app\tools\ci-selfcheck.ps1 -SkipPackageSmoke
+          .\app\tools\ci-selfcheck.ps1
 
       - name: Build ZIP and shared-folder releases
         shell: powershell

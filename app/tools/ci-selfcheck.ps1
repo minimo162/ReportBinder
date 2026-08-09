@@ -1,4 +1,8 @@
+﻿# Scope=Fast は変更ごとの門。同梱JREもjarのビルドも要らない検査だけを並べる。
+# Scope=Full は受け入れスイート全部。手動実行とリリース前だけ回す。
 param(
+    [ValidateSet('Full','Fast')]
+    [string]$Scope = 'Full',
     [switch]$SkipPackageSmoke,
     [string]$PackageOutputDir = ''
 )
@@ -17,6 +21,53 @@ function Invoke-Checked([string]$Label, [string]$FilePath, [string[]]$Arguments)
     Write-Output ("== {0} ==" -f $Label)
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Label failed with exit code $LASTEXITCODE." }
+}
+
+# 重い2本を同時に走らせる。どちらもCPUを使い切る実計算で、合計343秒のうち
+# 短いほうがそのまま短縮できる。互いに参照するファイルは無く、作業先も別。
+# 出力は各々ファイルへ取り、終わってからラベル順に出す。逐次実行のときと同じ
+# 見え方にして、失敗の切り分けが変わらないようにするため。
+function Invoke-CheckedInParallel([hashtable[]]$Checks) {
+    $entries = @()
+    foreach ($check in $Checks) {
+        $stem = [IO.Path]::Combine([IO.Path]::GetTempPath(), ('ci-' + [Guid]::NewGuid().ToString('N')))
+        $entries += [pscustomobject]@{
+            Label = [string]$check.Label
+            LogPath = ($stem + '.log')
+            CodePath = ($stem + '.code')
+            Job = Start-Job -ScriptBlock {
+                param($FilePath, $Arguments, $LogPath, $CodePath, $WorkingDirectory)
+                # ネイティブの stderr で止まらないようにする(Invoke-NativeCapture と同じ理由)。
+                $ErrorActionPreference = 'Continue'
+                Set-Location $WorkingDirectory
+                & $FilePath @Arguments *>&1 | Out-File -LiteralPath $LogPath -Encoding UTF8
+                # 終了コードはファイルで受け渡す。ジョブの State から読み取るのは当てにならない。
+                Set-Content -LiteralPath $CodePath -Value ([string]$LASTEXITCODE) -Encoding ASCII
+            } -ArgumentList $check.FilePath, $check.Arguments, ($stem + '.log'), ($stem + '.code'), (Get-Location).Path
+        }
+    }
+    $failures = @()
+    foreach ($entry in $entries) {
+        [void](Wait-Job -Job $entry.Job)
+        Write-Output ("== {0} ==" -f $entry.Label)
+        if (Test-Path -LiteralPath $entry.LogPath) {
+            Get-Content -LiteralPath $entry.LogPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Output $_ }
+        }
+        $code = $null
+        if (Test-Path -LiteralPath $entry.CodePath) {
+            $code = [string](Get-Content -LiteralPath $entry.CodePath -Raw -ErrorAction SilentlyContinue).Trim()
+        }
+        Receive-Job -Job $entry.Job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $entry.LogPath, $entry.CodePath -Force -ErrorAction SilentlyContinue
+        # 終了コードが取れない場合も失敗として扱う(ジョブが落ちて書けなかった場合)。
+        if ([string]::IsNullOrWhiteSpace($code) -or $code -ne '0') {
+            $shown = $code
+            if ([string]::IsNullOrWhiteSpace($shown)) { $shown = 'unknown' }
+            $failures += ("{0} (exit {1})" -f $entry.Label, $shown)
+        }
+    }
+    if ($failures.Count -gt 0) { throw (($failures -join '; ') + ' failed.') }
 }
 
 function Get-PythonCommand {
@@ -105,13 +156,26 @@ $node = (Get-Command node.exe -ErrorAction Stop).Source
 try {
     Assert-PowerShellSyntax
     Assert-VersionDocumented
+
+    if ($Scope -eq 'Fast') {
+        Remove-CiGeneratedFiles
+        Invoke-Checked 'Repository selfcheck (static)' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py'),'--static-only'))
+        Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
+        Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
+        # 何を見ていないかを結果に残す。通った表示だけが後から参照されるため。
+        Write-Output 'ReportBinder CI fast gate OK. (regression suites and package smoke tests were not run)'
+        return
+    }
+
     Invoke-Checked 'Third-party verification' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'verify-thirdparty.ps1'),'-RequirePdfJs','-RequirePortableJava')
     Remove-CiGeneratedFiles
     Invoke-Checked 'Repository selfcheck' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py')))
     Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
     Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
-    Invoke-Checked 'Diff regression' $node @((Join-Path $repoRoot 'tests\diff-regression.mjs'))
-    Invoke-Checked 'Practical PDF diff corpus' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pdf-diff-corpus-selfcheck.ps1'))
+    Invoke-CheckedInParallel @(
+        @{ Label = 'Diff regression'; FilePath = $node; Arguments = @((Join-Path $repoRoot 'tests\diff-regression.mjs')) },
+        @{ Label = 'Practical PDF diff corpus'; FilePath = 'powershell.exe'; Arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pdf-diff-corpus-selfcheck.ps1')) }
+    )
     Invoke-Checked 'Final composition regression' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'final-composition-selfcheck.py')))
     Invoke-Checked 'Operational readiness regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'operational-readiness-selfcheck.ps1'))
     Invoke-Checked 'Pack lifecycle regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-lifecycle-selfcheck.ps1'))
