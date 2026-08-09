@@ -46,12 +46,24 @@ for needed in ['Assert-PowerShellSyntax', 'Assert-VersionDocumented', 'Diff regr
                'Final composition regression', 'Operational readiness regression',
                'History logic regression', 'ZIP release smoke test', 'Assert-PackageContents']:
     if needed not in ci_selfcheck: raise SystemExit(f'CI acceptance coverage missing: {needed}')
+# 書かれているのに一度も呼ばれていない回帰テストを作らない。存在必須リストに載せた
+# PowerShell セルフチェックは、実行経路のどこかから必ず呼ぶ。
+# このファイル自身の必須リストにも名前が並ぶので、そこは数えない。実際の呼び出し
+# (ci-selfcheck.ps1 の起動と run_powershell_selfcheck) だけを実行経路とみなす。
+_runs = ci_selfcheck + '\n'.join(re.findall(r"run_powershell_selfcheck\('([^']+)'",
+                                            (root/'app/tools/selfcheck.py').read_text(encoding='utf-8')))
+for script in sorted(x for x in required if x.startswith('app/tools/') and x.endswith('-selfcheck.ps1')):
+    if Path(script).name not in _runs:
+        raise SystemExit(f'this regression suite is never executed by anything: {script}')
 for needed in ["Scope -eq 'Fast'", '--static-only', 'were not run']:
     if needed not in ci_selfcheck: raise SystemExit(f'CI fast-gate wiring missing: {needed}')
 # 速い門は同梱JREを要らないことが値打ちなので、重い検査が紛れ込んでいないか見る。
 _fast = ci_selfcheck.split("if ($Scope -eq 'Fast') {", 1)[1].split(chr(10)+'    }', 1)[0]
 if '--static-only' not in _fast:
     raise SystemExit('the fast gate must run selfcheck.py with --static-only')
+# 利用者データを不可逆に壊しうる種類は、外部依存ゼロで確かめられる限り毎回見る。
+if 'schema-v3-selfcheck.ps1' not in _fast:
+    raise SystemExit('the fast gate must keep the schema migration regression')
 for forbidden in ['verify-thirdparty.ps1', 'Invoke-CheckedInParallel', 'final-composition-selfcheck.py',
                   'operational-readiness-selfcheck.ps1', 'pdf-diff-corpus-selfcheck.ps1', 'package-release.ps1']:
     if forbidden in _fast: raise SystemExit(f'the fast gate must not depend on bundled Java or packaging: {forbidden}')
@@ -60,8 +72,13 @@ ci_workflow=(root/'.github/workflows/thirdparty-check.yml').read_text(encoding='
 for needed in ['pull_request:', 'branches:', '- main', 'install-thirdparty.ps1 -Force',
                'ci-requirements.txt', 'build.ps1', 'ci-selfcheck.ps1',
                'fast-gate:', 'ci-selfcheck.ps1 -Scope Fast', 'full-suite:',
-               "if: github.event_name == 'workflow_dispatch'"]:
+               "github.event_name == 'workflow_dispatch'"]:
     if needed not in ci_workflow: raise SystemExit(f'GitHub CI workflow coverage missing: {needed}')
+# 重いスイートが手動だけになると、誰も起動しない限り一生走らない。定期実行を必須にする。
+if 'schedule:' not in ci_workflow or 'cron:' not in ci_workflow:
+    raise SystemExit('the full suite must also run on a schedule, not only on demand')
+if "github.event_name == 'schedule'" not in ci_workflow:
+    raise SystemExit('the scheduled run must reach the full-suite job')
 # 変更ごとの門に依存導入が戻ると、狙いだった所要が元に戻る。
 _fast_job = ci_workflow.split('fast-gate:', 1)[1].split(chr(10)+'  full-suite:', 1)[0]
 for forbidden in ['install-thirdparty.ps1', 'build.ps1']:
@@ -711,7 +728,7 @@ if 'Invoke-FinalBuildAllLegacy' in _build_all_route:
 _arch = server.split('function New-FinalArchive', 1)[1].split('\nfunction ', 1)[0]
 if "return ''" in _arch: raise SystemExit('New-FinalArchive must not swallow failures')
 if 'throw (' not in _arch: raise SystemExit('New-FinalArchive must rethrow on failure')
-if _arch.index('New-SnapshotPin') < _arch.index('Move-Item -LiteralPath $stage'):
+if _arch.index('Set-FinalPdfSnapshotPins') < _arch.index('Move-Item -LiteralPath $stage'):
     raise SystemExit('pins must be created after the archive is moved into place')
 if 'Get-Structure' in _arch: raise SystemExit('archive metadata must come from the immutable build snapshot')
 if 'function Remove-FinalArchiveArtifacts' not in server:
@@ -954,6 +971,31 @@ for needed in ['[int]$TimeoutSeconds', 'WaitForExit(', 'Stop-ReportBinderProcess
 for line_no, line in enumerate(server.splitlines(), 1):
     if '2>&1' in line and 'Invoke-NativeCapture' not in line and not line.strip().startswith('#'):
         raise SystemExit(f'raw native 2>&1 capture outside Invoke-NativeCapture at line {line_no}')
+# 既定の上限に頼らない。既定はWord/PowerPointのCOM変換に合わせた値で、javaの実計算
+# (2000ページの分割、共有フォルダー宛ての組版)に流用できるものではない。呼び出しごとに
+# 用途の上限を明示させる。
+_timeout_vars = ['$Script:JavaProbeTimeoutSeconds', '$Script:PdfSplitTimeoutSeconds',
+                 '$Script:FinalComposeTimeoutSeconds', '$Script:PdfAnalyzeTimeoutSeconds']
+for needed in _timeout_vars:
+    if needed + ' = ' not in server:
+        raise SystemExit(f'missing native command timeout constant: {needed}')
+for line_no, line in enumerate(server.splitlines(), 1):
+    if 'Invoke-NativeCapture ' not in line or line.strip().startswith('#'):
+        continue
+    if 'function Invoke-NativeCapture' in line:
+        continue
+    if not any(v in line for v in _timeout_vars):
+        raise SystemExit(f'Invoke-NativeCapture must be given an explicit timeout at line {line_no}')
+# 時間切れと異常終了を呼び出し側が区別しないと、健全な入力に「破損」と表示してしまう。
+for anchor, label in [("'PDFSplit'", 'PDF split'), ("'BatchPdfSplitter'", 'batch split')]:
+    _seg = server.split(anchor, 1)[1][:1200]
+    if 'timedOut' not in _seg:
+        raise SystemExit(f'{label} must tell a timeout apart from a corrupt file')
+if server.count('$run.timedOut') < 4:
+    raise SystemExit('native timeouts must be reported as timeouts by their callers')
+# 起動できないjavaを「使える」と診断しない。診断画面が最も頼られる場面での誤報を防ぐ。
+if '$javaProbe.exitCode' not in server:
+    raise SystemExit('the environment diagnosis must check the java probe exit code')
 
 # The one workspace may restart its own stale UI process, never worker processes.
 launch = (root/'app/launch.ps1').read_text(encoding='utf-8-sig')
@@ -1261,7 +1303,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v176', 'style.css?v=20260809_v105']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v177', 'style.css?v=20260810_v106']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1316,7 +1358,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260809_v176' not in html:
+if 'app.js?v=20260810_v177' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1342,7 +1384,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260809_v176' not in html:
+if 'app.js?v=20260810_v177' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1436,6 +1478,32 @@ for needed in ["'/api/final/publish'", "'/api/v2/outputs/publish'", 'data-final-
                "publishable=available&&String(r.displayState||'')==='built'"]:
     if needed not in (server + html + appjs):
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
+# 出力したPDFは別タブで見られるだけでは持ち出せない。保存先そのものと、そこを開く
+# 手段を画面に出す。ここが無いと、添付も共有フォルダーへのコピーもできない。
+for needed in ["'/api/v2/outputs/reveal'", 'function Resolve-OutputPdfForReveal', 'function Open-OutputPdfLocation',
+               'data-final-reveal', 'data-final-path', 'async function revealFinalVolume']:
+    if needed not in (server + html + appjs):
+        raise SystemExit(f'the way to reach the produced PDF on disk is missing: {needed}')
+# 控えの作成に失敗しても、出力の元になった版を守る pin だけは作る。pin が無い版は
+# Invoke-InputHistoryCleanup が保持期間の猶予なしに消してよい対象として扱う。
+if 'function Set-FinalPdfSnapshotPins' not in server:
+    raise SystemExit('the snapshot pins must be separable from the archive')
+_arch_catch = server.split('New-FinalArchive $Language ([string]$scope.packId)', 1)[1][:1400]
+for needed in ['Set-FinalPdfSnapshotPins', "'final.archive.failed'"]:
+    if needed not in _arch_catch:
+        raise SystemExit(f'a failed archive must not silently drop the protection or the record: {needed}')
+if 'archiveError' not in appjs:
+    raise SystemExit('a failed archive must be shown to the person who pressed the button')
+_reveal = server.split('function Resolve-OutputPdfForReveal', 1)[1].split('\nfunction ', 1)[0]
+if 'StartsWith($root' not in _reveal:
+    raise SystemExit('reveal must refuse paths outside the output folder')
+# 実測: `/select` 直後のカンマを空白にすると窓が出ない。パスを引用しないと、カンマを
+# 含むファイル名(出力名は利用者が編集できるパターン由来)で窓が出ない。
+if """'/select,"' + $FullPath + '"'""" not in server:
+    raise SystemExit('reveal needs the comma after /select and the path quoted, or Explorer opens nothing')
+# 保存先は省略せず全体を出す。省略するとどのフォルダーか分からないままになる。
+if 'word-break:break-all' not in css.split('.final-path-value', 1)[1].split('}', 1)[0]:
+    raise SystemExit('the saved location must wrap instead of being truncated')
 for needed in ["'/api/v2/layout/snapshots'", "'/api/v2/layout/restore/preview'", "'/api/v2/layout/restore'",
                'function Get-LayoutScopeInfo', 'Test-WorkbookPack $wb[0] ([string]$scope.packId)',
                'layoutSnapshotId=$layoutSnapshotId', 'id="page-layout-revisions-btn"',
@@ -1462,8 +1530,13 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.09.18':
+if runtime_version != '2026.08.10.1':
     raise SystemExit('release quality gate must bump the immutable runtime version')
+# 成果物の呼称は「提出用PDF」に統一する。サーバーの日本語 throw は加工されずに画面へ
+# 出るため、ここに旧称が残ると利用者が画面に無い言葉を見せられる。
+for _old_name in ['最終PDF', '正式版PDF']:
+    if _old_name in server or _old_name in appjs or _old_name in html:
+        raise SystemExit(f'the produced PDF must be called 提出用PDF everywhere: {_old_name}')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
         raise SystemExit(f'workflow UX markup is missing: {needed}')
