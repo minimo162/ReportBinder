@@ -47,11 +47,16 @@ let expandedSourceSettings = new Set();
 let selectedPages = new Set();
 let pageBoardView = (() => { try { return sessionStorage.getItem('ReportBinderPageBoardView') === 'detail' ? 'detail' : 'thumbnail'; } catch { return 'thumbnail'; } })();
 let activePageVolume = (() => { try { return sessionStorage.getItem('ReportBinderActivePageVolume') || 'none'; } catch { return 'none'; } })();
+// Opening on the 未振り分け tab showed an empty board whenever everything was
+// already sorted, which reads as "my pages are gone". Pick a tab that has pages
+// once per session, then respect whatever the user selects.
+let pageVolumeAutoPicked = (() => { try { return !!sessionStorage.getItem('ReportBinderActivePageVolume'); } catch { return false; } })();
 let pageFilterText = '';
 let pageThumbnailSize = (() => { try { const value=Number(sessionStorage.getItem('ReportBinderPageThumbnailSize'));return Number.isFinite(value)?Math.min(260,Math.max(150,value)):190; } catch { return 190; } })();
 let pageLayoutUndoStack = [];
 let pageLayoutRedoStack = [];
 let pageLayoutHistoryBusy = false;
+let pageMutationBusy = false;
 let pendingPageLayoutUndo = null;
 let pageThumbnailObserver = null;
 let pageThumbnailRenderActive = 0;
@@ -151,10 +156,11 @@ function currentRenderProfileVersion() {
 const $ = (id) => document.getElementById(id);
 
 const VIEW_NAMES = {
+  dashboard: 'ホーム',
   excel: '原稿を登録・PDF化',
   history: '変更履歴・比較',
   pages: 'ページ構成',
-  final: '最終PDF'
+  final: '提出用PDF'
 };
 
 function setActiveView(view, options = {}) {
@@ -168,11 +174,19 @@ function setActiveView(view, options = {}) {
   document.querySelectorAll('[data-view-nav]').forEach(btn => {
     const on = btn.getAttribute('data-view-nav') === activeView;
     btn.classList.toggle('active', on);
-    if (on) btn.setAttribute('aria-current', 'page'); else btn.removeAttribute('aria-current');
+    // Step-bar entries are steps in a progress sequence, the sidebar entries are
+    // pages; both carry data-view-nav so the value has to be picked per element.
+    if (on) btn.setAttribute('aria-current', btn.hasAttribute('data-progress-view') ? 'step' : 'page');
+    else btn.removeAttribute('aria-current');
   });
+  // renderStepBar() only ran from renderAll(), so the "you are here" mark on the
+  // step bar lagged behind plain navigation. It is visible during work now, so
+  // it has to track every view change.
+  if (state) renderStepBar();
   if (!options.noScroll) {
     hideMessage();
-    window.scrollTo({top: 0, behavior: options.instant ? 'auto' : 'smooth'});
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion:reduce)').matches;
+    window.scrollTo({top: 0, behavior: (options.instant || reduceMotion) ? 'auto' : 'smooth'});
     requestAnimationFrame(() => {
       const heading=document.querySelector(`[data-view-panel="${CSS.escape(activeView)}"] h2`);
       if(!heading)return;
@@ -201,6 +215,12 @@ function formatDateTime(value) {
   const m = normalized.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})/);
   if (m) return `${m[1]}/${m[2].padStart(2,'0')}/${m[3].padStart(2,'0')} ${m[4].padStart(2,'0')}:${m[5]}`;
   return text.length > 22 ? text.slice(0, 22) : text;
+}
+function formatDateOnly(value) {
+  const text = String(value || '').trim();
+  if (!text) return '—';
+  const m = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  return m ? `${m[1]}/${m[2].padStart(2,'0')}/${m[3].padStart(2,'0')}` : text;
 }
 function compactDateTime(value) {
   const f = formatDateTime(value);
@@ -418,7 +438,7 @@ function userFriendlyError(message) {
   const text = String(message || '');
   const raw = text.length > 300 ? text.slice(0, 300) + '…' : text;
   if (/structure\.json|登録情報を安全に読み込めません|不完全な登録情報/i.test(text)) {
-    return '作業データを読み込めませんでした。原稿ファイルは変更されていません。別の原稿フォルダを選ぶか、ReportBinderを終了してもう一度開いてください。';
+    return '作業データを読み込めませんでした。原稿ファイルは変更されていません。別の原稿フォルダーを選ぶか、ReportBinderを終了してもう一度開いてください。';
   }
   // サーバーが日本語で説明しているメッセージは、そのまま表示するのが最も正確。
   // 技術的なエラー(例外・スタックトレース等)のときだけ、対処ヒントを付けて原文も併記する。
@@ -426,11 +446,11 @@ function userFriendlyError(message) {
   const hasJapanese = /[ぁ-んァ-ヶ一-龠]/.test(text);
   let hint = '';
   if (/用語 'java'|'java'\s*は.*認識され|java\.exe が見つかりません|Java Runtimeが(見つかり|あり)ません/i.test(text)) {
-    hint = '最終PDF作成用のJava Runtimeが見つかりません。app\\tools\\install-thirdparty.cmd を実行してください。';
+    hint = '提出用PDFの作成に必要な追加ソフトが入っていません。情報システム担当者に「ReportBinderのセットアップ」の実行を依頼してください。';
   } else if (/別のプロセスが使用中|being used by another process|使用中です/i.test(text)) {
     hint = 'ファイルが他のアプリで開かれています。該当ファイルを閉じてから再実行してください。';
   } else if (/アクセスが拒否|Access is denied|UnauthorizedAccess/i.test(text)) {
-    hint = 'ファイルへのアクセスが拒否されました。共有フォルダの権限や一時的な競合の可能性があります。少し待って再試行してください。';
+    hint = 'ファイルへのアクセスが拒否されました。共有フォルダーの権限や一時的な競合の可能性があります。少し待って再試行してください。';
   } else if (/COMException|HRESULT|RPC/i.test(text)) {
     hint = 'Excelの操作に失敗しました。Excelをすべて閉じてから再試行してください。';
   } else if (/FileNotFoundException|not found|見つかりません/i.test(text)) {
@@ -480,8 +500,16 @@ function showMessage(type, title, message, detail, actions=[], autoHideMs=null) 
       btn.addEventListener('click', async () => {
         const previousTitle = $('notice-title')?.textContent || '';
         const previousMessage = $('notice-message')?.textContent || '';
-        if (action.view) setActiveView(action.view);
-        if (typeof action.handler === 'function') await action.handler();
+        const siblings = Array.from(actionBox.querySelectorAll('button'));
+        siblings.forEach(b => { b.disabled = true; });
+        btn.classList.add('busy');
+        try {
+          if (action.view) setActiveView(action.view);
+          if (typeof action.handler === 'function') await action.handler();
+        } finally {
+          siblings.forEach(b => { b.disabled = false; });
+          btn.classList.remove('busy');
+        }
         if (($('notice-title')?.textContent || '') === previousTitle && ($('notice-message')?.textContent || '') === previousMessage) hideMessage();
       });
       actionBox.appendChild(btn);
@@ -527,6 +555,10 @@ function showErrorPanel(title, summary, detail, actions=[]) {
   if (!panel) return;
   const friendlySummary=userFriendlyError(summary);
   const items = extractErrorItems(detail, summary).filter(item=>String(item.message||'').trim()!==String(friendlySummary||'').trim());
+  // Reveal before writing: a display:none region is not rendered, so screen
+  // readers never picked up the text change and every failure was announced
+  // as silence.
+  panel.classList.remove('hidden');
   $('error-title').textContent = title || 'エラーがあります';
   $('error-summary').textContent = friendlySummary || '内容を確認してください。';
   const list=$('error-list');
@@ -544,14 +576,25 @@ function showErrorPanel(title, summary, detail, actions=[]) {
       btn.addEventListener('click', async () => {
         const previousTitle = $('error-title')?.textContent || '';
         const previousSummary = $('error-summary')?.textContent || '';
-        if (action.view) setActiveView(action.view);
-        if (typeof action.handler === 'function') await action.handler();
+        const siblings = Array.from(actionBox.querySelectorAll('button'));
+        siblings.forEach(b => { b.disabled = true; });
+        btn.classList.add('busy');
+        try {
+          if (action.view) setActiveView(action.view);
+          if (typeof action.handler === 'function') await action.handler();
+        } finally {
+          siblings.forEach(b => { b.disabled = false; });
+          btn.classList.remove('busy');
+        }
         if (($('error-title')?.textContent || '') === previousTitle && ($('error-summary')?.textContent || '') === previousSummary) hideErrorPanel();
       });
       actionBox.appendChild(btn);
     }
   }
-  panel.classList.remove('hidden');
+  // Pull the viewport and focus to the panel; it sits at the top of <main> and
+  // was routinely off-screen when a failure happened deep in the page board.
+  panel.scrollIntoView({block:'nearest'});
+  panel.focus({preventScroll:true});
 }
 function hideErrorPanel() {
   const panel = $('error-panel');
@@ -734,7 +777,7 @@ async function waitForRenderJob(jobId) {
     if (status === 'waiting' || status === 'missing' || last.transient || last.transientMissing) {
       transientStatuses += 1;
       if (transientStatuses > 70) {
-        const err = new Error('PDF作成ジョブの進捗を確認できません。処理中の場合は少し待って画面を更新してください。');
+        const err = new Error('変換の進み具合を確認できません。処理が続いている場合があります。1分ほど待ってから「更新確認」を押してください。');
         err.detail = last;
         throw err;
       }
@@ -797,7 +840,8 @@ async function fetchPdfObjectUrl(path, params={}) {
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
   if (!res.ok || contentType.includes('application/json')) {
     let detail = null;
-    let message = `PDFを取得できませんでした。HTTP ${res.status}`;
+    // The raw status code told the user nothing actionable; keep it in detail.
+    let message = `PDFを取得できませんでした。時間をおいて、もう一度お試しください。改善しない場合はReportBinderを開き直してください。（状態 ${res.status}）`;
     try {
       detail = await res.json();
       message = detail.error || detail.message || message;
@@ -841,7 +885,10 @@ async function loadFilesSilently() {
   return availableFiles;
 }
 async function scanUpdatesSilently({withFiles=false}={}) {
-  if (!configured() || updateMonitorInFlight || renderJobActive) return;
+  // A background refresh during a build re-renders the final cards and hands
+  // back a fresh, enabled build button, which let a second job start on top of
+  // the first and orphaned the running job's cancel button.
+  if (!configured() || updateMonitorInFlight || renderJobActive || activeFinalJobId) return;
   updateMonitorInFlight = true;
   try {
     await api('/api/scan-updates', {method:'POST', body:{force:false}});
@@ -878,7 +925,7 @@ async function loadFinalReadiness(){
     state.finalReadiness[key]={volumes};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
     if(activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
-  }).catch(e=>log('最終PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
+  }).catch(e=>log('提出用PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
   return finalReadinessInFlight;
 }
 
@@ -912,7 +959,7 @@ async function refreshAndLoad(btn) {
         scanError.detail || scanError.stack || scanError.message);
       return;
     }
-    showMessage('ok', '画面を更新しました', '提出フォルダと登録状態を読み込み直しました。');
+    showMessage('ok', '画面を更新しました', '提出フォルダーと登録状態を読み込み直しました。');
   }, false);
 }
 
@@ -983,7 +1030,7 @@ function renderAll(options={}) {
 function renderPathInputs() {
   const submission = $('submissionDir'); if (submission) submission.value = state?.paths?.submissionDir || '';
   const sourceFolder = $('source-folder-path'); if (sourceFolder) { sourceFolder.textContent=state?.paths?.submissionDir||'—';sourceFolder.title=state?.paths?.submissionDir||''; }
-  const choose=$('change-source-folder-btn');if(choose){const ready=configured();choose.className=`btn ${ready?'secondary':'primary'}`;choose.textContent=ready?'変更':'フォルダを選ぶ';}
+  const choose=$('change-source-folder-btn');if(choose){const ready=configured();choose.className=`btn ${ready?'secondary':'primary'}`;choose.textContent=ready?'変更':'フォルダーを選ぶ';}
   const scan=$('scan-btn');if(scan)scan.disabled=!configured();
   const data = $('dataDir'); if (data) data.textContent = state?.paths?.dataDir || '—';
   const output = $('outputDir'); if (output) output.textContent = state?.paths?.outputDir || '—';
@@ -1001,25 +1048,38 @@ function renderGlobalHeader() {
   el.classList.toggle('hidden',!hasPack);
   if(!hasPack){el.innerHTML='';el.removeAttribute('aria-label');return;}
   const unresolved=unresolvedPageCount();
-  const statusText=unresolved?`要確認（未振り分け ${unresolved}ページ）`:agg.text;
+  const statusText=unresolved?`未振り分け ${unresolved}ページ`:agg.text;
   el.className = 'global-status';
   if (agg.state === 'blocked') el.classList.add('danger');
   else if (unresolved || ['needs-rebuild','output-missing'].includes(agg.state)) el.classList.add('attention');
   const dot = unresolved || ['blocked','needs-rebuild','output-missing'].includes(agg.state) ? '<span class="status-dot"></span>' : '';
-  el.innerHTML = `${dot}<span class="global-status-label">提出用PDF</span>${escapeHtml(statusText.replace(/^提出用PDF(?:は|の)?/,'').trim())}`;
-  el.setAttribute('aria-label',statusText);
+  // Unassigned pages are a step-2 problem, so point the shortcut at step 2
+  // instead of sending people to the final screen to be bounced back.
+  const label = unresolved ? 'ページ構成' : '提出用PDF';
+  el.dataset.viewShortcut = unresolved ? 'pages' : 'final';
+  el.innerHTML = `${dot}<span class="global-status-label">${label}</span>${escapeHtml(statusText.replace(/^提出用PDF(?:は|の)?/,'').trim())}`;
+  el.setAttribute('aria-label',statusText.startsWith(label)?statusText:`${label} ${statusText}`);
 }
+const PACK_FREE_VIEWS=['dashboard','excel'];
 function renderPackRequiredState(){
   const hasPack=!!activePackRecord();
   document.querySelectorAll('[data-view-nav]').forEach(button=>{
     const view=String(button.dataset.viewNav||'');
-    if(!['excel','pages','history','final'].includes(view))return;
-    const disabled=view!=='excel'&&!hasPack;
-    button.disabled=disabled;
-    button.setAttribute('aria-disabled',String(disabled));
-    button.title=disabled?'先に原稿フォルダを設定し、資料パックを作成してください':'';
+    if(!VIEW_NAMES[view])return;
+    const locked=!PACK_FREE_VIEWS.includes(view)&&!hasPack;
+    // Left focusable on purpose: a real `disabled` button drops out of the tab
+    // order and swallows its own title, so keyboard users saw a dimmed item
+    // with no way to learn why it was unavailable.
+    button.disabled=false;
+    button.classList.toggle('nav-locked',locked);
+    button.setAttribute('aria-disabled',String(locked));
+    button.title=locked?'先に原稿フォルダーを設定し、資料パックを作成してください':'';
   });
-  if(!hasPack&&activeView!=='excel')setActiveView('excel',{noScroll:true});
+  if(!hasPack&&!PACK_FREE_VIEWS.includes(activeView))setActiveView('dashboard',{noScroll:true});
+}
+function explainPackRequired(){
+  setActiveView('dashboard');
+  showMessage('warn','先に資料パックを作成してください','原稿フォルダーを選び、今回まとめる資料パックに名前を付けると、ページ構成と提出用PDFに進めます。',null,[{label:'原稿フォルダーを選ぶ',primary:true,handler:()=>setActiveView('excel')}],0);
 }
 function setStepState(id, kind, fallback) {
   const el=$(id); if(!el) return;
@@ -1032,18 +1092,21 @@ function renderStepBar() {
   const currentMap={excel:'step-excel-state',pages:'step-pages-state',final:'step-final-state'};
   setStepState('step-excel-state', configured()&&workbooks.length&&needs===0?'complete':'attention','1');
   setStepState('step-pages-state', pages.some(p=>p.enabled!==false && String(p.volume||'none')!=='none')?'complete':(pages.length?'attention':''),'2');
-  setStepState('step-final-state', finalIsComplete()?'complete':(activeReadinessItems().length?'attention':''),'3');
+  // activeReadinessItems() counts targets that HAVE pages, not problems, so this
+  // used to show "!" next to "出力準備が整っています". Warn only on real blockers.
+  const finalBlockers=activeReadinessItems().flatMap(item=>asArray(item.ready.blockers)).length;
+  setStepState('step-final-state', finalIsComplete()?'complete':(finalBlockers?'attention':''),'3');
   document.querySelectorAll('[data-progress-view]').forEach(btn=>{
     const view=btn.dataset.progressView; btn.classList.toggle('current',view===activeView);
     if(view===activeView)btn.setAttribute('aria-current','step');else btn.removeAttribute('aria-current');
-    const st=$(currentMap[view]); if(view===activeView && st && !st.classList.contains('attention')) st.classList.add('current');
+    const st=$(currentMap[view]); if(st) st.classList.toggle('current', view===activeView);
   });
 }
 function renderNavBadges() {
   const needs=workbooksForActivePreset().filter(w=>!isLatestPdfWorkbook(w)).length;
   const unresolved=unresolvedPageCount();
   const excel=$('nav-excel-count'); if(excel){excel.textContent=needs;excel.classList.toggle('hidden',needs===0);}
-  const pages=$('nav-pages-count'); if(pages){pages.textContent=`未振分 ${unresolved}`;pages.classList.toggle('hidden',unresolved===0);}
+  const pages=$('nav-pages-count'); if(pages){pages.textContent=`未振り分け ${unresolved}`;pages.classList.toggle('hidden',unresolved===0);}
   const agg=aggregateFinalState(); const dot=$('nav-final-dot'); if(dot) dot.classList.toggle('hidden',!['blocked','needs-rebuild','output-missing'].includes(agg.state));
 }
 
@@ -1075,40 +1138,40 @@ function renderDashboardOverview() {
   $('dashboard-recent')?.classList.toggle('hidden',!hasPack);
   const title=$('dashboard-next-title'), caption=$('dashboard-next-caption'), action=$('dashboard-action-btn');
   if(title&&caption&&action){
-    if(!configured()){title.textContent='はじめる：原稿が入ったフォルダを選ぶ';caption.textContent='フォルダ内のExcel・Word・PowerPoint・PDFを見つけます。原稿は移動・削除しません。';action.textContent='はじめる';action.dataset.dashboardAction='folder';}
+    if(!configured()){title.textContent='はじめる：原稿が入ったフォルダーを選ぶ';caption.textContent='フォルダー内のExcel・Word・PowerPoint・PDFを見つけます。原稿は移動・削除しません。';action.textContent='はじめる';action.dataset.dashboardAction='folder';}
     else if(!activePackRecord()){title.textContent='今回まとめる一式に名前を付ける';caption.textContent='会議名や提出先など、あとで見つけやすい名前を付けます。';action.textContent='名前を付ける';action.dataset.dashboardAction='create-pack';}
     else if(workbooks.length===0){title.textContent='まとめる原稿を登録する';caption.textContent=`「${presetLabel()}」に入れる原稿を選びます。`;action.textContent='原稿を選ぶ';action.dataset.dashboardAction='excel';}
     else if(needsPdf>0){title.textContent=`変換PDFを作成してください（${needsPdf}件）`;caption.textContent='原稿の最新内容をページ構成用のPDFへ変換します。';action.textContent='PDF変換へ';action.dataset.dashboardAction='excel';}
     else if(blockers.length>0){title.textContent='提出用PDFを出力できません';caption.textContent=blockers[0]?.message||'原稿・変換PDFを確認してください。';action.textContent='原稿・変換PDFへ';action.dataset.dashboardAction='excel';}
     else if(unassigned>0){title.textContent=`ページ構成を確認してください（${unassigned}ページ）`;caption.textContent='出力先が未設定のページがあります。';action.textContent='ページ構成へ進む';action.dataset.dashboardAction='pages';}
     else if(['needs-rebuild','output-missing','not-built'].includes(agg.state)){title.textContent=agg.text;caption.textContent='各出力先の状態を確認して出力してください。';action.textContent='提出用PDFへ進む';action.dataset.dashboardAction='final';}
-    else{title.textContent='最新の状態です';caption.textContent='提出用PDFとページ構成は最新です。';action.textContent='出力フォルダを確認';action.dataset.dashboardAction='final';}
+    else{title.textContent='最新の状態です';caption.textContent='提出用PDFとページ構成は最新です。';action.textContent='出力フォルダーを確認';action.dataset.dashboardAction='final';}
   }
-  const cat=$('dashboard-category-summary');if(cat)cat.textContent=activePackRecord()?`${presetLabel()} / 登録済み原稿：${workbooks.length}件 / PDF作成が必要：${needsPdf}件`:'「今回まとめる一式」に、原稿・ページの順番・更新履歴をまとめて保存します。';
+  const cat=$('dashboard-category-summary');if(cat)cat.textContent=activePackRecord()?`${presetLabel()} / 登録済み原稿：${workbooks.length}件 / 変換PDFの作成が必要：${needsPdf}件`:'「今回まとめる一式」に、原稿・ページの順番・更新履歴をまとめて保存します。';
   const activity=$('dashboard-activity');if(!activity)return;
   const rows=[...workbooks].sort((a,b)=>String(latestWorkbookStamp(b)).localeCompare(String(latestWorkbookStamp(a)))).slice(0,5).map(w=>{
     if(String(w.status||'')==='render-error')return{text:`${workbookDisplayName(w)} のPDF変換でエラーがあります`,badge:'作成エラー',cls:'danger',time:latestWorkbookStamp(w)};
     if(isLatestPdfWorkbook(w))return{text:`${workbookDisplayName(w)} の変換PDFを作成しました`,badge:'作成済み',cls:'neutral',time:w.lastRenderedAt||latestWorkbookStamp(w)};
     return{text:`${workbookDisplayName(w)} は変換PDF作成が必要です`,badge:'作成が必要',cls:'attention',time:latestWorkbookStamp(w)};
   });
-  if(!rows.length)rows.push({text:configured()?(activePackRecord()?`「${presetLabel()}」へ原稿を登録してください`:'今回まとめる一式に名前を付けてください'):'上の「はじめる」から原稿フォルダを選んでください',badge:'はじめに',cls:'neutral',time:''});
+  if(!rows.length)rows.push({text:configured()?(activePackRecord()?`「${presetLabel()}」へ原稿を登録してください`:'今回まとめる一式に名前を付けてください'):'上の「はじめる」から原稿フォルダーを選んでください',badge:'はじめに',cls:'neutral',time:''});
   activity.innerHTML=rows.map(r=>`<div class="activity-row"><span class="activity-text">${escapeHtml(r.text)}</span>${badge(r.badge,r.cls)}<span class="activity-time">${escapeHtml(formatDateTime(r.time))}</span></div>`).join('');
   renderPackProgressDashboard();
 }
 
 function renderPackProgressDashboard(){
   const progress=state?.packProgress||{},summary=$('pack-progress-summary'),box=$('pack-progress-list'),toggle=$('pack-progress-attention-only');if(!box)return;if(toggle)toggle.checked=packProgressAttentionOnly;
-  if(summary)summary.textContent=Number(progress.totalCount||0)?`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`:'作成中の一式がここに表示されます。';
+  if(summary)summary.textContent=Number(progress.totalCount||0)?`全${Number(progress.totalCount||0)}件・完了 ${Number(progress.completeCount||0)}件・要対応 ${Number(progress.attentionCount||0)}件・未提出必須原稿 ${Number(progress.missingRequiredCount||0)}件・期限超過 ${Number(progress.overdueRequiredCount||0)}件・期限7日以内 ${Number(progress.dueSoonRequiredCount||0)}件`:'作成中の一式がここに表示されます。';
   const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'review-stale':6,'review-changes':7,'review-draft':8,'in-review':9,'no-pages':10,'not-started':11,complete:12};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??13)-(priority[String(b.state)]??13)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
   const stateInfo=value=>({complete:['承認済み','neutral'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['レビュー未提出','attention'],'in-review':['レビュー中','neutral'],'review-changes':['差し戻し','danger'],'review-stale':['承認対象が更新','danger']}[String(value)]||['要確認','attention']);
-  if(!rows.length){box.innerHTML=packProgressAttentionOnly?'<div class="empty-state">対応が必要な一式はありません。</div>':`<div class="pack-progress-empty"><div><strong>${configured()?'今回まとめる一式はまだありません':'まだ作業は始まっていません'}</strong><span>${configured()?'上の「次にやること」から名前を付けます。':'上の「はじめる」から原稿フォルダを選びます。'}</span></div></div>`;return;}
-  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${nearestDue}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}p</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
+  if(!rows.length){box.innerHTML=packProgressAttentionOnly?'<div class="empty-state">対応が必要な一式はありません。</div>':`<div class="pack-progress-empty"><div><strong>${configured()?'今回まとめる一式はまだありません':'まだ作業は始まっていません'}</strong><span>${configured()?'上の「次にやること」から名前を付けます。':'上の「はじめる」から原稿フォルダーを選びます。'}</span></div></div>`;return;}
+  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・期限7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${formatDateOnly(nearestDue)}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}ページ</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
   box.querySelectorAll('[data-pack-progress-open]').forEach(button=>button.addEventListener('click',async()=>{await applyPresetSelection(String(button.dataset.packProgressOpen||''));setActiveView(String(button.dataset.packProgressAction||'excel'));}));
 }
 
 
 function renderFolderOverview() {
-  const count=$('folder-file-count'); if(count) count.textContent=`${availableFiles.length || state?.summary?.totalWorkbooks || 0} 件`;
+  const count=$('folder-file-count'); if(count) count.textContent=`${availableFiles.length || state?.summary?.totalWorkbooks || 0}件`;
   const scan=$('folder-scan-time'); if(scan) scan.textContent=formatDateTime(state?.structure?.updatedAt||'');
   const result=$('folder-scan-result'); if(result){const errors=Number(state?.summary?.renderErrors||0);result.className=`badge ${errors?'danger':'neutral'}`;result.textContent=errors?'要確認':(configured()?'正常':'未設定');}
   renderDiagnosticsResult();
@@ -1116,7 +1179,7 @@ function renderFolderOverview() {
 
 function formatCapacity(bytes){const value=Number(bytes);if(!Number.isFinite(value)||value<0)return'—';if(value>=1024**3)return`${(value/1024**3).toFixed(value<10*1024**3?1:0)} GB`;return`${Math.round(value/1024**2)} MB`;}
 function renderDiagnosticsResult(){
-  const box=$('diagnostics-result');if(!box)return;if(!diagnosticsResult){box.innerHTML='<div class="empty-state">未診断です。初回利用時やPC更新後に実行してください。</div>';return;}
+  const box=$('diagnostics-result');if(!box)return;if(!diagnosticsResult){box.innerHTML='<div class="empty-state">まだ診断していません。ReportBinderをはじめて使うときや、PCの更新後、変換に失敗したときに実行してください。</div>';return;}
   const d=diagnosticsResult,office=d.office||{},runtime=d.runtime||{},storage=d.storage||{};
   const statusLabel=value=>({ready:'利用可能',limited:'一部利用可能',blocked:'修復が必要','not-installed':'未導入',unsupported:'非対応版',unavailable:'起動不可'})[String(value||'')]||'要確認';
   const statusClass=value=>String(value)==='ready'?'neutral':String(value)==='blocked'?'danger':'attention';
@@ -1135,6 +1198,14 @@ function renderPageOverview() {
   const summaryItems=[['未振り分け',counts.none,'attention'],...activeTargetDefinitions().map(target=>[`${target.displayName||target.targetId} PDF`,counts.volumes[targetVolume(target.targetId)]||0,''])];
   if(strip)strip.innerHTML=summaryItems.map(([label,n,cls])=>`<div class="page-summary-item ${cls&&n?'attention':''}"><div class="summary-label">${escapeHtml(label)}</div><div><span class="summary-value">${n}</span> ページ</div></div>`).join('');
   const manual=pagesForActivePreset().some(p=>p.orderManual===true); const label=$('sort-state-label'); if(label){label.textContent=manual?'手動':'原稿内の順序';label.classList.toggle('manual',manual);}
+  // Step 1 hands off to step 2 with a primary button; step 2 had no equivalent
+  // and left people wondering whether the sorting work was finished.
+  const assigned=pagesForActivePreset().some(p=>p.enabled!==false&&String(p.volume||'none')!=='none');
+  const sortingDone=assigned&&unresolvedPageCount()===0;
+  $('pages-next-action')?.classList.toggle('hidden',!sortingDone);
+  // Hide the "first, do this" guide once there is nothing left to sort; showing
+  // both it and "ページの振り分けが終わりました" made the state unreadable.
+  document.querySelector('.assignment-guide')?.classList.toggle('hidden',sortingDone);
   updateBulkSelectionLabel();
 }
 function renderFinalOverview() {
@@ -1146,11 +1217,11 @@ function renderFinalOverview() {
   const preflight=renderFinalPreflight(entries);
   const unassigned=Number(preflight?.unassigned||0);
   const visibleEntries=entries.filter(entry=>entry.target?.required!==false||Number(entry.ready?.pageCount||0)>0);
-  const grid=$('final-target-grid');if(grid)grid.innerHTML=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const grid=$('final-target-grid');if(grid)grid.innerHTML=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
   const renderFreshness=(ready,card)=>{
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
     const blockers=asArray(ready.blockers),reasons=asArray(ready.staleReasons).slice(0,3);const display=String(ready.displayState||'not-built');
-    let title='提出用PDFは未出力',cls='neutral',body='出力すると、このカテゴリ専用の提出用PDFを作成します。';
+    let title='提出用PDFは未出力',cls='neutral',body='出力すると、この出力先の提出用PDFを作成します。';
     if(Number(ready.pageCount||0)===0){title='出力ページがありません';body='ページ構成でこの出力先にページを設定してください。';}
     else if(display==='blocked'){title='提出用PDFを出力できません';cls='danger';body=`<ul class="blocker-list">${blockers.slice(0,3).map(b=>`<li>${escapeHtml(b.message||'出力条件を確認してください。')}</li>`).join('')}</ul>`;}
     else if(display==='needs-rebuild'){title='再出力が必要';cls='attention';body=reasons.length?`<ul class="reason-list">${reasons.map(r=>`<li><span>${escapeHtml(r.detail||'入力が変更されました')}</span><time>${escapeHtml(formatDateTime(r.at))}</time></li>`).join('')}</ul>`:'入力が変更されています。';}
@@ -1163,8 +1234,8 @@ function renderFinalOverview() {
     if(fix)fix.classList.toggle('hidden',blockers.length===0||Number(ready.pageCount||0)===0);
   };
   for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
-  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0;allBtn.className=`btn ${unassigned&&!hardProblems?'secondary':'primary'}`;allBtn.textContent=hardProblems?`先に${hardProblems}項目を確認`:unassigned?`未振り分け ${unassigned}ページを確認`:'最終PDFをまとめて作る';}
-  const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)} ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力履歴はありません。</div>';}
+  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;allBtn.classList.toggle('busy',!!activeFinalJobId);allBtn.className=`btn ${activeFinalJobId?'primary busy':'primary'}`;allBtn.textContent=hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力';}
+  const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>';}
   renderPackReview();
   renderVolumeLinks();
 }
@@ -1185,14 +1256,36 @@ function renderFinalPreflight(entries=[]) {
   checks.push({label:'ページ構成',state:unassigned?'attention':'ok',detail:unassigned?`${unassigned}ページが未振り分けです`:'未振り分けページはありません',view:'pages'});
   const targetProblems=emptyRequiredTargets.length+blockedTargets.length;
   checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':'excel'});
-  checks.push({label:'出力ファイル名',state:pattern?'ok':'danger',detail:pattern?'出力名を設定済み':'出力ファイル名を設定してください',view:'final'});
+  checks.push({label:'出力ファイル名',state:pattern?'ok':'danger',detail:pattern?'出力名を設定済み':'出力ファイル名を設定してください',view:'final',focus:'pack-output-pattern'});
   const problems=checks.filter(check=>check.state!=='ok'),completed=checks.filter(check=>check.state==='ok');
   const problemCount=problems.length,hardProblemCount=problems.filter(check=>check.label!=='ページ構成').length,ready=problemCount===0;
+  // The whole block is re-rendered by every renderAll(), so an aria-live region
+  // here re-read the full preflight text on unrelated edits. Announce only when
+  // the outcome actually changes.
+  const announce=$('final-preflight-announce');
+  if(announce){
+    const key=`${ready?'ready':'attention'}:${problemCount}`;
+    if(announce.dataset.key!==key){
+      announce.dataset.key=key;
+      announce.textContent=ready?'出力前チェック：すべての確認項目を満たしています。':`出力前チェック：${problemCount}項目の確認が必要です。`;
+    }
+  }
   summary.className=`final-preflight-summary ${ready?'ready':'attention'}`;
   summary.innerHTML=`<div><strong>${ready?'出力準備が整っています':'出力前に確認が必要です'}</strong><span>${ready?'すべての確認項目を満たしています。':`${problemCount}項目を確認してください。`}</span></div>${badge(ready?'準備完了':`${problemCount}項目`,ready?'ok':'attention')}<time>確認 ${escapeHtml(finalPreflightCheckedAt?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`;
-  const row=check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ${check.label==='ページ構成'?'primary':'secondary'} compact" type="button" data-preflight-view="${escapeAttr(check.view)}" aria-label="${escapeAttr(`${check.label}を確認する`)}">${check.label==='ページ構成'?`${unassigned}ページを確認`:`${check.label}を確認`}</button>`}</div>`;
+  const row=check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ${check.label==='ページ構成'?'primary':'secondary'} compact" type="button" data-preflight-view="${escapeAttr(check.view)}"${check.focus?` data-preflight-focus="${escapeAttr(check.focus)}"`:''} aria-label="${escapeAttr(`${check.label}を確認する`)}">${check.label==='ページ構成'?`${unassigned}ページを確認`:`${check.label}を確認`}</button>`}</div>`;
   list.innerHTML=problems.map(row).join('')+(completed.length?`<details class="preflight-complete" ${ready?'open':''}><summary>確認済み ${completed.length}項目</summary><div>${completed.map(row).join('')}</div></details>`:'');
-  list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>setActiveView(String(button.dataset.preflightView||'final'))));
+  list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>{
+    setActiveView(String(button.dataset.preflightView||'final'));
+    // Without this the "出力ファイル名を確認" button only scrolled to the top of
+    // the screen it was already on, leaving the field shut inside its <details>.
+    const targetId=String(button.dataset.preflightFocus||'');
+    if(!targetId)return;
+    const field=$(targetId);
+    if(!field)return;
+    field.closest('details')?.setAttribute('open','');
+    field.scrollIntoView({block:'center'});
+    field.focus();
+  }));
   return {ready,problemCount,hardProblemCount,unassigned,checks};
 }
 
@@ -1224,7 +1317,7 @@ function renderPackReview(){
   if(buttons.reopen)buttons.reopen.disabled=status==='draft';
   const actionLabels={submit:'レビュー提出',approve:'承認','request-changes':'差し戻し',reopen:'下書きへ戻す'};
   const rows=asArray(review.events).slice().reverse();
-  eventsBox.innerHTML=rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${escapeHtml(event.actor||'利用者')}${event.note?`・${escapeHtml(event.note)}`:''}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">レビュー操作はまだありません。</div>';
+  eventsBox.innerHTML=rows.length?rows.map(event=>`<div class="pack-review-event"><span class="pack-review-event-mark"></span><div><strong>${escapeHtml(actionLabels[String(event.action||'')]||event.action||'更新')}</strong><span>${escapeHtml(event.actor||'利用者')}${event.note?`・${escapeHtml(event.note)}`:''}</span></div><time>${escapeHtml(formatDateTimeWithSeconds(event.at))}</time></div>`).join(''):'<div class="empty-state">レビューの記録はまだありません。「レビューへ提出」を押すと、提出・承認・差し戻しの記録がここに残ります。</div>';
 }
 
 async function performPackReviewAction(action,button){
@@ -1258,12 +1351,14 @@ async function refreshFinalPreflight(btn) {
 function updateBulkSelectionLabel() {
   const count = selectedPages.size;
   const el = $('bulk-selected-count');
-  if (el) el.textContent = count ? `${count}ページ選択中。移動先を押してください` : 'ページをクリックして選択';
+  if (el) el.textContent = count ? `${count}ページ選択中。移動先を押してください` : 'ページをクリックして選ぶと移動できます';
   const bar = $('page-command-bar');
   if (bar) bar.classList.toggle('has-selection', count > 0);
   document.querySelectorAll('[data-bulk-target],#bulk-none-btn,#clear-selected-pages-btn').forEach(button=>{
     const destination=button.matches('#bulk-none-btn')?'none':String(button.dataset.bulkTarget||'');
-    button.disabled=count===0||(destination&&destination===activePageVolume);
+    // pageMutationBusy: a background re-render used to re-enable these mid-move,
+    // letting a second destination be pressed with the same page ids in flight.
+    button.disabled=pageMutationBusy||count===0||(destination&&destination===activePageVolume);
   });
   const undoEntry=pageLayoutUndoStack[pageLayoutUndoStack.length-1],redoEntry=pageLayoutRedoStack[pageLayoutRedoStack.length-1],undo=$('page-layout-undo-btn'),redo=$('page-layout-redo-btn');
   if(undo){undo.disabled=pageLayoutHistoryBusy||!undoEntry;undo.title=undoEntry?`${undoEntry.label}を元に戻す（Ctrl+Z）`:'元に戻せるページ構成変更はありません';undo.setAttribute('aria-label',undo.title);}
@@ -1364,7 +1459,7 @@ function openPackEditor(mode='create',packId='') {
   const modal=$('pack-editor-modal');if(!modal)return;
   if(mode!=='rename'&&!configured()){
     setActiveView('excel');
-    showMessage('warn','先に原稿フォルダを選んでください','フォルダを選ぶと、続けて今回まとめる一式に名前を付けられます。');
+    showMessage('warn','先に原稿フォルダーを選んでください','フォルダーを選ぶと、続けて今回まとめる一式に名前を付けられます。');
     setTimeout(()=>$('change-source-folder-btn')?.focus(),0);
     return;
   }
@@ -1411,7 +1506,7 @@ function newTemplateTarget(){return {targetId:`output_${Date.now().toString(16).
 function collectTemplateTargets(){return [...document.querySelectorAll('[data-template-target]')].map(row=>({targetId:String(row.querySelector('[data-target-id]')?.value||'').trim().toLowerCase(),displayName:String(row.querySelector('[data-target-name]')?.value||'').trim(),required:!!row.querySelector('[data-target-required]')?.checked}));}
 function templateTargetOptions(selected='unassigned'){return `<option value="unassigned" ${selected==='unassigned'?'selected':''}>未振り分け</option>${collectTemplateTargets().filter(target=>target.targetId).map(target=>`<option value="${escapeAttr(target.targetId)}" ${selected===target.targetId?'selected':''}>${escapeHtml(target.displayName||target.targetId)}</option>`).join('')}`;}
 function renderTemplateTargets(targets=[],readOnly=false){
-  const box=$('template-targets-list');if(!box)return;const items=asArray(targets).length?asArray(targets):[{targetId:'main',displayName:'本体',required:true},{targetId:'appendix',displayName:'補足',required:false}];box.innerHTML=items.map((target,index)=>`<div class="template-target-row" data-template-target><label><span>出力先ID</span><input data-target-id type="text" maxlength="48" pattern="[a-z0-9][a-z0-9_-]*" value="${escapeAttr(target.targetId||'')}" ${readOnly?'disabled':''}></label><label><span>表示名</span><input data-target-name type="text" maxlength="60" value="${escapeAttr(target.displayName||'')}" ${readOnly?'disabled':''}></label><label class="template-check"><input data-target-required type="checkbox" ${target.required?'checked':''} ${readOnly?'disabled':''}> 必須</label><button class="btn ghost compact" type="button" data-remove-target ${readOnly||items.length<=1?'disabled':''}>削除</button></div>`).join('');
+  const box=$('template-targets-list');if(!box)return;const items=asArray(targets).length?asArray(targets):[{targetId:'main',displayName:'本体',required:true},{targetId:'appendix',displayName:'補足',required:false}];box.innerHTML=items.map((target,index)=>`<div class="template-target-row" data-template-target><label><span>出力先ID</span><input data-target-id type="text" maxlength="48" pattern="[a-z0-9][a-z0-9_\\-]*" value="${escapeAttr(target.targetId||'')}" ${readOnly?'disabled':''}></label><label><span>表示名</span><input data-target-name type="text" maxlength="60" value="${escapeAttr(target.displayName||'')}" ${readOnly?'disabled':''}></label><label class="template-check"><input data-target-required type="checkbox" ${target.required?'checked':''} ${readOnly?'disabled':''}> 必須</label><button class="btn ghost compact" type="button" data-remove-target ${readOnly||items.length<=1?'disabled':''}>削除</button></div>`).join('');
   box.querySelectorAll('[data-remove-target]').forEach((button,index)=>button.addEventListener('click',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned'),next=collectTemplateTargets().filter((_,itemIndex)=>itemIndex!==index);renderTemplateTargets(next,false);renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,false);}));
   box.querySelectorAll('[data-target-id],[data-target-name]').forEach(input=>input.addEventListener('change',()=>{const requirements=collectTemplateRequirements(),destination=String($('template-new-destination')?.value||'unassigned');renderTemplateDestinationOptions(destination);renderTemplateRequirements(requirements,readOnly);}));
 }
@@ -1448,10 +1543,10 @@ async function submitTemplateManager(btn){
   const invalidTarget=body.targets.find(target=>!target.targetId||!target.displayName||!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(target.targetId));if(!body.targets.length||invalidTarget||new Set(body.targets.map(target=>target.targetId)).size!==body.targets.length){showMessage('warn','出力先の設定を確認してください','出力先IDは英小文字・数字・ハイフン・アンダースコアで重複なく入力し、表示名も設定してください。');return;}const invalidRequirement=body.sourceRequirements.find(item=>!item.displayName||!item.acceptedSourceTypes.length);if(invalidRequirement){showMessage('warn','必要原稿の設定を確認してください','原稿名を入力し、扱う形式を1つ以上選択してください。');return;}
   await runBusy(btn,async()=>{const response=await api(selected?`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`:'/api/v2/pack-templates',{method:selected?'PATCH':'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok',selected?'ひな形を更新しました':'ひな形を作成しました','新しく作る資料パックで選択できます。');},false);
 }
-async function deleteManagedTemplate(btn){const selected=templateManagerSelected();if(!selected||selected.builtIn)return;const accepted=await confirmAction({title:'このひな形を削除しますか？',message:`「${selected.displayName||'ひな形'}」を削除します。`,detail:'使用中の資料パックがあるひな形は削除できません。',confirmLabel:'削除',danger:true});if(!accepted)return;await runBusy(btn,async()=>{const response=await api(`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`,{method:'DELETE'});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect('');showMessage('ok','ひな形を削除しました','資料パック作成時の一覧から削除しました。');},false);}
+async function deleteManagedTemplate(btn){const selected=templateManagerSelected();if(!selected||selected.builtIn)return;const accepted=await confirmAction({title:'このひな形を削除しますか？',message:`「${selected.displayName||'ひな形'}」を削除します。`,detail:'このひな形からすでに作った資料パックは、そのまま使えます（原稿・ページ構成・出力先の設定は残ります）。削除すると、今後の資料パック作成でこのひな形を選べなくなり、必要原稿リストと出力条件の設定は元に戻せません。',confirmLabel:'削除',danger:true});if(!accepted)return;await runBusy(btn,async()=>{const response=await api(`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`,{method:'DELETE'});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect('');showMessage('ok','ひな形を削除しました','資料パック作成時の一覧から削除しました。');},false);}
 async function duplicateManagedTemplate(btn){const selected=templateManagerSelected();if(!selected)return;const body=templateManagerRequest();body.displayName=`${body.displayName||selected.displayName||'ひな形'}（コピー）`;await runBusy(btn,async()=>{const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形を複製しました','用途に合わせて名前や必要原稿を編集できます。');},false);}
-function exportManagedTemplate(){const selected=templateManagerSelected();if(!selected)return;const data=templateManagerRequest();data.templateSchemaVersion=1;const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`ReportBinder-template-${String(selected.displayName||'template').replace(/[\\/:*?"<>|]/g,'_')}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showMessage('ok','ひな形JSONを出力しました','別のPCや利用者へ渡して読み込めます。');}
-async function importManagedTemplateFile(file,btn){if(!file)return;try{const body=JSON.parse(await file.text());delete body.templateId;delete body.templateVersion;const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形JSONを読み込みました','内容を確認してから資料パックを作成してください。');}catch(error){showMessage('danger','ひな形JSONを読み込めません',userFriendlyError(error.message),error.detail||error.message);}finally{if(btn)btn.value='';}}
+function exportManagedTemplate(){const selected=templateManagerSelected();if(!selected)return;const data=templateManagerRequest();data.templateSchemaVersion=1;const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`ReportBinder-template-${String(selected.displayName||'template').replace(/[\\/:*?"<>|]/g,'_')}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showMessage('ok','ひな形ひな形をファイルに書き出しました','別のPCや利用者へ渡して読み込めます。');}
+async function importManagedTemplateFile(file,btn){if(!file)return;try{const body=JSON.parse(await file.text());delete body.templateId;delete body.templateVersion;const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形ひな形をファイルから読み込みました','内容を確認してから資料パックを作成してください。');}catch(error){showMessage('danger','ひな形ひな形を読み込めません',userFriendlyError(error.message),error.detail||error.message);}finally{if(btn)btn.value='';}}
 async function duplicatePack(packId,btn) {
   const pack=findPackForManagement(packId);if(!pack)return;
   closePackMenu();
@@ -1708,16 +1803,16 @@ function packMenuRow(pack, archived=false) {
   const active=!archived&&workflow&&id===activePackId;
   const status=archived?'アーカイブ済み':(workflow?(active?'利用中':'選択して使用'):'現在は利用できません');
   const selectAttrs=archived?'disabled':(workflow?`data-pack-select="${escapeAttr(id)}"`:`data-pack-unavailable="${escapeAttr(id)}"`);
-  const archiveAction=!archived&&pack?.archivable?`<button class="danger" type="button" data-pack-action="archive" data-pack-id="${escapeAttr(id)}">保管</button>`:'';
+  const archiveAction=!archived&&pack?.archivable?`<button class="danger" type="button" data-pack-action="archive" data-pack-id="${escapeAttr(id)}">アーカイブ</button>`:'';
   const restoreAction=archived?`<button type="button" data-pack-action="restore" data-pack-id="${escapeAttr(id)}">復元</button>`:'';
   const templateUpgrade=!archived&&pack?.templateUpdateAvailable?`<button class="attention" type="button" data-pack-action="template-upgrade" data-pack-id="${escapeAttr(id)}">ひな形更新</button>`:'';
-  return `<div class="pack-menu-row" data-pack-row="${escapeAttr(id)}"><button class="pack-option${active?' active':''}" type="button" ${selectAttrs} ${active?'aria-current="true"':''}><span class="pack-option-marker" aria-hidden="true"></span><span class="pack-option-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(status)}${pack?.templateUpdateAvailable?`・ひな形 v${Number(pack.availableTemplateVersion||1)}あり`:''}</small></span></button><div class="pack-row-actions">${restoreAction}${templateUpgrade}<button type="button" data-pack-action="duplicate" data-pack-id="${escapeAttr(id)}">複製</button><button type="button" data-pack-action="rename" data-pack-id="${escapeAttr(id)}">名前</button>${archiveAction}</div></div>`;
+  return `<div class="pack-menu-row" data-pack-row="${escapeAttr(id)}"><button class="pack-option${active?' active':''}" type="button" ${selectAttrs} ${active?'aria-current="true"':''}><span class="pack-option-marker" aria-hidden="true"></span><span class="pack-option-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(status)}${pack?.templateUpdateAvailable?`・ひな形 v${Number(pack.availableTemplateVersion||1)}あり`:''}</small></span></button><div class="pack-row-actions">${restoreAction}${templateUpgrade}<button type="button" data-pack-action="duplicate" data-pack-id="${escapeAttr(id)}">複製</button><button type="button" data-pack-action="rename" data-pack-id="${escapeAttr(id)}">名前を変更</button>${archiveAction}</div></div>`;
 }
 function renderPackSwitcher() {
   const selected=activePackRecord();
   const label=$('active-pack-name'),button=$('pack-menu-button');
   if(label)label.textContent=String(selected?.displayName||(configured()?'名前を付ける':'未作成'));
-  if(button){button.disabled=!configured()&&!selected;button.classList.toggle('empty',!selected);button.setAttribute('aria-label',selected?`資料パック「${String(selected.displayName||'名称未設定')}」を切り替え・管理`:(configured()?'今回まとめる資料パックに名前を付ける':'原稿フォルダを設定すると資料パックを作成できます'));button.setAttribute('aria-haspopup',selected?'dialog':'true');}
+  if(button){button.disabled=!configured()&&!selected;button.classList.toggle('empty',!selected);button.setAttribute('aria-label',selected?`資料パック「${String(selected.displayName||'名称未設定')}」を切り替え・管理`:(configured()?'今回まとめる資料パックに名前を付ける':'原稿フォルダーを設定すると資料パックを作成できます'));button.setAttribute('aria-haspopup',selected?'dialog':'true');}
   const all=packAdminPacks.length?packAdminPacks:asArray(state?.packs);
   const active=all.filter(pack=>!pack?.archived),archived=all.filter(pack=>!!pack?.archived);
   const list=$('pack-menu-list');if(list)list.innerHTML=active.length?active.map(pack=>packMenuRow(pack,false)).join(''):'<div class="pack-menu-empty">使用できる資料パックがありません。</div>';
@@ -1725,6 +1820,24 @@ function renderPackSwitcher() {
   if(toggle){toggle.classList.toggle('hidden',archived.length===0);toggle.textContent=`アーカイブ済み（${archived.length}件）${archivedPacksExpanded?'を閉じる':'を表示'}`;toggle.setAttribute('aria-expanded',String(archivedPacksExpanded));}
   const archivedList=$('archived-pack-list');
   if(archivedList){archivedList.classList.toggle('hidden',!archivedPacksExpanded||archived.length===0);archivedList.innerHTML=archived.map(pack=>packMenuRow(pack,true)).join('');}
+}
+// Non-modal popovers must not linger behind the focus ring: if Tab (or a click)
+// takes focus out of them, close them the same way an outside click does.
+function closePopoverOnFocusOut(container, close){
+  if(!container||container.dataset.focusOutBound==='1')return;
+  container.dataset.focusOutBound='1';
+  container.addEventListener('focusout',event=>{
+    if(container.classList.contains('hidden'))return;
+    const next=event.relatedTarget;
+    if(next&&(container.contains(next)||next.getAttribute?.('aria-controls')===container.id))return;
+    if(next===null)return; // focus left the document entirely; keep it open
+    close(false);
+  });
+}
+function focusFirstIn(container){
+  if(!container)return;
+  const target=container.querySelector('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])');
+  target?.focus();
 }
 function closePackMenu(returnFocus=false) {
   const menu=$('pack-menu'),button=$('pack-menu-button');if(!menu)return;
@@ -1744,6 +1857,10 @@ async function togglePackMenu() {
   if(!menu.classList.contains('hidden')){closePackMenu(true);return;}
   menu.classList.remove('hidden');button.setAttribute('aria-expanded','true');renderPackSwitcher();
   try{await loadPackAdminPacks();}catch(error){showMessage('danger','資料パック一覧を読み込めません',userFriendlyError(error.message),error.detail||error.message);}
+  // role="dialog" + aria-modal announces "dialog" but focus stayed on the
+  // trigger, so Tab walked straight past the menu into the page behind it.
+  // Must run after loadPackAdminPacks(), which rebuilds the list innerHTML.
+  if(!menu.classList.contains('hidden')){closePopoverOnFocusOut(menu,closePackMenu);focusFirstIn(menu);}
 }
 function visibleUnregisteredFiles(files) {
   const registered=new Set(workbooksForActivePreset().map(w=>String(w.relativePath||'').replace(/\\/g,'/').toLowerCase()));
@@ -1926,8 +2043,17 @@ function clearActivePageSelection() {
 }
 
 async function moveSelectedPagesToVolume(volume, btn) {
-  const target=String(volume||'');const ids=[...selectedPages].map(String).filter(id=>!!getPage(id));
+  await movePageIdsToVolume([...selectedPages], volume, btn);
+}
+// Shared by the 移動先 buttons and by dropping a drag onto a volume tab, so both
+// routes produce the same reorder request, undo entry and toast.
+async function movePageIdsToVolume(pageIds, volume, btn) {
+  const target=String(volume||'');const ids=asArray(pageIds).map(String).filter(id=>!!getPage(id));
   if(!ids.length){showMessage('warn','ページを選択してください','移動するページにチェックを入れてください。');return;}
+  if(pageMutationBusy)return;
+  pageMutationBusy=true;
+  updateBulkSelectionLabel();
+  try{
   await runBusy(btn,async()=>{
     const beforeVolumes=collectBoardVolumes();
     const first=activeTargetVolumes()[0]||mainVolume(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),selected=new Set(ids);
@@ -1936,12 +2062,13 @@ async function moveSelectedPagesToVolume(volume, btn) {
     const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});applyPageMutationResult(response);rememberPageLayoutUndo(`${ids.length}ページの移動`,beforeVolumes);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
     showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
   });
+  }finally{pageMutationBusy=false;updateBulkSelectionLabel();}
   syncPageSelectionUi();
 }
 
 async function loadFiles(btn) {
   if (!configured()) {
-    showMessage('warn', '原稿フォルダを選んでください', 'フォルダを選ぶと原稿を表示できます。');
+    showMessage('warn', '原稿フォルダーを選んでください', 'フォルダーを選ぶと原稿を表示できます。');
     return [];
   }
   await runBusy(btn, async () => {
@@ -1952,7 +2079,7 @@ async function loadFiles(btn) {
     renderFileList(availableFiles);
     renderFolderOverview();
     renderDashboardOverview();
-    showMessage(availableFiles.length ? 'ok' : 'warn', availableFiles.length ? '原稿一覧を更新しました' : '対応する原稿が見つかりません', '原稿フォルダ直下の対応形式だけを表示しています。');
+    showMessage(availableFiles.length ? 'ok' : 'warn', availableFiles.length ? '原稿一覧を更新しました' : '対応する原稿が見つかりません', '原稿フォルダー直下の対応形式だけを表示しています。');
   }, false);
   return availableFiles;
 }
@@ -1976,7 +2103,7 @@ function renderFileList(files) {
   updatePresetTabs();
   if (!configured()) {
     box.className = 'table-shell empty-state';
-    box.textContent = '上の「フォルダを選ぶ」から原稿フォルダを設定してください。';
+    box.textContent = '上の「フォルダーを選ぶ」から原稿フォルダーを設定してください。';
     setFileSelectionSummary(0, 0);
     return;
   }
@@ -2043,6 +2170,9 @@ function renderFileList(files) {
   }));
 }
 async function applyPresetSelection(presetOrButton) {
+  // Switching packs mid-job made the finishing job apply its results (selection,
+  // highlights, progress counts) to whichever pack happened to be active.
+  if(renderJobActive||activeFinalJobId){showMessage('warn','処理中は資料パックを切り替えられません','PDFの作成が終わってから切り替えてください。中止する場合は進捗パネルの「中止」を押してください。');return;}
   const requested=typeof presetOrButton==='string'?presetOrButton:(presetOrButton?.dataset?.packSelect||presetOrButton?.dataset?.preset||activePackId||activePreset);
   const pack=asArray(state?.packs).find(item=>String(item?.packId||'')===String(requested))
     || asArray(state?.packs).find(item=>String(item?.category||'').toLowerCase()===String(requested||'').toLowerCase());
@@ -2103,7 +2233,7 @@ async function unregisterSelected(btn) {
 }
 
 // ---- V5: シート単位の変更表示 ----
-// 表現は「見落としなし」ではなく「最終PDFの見た目を基準とした高精度な判定」。
+// 表現は「見落としなし」ではなく「提出用PDFの見た目を基準とした高精度な判定」。
 let showChangedOnly = false;
 function changeSummaryFor(workbookId){
   const map = state?.changeSummaries;
@@ -3140,7 +3270,12 @@ function renderDiffSheetList(){
       const buttons=[...box.querySelectorAll('[data-diff-sheet]')];
       const index=buttons.indexOf(btn);
       const next=buttons[Math.max(0,Math.min(buttons.length-1,index+(e.key==='ArrowDown'?1:-1)))];
-      next?.focus();if(next)selectDiffSheet(next.dataset.diffSheet||'',false);
+      if(!next)return;
+      // selectDiffSheet re-renders this list, destroying the node we just
+      // focused, so focus has to be re-applied to its replacement afterwards.
+      const nextKey=next.dataset.diffSheet||'';
+      selectDiffSheet(nextKey,false);
+      box.querySelector(`[data-diff-sheet="${CSS.escape(nextKey)}"]`)?.focus();
     });
   });
 }
@@ -3250,6 +3385,8 @@ function applyDiffMode(){
   $('diff-mobile-tabs')?.classList.toggle('hidden',overlay);
   $('diff-mode-side')?.classList.toggle('active',!overlay);
   $('diff-mode-overlay')?.classList.toggle('active',overlay);
+  $('diff-mode-side')?.setAttribute('aria-pressed',String(!overlay));
+  $('diff-mode-overlay')?.setAttribute('aria-pressed',String(overlay));
   $('diff-opacity-wrap')?.classList.toggle('hidden',!overlay);
   $('diff-after-underlay')?.classList.toggle('hidden',!overlay);
   const opacity=Math.max(0,Math.min(100,Number($('diff-opacity')?.value||50)));
@@ -3419,7 +3556,7 @@ async function saveSourceMetadata(sourceId, patch, control) {
 function activeSourceRequirements(){return asArray(activePackRecord()?.sourceRequirements);}
 function renderSourceRequirementStatus(workbooks=workbooksForActivePreset()){
   const box=$('source-requirement-status');if(!box)return;const requirements=activeSourceRequirements();box.classList.toggle('hidden',requirements.length===0);if(!requirements.length){box.innerHTML='';return;}
-  const rows=requirements.map(requirement=>{const assigned=asArray(workbooks).find(w=>String(w?.requirementId||'')===String(requirement?.requirementId||''));let stateLabel='未提出',stateClass=requirement?.required===false?'neutral':'danger';if(assigned){if(String(assigned.status||'')==='missing'){stateLabel='ファイルなし';stateClass='danger';}else if(isLatestPdfWorkbook(assigned)){stateLabel='提出・変換済み';stateClass='ok';}else{stateLabel='提出済み・変換待ち';stateClass='attention';}}const details=[requirement.ownerDepartment||'',requirement.dueDate?`期限 ${requirement.dueDate}`:'',requirement.required===false?'任意':'必須'].filter(Boolean).join('・');return `<div class="source-requirement-item ${assigned?'assigned':'unassigned'}"><div><strong>${escapeHtml(requirement.displayName||'必要原稿')}</strong><span>${escapeHtml(details)}</span></div><div><span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span><small>${escapeHtml(assigned?workbookDisplayName(assigned):'登録後、原稿設定から割り当てます')}</small></div></div>`;});
+  const rows=requirements.map(requirement=>{const assigned=asArray(workbooks).find(w=>String(w?.requirementId||'')===String(requirement?.requirementId||''));let stateLabel='未提出',stateClass=requirement?.required===false?'neutral':'danger';if(assigned){if(String(assigned.status||'')==='missing'){stateLabel='ファイルなし';stateClass='danger';}else if(isLatestPdfWorkbook(assigned)){stateLabel='提出・変換済み';stateClass='ok';}else{stateLabel='提出済み・変換待ち';stateClass='attention';}}const details=[requirement.ownerDepartment||'',requirement.dueDate?`期限 ${formatDateOnly(requirement.dueDate)}`:'',requirement.required===false?'任意':'必須'].filter(Boolean).join('・');return `<div class="source-requirement-item ${assigned?'assigned':'unassigned'}"><div><strong>${escapeHtml(requirement.displayName||'必要原稿')}</strong><span>${escapeHtml(details)}</span></div><div><span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span><small>${escapeHtml(assigned?workbookDisplayName(assigned):'登録後、原稿設定から割り当てます')}</small></div></div>`;});
   const complete=rows.length&&requirements.every(requirement=>requirement.required===false||asArray(workbooks).some(w=>String(w?.requirementId||'')===String(requirement?.requirementId||'')&&String(w?.status||'')!=='missing'));
   box.innerHTML=`<div class="source-requirement-title"><strong>必要原稿</strong><span>${complete?'必須原稿はすべて提出済みです':'未提出の必須原稿があります'}</span></div><div class="source-requirement-list">${rows.join('')}</div>`;
 }
@@ -3428,7 +3565,7 @@ function sourceSettingsHtml(w){
   const sourceType=sourceTypeValue(w),requirements=activeSourceRequirements().filter(item=>asArray(item?.acceptedSourceTypes).map(String).includes(sourceType)),assignedElsewhere=new Map(workbooksForActivePreset().filter(item=>String(item?.workbookId||'')!==id&&item?.requirementId).map(item=>[String(item.requirementId),workbookDisplayName(item)])),requirementId=String(w?.requirementId||'');
   const requirementSelect=requirements.length?`<label class="source-requirement-label">必要原稿<select class="source-requirement-select" data-source-requirement="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の必要原稿"><option value="">割り当てなし</option>${requirements.map(item=>{const rid=String(item.requirementId||''),occupied=assignedElsewhere.get(rid);return `<option value="${escapeAttr(rid)}" ${rid===requirementId?'selected':''} ${occupied?'disabled':''}>${escapeHtml(item.displayName||'必要原稿')}${item.required===false?'（任意）':'（必須）'}${occupied?`・${escapeHtml(occupied)}へ割当済み`:''}</option>`;}).join('')}</select></label>`:'';
   const targetOptions=activeTargetDefinitions().map(target=>`<option value="${escapeAttr(target.targetId)}" ${defaultTarget===String(target.targetId)?'selected':''}>${escapeHtml(target.displayName||target.targetId)}</option>`).join('');
-  return `<details class="source-advanced-settings" data-source-settings-details="${escapeAttr(id)}" ${expandedSourceSettings.has(id)?'open':''}><summary>原稿の扱いを変更</summary><div class="source-settings" aria-label="原稿の詳細設定">${requirementSelect}<label class="source-owner-label"><span>担当部署（任意）<small>進捗一覧に表示する管理用メモです</small></span><input class="source-owner-input" type="text" maxlength="120" value="${escapeAttr(owner)}" placeholder="例：営業部" data-source-owner="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の担当部署"></label><label class="source-required-label"><input type="checkbox" data-source-required="${escapeAttr(id)}" ${required?'checked':''}><span>最終PDFに必須<small>未作成・更新あり・エラーの間は最終PDFを出力しません</small></span></label><label class="source-default-target-label"><span>更新で増えたページの追加先<small>既に並べたページは移動しません</small></span><select class="source-default-target" data-source-default-target="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の追加ページ配置"><option value="unassigned" ${defaultTarget==='unassigned'?'selected':''}>一式の既定：${escapeHtml(activePackDefaultTargetLabel())}</option>${targetOptions}</select></label></div></details>`;
+  return `<details class="source-advanced-settings" data-source-settings-details="${escapeAttr(id)}" ${expandedSourceSettings.has(id)?'open':''}><summary>原稿の扱いを変更</summary><div class="source-settings" aria-label="原稿の詳細設定">${requirementSelect}<label class="source-owner-label"><span>担当部署（任意）<small>進捗一覧に表示する管理用メモです</small></span><input class="source-owner-input" type="text" maxlength="120" value="${escapeAttr(owner)}" placeholder="例：営業部" data-source-owner="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の担当部署"></label><label class="source-required-label"><input type="checkbox" data-source-required="${escapeAttr(id)}" ${required?'checked':''}><span>提出用PDFに必須<small>未作成・更新あり・エラーの間は提出用PDFを出力しません</small></span></label><label class="source-default-target-label"><span>更新で増えたページの追加先<small>既に並べたページは移動しません</small></span><select class="source-default-target" data-source-default-target="${escapeAttr(id)}" aria-label="${escapeAttr(workbookDisplayName(w))}の追加ページ配置"><option value="unassigned" ${defaultTarget==='unassigned'?'selected':''}>一式の既定：${escapeHtml(activePackDefaultTargetLabel())}</option>${targetOptions}</select></label></div></details>`;
 }
 function syncDiffScroll(source,target){
   if(diffSyncingScroll||diffViewState.mode!=='side'||!source||!target)return;
@@ -3474,7 +3611,7 @@ function summarizeRenderResults(results) {
   }
   if (warnings.length) {
     const shown = warnings.slice(0, 6).join('\n');
-    const more = warnings.length > 6 ? `\n…ほか ${warnings.length - 6} 件(詳細はログ参照)` : '';
+    const more = warnings.length > 6 ? `\n…ほか ${warnings.length - 6}件。「原稿を登録・PDF化」の登録済み原稿一覧で、対象の原稿の状態欄を確認してください` : '';
     return {kind:'warn', title:'PDFを作成しました(要確認)', message: shown + more, detail:list};
   }
   if (list.length) return {kind:'ok', title:'PDFを作成しました', message:`${list.length}件の原稿を処理しました。`, detail:list};
@@ -3569,7 +3706,18 @@ async function renderUpdated(btn) {
 }
 async function renderAllWorkbooks(btn) {
   const ids = workbooksForActivePreset().map(w => w.workbookId);
-  await renderWorkbookIds(ids, btn, {targetMode:'all', startMessage:`${presetLabel()}の登録済み原稿 ${ids.length}件をPDF変換します。`});
+  if (!ids.length) { showMessage('warn','登録済み原稿がありません','先に原稿を登録してください。'); return; }
+  // Every other destructive action here confirms first. This one re-runs Office
+  // for every file and knocks all finished 提出用PDF back to "要再出力".
+  const accepted = await confirmAction({
+    title:`登録済み原稿 ${ids.length}件をすべて作り直しますか？`,
+    message:'更新のない原稿も含めて、変換PDFをすべて作り直します。',
+    detail:'完了までに時間がかかり、作成済みの提出用PDFはすべて「再出力が必要」になります。更新された原稿だけでよい場合は「更新確認」を使ってください。',
+    confirmLabel:'すべて作り直す',
+    danger:true
+  });
+  if (!accepted) return;
+  await renderWorkbookIds(ids, btn, {targetMode:'all', startMessage:`登録済み原稿 ${ids.length}件の変換PDFを作成します。`});
 }
 async function renderSelectedPages(btn) {
   const pageIds = [...selectedPages];
@@ -3638,12 +3786,20 @@ function renderPages() {
   if(lastPageBoardRenderSignature===signature&&box.childElementCount)return;lastPageBoardRenderSignature=signature;
   const scrollSnap=capturePageBoardScroll();selectedPages=new Set([...selectedPages].filter(id=>allPages.some(p=>resolvedPageId(p)===id)));
   const banners=[];const unassigned=allPages.filter(p=>String(p.volume)==='none'||p.enabled===false).length;
-  if(unassigned)banners.push(`<div class="page-status-banner attention"><strong>未振り分けのページが ${unassigned} ページあります</strong><span>出力先へ移したページだけが提出用PDFに含まれます。</span></div>`);
+  if(unassigned)banners.push(`<div class="page-status-banner attention"><strong>未振り分けのページが ${unassigned}ページあります</strong><span>出力先へ移したページだけが提出用PDFに含まれます。</span></div>`);
   if(needsPdf.length)banners.push(`<div class="page-status-banner"><strong>変換PDF作成が必要な原稿があります</strong><span>${needsPdf.length}件。先に変換PDFを作成してください。</span></div>`);
   if(agg.state==='needs-rebuild')banners.push('<div class="page-status-banner"><strong>ページ構成または変換PDFが変更されています</strong><span>提出用PDFの再出力が必要です。</span></div>');
   const panels=[{volume:'none',title:'未振り分け（出力しない）',description:'新規ページはここに入ります。必要なページを選び、出力先へ移してください。'},...activeTargetDefinitions().map(target=>({volume:targetVolume(target.targetId),title:String(target.displayName||target.targetId),description:`ここへ入れたページが「${target.displayName||target.targetId}」PDFに含まれます。`}))];
   if(!panels.some(panel=>panel.volume===activePageVolume))activePageVolume=panels[0]?.volume||'none';
-  const tabs=$('page-volume-tabs');if(tabs){tabs.innerHTML=panels.map(panel=>{const count=allPages.filter(page=>panel.volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||activeTargetVolumes()[0]||mainVolume())===panel.volume&&page.enabled!==false)).length;const selected=panel.volume===activePageVolume,target=panel.volume==='none'?null:activeTargetDefinitions().find(item=>targetVolume(item.targetId)===panel.volume),optionalEmpty=target?.required===false&&count===0&&!selected,label=panel.volume==='none'?'未振り分け':optionalEmpty?`＋ ${panel.title}を使う`:panel.title;return `<button class="page-volume-tab ${selected?'active':''} ${optionalEmpty?'optional-empty':''}" type="button" role="tab" aria-selected="${selected}" data-page-volume-tab="${escapeAttr(panel.volume)}"><span>${escapeHtml(label)}</span>${optionalEmpty?'':`<b>${count}</b>`}</button>`;}).join('');tabs.querySelectorAll('[data-page-volume-tab]').forEach(button=>button.addEventListener('click',()=>{activePageVolume=String(button.dataset.pageVolumeTab||'none');try{sessionStorage.setItem('ReportBinderActivePageVolume',activePageVolume);}catch{}lastPageBoardRenderSignature='';selectedPages.clear();renderPages();}));}
+  if(!pageVolumeAutoPicked&&allPages.length){
+    const pageCountFor=volume=>allPages.filter(page=>volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||activeTargetVolumes()[0]||mainVolume())===volume&&page.enabled!==false)).length;
+    if(!pageCountFor(activePageVolume)){
+      const populated=panels.find(panel=>pageCountFor(panel.volume)>0);
+      if(populated)activePageVolume=populated.volume;
+    }
+    pageVolumeAutoPicked=true;
+  }
+  const tabs=$('page-volume-tabs');if(tabs){tabs.innerHTML=panels.map(panel=>{const count=allPages.filter(page=>panel.volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||activeTargetVolumes()[0]||mainVolume())===panel.volume&&page.enabled!==false)).length;const selected=panel.volume===activePageVolume,target=panel.volume==='none'?null:activeTargetDefinitions().find(item=>targetVolume(item.targetId)===panel.volume),optionalEmpty=target?.required===false&&count===0&&!selected,label=panel.volume==='none'?'未振り分け':optionalEmpty?`＋ ${panel.title}を使う`:panel.title;return `<button class="page-volume-tab ${selected?'active':''} ${optionalEmpty?'optional-empty':''}" type="button" aria-pressed="${selected}" data-page-volume-tab="${escapeAttr(panel.volume)}"><span>${escapeHtml(label)}</span>${optionalEmpty?'':`<b>${count}</b>`}</button>`;}).join('');tabs.querySelectorAll('[data-page-volume-tab]').forEach(button=>button.addEventListener('click',()=>{activePageVolume=String(button.dataset.pageVolumeTab||'none');try{sessionStorage.setItem('ReportBinderActivePageVolume',activePageVolume);}catch{}lastPageBoardRenderSignature='';selectedPages.clear();renderPages();}));}
   if(sourcePages.length>0&&visiblePages.length===0){const searching=!!String(pageFilterText||'').trim();const title=searching?'一致するページがありません':'変更されたページはありません';const hint=searching?'検索語を短くするか、クリアしてください。':'「変更分のみ」を解除すると、すべてのページを表示できます。';banners.push(`<div class="page-filter-empty"><strong>${title}</strong><span>${hint}</span></div>`);}
   box.className=`board ${pageBoardView==='thumbnail'?'thumbnail-board':'detail-board'}`;box.innerHTML=banners.join('')+panels.map(panel=>dynamicVolumePanelHtml(panel,allPages,visibleIds)).join('');attachBoardEvents();preparePageThumbnails();restorePageBoardScroll(scrollSnap);syncPageBoardViewControls();syncPageSelectionUi();
 }
@@ -3663,7 +3819,10 @@ function filteredOutPageHtml(pid,isRow){
 function pageRowHtml(p, idx, filteredOut=false) {
   if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),true);
   const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
-  return `<tr tabindex="0" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="check-col"><input type="checkbox" data-page-check value="${escapeAttr(pid)}" ${checked?'checked':''}></td><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="drag-col"><span class="drag-handle" title="ドラッグして移動">${iconUse('i-drag')}</span></td><td class="page-main-cell"><input class="title-input" data-page-title value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
+  // Table headers do not name form controls, so without these every row read
+  // out as an unlabelled checkbox / textbox / combobox in a list of hundreds.
+  const rowLabel=`${idx+1}ページ目 ${p.title||p.sheetName||'ページ'}`;
+  return `<tr tabindex="0" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="check-col"><input type="checkbox" data-page-check value="${escapeAttr(pid)}" aria-label="${escapeAttr(`${rowLabel}を選択`)}" ${checked?'checked':''}></td><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="drag-col"><span class="drag-handle" title="ドラッグして移動">${iconUse('i-drag')}</span></td><td class="page-main-cell"><input class="title-input" data-page-title aria-label="${escapeAttr(`${rowLabel}のページ名`)}" value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering aria-label="${escapeAttr(`${rowLabel}のページ番号表示`)}"><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range aria-label="${escapeAttr(`${rowLabel}で使用するページ範囲`)}" value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
 }
 function pageThumbnailHtml(p,idx,filteredOut=false){
   if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),false);
@@ -3708,6 +3867,24 @@ function preparePageThumbnails(){
 function clearDropHighlights() {
   document.querySelectorAll('.drop-active').forEach(el => el.classList.remove('drop-active'));
   document.querySelectorAll('.drop-placeholder').forEach(el => el.remove());
+  document.querySelectorAll('.drop-target-tab').forEach(el => el.classList.remove('drop-target-tab'));
+}
+// Only one volume panel is rendered at a time (.inactive-volume{display:none}),
+// so there is no in-board drop target for the other volumes. The tabs stand in
+// for them: drop a drag on a tab to send the pages to that volume.
+function findVolumeTabAt(x, y) {
+  for (const el of document.elementsFromPoint(x, y)) {
+    const tab = el.closest?.('[data-page-volume-tab]');
+    if (tab) return tab;
+  }
+  return null;
+}
+function volumeOfRow(row) {
+  return String(row?.closest('[data-volume]')?.getAttribute('data-volume') || '');
+}
+function highlightVolumeTabTarget(tab) {
+  document.querySelectorAll('.drop-target-tab').forEach(el => { if (el !== tab) el.classList.remove('drop-target-tab'); });
+  tab?.classList.add('drop-target-tab');
 }
 function renumberBoardRows() {
   document.querySelectorAll('[data-volume]').forEach(tbody => {
@@ -3918,6 +4095,10 @@ function beginPointerPageDrag(e, row) {
     pendingMove = null;
     if (!ev || !draggingRow) return;
     positionPageDragGhost(draggingRow.ghost, ev.clientX, ev.clientY);
+    const tab = findVolumeTabAt(ev.clientX, ev.clientY);
+    draggingRow.tabTarget = tab && volumeOfRow(draggingRow.sourceRow) !== String(tab.dataset.pageVolumeTab || '') ? tab : null;
+    highlightVolumeTabTarget(draggingRow.tabTarget);
+    if (draggingRow.tabTarget) return;
     const tbody = findDropTbodyAt(ev.clientX, ev.clientY);
     autoScrollDuringDragPointer(ev, tbody);
     if (tbody) moveDropPlaceholder(tbody, ev.clientX, ev.clientY);
@@ -3934,6 +4115,17 @@ function beginPointerPageDrag(e, row) {
   const onUp = (ev) => {
     cleanup(ev);
     if (!started) { return; }
+    const tab = draggingRow ? findVolumeTabAt(ev.clientX, ev.clientY) : null;
+    if (tab) {
+      const target = String(tab.dataset.pageVolumeTab || '');
+      const ids = draggingRow.rows.map(r => r.getAttribute('data-page-id')).filter(Boolean);
+      const sameVolume = volumeOfRow(draggingRow.sourceRow) === target;
+      // Cancel first: that restores the board to its pre-drag DOM, which
+      // movePageIdsToVolume reads as the undo baseline.
+      finishPointerDrag(false);
+      if (!sameVolume && ids.length) void movePageIdsToVolume(ids, target, null);
+      return;
+    }
     const targetTbody = findDropTbodyAt(ev.clientX, ev.clientY);
     const commit = !!(draggingRow && draggingRow.placeholder && targetTbody && draggingRow.placeholder.parentElement && !draggingRow.isNoop);
     finishPointerDrag(commit);
@@ -4004,10 +4196,14 @@ function delegateBoardEvents(box){
     if(save){e.stopPropagation();void savePageFromThumbnail(save.closest('.page-thumb-card'),save);return;}
     const preview=e.target.closest('[data-preview-page]');
     if(preview){if(draggingRow)return;if(e.target&&e.target.matches('input,select,option'))return;const row=preview.closest('.page-row');previewPage(preview.dataset.previewPage||row?.dataset.pageId,pageFallbackFromRow(row));return;}
-    const card=e.target.closest('.page-thumb-card');
+    // .page-row, not .page-thumb-card: the detail view renders <tr class="page-row">
+    // and used to ignore row clicks entirely, so the on-screen instruction
+    // "ページをクリックして選ぶ" did nothing there and hitting the widest target
+    // (the title input) silently started a rename instead.
+    const card=e.target.closest('.page-row');
     if(card){
       if(card.dataset.suppressClick==='true'){delete card.dataset.suppressClick;e.preventDefault();e.stopPropagation();return;}
-      if(e.target.closest('input,button,a,select,.drag-handle,.badge,.page-thumb-check,.page-thumb-editor'))return;
+      if(e.target.closest('input,button,a,select,.drag-handle,.badge,.page-thumb-check,.page-thumb-editor,.page-thumb-preview,[data-preview-page]'))return;
       const ch=card.querySelector('[data-page-check]');if(!ch)return;
       ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);
     }
@@ -4272,15 +4468,15 @@ async function chooseSubmissionFolder(btn) {
   if (folderPickerBusy) return;
   const replacingExistingFolder=!!activePackRecord()||asArray(state?.packs).length>0;
   const previousFolder=String(state?.paths?.submissionDir||'');
-  // 原稿フォルダを変えると、作業データ領域ごと別のワークスペースに切り替わる。
+  // 原稿フォルダーを変えると、作業データ領域ごと別のワークスペースに切り替わる。
   // 登録済みの原稿も作った一式も画面から消えるため、押した瞬間に実行してはいけない。
   if (replacingExistingFolder) {
     const packCount=asArray(state?.packs).filter(pack=>!pack?.archived).length;
     const sourceCount=asArray(state?.structure?.workbooks).length;
     const accepted=await confirmAction({
-      title:'原稿フォルダを変更しますか？',
-      message:`いま表示している原稿 ${sourceCount} 件と一式 ${packCount} 件は、この画面から見えなくなります。`,
-      detail:`現在のフォルダ：${previousFolder||'(未設定)'}\n\n作業内容が消えるわけではありません。元に戻すには、このフォルダをもう一度選び直してください。`,
+      title:'原稿フォルダーを変更しますか？',
+      message:`いま表示している原稿 ${sourceCount}件と一式 ${packCount}件は、この画面から見えなくなります。`,
+      detail:`現在のフォルダー：${previousFolder||'(未設定)'}\n\n作業内容が消えるわけではありません。元に戻すには、このフォルダーをもう一度選び直してください。`,
       confirmLabel:'変更する',
       danger:true
     });
@@ -4289,7 +4485,7 @@ async function chooseSubmissionFolder(btn) {
   folderPickerBusy = true;
   const old = btn?.textContent;
   if (btn) { btn.disabled = true; btn.textContent = '選択画面を開く'; }
-  showMessage('', '原稿フォルダを選んでください', 'フォルダ選択画面を開いています。');
+  showMessage('', '原稿フォルダーを選んでください', 'フォルダー選択画面を開いています。');
   try {
     await sleep(40); // Let the button/message repaint before the local server opens the native dialog.
     const data = await api('/api/submission/select-and-start', {
@@ -4315,15 +4511,15 @@ async function chooseSubmissionFolder(btn) {
     if (replacingExistingFolder) {
       // 旧パスを残さないと、戻りたくなったときに選び直す先が分からなくなる。
       // 画面のパス表示は既に新しい値へ上書きされている。
-      showMessage('ok', '原稿フォルダを変更しました', '新しいフォルダの原稿を確認しました。',
-        previousFolder?`前のフォルダ：${previousFolder}`:null,
-        previousFolder?[{label:'前のフォルダに戻す',handler:()=>restorePreviousSubmissionFolder(previousFolder)}]:[], 0);
+      showMessage('ok', '原稿フォルダーを変更しました', '新しいフォルダーの原稿を確認しました。',
+        previousFolder?`前のフォルダー：${previousFolder}`:null,
+        previousFolder?[{label:'前のフォルダーに戻す',handler:()=>restorePreviousSubmissionFolder(previousFolder)}]:[], 0);
     } else {
-      showMessage('ok', '原稿フォルダを設定しました', '続けて、今回まとめる一式に名前を付けます。');
+      showMessage('ok', '原稿フォルダーを設定しました', '続けて、今回まとめる一式に名前を付けます。');
     }
     if(replacingExistingFolder)setActiveView('excel');else continueFirstRunAfterFolderSelection();
   } catch(e) {
-    showMessage('danger', '原稿フォルダを選べません', userFriendlyError(e.message), e.detail || e.stack || e.message);
+    showMessage('danger', '原稿フォルダーを選べません', userFriendlyError(e.message), e.detail || e.stack || e.message);
   } finally {
     folderPickerBusy = false;
     if (btn) { btn.disabled = false; btn.textContent = old; }
@@ -4331,7 +4527,7 @@ async function chooseSubmissionFolder(btn) {
 }
 
 // Kept for compatibility with older local pages; the current UX uses chooseSubmissionFolder().
-// 変更直後に「やっぱり戻したい」を1操作で満たす。ネイティブのフォルダ選択画面から
+// 変更直後に「やっぱり戻したい」を1操作で満たす。ネイティブのフォルダー選択画面から
 // 元のパスを探し直させると、パス表示が既に上書きされているため到達できない。
 async function restorePreviousSubmissionFolder(previousFolder) {
   const target=String(previousFolder||'').trim();
@@ -4343,15 +4539,15 @@ async function restorePreviousSubmissionFolder(previousFolder) {
     selectedFiles.clear();selectedWorkbooks.clear();selectedPages.clear();
     lastFileRangeAnchor='';lastWorkbookRangeAnchor='';lastPageRangeAnchor='';
     renderAll();
-    showMessage('ok','前の原稿フォルダに戻しました',target);
+    showMessage('ok','前の原稿フォルダーに戻しました',target);
   }catch(e){
-    showMessage('danger','前のフォルダに戻せません',userFriendlyError(e.message),e.detail||e.stack||e.message);
+    showMessage('danger','前のフォルダーに戻せません',userFriendlyError(e.message),e.detail||e.stack||e.message);
   }
 }
 async function savePaths(btn) {
   const submissionDir = pathElementValue('submissionDir').trim();
   if (!submissionDir) {
-    showMessage('warn', '原稿フォルダを入力してください', 'フォルダのパスを入力するか、「フォルダを選ぶ」を使用してください。');
+    showMessage('warn', '原稿フォルダーを入力してください', 'フォルダーのパスを入力するか、「フォルダーを選ぶ」を使用してください。');
     $('submissionDir')?.focus();
     return;
   }
@@ -4360,7 +4556,7 @@ async function savePaths(btn) {
     await api('/api/paths', {method:'POST', body});
     await refresh();
     await loadFiles(null);
-    showMessage('ok', '原稿フォルダを設定しました', '続けて、今回まとめる一式に名前を付けます。');
+    showMessage('ok', '原稿フォルダーを設定しました', '続けて、今回まとめる一式に名前を付けます。');
     continueFirstRunAfterFolderSelection();
   });
 }
@@ -4383,7 +4579,7 @@ async function buildVolume(volume, btn) {
       return;
     }
     const built=asArray(job.built)[0];
-    showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf||'出力フォルダを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);
+    showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf?`${outputFileName(built.outputPdf)} を保存しました。「PDFを開く」で内容を確認できます。`:'出力フォルダーを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);
     showPostBuildWarning(volume);
   },false);
 }
@@ -4395,7 +4591,7 @@ async function runFinalBuildJob(targetIds){
   if(!ids.length){showMessage('warn','出力先がありません','ページ構成で本体または補足にページを設定してください。');return null;}
   const started=await api('/api/v2/outputs/build',{method:'POST',body:{packId:activePackId,targetIds:ids}});
   const jobId=String(started.job?.jobId||'');
-  if(!jobId)throw new Error('出力ジョブを開始できませんでした。');
+  if(!jobId)throw new Error('提出用PDFの出力を開始できませんでした。もう一度「提出用PDFをまとめて出力」を押してください。');
   activeFinalJobId=jobId;activeFinalCancelRequested=false;
   updateFinalProgressPanel(started.job);
   try{
@@ -4457,7 +4653,7 @@ async function publishFinalVolume(volume,btn) {
     const custom=!activePackIsBuiltIn();
     const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
     const result=response.result||{};
-    showMessage('ok',`${volumeLabel(volume)}PDFを共有用フォルダにコピーしました`,
+    showMessage('ok',`${volumeLabel(volume)}PDFを共有用フォルダーにコピーしました`,
       `${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
       result,[],0);
   });
@@ -4465,7 +4661,12 @@ async function publishFinalVolume(volume,btn) {
 
 async function buildAllVolumes(btn) {
   const unassigned=unresolvedPageCount();
-  if(unassigned){setActiveView('pages');showMessage('warn',`未振り分け ${unassigned}ページを確認してください`,'必要なページを提出用PDFへ移してから出力します。');return;}
+  // Match buildVolume: the per-target button lets you confirm and go ahead, so
+  // refusing outright here made two adjacent buttons disagree about the rule.
+  if(unassigned){
+    const accepted=await confirmAction({title:`未振り分け ${unassigned}ページを除外しますか？`,message:'未振り分けのページは、今回の提出用PDFに入りません。',detail:'ページ構成へ戻って振り分ける場合は「キャンセル」を押してください。',confirmLabel:'除外して出力'});
+    if(!accepted){setActiveView('pages');return;}
+  }
   // V5: 本体だけ成功する状態を作らないよう、組み込みパックの一括出力はサーバー側の
   // 準トランザクションAPIを1回だけ呼ぶ。ジョブ化してもその分岐はサーバー側で維持している。
   await runBusy(btn, async () => {
@@ -4489,9 +4690,19 @@ async function buildAllVolumes(btn) {
 
 
 async function runBusy(btn, fn, showProcessing=true) {
-  if(btn){btn.disabled=true;btn.classList.add('busy');}
+  // Disabling the focused button hands focus to <body>, and most of these
+  // handlers re-render their own button, so remember the id and put focus back
+  // rather than dumping keyboard users at the top of the page after every action.
+  const btnId=btn?.id||'';
+  const hadFocus=!!btn&&document.activeElement===btn;
+  if(btn){btn.disabled=true;btn.classList.add('busy');btn.setAttribute('aria-busy','true');}
   if(showProcessing)showMessage('','処理中です','完了すると画面が更新されます。');
-  try{await fn();}catch(e){hideProgressPanel();showMessage('danger','処理できませんでした',userFriendlyError(e.message),e.detail||e.stack||e.message);}finally{if(btn){btn.disabled=false;btn.classList.remove('busy');}}
+  try{await fn();}catch(e){hideProgressPanel();showMessage('danger','処理できませんでした',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+  finally{
+    const back=(btnId&&$(btnId))||btn;
+    if(back){back.disabled=false;back.classList.remove('busy');back.removeAttribute('aria-busy');}
+    if(hadFocus&&back&&back.isConnected&&document.activeElement===document.body)back.focus({preventScroll:true});
+  }
 }
 
 
@@ -4514,7 +4725,11 @@ function bind(id, event, handler) {
   if (el) el.addEventListener(event, handler);
 }
 
-document.querySelectorAll('[data-view-nav]').forEach(btn=>btn.addEventListener('click',()=>setActiveView(btn.dataset.viewNav)));
+document.querySelectorAll('[data-view-nav]').forEach(btn=>btn.addEventListener('click',()=>{
+  if(btn.classList.contains('nav-locked')){explainPackRequired();return;}
+  setActiveView(btn.dataset.viewNav);
+}));
+bind('pages-next-final','click',()=>setActiveView('final'));
 document.querySelectorAll('[data-view-shortcut]').forEach(btn=>btn.addEventListener('click',()=>setActiveView(btn.dataset.viewShortcut)));
 setActiveView(activeView,{noScroll:true,instant:true});
 const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEventListener('input',()=>{fileFilterText=fileFilterInput.value||'';renderFileList(availableFiles);});
@@ -4546,10 +4761,12 @@ if(pageSearchInput)pageSearchInput.addEventListener('input',()=>{
   if(pageSearchDebounceTimer)clearTimeout(pageSearchDebounceTimer);
   pageSearchDebounceTimer=setTimeout(()=>{
     pageSearchDebounceTimer=null;
-    selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
+    // Keep the selection: renderPages() already drops ids that no longer exist,
+    // and clearing here threw away work every time a filter character was typed.
+    lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
   },180);
 });
-if(pageSearchClear)pageSearchClear.addEventListener('click',()=>{pageFilterText='';if(pageSearchInput){pageSearchInput.value='';pageSearchInput.focus();}pageSearchClear.classList.add('hidden');selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
+if(pageSearchClear)pageSearchClear.addEventListener('click',()=>{pageFilterText='';if(pageSearchInput){pageSearchInput.value='';pageSearchInput.focus();}pageSearchClear.classList.add('hidden');lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 const pageThumbnailSizeInput=$('page-thumbnail-size');if(pageThumbnailSizeInput){pageThumbnailSizeInput.value=String(pageThumbnailSize);pageThumbnailSizeInput.addEventListener('input',()=>applyPageThumbnailSize(pageThumbnailSizeInput.value));pageThumbnailSizeInput.addEventListener('change',()=>{try{sessionStorage.setItem('ReportBinderPageThumbnailSize',String(pageThumbnailSize));}catch{}});}
 bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
 bind('register-selected-btn','click',()=>registerSelected($('register-selected-btn')));bind('unregister-selected-btn','click',()=>unregisterSelected($('unregister-selected-btn')));bind('render-selected-btn','click',()=>renderSelectedWorkbooks($('render-selected-btn')));bind('render-all-btn','click',()=>renderAllWorkbooks($('render-all-btn')));bind('sort-by-sheet-btn','click',()=>sortPagesBySheet($('sort-by-sheet-btn')));
@@ -4563,11 +4780,11 @@ bind('pack-review-approve','click',()=>performPackReviewAction('approve',$('pack
 bind('pack-review-request-changes','click',()=>performPackReviewAction('request-changes',$('pack-review-request-changes')));
 bind('pack-review-reopen','click',()=>performPackReviewAction('reopen',$('pack-review-reopen')));
 const changedOnlyToggle=$('changed-only-toggle');
-if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
+if(changedOnlyToggle)changedOnlyToggle.addEventListener('change',()=>{showChangedOnly=!!changedOnlyToggle.checked;lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 bind('history-refresh-btn','click',()=>loadHistoryPanels({force:true}));
 // V5-P1(#12): 版履歴パネルの対象Excel切り替え。
 bind('snapshot-history-workbook','change',e=>{snapshotHistoryState.workbookId=String(e.target.value||'');try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',snapshotHistoryState.workbookId);}catch{}snapshotHistoryState.snapshots=[];snapshotHistoryState.fromId='';snapshotHistoryState.toId='';const db=$('snapshot-history-diff');if(db)db.innerHTML='';void loadSnapshotHistory();});
-bind('app-menu-button','click',()=>{const pop=$('app-menu-popover'),btn=$('app-menu-button');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));});bind('app-exit-button','click',()=>requestAppShutdown($('app-exit-button')));
+bind('app-menu-button','click',()=>{const pop=$('app-menu-popover'),btn=$('app-menu-button');const hidden=pop.classList.toggle('hidden');btn.setAttribute('aria-expanded',String(!hidden));if(!hidden){closePopoverOnFocusOut(pop,closeAppMenu);requestAnimationFrame(()=>focusFirstIn(pop));}});bind('app-exit-button','click',()=>requestAppShutdown($('app-exit-button')));
 bind('preview-close','click',closePreview);const previewModal=$('preview-modal');if(previewModal)previewModal.addEventListener('click',e=>{if(e.target===previewModal)closePreview();});
 bind('preview-prev-page','click',()=>navigatePreviewPage(-1));bind('preview-next-page','click',()=>navigatePreviewPage(1));bind('preview-move-none','click',()=>moveCurrentPreviewPageToVolume('none',$('preview-move-none')));
 bind('diff-close','click',closeDiffDetail);
@@ -4595,7 +4812,7 @@ bind('diff-next-region','click',()=>moveDiffRegion(1));
 bind('diff-confirm-sheet','click',()=>toggleDiffSheetReviewed($('diff-confirm-sheet')));
 document.querySelectorAll('[data-diff-tab]').forEach(btn=>btn.addEventListener('click',()=>{
   diffViewState.mobileTab=btn.dataset.diffTab||'before';
-  document.querySelectorAll('[data-diff-tab]').forEach(x=>x.classList.toggle('active',x===btn));
+  document.querySelectorAll('[data-diff-tab]').forEach(x=>{x.classList.toggle('active',x===btn);x.setAttribute('aria-pressed',String(x===btn));});
   $('diff-viewers')?.classList.toggle('show-after',diffViewState.mobileTab==='after');
   requestAnimationFrame(updateDiffStageScale);
 }));
@@ -4609,12 +4826,19 @@ window.addEventListener('keydown',e=>{
   if(activeView==='pages'&&!isAnyModalOpen()&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!editableTarget&&shortcutKey==='a'){e.preventDefault();selectAllActivePages();return;}
   if(activeView==='pages'&&!isAnyModalOpen()&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!editableTarget){const wantsUndo=shortcutKey==='z'&&!e.shiftKey,wantsRedo=(shortcutKey==='z'&&e.shiftKey)||(shortcutKey==='y'&&!e.shiftKey),available=wantsUndo?(pageLayoutUndoStack.length>0||!!pendingPageLayoutUndo):(wantsRedo&&pageLayoutRedoStack.length>0);if(available){e.preventDefault();void(wantsUndo?undoLastPageLayout():redoLastPageLayout());return;}}
   if(e.key==='Escape'){
+    // Cancel an in-flight drag first. Previously Escape fell through to
+    // clearActivePageSelection(), which unhighlighted the rows but left the
+    // drag running, so the "cancelled" move still committed on drop.
+    if(draggingRow){e.preventDefault();finishPointerDrag(false);return;}
     if(isConfirmModalOpen())closeConfirmModal(false);else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('app-menu-popover')?.classList.contains('hidden'))closeAppMenu(true);else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
     return;
   }
   if(isModalOpen()&&!isDiffModalOpen()&&previewOrganizerMode&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!e.target.matches('input,select,textarea')&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();void navigatePreviewPage(e.key==='ArrowLeft'?-1:1);return;}
   if(e.key!=='Tab')return;
   const modal=isConfirmModalOpen()?$('confirm-modal'):(isPageLayoutRevisionsOpen()?$('page-layout-revisions-modal'):(isTemplateManagerOpen()?$('template-manager-modal'):(isPackEditorOpen()?$('pack-editor-modal'):(isDiffModalOpen()?$('diff-modal'):(isModalOpen()?$('preview-modal'):null)))));
+  // The pack switcher and the app menu are NOT trapped: they have no scrim and a
+  // click anywhere outside dismisses them, so they are non-modal popovers. They
+  // get focus-in, Escape and focus-return instead; tabbing past closes them.
   if(!modal)return;
   const focusable=[...modal.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"]),iframe')].filter(el=>el.offsetParent!==null);
   if(!focusable.length)return;
@@ -4695,25 +4919,26 @@ function renderAutoStatus(){
   const attentionCount=items.filter(item=>!['idle',''].includes(String(item.state||''))).length;
   const statusText=attentionCount?`${attentionCount}件に対応が必要`:auto.enabled?`有効・変更後 ${Math.round(Number(auto.quietPeriodSeconds||180)/60)}分待機`:'無効';
   box.innerHTML=`<details class="secondary-disclosure auto-disclosure"><summary><span>自動PDF作成</span><small>${escapeHtml(statusText)}</small></summary><div class="secondary-disclosure-body"><div class="disclosure-actions"><p>${attentionCount?'保留中または再試行待ちの原稿があります。':'原稿更新後のPDF作成を自動化できます。'}</p><button class="btn ghost compact" type="button" data-auto-settings-toggle>設定を変更</button></div><div class="auto-settings" data-auto-settings hidden><label><input id="auto-enabled" type="checkbox" ${auto.enabled?'checked':''}> 自動PDF作成を有効にする</label><label>静止待ち<select id="auto-quiet-seconds">${[[60,'1分'],[180,'3分'],[300,'5分'],[600,'10分']].map(([value,label])=>`<option value="${value}" ${Number(auto.quietPeriodSeconds||180)===value?'selected':''}>${label}</option>`).join('')}</select></label><label>失敗時の再試行<select id="auto-max-retries">${[0,1,3,5].map(value=>`<option value="${value}" ${Number(auto.maxRetryCount||3)===value?'selected':''}>${value}回</option>`).join('')}</select></label><label>必要な空き容量<select id="auto-min-free">${[[512,'0.5 GB'],[1024,'1 GB'],[2048,'2 GB'],[5120,'5 GB']].map(([value,label])=>`<option value="${value}" ${Number(auto.minFreeMegabytes||1024)===value?'selected':''}>${label}</option>`).join('')}</select></label><label><input id="auto-notify-success" type="checkbox" ${auto.notifyOnCompletion!==false?'checked':''}> 完了を通知</label><label><input id="auto-notify-failure" type="checkbox" ${auto.notifyOnFailure!==false?'checked':''}> 失敗を通知</label><button class="btn primary compact" type="button" data-auto-settings-save>保存</button></div>`
-    +(items.length?`<div class="auto-list">${lines}</div>`:'<div class="caption">保留中の変更はありません。</div>')
+    +(items.length?`<div class="auto-list">${lines}</div>`:'<div class="caption">自動処理の待ち行列は空です。原稿を更新すると、ここに検知した変更が並びます。</div>')
     +(overCap?`<p class="warn-strip">変更履歴の使用量が ${size}MB です（上限の目安 ${cap}MB）。</p>`:'')
     +'</div></details>';
-  box.querySelectorAll('[data-auto-run]').forEach(b=>b.addEventListener('click',async()=>{
-    try{await api('/api/auto/run-now',{method:'POST',body:{workbookId:b.getAttribute('data-auto-run')}});await refresh();}
-    catch(e){showMessage('danger','実行を要求できません',userFriendlyError(e.message));}
-  }));
+  box.querySelectorAll('[data-auto-run]').forEach(b=>b.addEventListener('click',()=>runBusy(b,async()=>{
+    await api('/api/auto/run-now',{method:'POST',body:{workbookId:b.getAttribute('data-auto-run')}});
+    await refresh();
+    showMessage('ok','実行を要求しました','変換の開始を待っています。');
+  },false)));
   box.querySelector('[data-auto-settings-toggle]')?.addEventListener('click',()=>{const settings=box.querySelector('[data-auto-settings]');if(settings)settings.hidden=!settings.hidden;});box.querySelector('[data-auto-settings-save]')?.addEventListener('click',event=>saveAutoSettings(event.currentTarget));
 }
 
 async function loadHistoryTimeline(){
   const box=$('history-timeline');
   if(!box)return;
-  if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴は無効です。</div>';return;}
+  if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴の記録がオフになっているため、更新前後の比較は利用できません。比較を使うには、情報システム担当者に変更履歴の有効化を依頼してください。</div>';return;}
   try{
     const r=await api('/api/history/timeline?limit=50');
     const events=asArray(r.events);
     if(!events.length){box.innerHTML='<div class="caption">履歴はまだありません。</div>';return;}
-    const label={'input.snapshot.created':'提出Excelの変更を検知','input.snapshot.deduplicated':'同じ内容を再検知','input.source.removed':'保存期限により現物を削除','render.started':'PDF作成を開始','render.completed':'PDF作成が完了','render.failed':'PDF作成に失敗','compare.completed':'変更を判定','layout.changed':'ページ構成を変更','layout.restored':'ページ構成を復元','final.built':'最終PDFを出力','final.build.failed':'最終PDFの出力に失敗','final.archive.created':'最終PDFを保存','final.published':'最終PDFを共有発行','auto.detected':'自動処理が変更を検知','auto.deferred':'自動処理を保留','history.cleanup':'履歴を整理'};
+    const label={'input.snapshot.created':'提出Excelの変更を検知','input.snapshot.deduplicated':'同じ内容を再検知','input.source.removed':'保存期限により現物を削除','render.started':'PDF作成を開始','render.completed':'PDF作成が完了','render.failed':'PDF作成に失敗','compare.completed':'変更を判定','layout.changed':'ページ構成を変更','layout.restored':'ページ構成を復元','final.built':'提出用PDFを出力','final.build.failed':'提出用PDFの出力に失敗','final.archive.created':'提出用PDFを保存','final.published':'提出用PDFを共有発行','auto.detected':'自動処理が変更を検知','auto.deferred':'自動処理を保留','history.cleanup':'履歴を整理'};
     box.innerHTML=events.map(e=>{
       const t=String(e.eventType||'');
       return `<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(e.at))}</span><span>${escapeHtml(label[t]||t)}</span><span class="subtext">${escapeHtml(String(e.data?.workbookId||e.data?.category||''))}</span></div>`;
@@ -4738,7 +4963,7 @@ function closePageLayoutRevisions(returnFocus=true){
 async function loadLayoutSnapshots(){
   const box=$('page-layout-revisions-list');
   if(!box)return;
-  if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴は無効です。</div>';return;}
+  if(!state?.inputHistoryEnabled){box.innerHTML='<div class="caption">変更履歴の記録がオフになっているため、更新前後の比較は利用できません。比較を使うには、情報システム担当者に変更履歴の有効化を依頼してください。</div>';return;}
   box.innerHTML='<div class="empty-state">保存履歴を読み込んでいます。</div>';
   try{
     const custom=!activePackIsBuiltIn();
@@ -4748,11 +4973,15 @@ async function loadLayoutSnapshots(){
     const reasonLabel={reorder:'ページの移動・並べ替え','sort-by-sheet':'原稿内の順序に整える','page-update':'ページ設定の変更','volume-change':'出力先の変更',numbering:'ページ番号の変更',enabled:'出力対象の変更',restore:'復元',
       'pre-restore':'復元の直前'};
     box.innerHTML=list.map(x=>`<div class="page-layout-revision"><div><strong>${escapeHtml(reasonLabel[String(x.reason||'')]||String(x.reason||'ページ構成の変更'))}</strong><span>${escapeHtml(formatDateTime(x.createdAt))}・${Number(x.pageCount||0)}ページ</span></div><button class="btn secondary compact" type="button" data-restore-layout="${escapeAttr(x.snapshotId)}">この構成に戻す</button></div>`).join('');
-    box.querySelectorAll('[data-restore-layout]').forEach(b=>b.addEventListener('click',()=>previewLayoutRestore(b.getAttribute('data-restore-layout'))));
+    box.querySelectorAll('[data-restore-layout]').forEach(b=>b.addEventListener('click',()=>previewLayoutRestore(b.getAttribute('data-restore-layout'),b)));
   }catch(e){box.innerHTML=`<div class="empty-state">履歴を読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
 }
 
-async function previewLayoutRestore(snapshotId){
+async function previewLayoutRestore(snapshotId, btn){
+  // Both the preview fetch and the restore itself can take seconds; with no
+  // busy state people pressed again and the second press replaced the confirm
+  // dialog that the first press was still opening.
+  if(btn){if(btn.disabled)return;btn.disabled=true;btn.classList.add('busy');}
   try{
     const custom=!activePackIsBuiltIn(),body=custom?{packId:activePackId,snapshotId}:{category:activePreset,snapshotId};
     const r=await api(custom?'/api/v2/layout/restore/preview':'/api/layout/restore/preview',{method:'POST',body});
@@ -4773,6 +5002,7 @@ async function previewLayoutRestore(snapshotId){
     showMessage('ok','ページ構成を復元しました',`${Number(res.result?.appliedPageCount||0)}ページに適用しました。取り消す場合は保存履歴の「復元の直前」から戻せます。`,null,
                 [{label:'提出用PDFを確認',view:'final'}],0);
   }catch(e){showMessage('danger','復元できません',userFriendlyError(e.message));}
+  finally{if(btn&&btn.isConnected){btn.disabled=false;btn.classList.remove('busy');}}
 }
 
 function volumeLabel(v){
@@ -4786,7 +5016,7 @@ async function loadFinalArchives(){
   try{
     const r=await api(activePackIsBuiltIn()?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(activePackId)}`);
     const list=asArray(r.archives);
-    if(!list.length){box.innerHTML='<div class="caption">保存された出力はまだありません。</div>';return;}
+    if(!list.length){box.innerHTML='<div class="caption">保存された出力はまだありません。提出用PDFを出力すると、その時点のPDFを自動で保存します。</div>';return;}
     box.innerHTML=list.slice(0,20).map(a=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(a.builtAt))}</span><span>${escapeHtml(volumeLabel(a.volume))}</span><span class="subtext">${escapeHtml(String(a.outputFileName||''))}（${Number(a.pageCount||0)}ページ）</span></div>`).join('');
   }catch(e){box.innerHTML=`<div class="caption">読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
 }
@@ -4869,7 +5099,7 @@ async function loadSnapshotHistory(options={}){
   const requestSerial=++snapshotHistoryLoadSerial;
   const box=$('snapshot-history'), diffBox=$('snapshot-history-diff');
   if(!box)return;
-  if(!state?.inputHistoryEnabled){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">変更履歴は無効です。</div>';if(diffBox)diffBox.innerHTML='';return;}
+  if(!state?.inputHistoryEnabled){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">変更履歴の記録がオフになっているため、更新前後の比較は利用できません。比較を使うには、情報システム担当者に変更履歴の有効化を依頼してください。</div>';if(diffBox)diffBox.innerHTML='';return;}
   populateSnapshotHistoryWorkbooks();
   const wbId=String(snapshotHistoryState.workbookId||'');
   if(!wbId){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">対象原稿を選ぶと、版の一覧・差分・保護を表示します。</div>';if(diffBox)diffBox.innerHTML='';return;}
@@ -4891,7 +5121,7 @@ async function loadSnapshotHistory(options={}){
       const selectedFrom=String(snapshotHistoryState.fromId)===id,selectedTo=String(snapshotHistoryState.toId)===id;
       return `<li class="snapshot-timeline-item ${selectedFrom?'selected-from ':''}${selectedTo?'selected-to':''}" data-snapshot-id="${escapeAttr(id)}"><span class="snapshot-timeline-marker" aria-hidden="true"></span><div class="snapshot-card"><div class="snapshot-card-main"><div class="snapshot-title"><time>${escapeHtml(formatDateTime(s.detectedAt))}</time>${index===0?badge('最新版','neutral'):''}${pinned?badge('保護中','neutral'):''}</div><p>${ready?'この版は視覚比較に使えます。':escapeHtml(reason)}</p><details><summary>版の詳細</summary><span>現物: ${escapeHtml(retained)} ／ 識別: ${escapeHtml(hash)}</span></details></div><div class="snapshot-card-actions"><div class="snapshot-role-buttons" aria-label="比較での役割"><button class="btn ghost compact ${selectedFrom?'active':''}" type="button" data-snapshot-from="${escapeAttr(id)}" aria-pressed="${selectedFrom}" ${disabled}>比較元にする</button><button class="btn ghost compact ${selectedTo?'active':''}" type="button" data-snapshot-to="${escapeAttr(id)}" aria-pressed="${selectedTo}" ${disabled}>比較先にする</button></div><button class="btn ghost compact" type="button" data-snap-pin="${escapeAttr(id)}" data-pinned="${pinned?'1':'0'}">${pinned?'保護を解除':'この版を保護'}</button></div></div></li>`;
     }).join('')}</ol><div class="snapshot-footer-actions"><button class="btn ghost compact" id="snap-swap-btn" type="button" ${ready.length<2?'disabled':''}>比較元・比較先を入れ替え</button><button class="btn primary compact" id="snap-diff-btn" type="button" ${ready.length<2?'disabled':''}>選んだ2版を比較</button></div>`;
-    box.querySelectorAll('[data-snap-pin]').forEach(b=>b.addEventListener('click',()=>toggleSnapshotPin(wbId,b.getAttribute('data-snap-pin'),b.getAttribute('data-pinned')==='1')));
+    box.querySelectorAll('[data-snap-pin]').forEach(b=>b.addEventListener('click',()=>toggleSnapshotPin(wbId,b.getAttribute('data-snap-pin'),b.getAttribute('data-pinned')==='1',b)));
     box.querySelectorAll('[data-snapshot-from]').forEach(el=>el.addEventListener('click',()=>{snapshotHistoryState.fromId=el.dataset.snapshotFrom;syncSnapshotHistorySelectionInputs();}));
     box.querySelectorAll('[data-snapshot-to]').forEach(el=>el.addEventListener('click',()=>{snapshotHistoryState.toId=el.dataset.snapshotTo;syncSnapshotHistorySelectionInputs();}));
     const swap=$('snap-swap-btn');if(swap)swap.addEventListener('click',()=>{const previousFrom=snapshotHistoryState.fromId;snapshotHistoryState.fromId=snapshotHistoryState.toId;snapshotHistoryState.toId=previousFrom;syncSnapshotHistorySelectionInputs();});
@@ -4903,13 +5133,17 @@ async function loadSnapshotHistory(options={}){
   }
 }
 
-async function toggleSnapshotPin(workbookId, snapshotId, pinned){
+async function toggleSnapshotPin(workbookId, snapshotId, pinned, btn){
+  // Without a busy state the button looked inert during the round trip, and a
+  // double press sent pin and unpin back to back.
+  if(btn){if(btn.disabled)return;btn.disabled=true;btn.classList.add('busy');}
   try{
     await api(pinned?'/api/history/unpin':'/api/history/pin',{method:'POST',body:{workbookId,snapshotId}});
     showMessage('ok',pinned?'保護を解除しました':'この版を保護しました',pinned?'':'保存期限による自動削除から守ります。');
     snapshotHistoryResponseCache.delete(String(workbookId||''));
     await loadSnapshotHistory({force:true});
   }catch(e){showMessage('danger','操作できません',userFriendlyError(e.message));}
+  finally{if(btn){btn.disabled=false;btn.classList.remove('busy');}}
 }
 
 async function loadSnapshotDiff(workbookId){
@@ -4919,7 +5153,7 @@ async function loadSnapshotDiff(workbookId){
   const toItem=snapshotHistoryState.snapshots.find(s=>String(s.snapshotId)===to);
   if(!from||!to){diffBox.innerHTML='<div class="caption">比較可能な版から比較元と比較先を選んでください。</div>';return;}
   if(from===to){diffBox.innerHTML='<div class="caption">異なる2版を選んでください。</div>';return;}
-  if(!fromItem?.visualCompareReady||!toItem?.visualCompareReady){diffBox.innerHTML='<div class="caption">画像ハッシュと同一世代のcontent PDFがそろった版だけ比較できます。</div>';return;}
+  if(!fromItem?.visualCompareReady||!toItem?.visualCompareReady){diffBox.innerHTML='<div class="caption">この2つの版は比較できません。どちらかの版が古く、比較に使うPDFが残っていないためです。新しい2つの版を選び直してください。</div>';return;}
   diffBox.innerHTML='<div class="caption">選択した履歴版の差分を準備します。自動比較の基準は変更されません。</div>';
   await openDiffDetail(workbookId,$('snap-diff-btn'),{fromSnapshotId:from,toSnapshotId:to});
 }

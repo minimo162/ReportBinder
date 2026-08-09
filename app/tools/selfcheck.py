@@ -317,11 +317,11 @@ for needle in ['unregistered-card','registered-card','workbook-context-bar','ren
     if needle not in html: raise SystemExit(f'v4.3 Excel HTML feature not found: {needle}')
 for needle in ['font-family:"Segoe UI","BIZ UDPGothic","BIZ UDPゴシック"','grid-template-columns:minmax(460px,.82fr) minmax(650px,1.18fr)','font-size:16px','.workbook-table{width:100%;min-width:0']:
     if needle not in css: raise SystemExit(f'v4.3 readability CSS feature not found: {needle}')
-for needle in ['.workbook-table .pdf-status-col{width:320px}', '.excel-grid{grid-template-columns:minmax(340px,.65fr) minmax(720px,1.35fr)', '.excel-grid>.card+.card{margin-top:0}', '.excel-grid .file-name-cell strong{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere', '.pdf-status-stack{display:grid;gap:5px}', '@media(max-width:1320px){.excel-grid{grid-template-columns:1fr}']:
+for needle in ['.workbook-table .pdf-status-col{width:320px}', '.excel-grid{grid-template-columns:minmax(360px,.62fr) minmax(600px,1.38fr)', '.excel-grid>.card+.card{margin-top:0}', '.excel-grid .file-name-cell strong{overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere', '.pdf-status-stack{display:grid;gap:5px}', '@media(max-width:1320px){.excel-grid{grid-template-columns:1fr}']:
     if needle not in css: raise SystemExit(f'change column readability CSS missing: {needle}')
 for needle in ['<div class="file-meta"', '更新日時：', '変換PDF作成日時：', '<th class="pdf-status-col">変換PDFの状態</th>', '原稿更新あり', 'PDFを再作成して更新を反映してください', '見た目変更 ${affected}', 'class="pdf-comparison-link"', 'data-open-history', 'sourceTypeBadge', 'data-source-owner', 'data-source-required']:
     if needle not in appjs: raise SystemExit(f'file identity UX feature missing: {needle}')
-for needle in ['class="source-advanced-settings"', '<summary>原稿の扱いを変更</summary>', '最終PDFに必須', '更新で増えたページの追加先', '既に並べたページは移動しません', 'data-source-settings-details', 'activePackDefaultTargetLabel()', '一式の既定：']:
+for needle in ['class="source-advanced-settings"', '<summary>原稿の扱いを変更</summary>', '提出用PDFに必須', '更新で増えたページの追加先', '既に並べたページは移動しません', 'data-source-settings-details', 'activePackDefaultTargetLabel()', '一式の既定：']:
     if needle not in appjs: raise SystemExit(f'advanced source settings disclosure missing: {needle}')
 if 'ひな形に従う' in appjs:
     raise SystemExit('source settings must explain the default instead of saying template-driven')
@@ -1153,7 +1153,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260808_v150', 'style.css?v=20260808_v93']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v159', 'style.css?v=20260809_v102']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1208,7 +1208,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260808_v150' not in html:
+if 'app.js?v=20260809_v159' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1234,7 +1234,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260808_v150' not in html:
+if 'app.js?v=20260809_v159' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1371,10 +1371,10 @@ for needed in ['$proc.WaitForExit(60000)', '$proc.Kill()', '画面でパスを�
 # 2026-08-08 first-time novice onboarding -----------------------------------
 for needed in ['ReportBinderでできること', '複数の原稿を、必要な順番で1つのPDFにまとめる',
                'id="dashboard-onboarding"', '原稿を集める', '順番を整える', '1つのPDFにする',
-               'フォルダを選べない場合', '保存先の詳しい説明']:
+               'フォルダーを選べない場合', '保存先の詳しい説明']:
     if needed not in html:
         raise SystemExit(f'first-time purpose/onboarding copy is missing: {needed}')
-for needed in ['はじめる：原稿が入ったフォルダを選ぶ', "action.textContent='はじめる'",
+for needed in ['はじめる：原稿が入ったフォルダーを選ぶ', "action.textContent='はじめる'",
                'function continueFirstRunAfterFolderSelection', "setTimeout(()=>openPackEditor('create'),120)",
                "if(!wasRename){setActiveView('excel')", "button.disabled=!configured()&&!selected"]:
     if needed not in appjs:
@@ -1573,7 +1573,7 @@ for needed in ['ページをクリックして選ぶ', '移動先を押す', '�
                'createPageDragGhost', 'directCardDrag', 'page-drag-ghost']:
     if needed not in html + appjs + css:
         raise SystemExit(f'direct page movement UX missing: {needed}')
-for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・検索・履歴</summary>', 'page-command-bar:not(.has-selection) .page-destination-actions']:
+for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・絞り込み・並び</summary>', '.page-command-bar:not(.has-selection) .page-destination-actions{opacity:.55}']:
     if needed not in html + css:
         raise SystemExit(f'page composition progressive disclosure missing: {needed}')
 if "pages: 'ページ構成'" not in appjs:
@@ -1605,7 +1605,7 @@ for needed in ['function previewOrganizerPageIds', 'function syncPreviewOrganize
                "currentCard?.querySelector('[data-preview-page]')"]:
     if needed not in appjs:
         raise SystemExit(f'page-preview organizer behavior missing: {needed}')
-for needed in ['.preview-page-tools', '.preview-page-assign', '.notice{z-index:120}']:
+for needed in ['.preview-page-tools', '.preview-page-assign', '.notice{z-index:180}']:
     if needed not in css:
         raise SystemExit(f'page-preview organizer styling missing: {needed}')
 
@@ -1933,8 +1933,8 @@ if appjs.count("e.code==='structure-conflict'") + appjs.count("error.code==='str
 
 # 2026-08-09 changing the source folder is a workspace switch ---------------
 _choose = appjs.split('async function chooseSubmissionFolder(', 1)[1].split('\nasync function ', 1)[0]
-for needed in ['confirmAction({', '原稿フォルダを変更しますか？', 'danger:true', 'if(!accepted)return;',
-               'const previousFolder=', '前のフォルダに戻す']:
+for needed in ['confirmAction({', '原稿フォルダーを変更しますか？', 'danger:true', 'if(!accepted)return;',
+               'const previousFolder=', '前のフォルダーに戻す']:
     if needed not in _choose:
         raise SystemExit(f'source folder change guard missing: {needed}')
 # 初回設定は既存の一式が無いので、確認を挟むと最初の一歩が増えるだけになる。
