@@ -4,6 +4,9 @@ app/logs/*
 app/cache/
 app/temp/
 app/tmp/
+# Repository-root scratch space (debug runs, audit workspaces, sample PDFs).
+# Anchored with a leading slash so only this one is ignored, not tmp/ elsewhere.
+/tmp/
 app/output/
 app/history/
 app/snapshots/
