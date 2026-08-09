@@ -18,6 +18,13 @@ try {
     $definitions = $server.Substring(0, $startupAt)
     $definitions = $definitions.Replace('$Script:AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path', '$Script:AppRoot = $env:REPORTBINDER_ADAPTER_APPROOT')
     $testBody = @'
+# REPORTBINDER_SELFCHECK_TRACE が指す先へ段階を追記する。1行ごとに開いて閉じるので、
+# プロセスを強制終了されてもそこまでの記録が残る。未設定なら何もしない。
+function Write-SelfcheckTrace([string]$Stage) {
+    $path = [string]$env:REPORTBINDER_SELFCHECK_TRACE
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    try { [IO.File]::AppendAllText($path, ((Get-Date).ToString('HH:mm:ss.fff') + ' ' + $Stage + [Environment]::NewLine)) } catch { }
+}
 function Assert-AdapterTest([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
@@ -60,6 +67,7 @@ function New-TestPresentationPdf([string]$Path, [int]$ExpectedPages) {
     }
     throw "Could not create a $ExpectedPages-page presentation PDF fixture."
 }
+Write-SelfcheckTrace 'definitions loaded'
 $submissionDir = Join-Path $Script:LocalConfigRoot 'submission'
 $dataDir = Join-Path $Script:LocalConfigRoot 'data'
 $outputDir = Join-Path $Script:LocalConfigRoot 'output'
@@ -101,11 +109,14 @@ $validatedXlsm = Test-SourceCandidate ([pscustomobject]@{ relativePath='01_ECM_a
 Assert-AdapterTest ([bool]$validatedXlsm.ok -and (Resolve-SourceTypeFromPath '01_ECM_adapter.xlsm') -eq 'excel') 'Macro-enabled Excel candidate validation failed.'
 $validatedPptx = Test-SourceCandidate ([pscustomobject]@{ relativePath='02_ECM_presentation.pptx'; sourceType='powerpoint' })
 Assert-AdapterTest ([bool]$validatedPptx.ok -and (Resolve-SourceTypeFromPath '02_ECM_presentation.pptx') -eq 'powerpoint') 'PowerPoint candidate validation failed.'
+Write-SelfcheckTrace 'before Inspect-PowerPointSourceFile'
 $pptxInspection = Inspect-PowerPointSourceFile $pptxPath
 Assert-AdapterTest ([int]$pptxInspection.pageCount -eq 2 -and @($pptxInspection.units).Count -eq 2) 'PowerPoint inspection did not enumerate slides.'
+Write-SelfcheckTrace 'before Get-SourceCandidates'
 $powerPointCandidates = @(Get-SourceCandidates @('powerpoint'))
 Assert-AdapterTest ($powerPointCandidates.Count -eq 1 -and [string]$powerPointCandidates[0].adapterId -eq 'powerpoint-com-v1') 'PowerPoint candidate scanning failed.'
 
+Write-SelfcheckTrace 'before Register-SourcesBatch excel'
 $batch = Register-SourcesBatch 'ja' @('01_ECM_adapter.xlsx','01_ECM_adapter.xlsx') 'pack_ecm' 'excel'
 Assert-AdapterTest ([int]$batch.registeredCount -eq 1 -and [int]$batch.errorCount -eq 0) 'Source batch registration failed or duplicate was not removed.'
 $sourceId = [string]$batch.registered[0].sourceId
@@ -117,17 +128,20 @@ Assert-AdapterTest ($source.Count -eq 1) 'Registered schema v3 source is missing
 Assert-AdapterTest ([string]$source[0].packId -eq 'pack_ecm' -and [string]$source[0].sourceType -eq 'excel' -and [string]$source[0].adapterId -eq 'excel-com-v1') 'Registered source adapter fields are invalid.'
 $context = Get-RegisteredSourceAdapterContext 'ja' $sourceId
 Assert-AdapterTest ([string]$context.adapter.adapterId -eq 'excel-com-v1') 'Registered source did not resolve through adapter dispatcher.'
+Write-SelfcheckTrace 'before Register-SourcesBatch powerpoint'
 $pptBatch = Register-SourcesBatch 'ja' @('02_ECM_presentation.pptx') 'pack_ecm' 'powerpoint'
 Assert-AdapterTest ([int]$pptBatch.registeredCount -eq 1 -and [int]$pptBatch.errorCount -eq 0) 'PowerPoint source registration failed.'
 $pptContext = Get-RegisteredSourceAdapterContext 'ja' ([string]$pptBatch.registered[0].sourceId)
 Assert-AdapterTest ([string]$pptContext.sourceType -eq 'powerpoint' -and [string]$pptContext.adapter.adapterId -eq 'powerpoint-com-v1') 'Registered PowerPoint source did not resolve through the adapter dispatcher.'
 $pptSourceId = [string]$pptBatch.registered[0].sourceId
 $Script:PowerPointFixturePdf = Join-Path $Script:LocalConfigRoot 'powerpoint-render-fixture.pdf'
+Write-SelfcheckTrace 'before New-TestPresentationPdf'
 New-TestPresentationPdf $Script:PowerPointFixturePdf 2
 function Invoke-PowerPointToPdf([string]$InputPath, [string]$OutputPath, [int]$TimeoutSeconds = 0) {
     Copy-Item -LiteralPath $Script:PowerPointFixturePdf -Destination $OutputPath -Force
     return [pscustomobject][ordered]@{ ok=$true; powerPointVersion='selfcheck'; outputPath=$OutputPath }
 }
+Write-SelfcheckTrace 'before Render-Source'
 $pptRendered = Render-Source 'ja' $pptSourceId
 Assert-AdapterTest ([string]$pptRendered.sourceType -eq 'powerpoint' -and @($pptRendered.rendered).Count -eq 2) 'PowerPoint rendering did not preserve every slide.'
 $pptStructure = Get-Structure 'ja'
@@ -151,6 +165,7 @@ $updatedV4 = ConvertTo-V4StructureCompatibilityView $updatedStructure
 Assert-AdapterTest ([string]$updatedV4.workbooks[0].ownerDepartment -eq '経理部' -and -not [bool]$updatedV4.workbooks[0].required) 'Source metadata was not mirrored to V4 compatibility.'
 $v2State = Get-V2StatePayload 'ja'
 Assert-AdapterTest ([int]$v2State.apiVersion -eq 2 -and [int]$v2State.domainSchemaVersion -eq 3 -and @($v2State.packs).Count -eq 0) 'V2 state payload is invalid.'
+Write-SelfcheckTrace 'done'
 Write-Output 'source-adapter selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

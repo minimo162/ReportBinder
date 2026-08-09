@@ -374,10 +374,20 @@ def run_powershell_selfcheck(script_name, marker, label, timeout=90):
     # 「プロセスが終わらないこと」だけに掛かる。
     script_path = root/'app/tools'/script_name
     started = time.monotonic()
+    # 段階トレース。強制終了で標準出力のバッファは失われるため、どこまで進んだかは
+    # 1行ごとに開いて閉じる別ファイルへ書かせる。
+    trace_path = os.path.join(tempfile.gettempdir(), 'reportbinder-selfcheck-trace-%d.log' % os.getpid())
+    try:
+        if os.path.exists(trace_path):
+            os.remove(trace_path)
+    except OSError:
+        pass
+    child_env = dict(os.environ)
+    child_env['REPORTBINDER_SELFCHECK_TRACE'] = trace_path
     with tempfile.TemporaryFile() as sink:
         proc = subprocess.Popen(
             [powershell,'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',str(script_path)],
-            cwd=root, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT
+            cwd=root, env=child_env, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT
         )
         try:
             returncode = proc.wait(timeout=timeout)
@@ -394,10 +404,17 @@ def run_powershell_selfcheck(script_name, marker, label, timeout=90):
                                            capture_output=True, text=True, timeout=30).stdout
             except Exception:
                 pass
+            trace = ''
+            try:
+                with open(trace_path, encoding='utf-8', errors='replace') as handle:
+                    trace = handle.read()
+            except OSError:
+                trace = '(no trace file)'
             raise SystemExit(
                 '{0} timed out after {1}s (actual wall clock {2:.1f}s)\n'
-                '--- surviving java processes ---\n{3}\n--- output so far ---\n{4}'.format(
-                    label, timeout, time.monotonic()-started, survivors, partial))
+                '--- stage trace (last line is where it stopped) ---\n{3}\n'
+                '--- surviving java processes ---\n{4}\n--- output so far ---\n{5}'.format(
+                    label, timeout, time.monotonic()-started, trace, survivors, partial))
         sink.seek(0)
         output = sink.read().decode('utf-8','replace')
     if returncode != 0 or marker not in output:
