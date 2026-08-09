@@ -369,9 +369,14 @@ if powershell:
     )
     if schema_check.returncode != 0 or 'schema-v3 selfcheck ok' not in schema_check.stdout:
         raise SystemExit('schema v3 PowerShell selfcheck failed:\n'+schema_check.stdout)
+    # 90秒では足りない。source-adapter-selfcheck.ps1 の New-TestPresentationPdf は
+    # 目的のページ数になるまで最大23回ループし、その各回で PDFBox の JVM を起動する。
+    # これを2箇所から呼ぶため、JVM起動が遅いマシン(CIランナーはウイルス対策の
+    # スキャンも入る)では所要時間が跳ね上がる。ローカルでは7.6秒だが、CIでは90秒を
+    # 超えて打ち切られた。処理量は有界なので、ハングの検出は300秒でも果たせる。
     adapter_check=subprocess.run(
         [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/source-adapter-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
+        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300
     )
     if adapter_check.returncode != 0 or 'source-adapter selfcheck ok' not in adapter_check.stdout:
         raise SystemExit('source adapter PowerShell selfcheck failed:\n'+adapter_check.stdout)
