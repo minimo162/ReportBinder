@@ -1,5 +1,5 @@
 ﻿from pathlib import Path
-import json, os, re, shutil, subprocess, zipfile
+import json, os, re, shutil, subprocess, tempfile, time, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
@@ -362,25 +362,53 @@ for needed in ['function Get-SourceAdapterDescriptor','function Test-SourceCandi
                "adapterId = 'excel-com-v1'",'Render-Source $language $id $excel $true']:
     if needed not in server: raise SystemExit(f'source adapter feature missing: {needed}')
 powershell = shutil.which('powershell.exe') or shutil.which('powershell')
+def run_powershell_selfcheck(script_name, marker, label, timeout=90):
+    # stdout=subprocess.PIPE を使わない。subprocess のタイムアウトはプロセスの終了
+    # ではなくパイプの EOF を待つ。PowerShell が起動した java は CreateProcess の
+    # ハンドル継承でこのパイプの書き込み端を受け取るため、PowerShell が終了しても
+    # (あるいは kill されても) java が生きている限り EOF は来ず、Python は待たされ
+    # 続ける。さらに subprocess.run は TimeoutExpired を捕まえたあとタイムアウト
+    # なしで communicate を再実行するので、例外が報告する秒数は実際の経過時間と
+    # 一致しない。ローカル実測では timeout=5 指定の例外が19.4秒後に発生した。
+    # 一時ファイルへ落とせばリーダースレッドが不要になり、タイムアウトは素直に
+    # 「プロセスが終わらないこと」だけに掛かる。
+    script_path = root/'app/tools'/script_name
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as sink:
+        proc = subprocess.Popen(
+            [powershell,'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',str(script_path)],
+            cwd=root, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT
+        )
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # proc.kill() は PowerShell だけを終了させ java を孤児にする。ツリーごと落とす。
+            subprocess.run(['taskkill','/F','/T','/PID',str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.wait()
+            sink.seek(0)
+            partial = sink.read().decode('utf-8','replace')
+            survivors = ''
+            try:
+                survivors = subprocess.run(['tasklist','/FI','IMAGENAME eq java.exe'],
+                                           capture_output=True, text=True, timeout=30).stdout
+            except Exception:
+                pass
+            raise SystemExit(
+                '{0} timed out after {1}s (actual wall clock {2:.1f}s)\n'
+                '--- surviving java processes ---\n{3}\n--- output so far ---\n{4}'.format(
+                    label, timeout, time.monotonic()-started, survivors, partial))
+        sink.seek(0)
+        output = sink.read().decode('utf-8','replace')
+    if returncode != 0 or marker not in output:
+        raise SystemExit('{0} failed (exit {1}, {2:.1f}s):\n{3}'.format(
+            label, returncode, time.monotonic()-started, output))
+    return output
+
 if powershell:
-    schema_check=subprocess.run(
-        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/schema-v3-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
-    )
-    if schema_check.returncode != 0 or 'schema-v3 selfcheck ok' not in schema_check.stdout:
-        raise SystemExit('schema v3 PowerShell selfcheck failed:\n'+schema_check.stdout)
-    adapter_check=subprocess.run(
-        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/source-adapter-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
-    )
-    if adapter_check.returncode != 0 or 'source-adapter selfcheck ok' not in adapter_check.stdout:
-        raise SystemExit('source adapter PowerShell selfcheck failed:\n'+adapter_check.stdout)
-    operations_check=subprocess.run(
-        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/operational-readiness-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
-    )
-    if operations_check.returncode != 0 or 'operational readiness selfcheck ok' not in operations_check.stdout:
-        raise SystemExit('operational readiness PowerShell selfcheck failed:\n'+operations_check.stdout)
+    run_powershell_selfcheck('schema-v3-selfcheck.ps1', 'schema-v3 selfcheck ok', 'schema v3 PowerShell selfcheck')
+    run_powershell_selfcheck('source-adapter-selfcheck.ps1', 'source-adapter selfcheck ok', 'source adapter PowerShell selfcheck')
+    run_powershell_selfcheck('operational-readiness-selfcheck.ps1', 'operational readiness selfcheck ok', 'operational readiness PowerShell selfcheck')
 
 logs=[x for x in (root/'app/logs').glob('*') if x.name!='.gitkeep'] if (root/'app/logs').exists() else []
 if logs: raise SystemExit('runtime logs must not be distributed')
