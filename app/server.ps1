@@ -83,10 +83,18 @@ $Script:PowerPointRenderTimeoutSeconds = 120
 # 落とす方法が使えない。進捗が止まってからの猶予として長めに取る(大きなブックは
 # 1シートに数十秒かかる)。詳細は Start-ExcelRenderWatchdog を参照。
 $Script:ExcelRenderTimeoutSeconds = 300
+# 1シートあたりの上乗せ。複数シートを1回で書き出す経路は、その間まったく心拍を
+# 打てないため、シート数ぶん猶予を伸ばさないと正常な変換を殺してしまう。
+$Script:ExcelPerSheetAllowanceSeconds = 60
 $Script:ExcelWatchdogProcess = $null
 $Script:ExcelWatchdogHeartbeatPath = ''
 $Script:ExcelWatchdogKilledPath = ''
+$Script:ExcelWatchdogFiredSticky = $false
+$Script:ExcelWatchdogLogPaths = @()
 $Script:OwnedExcelProcessId = 0
+# 実行中のジョブが「中止が要求されたか」を答えるスクリプトブロック。外部コマンドの
+# 待ちループがこれを1秒ごとに見る。ジョブ外では $null。
+$Script:NativeCancelProbe = $null
 # 外部コマンド(呼び先はすべて java)の上限。用途ごとに分ける。
 # 2026-08-10: 上限を導入した時点、9箇所すべてが既定の120秒で走っていた。120秒は
 # Word/PowerPoint の COM 変換に合わせた値で、java の実計算に流用できるものではない。
@@ -210,6 +218,7 @@ function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$
     $psi.RedirectStandardInput = $true
     $proc = $null
     $timedOut = $false
+    $cancelled = $false
     $exit = -1
     $stdout = ''
     $stderr = ''
@@ -220,9 +229,25 @@ function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$
         try { $proc.StandardInput.Close() } catch { }
         $outTask = $proc.StandardOutput.ReadToEndAsync()
         $errTask = $proc.StandardError.ReadToEndAsync()
-        if ($proc.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+        # 1秒ずつ待って、そのたびに中止要求を見る。上限だけで待つと、上限を長くした分
+        # そのまま「中止を押しても何も起きない時間」になる(組版と分割は15分)。
+        $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
+        $exited = $false
+        while ($true) {
+            if ($proc.WaitForExit(1000)) { $exited = $true; break }
+            if ([DateTime]::UtcNow -ge $deadline) { break }
+            if ($null -ne $Script:NativeCancelProbe) {
+                $shouldCancel = $false
+                try { $shouldCancel = [bool](& $Script:NativeCancelProbe) } catch { $shouldCancel = $false }
+                if ($shouldCancel) { $cancelled = $true; break }
+            }
+        }
+        if ($exited) {
             try { $proc.WaitForExit() } catch { }
             $exit = [int]$proc.ExitCode
+        } elseif ($cancelled) {
+            try { Stop-ReportBinderProcessTree ([int]$proc.Id) } catch { }
+            try { [void]$proc.WaitForExit(5000) } catch { }
         } else {
             $timedOut = $true
             try { Stop-ReportBinderProcessTree ([int]$proc.Id) } catch { }
@@ -240,8 +265,11 @@ function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$
     if ($timedOut) {
         $text = (("NATIVE_TIMEOUT: " + $FilePath + " が " + [string]$TimeoutSeconds + " 秒で終わらないため中止しました。") + "`n" + $text).Trim()
     }
+    if ($cancelled) {
+        $text = ("NATIVE_CANCELLED: 中止の要求を受けて外部コマンドを終了しました。" + "`n" + $text).Trim()
+    }
     $lines = if ($text -eq '') { @() } else { @($text -split "`n") }
-    return [ordered]@{ exitCode = $exit; output = $lines; text = $text; timedOut = $timedOut }
+    return [ordered]@{ exitCode = $exit; output = $lines; text = $text; timedOut = $timedOut; cancelled = $cancelled }
 }
 
 # Read a file timestamp from an open Windows file handle. On SMB shares this is
@@ -3799,6 +3827,11 @@ function Apply-DefaultNumberingPerVolume([string]$Language, $Structure, [string]
 function ConvertTo-UserRenderError([string]$Message) {
     $text = [string]$Message
     $rawTail = if ($text.Length -gt 250) { ' (元のエラー: ' + $text.Substring(0, 250) + '…)' } else { ' (元のエラー: ' + $text + ')' }
+    # 監視プロセスが Excel を終了させていたら、以降のCOM呼び出しはすべてRPCの失敗として
+    # 返る。開く・閉じる・一括書き出しなど、どこで踏んでも原因は同じなので最初に判定する。
+    if (Test-ExcelRenderWatchdogFired) {
+        return 'Excelでの変換が進まなくなったため中止しました。Excelの画面に確認のダイアログが出ていないか確かめてから、もう一度お試しください。原稿が大きい場合は、シート数を減らすか分割すると通ることがあります。'
+    }
     if ($text -match 'WORD_TIMEOUT') { return 'Word原稿のPDF変換が時間内に完了しませんでした。Wordの確認画面が開いていないか、文書が破損していないか確認してください。前回成功した変換PDFは保持されています。' }
     if ($text -match 'WORD_NOT_AVAILABLE|ActiveX component can.t create object|Class not registered') { return 'Microsoft Wordを起動できませんでした。このPCにデスクトップ版Wordがインストールされ、通常起動できることを確認してください。' }
     if ($text -match 'WORD_OPEN_FAILED') { return 'Wordが原稿を開けませんでした。パスワード保護、秘密度ラベル、破損、変換確認が必要な文書ではないか確認してください。' }
@@ -4393,7 +4426,10 @@ function Export-WorkbookSheetsToPdfBatch($Excel, $Workbook, $SheetInfos, [string
         $active = $Workbook.ActiveSheet
         try {
             # 選択した複数シートを1回でPDF化する。シートごとのExportAsFixedFormat回数を減らすのが狙い。
+            # この1回の同期呼び出しの内側では心拍を打てないので、シート数ぶん猶予を伸ばしてから入る。
+            Update-ExcelRenderHeartbeat (Get-ExcelBatchAllowanceSeconds $infos.Count)
             $active.ExportAsFixedFormat(0, $batchPdf, 0, $true, $false, $missing, $missing, $false, $missing)
+            Update-ExcelRenderHeartbeat
         } finally {
             Invoke-ComRelease $active
         }
@@ -4503,16 +4539,50 @@ function Get-OwnedExcelProcessId($Excel) {
     } catch { return 0 }
 }
 
-function Update-ExcelRenderHeartbeat {
+# 心拍には「次の心拍までに許す時間」も一緒に書く。Excel の PDF 書き出しは、複数シートを
+# 1回の ExportAsFixedFormat で出す経路(Export-WorkbookSheetsToPdfBatch)が既定で、
+# その1回の同期呼び出しの内側では心拍を打てない。固定の猶予だと、正常に動いている
+# 大きなブックを殺してしまうため、これから始める作業の重さに応じて猶予を伸ばす。
+function Update-ExcelRenderHeartbeat([int]$AllowanceSeconds = 0) {
     if ([string]::IsNullOrWhiteSpace($Script:ExcelWatchdogHeartbeatPath)) { return }
-    try { [IO.File]::WriteAllText($Script:ExcelWatchdogHeartbeatPath, [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())) } catch { }
+    $allowance = if ($AllowanceSeconds -gt 0) { $AllowanceSeconds } else { [int]$Script:ExcelRenderTimeoutSeconds }
+    try { [IO.File]::WriteAllText($Script:ExcelWatchdogHeartbeatPath, ('{0} {1}' -f [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(), $allowance)) } catch { }
+}
+
+# 監視プロセスの作業ファイルは、サーバーが強制終了されると残る。放っておくと
+# %TEMP% に無期限に溜まるので、監視を始めるたびに古いものを掃除する。
+function Remove-StaleExcelWatchdogFiles {
+    $runDir = Join-Path ([IO.Path]::GetTempPath()) 'ReportBinderExcelWatchdog'
+    if (-not (Test-Path -LiteralPath $runDir)) { return }
+    $cutoff = [DateTime]::UtcNow.AddHours(-6)
+    try {
+        foreach ($file in @(Get-ChildItem -LiteralPath $runDir -File -ErrorAction SilentlyContinue)) {
+            if ($file.LastWriteTimeUtc -lt $cutoff) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
+        }
+    } catch { }
+}
+
+# シート数に応じた猶予。1シートあたりの上限を積み、下限は既定値。
+function Get-ExcelBatchAllowanceSeconds([int]$SheetCount) {
+    $perSheet = [int]$Script:ExcelPerSheetAllowanceSeconds
+    $scaled = [int]$Script:ExcelRenderTimeoutSeconds + ($perSheet * [Math]::Max(0, $SheetCount))
+    if ($scaled -lt [int]$Script:ExcelRenderTimeoutSeconds) { return [int]$Script:ExcelRenderTimeoutSeconds }
+    return $scaled
 }
 
 function Start-ExcelRenderWatchdog($Excel) {
+    # 監視の枠は1組しかない。前の Excel が生きているうちに2つ目を作ると、1つ目の心拍の
+    # 場所を見失い、更新されないまま現役の Excel が終了させられる。今は経路の約束だけで
+    # 二重起動を避けているので、約束が破れたことをここで検知する。
+    if (-not [string]::IsNullOrWhiteSpace($Script:ExcelWatchdogHeartbeatPath) -and (Test-Path -LiteralPath $Script:ExcelWatchdogHeartbeatPath)) {
+        throw 'Excelの監視がすでに動いています。前の変換を終えてから次を開始してください。'
+    }
+    $Script:ExcelWatchdogFiredSticky = $false
     $Script:ExcelWatchdogProcess = $null
     $Script:ExcelWatchdogHeartbeatPath = ''
     $Script:ExcelWatchdogKilledPath = ''
     $Script:OwnedExcelProcessId = 0
+    Remove-StaleExcelWatchdogFiles
     if ($Script:ExcelRenderTimeoutSeconds -le 0) { return }
     $excelPid = Get-OwnedExcelProcessId $Excel
     if ($excelPid -le 0) { return }
@@ -4534,9 +4604,14 @@ while (`$true) {
     if (-not (Test-Path -LiteralPath '$beatEscaped')) { break }
     `$raw = ''
     try { `$raw = [IO.File]::ReadAllText('$beatEscaped') } catch { continue }
-    `$last = 0
-    if (-not [long]::TryParse(`$raw.Trim(), [ref]`$last)) { continue }
-    if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - `$last) -lt $limit) { continue }
+    # "<unix秒> <その作業に許す秒数>"。猶予は作業ごとに変わる(複数シートの一括書き出しなど)。
+    `$parts = @(`$raw.Trim() -split '\s+')
+    [long]`$last = 0
+    if (`$parts.Count -lt 1 -or -not [long]::TryParse(`$parts[0], [ref]`$last)) { continue }
+    [long]`$allowance = $limit
+    if (`$parts.Count -ge 2) { [void][long]::TryParse(`$parts[1], [ref]`$allowance) }
+    if (`$allowance -lt 1) { `$allowance = $limit }
+    if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - `$last) -lt `$allowance) { continue }
     `$target = Get-Process -Id $excelPid -ErrorAction SilentlyContinue
     if (`$null -eq `$target -or `$target.ProcessName -ne 'EXCEL') { break }
     try { [IO.File]::WriteAllText('$killedEscaped', 'timeout') } catch { }
@@ -4546,17 +4621,22 @@ while (`$true) {
 "@
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+    $Script:ExcelWatchdogLogPaths = @((Join-Path $runDir "out-$runId.log"), (Join-Path $runDir "err-$runId.log"))
     try {
-        $Script:ExcelWatchdogProcess = Start-HiddenPowerShellChild $psExe $command (Join-Path $runDir "out-$runId.log") (Join-Path $runDir "err-$runId.log")
+        $Script:ExcelWatchdogProcess = Start-HiddenPowerShellChild $psExe $command $Script:ExcelWatchdogLogPaths[0] $Script:ExcelWatchdogLogPaths[1]
     } catch { $Script:ExcelWatchdogProcess = $null }
 }
 
 function Test-ExcelRenderWatchdogFired {
+    # 監視を止めた後でも判定できるようにする。失敗の文言を組み立てるのは、
+    # 後片付けが終わってからのことがあるため。
+    if ($Script:ExcelWatchdogFiredSticky) { return $true }
     if ([string]::IsNullOrWhiteSpace($Script:ExcelWatchdogKilledPath)) { return $false }
     return (Test-Path -LiteralPath $Script:ExcelWatchdogKilledPath)
 }
 
 function Stop-ExcelRenderWatchdog {
+    if (Test-ExcelRenderWatchdogFired) { $Script:ExcelWatchdogFiredSticky = $true }
     if (-not [string]::IsNullOrWhiteSpace($Script:ExcelWatchdogHeartbeatPath)) {
         Remove-Item -LiteralPath $Script:ExcelWatchdogHeartbeatPath -Force -ErrorAction SilentlyContinue
     }
@@ -4566,6 +4646,11 @@ function Stop-ExcelRenderWatchdog {
     if (-not [string]::IsNullOrWhiteSpace($Script:ExcelWatchdogKilledPath)) {
         Remove-Item -LiteralPath $Script:ExcelWatchdogKilledPath -Force -ErrorAction SilentlyContinue
     }
+    # 監視プロセスの標準出力・標準エラーのファイルも消す。Excelを起動するたび2つ増える。
+    foreach ($logPath in @($Script:ExcelWatchdogLogPaths)) {
+        if (-not [string]::IsNullOrWhiteSpace($logPath)) { Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue }
+    }
+    $Script:ExcelWatchdogLogPaths = @()
     $Script:ExcelWatchdogProcess = $null
     $Script:ExcelWatchdogHeartbeatPath = ''
     $Script:ExcelWatchdogKilledPath = ''
@@ -4592,11 +4677,14 @@ function New-ExcelApplicationForRender {
 }
 
 function Close-ExcelApplicationForRender($Excel) {
-    Stop-ExcelRenderWatchdog
+    # Quit() も同期COM呼び出しで、確認ダイアログや保留イベントで固まりうる。
+    # 監視を先に止めると、いちばん固まりやすい所だけ無防備になる。閉じ終えてから止める。
     if ($Excel) {
+        Update-ExcelRenderHeartbeat
         try { $Excel.Quit() } catch { }
         Invoke-ComRelease $Excel
     }
+    Stop-ExcelRenderWatchdog
 }
 
 function Get-RenderEnvironment($Excel) {
@@ -6343,6 +6431,9 @@ function Invoke-FinalBuildJobFromFile([string]$JobPath) {
         $targetIds = @()
     }
 
+    # 組版の待ちからも中止要求が見えるようにする（上限は15分）。
+    $Script:NativeCancelProbe = { Test-FinalJobCancellationRequested $language $jobId }.GetNewClosure()
+    try {
     foreach ($targetId in $targetIds) {
         if (Test-FinalJobCancellationRequested $language $jobId) { $cancelled = $true; break }
         $displayName = [string](Get-PackTargetDisplayName $language $scope.pack $targetId)
@@ -6385,6 +6476,9 @@ function Invoke-FinalBuildJobFromFile([string]$JobPath) {
     Set-NoteProperty $status 'phase' ''
     Set-NoteProperty $status 'percent' 100
     Set-NoteProperty $status 'built' @($built)
+    } finally {
+        $Script:NativeCancelProbe = $null
+    }
     Set-NoteProperty $status 'skipped' @($skipped)
     Set-NoteProperty $status 'errors' @($errors)
     if ($cancelled) {
@@ -6527,6 +6621,9 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
     $excelStartupError = ''
     $renderLoopSucceeded = $false
     $jobCancelled = $false
+    # 外部コマンドの待ちからも中止要求が見えるようにする。これが無いと、java の待ちに
+    # 入っている間は上限(最大15分)まで中止が効かない。
+    $Script:NativeCancelProbe = { Test-RenderJobCancellationRequested $language $jobId }.GetNewClosure()
     try {
         if (Test-RenderJobCancellationRequested $language $jobId) {
             [void](Set-RenderJobCancelledStatus $statusPath $status)
@@ -6638,6 +6735,10 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
             Write-RenderJobStatus $statusPath $status
             $callback = {
                 param($stage, $workbookId, $sheetName)
+                # 進捗が動いた印。この callback は open / sheet-setup / batch / split / sheet /
+                # word / powerpoint のすべてで呼ばれるので、変換が進んでいる限り心拍が続く。
+                # 監視プロセスが見るのはこの心拍であって、Excel を起動してからの経過ではない。
+                Update-ExcelRenderHeartbeat
                 $status.currentWorkbookId = [string]$workbookId
                 $status.currentWorkbookName = $name
                 $status.currentSheet = [string]$sheetName
@@ -6697,6 +6798,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
         Write-RenderJobStatus $statusPath $status
         throw
     } finally {
+        $Script:NativeCancelProbe = $null
         Close-ExcelApplicationForRender $excel
         [GC]::Collect(); [GC]::WaitForPendingFinalizers()
         # V5-P1: Excel を閉じ、レンダリングロックも解放してから解析する。
@@ -7443,46 +7545,6 @@ function Get-PackProgressDashboard($Structure, [string]$Language) {
         unassignedPageCount=[int](($rows | ForEach-Object { [int]$_.unassignedPageCount } | Measure-Object -Sum).Sum)
     }
 }
-
-function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Category='') {
-    if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $cat=Require-WorkbookCategory $Category;$paths=Get-Paths;$workspace=Get-WorkspacePath $Language;try{[void](Scan-Updates $Language $null $false)}catch{}
-    $lockPath=Join-Path $workspace "locks\volume_${Volume}_${cat}.lock"
-    return Invoke-WithLock $lockPath {
-        $composerJar=Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar';$pdfboxJar=Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar';if(-not(Test-Path $composerJar)){throw 'ReportPdfComposer.jar がありません。'};if(-not(Test-Path $pdfboxJar)){throw 'pdfbox-app.jar がありません。'}
-        $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
-        if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
-        $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=[string]$snapshotBefore.outputFileName;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
-        if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の提出用PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
-        $manifest=[ordered]@{schemaVersion=3;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;document=$snapshotBefore.document;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};physicalPages=$snapshotBefore.physicalPages;pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
-        $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath) $Script:FinalComposeTimeoutSeconds;$exit=[int]$run.exitCode;$text=[string]$run.text;if($run.timedOut){throw ('PDFの結合が{0}分以内に終わりませんでした。出力先がネットワーク上のフォルダーの場合は、いったんPC内のフォルダーに出力してみてください。' -f [int]($Script:FinalComposeTimeoutSeconds / 60))};if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '提出用PDFを作成できませんでした。'}
-        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'source-updated' '元原稿が更新されたため、変換PDFを再作成後に提出用PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
-        if($commit.changed){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'PDF作成中にページ構成またはPDF入力が変更されました。最新の状態で再度出力してください。'}
-        $manifest.outputPdf=$outPath;Write-JsonFile $manifestPath $manifest
-        return [ordered]@{volume=$Volume;category=$cat;outputPdf=$outPath;inputFingerprint=$fpBefore;message=$text;readiness=$commit.readiness}
-    }
-}
-
-
-function Invoke-FinalBuildAllLegacy([string]$Language, [string]$Category, [string[]]$Volumes) {
-    # V4.1互換実装。現在のルートからは呼ばないが、旧形式の復旧・仕様照合用に保持する。
-    # V4.1 経路(Build-FinalPdfLegacy)を巻ごとに回す。
-    # トランザクション版と同様、ページが無い巻はスキップし、本当のブロッカーは Build-FinalPdfLegacy 側で送出する。
-    $cat = Require-WorkbookCategory $Category
-    $allowed = @(Get-VolumeList $Language | Where-Object { $_ -ne 'none' })
-    $requested = @($Volumes | Where-Object { $allowed -contains $_ })
-    if ($requested.Count -eq 0) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $built = @()
-    $skipped = @()
-    foreach ($v in $requested) {
-        $structure = Get-Structure $Language
-        $rd = Get-FinalBuildReadiness $structure $Language $v $cat
-        if ([int]$rd.pageCount -le 0) { $skipped += $v; continue }
-        $built += @(Build-FinalPdfLegacy $Language $v $cat)
-    }
-    return [ordered]@{ built = @($built); skipped = @($skipped); message = (if ($built.Count -eq 0) { '出力対象がありません。' } else { '' }) }
-}
-
 
 function Build-FinalPdf([string]$Language,[string]$Volume,[string]$Category='') {
     # category は fail closed。ここでも明示的に検証する。
@@ -10612,6 +10674,10 @@ function Invoke-PdfPageAnalyzer([hashtable[]]$Sheets) {
             }
         }) })
         $run = Invoke-NativeCapture $javaExe @('-Djava.awt.headless=true', '-cp', $cp, 'PdfPageAnalyzer', '--input', $req, '--output', $res, '--dpi', [string]$Script:VisualHashDpi) $Script:PdfAnalyzeTimeoutSeconds
+        if ($run.timedOut) {
+            # 解析はPDF作成のクリティカルパス外。失敗として返すが、記録には理由を残す。
+            return [ordered]@{ ok = $false; message = ('見た目の解析が{0}分以内に終わりませんでした。' -f [int]($Script:PdfAnalyzeTimeoutSeconds / 60)) }
+        }
         if ([int]$run.exitCode -ne 0 -or -not (Test-Path -LiteralPath $res)) {
             return [ordered]@{ ok = $false; message = ("exit=" + [string]$run.exitCode + "`n" + [string]$run.text) }
         }
@@ -11849,6 +11915,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     $run = Invoke-NativeCapture $java @('-cp', "$composerJar;$pdfboxJar", 'ReportPdfComposer', '--manifest', $manifestPath) $Script:FinalComposeTimeoutSeconds
                     $exit = [int]$run.exitCode
                     $text = [string]$run.text
+                    if ($run.timedOut) { throw ('PDFの結合が{0}分以内に終わりませんでした。出力先がネットワーク上のフォルダーの場合は、いったんPC内のフォルダーに出力してみてください。' -f [int]($Script:FinalComposeTimeoutSeconds / 60)) }
                     if ($exit -ne 0) { throw "PDFBox組版に失敗しました。exit=$exit`n$text" }
                 } finally {
                     if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }

@@ -260,7 +260,8 @@ for needle in ['function New-DocumentPack', 'function Copy-DocumentPack', 'funct
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
     'Get-VolumeStateKey','builtFingerprint','Get-FinalBuildInputSnapshot','contentPdfLastWriteUtcTicks','contentPdfSize',
-    'manifest_${Volume}_${cat}.json','~building_${Volume}_${cat}.pdf','Require-WorkbookCategory','System.ArgumentException',
+    # 旧V4.1経路(Build-FinalPdfLegacy)を消したので、現行のトランザクション経路の形で固定する。
+    'exports\\manifest_{0}_{1}.json','~building_{0}_{1}.pdf','Require-WorkbookCategory','System.ArgumentException',
     'Mark-VolumeNeedsRebuild','staleReasons','Sort-PagesBySheet','Insert-PageInSheetOrder','Renumber-VolumeOrder',
     'CenterHorizontally = $true','LeftMargin = Convert-CmToPt 1.2','RightMargin = Convert-CmToPt 1.2','punchShiftPt=(Convert-CmToPt 0.2)',
     'lib\\java\\bin\\java.exe','Apply-DefaultNumberingPerVolume','first-page-none','ExcelPrintProfileVersion',
@@ -318,8 +319,10 @@ snapshot_block=server.split('function Get-FinalBuildInputSnapshot',1)[1].split('
 if 'Resolve-DocumentPackScope' not in snapshot_block:
     raise SystemExit('final build snapshot must require an existing document pack')
 # Long-running Excel/Java work must be outside the structure transaction body.
-build=server.split('function Build-FinalPdf',1)[1].split('function Get-StatePayload',1)[0]
-java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit=Update-StructureLocked')
+# 旧V4.1経路を消したので、実際に使われる Build-DocumentPackPdf を見る。以前はここが
+# 到達しない Build-FinalPdfLegacy に当たっており、現行経路を検査していなかった。
+build=server.split('function Build-DocumentPackPdf',1)[1].split('function Get-StatePayload',1)[0]
+java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit = Update-StructureLocked')
 if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commit order is invalid')
 
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
@@ -968,9 +971,52 @@ for needed in ['[int]$TimeoutSeconds', 'WaitForExit(', 'Stop-ReportBinderProcess
                'NATIVE_TIMEOUT', 'RedirectStandardInput']:
     if needed not in _nc:
         raise SystemExit('Invoke-NativeCapture must bound the wait and kill the tree: ' + needed)
+# 上限まで一息に待つと、上限を伸ばした分がそのまま「中止が効かない時間」になる。
+# 1秒ずつ待って、そのたびに実行中のジョブの中止要求を見る。
+for needed in ['WaitForExit(1000)', '$Script:NativeCancelProbe', 'NATIVE_CANCELLED']:
+    if needed not in _nc:
+        raise SystemExit('the native wait must stay interruptible by a cancel request: ' + needed)
+for _job, _label in [('function Invoke-RenderJobFromFile', 'render job'), ('function Invoke-FinalBuildJobFromFile', 'final build job')]:
+    if _job not in server:
+        raise SystemExit(f'the {_label} entry point was renamed; the cancel-probe check no longer applies')
+    _body = server.split(_job, 1)[1].split('\nfunction ', 1)[0]
+    # 「= $null」で片付ける行にも同じ名前が出るので、公開している形そのものを見る。
+    if '$Script:NativeCancelProbe = {' not in _body:
+        raise SystemExit(f'the {_label} must publish a cancel probe for the native wait')
+if server.count('$Script:NativeCancelProbe = $null') < 2:
+    raise SystemExit('each job must clear its cancel probe when it finishes')
 for line_no, line in enumerate(server.splitlines(), 1):
     if '2>&1' in line and 'Invoke-NativeCapture' not in line and not line.strip().startswith('#'):
         raise SystemExit(f'raw native 2>&1 capture outside Invoke-NativeCapture at line {line_no}')
+# Excel の監視は「Excelを起動してからの経過」ではなく「進捗が止まってからの経過」を
+# 測る。心拍が主経路に無いと、正常に動いている大きなブックを終了させてしまう。
+if 'Update-ExcelRenderHeartbeat' not in server:
+    raise SystemExit('the Excel watchdog needs a heartbeat')
+_batch = server.split('function Export-WorkbookSheetsToPdfBatch', 1)[1].split('\nfunction ', 1)[0]
+if 'Update-ExcelRenderHeartbeat' not in _batch:
+    raise SystemExit('the batch export is the default path for multi-sheet books and must beat')
+# 1回の同期COM呼び出しの内側では心拍を打てないので、シート数ぶん猶予を伸ばして入る。
+if 'Get-ExcelBatchAllowanceSeconds' not in _batch:
+    raise SystemExit('the batch export must widen the allowance before the blocking call')
+_job_callback = server.split('$callback = {', 1)[1].split('\n            }', 1)[0]
+if 'Update-ExcelRenderHeartbeat' not in _job_callback:
+    raise SystemExit('the render progress callback must beat so long jobs are not killed')
+# 固まりやすい Quit() を保護の外に出さない。
+_close_excel = server.split('function Close-ExcelApplicationForRender', 1)[1].split('\nfunction ', 1)[0]
+if _close_excel.index('Quit()') > _close_excel.index('Stop-ExcelRenderWatchdog'):
+    raise SystemExit('Excel must be closed while the watchdog is still running')
+# 監視が殺したことは、開く・閉じる・一括書き出しのどこで踏んでも同じ説明になること。
+_render_err = server.split('function ConvertTo-UserRenderError', 1)[1].split('\nfunction ', 1)[0]
+if 'Test-ExcelRenderWatchdogFired' not in _render_err:
+    raise SystemExit('a watchdog kill must be explained wherever it surfaces')
+# 監視の枠は1組しかない。2つ目を黙って始めると現役のExcelが殺される。
+_start_watchdog = server.split('function Start-ExcelRenderWatchdog', 1)[1].split('\nfunction ', 1)[0]
+if 'throw' not in _start_watchdog:
+    raise SystemExit('starting a second Excel watchdog must fail loudly')
+_stop_watchdog = server.split('function Stop-ExcelRenderWatchdog', 1)[1].split('\nfunction ', 1)[0]
+if 'ExcelWatchdogLogPaths' not in _stop_watchdog:
+    raise SystemExit('the watchdog must not leave its log files behind')
+
 # 既定の上限に頼らない。既定はWord/PowerPointのCOM変換に合わせた値で、javaの実計算
 # (2000ページの分割、共有フォルダー宛ての組版)に流用できるものではない。呼び出しごとに
 # 用途の上限を明示させる。
@@ -991,8 +1037,17 @@ for anchor, label in [("'PDFSplit'", 'PDF split'), ("'BatchPdfSplitter'", 'batch
     _seg = server.split(anchor, 1)[1][:1200]
     if 'timedOut' not in _seg:
         raise SystemExit(f'{label} must tell a timeout apart from a corrupt file')
-if server.count('$run.timedOut') < 4:
-    raise SystemExit('native timeouts must be reported as timeouts by their callers')
+# 件数で数えると、到達しないコードの分まで数に入って抜けを見逃す(実際に
+# Build-FinalPdfLegacy を数えていて、利用者が通る組版経路の抜けを通してしまった)。
+# 呼び出しごとに、その直後で時間切れを判定していることを見る。
+for _line_no, _line in enumerate(server.splitlines(), 1):
+    if 'Invoke-NativeCapture ' not in _line or _line.strip().startswith('#'):
+        continue
+    if 'function Invoke-NativeCapture' in _line or '$Script:JavaProbeTimeoutSeconds' in _line:
+        continue
+    _after = '\n'.join(server.splitlines()[_line_no - 1:_line_no + 12])
+    if 'timedOut' not in _after:
+        raise SystemExit(f'the caller must tell a timeout apart from a failure at line {_line_no}')
 # 起動できないjavaを「使える」と診断しない。診断画面が最も頼られる場面での誤報を防ぐ。
 if '$javaProbe.exitCode' not in server:
     raise SystemExit('the environment diagnosis must check the java probe exit code')
@@ -1192,7 +1247,7 @@ if "history: '変更履歴・比較'" not in appjs or "activeView === 'history'"
     raise SystemExit('history navigation is not wired')
 
 # Final PDF names must use the selected category, not a category inherited from an Excel file name.
-for needed in ['function Get-CategoryProjectId', 'Resolve-OutputFileNamePattern', '$outName=[string]$snapshotBefore.outputFileName', '$outName = [string]$snapshots[$v].outputFileName']:
+for needed in ['function Get-CategoryProjectId', 'Resolve-OutputFileNamePattern', '$outputName = [string]$snapshotBefore.outputFileName', '$outName = [string]$snapshots[$v].outputFileName']:
     if needed not in server: raise SystemExit(f'category-aware final filename missing: {needed}')
 if '$outName=Get-OutputFileName $Volume $projectId;' in server:
     raise SystemExit('legacy final output still omits category')
