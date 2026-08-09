@@ -150,24 +150,78 @@ function Get-ErrorDetail($ErrorRecord) {
 
 
 
-function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList) {
+function ConvertTo-NativeArgumentString([string[]]$ArgumentList) {
+    # CommandLineToArgvW の規則で1本のコマンドライン文字列にする。
+    $parts = @()
+    foreach ($argument in @($ArgumentList)) {
+        $value = [string]$argument
+        if ($value -eq '') { $parts += '""'; continue }
+        if ($value -notmatch '[\s"]') { $parts += $value; continue }
+        $escaped = [regex]::Replace($value, '(\\*)"', '$1$1\"')
+        $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+        $parts += ('"' + $escaped + '"')
+    }
+    return ($parts -join ' ')
+}
+function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSeconds = 120) {
     # V5-P3: Windows PowerShell 5.1 では、ネイティブコマンドの stderr を 2>&1 で取り込むと
     # ErrorRecord としてパイプラインに流れ、$ErrorActionPreference='Stop' の下では
     # NativeCommandError の例外になる。
     # PDFBox は日本語フォントを含むPDFで警告(Format 14 cmap table ...)を stderr に出すため、
     # 解析や組版が成功していても呼び出し側が「失敗」と誤認していた。
-    # ここだけ Continue に落として出力を文字列として回収する。
+    #
+    # 2026-08-09: 従来は `& $FilePath @args 2>&1 | ...` で待っており、待ち時間の上限が
+    # 無かった。この関数の呼び出し先はすべて java で、その1つ PdfPageAnalyzer は PDF を
+    # ラスタライズするため Windows では -Djava.awt.headless=true を付けても AWT の
+    # ツールキット(sun.awt.windows.WToolkit)を生成する。その初期化はウィンドウ
+    # ステーションが使えないと上限なしで待ち続けるため、CIのように対話デスクトップが
+    # 不安定な環境では java が永久に返らず、呼び出し元ごと固まっていた。
+    # ProcessStartInfo で直接起動し、上限を過ぎたらプロセスツリーごと終了させる。
+    # 解析は「PDF作成のクリティカルパスの外」(Invoke-PostRenderAnalysis を参照)なので、
+    # 例外ではなく exitCode 非0 として返し、呼び出し元の既存の失敗処理に載せる。
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ConvertTo-NativeArgumentString $ArgumentList
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # 標準入力を渡さない。継承した端を子や孫が握ると、呼び出し元のパイプが閉じない。
+    $psi.RedirectStandardInput = $true
+    $proc = $null
+    $timedOut = $false
+    $exit = -1
+    $stdout = ''
+    $stderr = ''
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $lines = @()
-    $exit = -1
     try {
-        $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })
-        $exit = $LASTEXITCODE
+        $proc = [Diagnostics.Process]::Start($psi)
+        try { $proc.StandardInput.Close() } catch { }
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        if ($proc.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+            try { $proc.WaitForExit() } catch { }
+            $exit = [int]$proc.ExitCode
+        } else {
+            $timedOut = $true
+            try { Stop-ReportBinderProcessTree ([int]$proc.Id) } catch { }
+            try { [void]$proc.WaitForExit(5000) } catch { }
+        }
+        try { if ($outTask.Wait(5000)) { $stdout = [string]$outTask.Result } } catch { }
+        try { if ($errTask.Wait(5000)) { $stderr = [string]$errTask.Result } } catch { }
+    } catch {
+        $stderr = [string]$_.Exception.Message
     } finally {
         $ErrorActionPreference = $previous
+        if ($null -ne $proc) { try { $proc.Dispose() } catch { } }
     }
-    return [ordered]@{ exitCode = $exit; output = $lines; text = ($lines -join "`n") }
+    $text = (($stdout + "`n" + $stderr) -replace "`r`n", "`n").Trim()
+    if ($timedOut) {
+        $text = (("NATIVE_TIMEOUT: " + $FilePath + " が " + [string]$TimeoutSeconds + " 秒で終わらないため中止しました。") + "`n" + $text).Trim()
+    }
+    $lines = if ($text -eq '') { @() } else { @($text -split "`n") }
+    return [ordered]@{ exitCode = $exit; output = $lines; text = $text; timedOut = $timedOut }
 }
 
 # Read a file timestamp from an open Windows file handle. On SMB shares this is

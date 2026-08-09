@@ -1,5 +1,5 @@
 ﻿from pathlib import Path
-import json, os, re, shutil, subprocess, zipfile
+import json, os, re, shutil, subprocess, tempfile, time, zipfile
 
 root = Path(__file__).resolve().parents[2]
 required = [
@@ -362,25 +362,94 @@ for needed in ['function Get-SourceAdapterDescriptor','function Test-SourceCandi
                "adapterId = 'excel-com-v1'",'Render-Source $language $id $excel $true']:
     if needed not in server: raise SystemExit(f'source adapter feature missing: {needed}')
 powershell = shutil.which('powershell.exe') or shutil.which('powershell')
+def run_powershell_selfcheck(script_name, marker, label, timeout=240):
+    # stdout=subprocess.PIPE を使わない。subprocess のタイムアウトはプロセスの終了
+    # ではなくパイプの EOF を待つ。PowerShell が起動した java は CreateProcess の
+    # ハンドル継承でこのパイプの書き込み端を受け取るため、PowerShell が終了しても
+    # (あるいは kill されても) java が生きている限り EOF は来ず、Python は待たされ
+    # 続ける。さらに subprocess.run は TimeoutExpired を捕まえたあとタイムアウト
+    # なしで communicate を再実行するので、例外が報告する秒数は実際の経過時間と
+    # 一致しない。ローカル実測では timeout=5 指定の例外が19.4秒後に発生した。
+    # 一時ファイルへ落とせばリーダースレッドが不要になり、タイムアウトは素直に
+    # 「プロセスが終わらないこと」だけに掛かる。
+    # 上限は内側 < 外側にする。server.ps1 の Invoke-NativeCapture が120秒で
+    # 外部コマンドを打ち切り NATIVE_TIMEOUT を返すので、ここはその後始末が
+    # 終わるのを待つ backstop でよい。逆順(内側300秒/外側90秒)にしていたときは、
+    # 製品側のタイムアウトが発火する前にハーネスがツリーごと殺してしまい、
+    # 何が固まったのか分からないまま終わっていた。
+    script_path = root/'app/tools'/script_name
+    started = time.monotonic()
+    # 段階トレース。強制終了で標準出力のバッファは失われるため、どこまで進んだかは
+    # 1行ごとに開いて閉じる別ファイルへ書かせる。
+    trace_path = os.path.join(tempfile.gettempdir(), 'reportbinder-selfcheck-trace-%d.log' % os.getpid())
+    try:
+        if os.path.exists(trace_path):
+            os.remove(trace_path)
+    except OSError:
+        pass
+    child_env = dict(os.environ)
+    child_env['REPORTBINDER_SELFCHECK_TRACE'] = trace_path
+    with tempfile.TemporaryFile() as sink:
+        proc = subprocess.Popen(
+            [powershell,'-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',str(script_path)],
+            cwd=root, env=child_env, stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT
+        )
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 生きているプロセスは kill する前に採る。順序を逆にすると、自分で
+            # 殺しておいて「残っていない」と報告することになる(実際に一度そうした)。
+            survivors = ''
+            try:
+                survivors = subprocess.run(
+                    ['wmic','process','where',"name='java.exe'",'get','processid,commandline'],
+                    capture_output=True, text=True, timeout=30).stdout.strip()
+            except Exception:
+                pass
+            if not survivors:
+                try:
+                    survivors = subprocess.run(['tasklist','/FI','IMAGENAME eq java.exe'],
+                                               capture_output=True, text=True, timeout=30).stdout
+                except Exception:
+                    pass
+            # proc.kill() は PowerShell だけを終了させ java を孤児にする。ツリーごと落とす。
+            subprocess.run(['taskkill','/F','/T','/PID',str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.wait()
+            sink.seek(0)
+            partial = sink.read().decode('utf-8','replace')
+            trace = ''
+            try:
+                with open(trace_path, encoding='utf-8', errors='replace') as handle:
+                    trace = handle.read()
+            except OSError:
+                trace = '(no trace file)'
+            raise SystemExit(
+                '{0} timed out after {1}s (actual wall clock {2:.1f}s)\n'
+                '--- stage trace (last line is where it stopped) ---\n{3}\n'
+                '--- surviving java processes ---\n{4}\n--- output so far ---\n{5}'.format(
+                    label, timeout, time.monotonic()-started, trace, survivors, partial))
+        sink.seek(0)
+        output = sink.read().decode('utf-8','replace')
+    if returncode != 0 or marker not in output:
+        raise SystemExit('{0} failed (exit {1}, {2:.1f}s):\n{3}'.format(
+            label, returncode, time.monotonic()-started, output))
+    # 成功時も所要と段階の時刻を出す。断続的に遅くなる箇所を、落ちてからではなく
+    # 落ちる前に見つけられるようにするため。
+    print('{0}: {1:.1f}s'.format(label, time.monotonic()-started))
+    try:
+        with open(trace_path, encoding='utf-8', errors='replace') as handle:
+            stages = handle.read().strip()
+        if stages:
+            print('  ' + stages.replace(chr(10), chr(10) + '  '))
+    except OSError:
+        pass
+    return output
+
 if powershell:
-    schema_check=subprocess.run(
-        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/schema-v3-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
-    )
-    if schema_check.returncode != 0 or 'schema-v3 selfcheck ok' not in schema_check.stdout:
-        raise SystemExit('schema v3 PowerShell selfcheck failed:\n'+schema_check.stdout)
-    adapter_check=subprocess.run(
-        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/source-adapter-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
-    )
-    if adapter_check.returncode != 0 or 'source-adapter selfcheck ok' not in adapter_check.stdout:
-        raise SystemExit('source adapter PowerShell selfcheck failed:\n'+adapter_check.stdout)
-    operations_check=subprocess.run(
-        [powershell,'-NoProfile','-ExecutionPolicy','Bypass','-File',str(root/'app/tools/operational-readiness-selfcheck.ps1')],
-        cwd=root, text=True, encoding='utf-8', errors='replace', stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90
-    )
-    if operations_check.returncode != 0 or 'operational readiness selfcheck ok' not in operations_check.stdout:
-        raise SystemExit('operational readiness PowerShell selfcheck failed:\n'+operations_check.stdout)
+    run_powershell_selfcheck('schema-v3-selfcheck.ps1', 'schema-v3 selfcheck ok', 'schema v3 PowerShell selfcheck')
+    run_powershell_selfcheck('source-adapter-selfcheck.ps1', 'source-adapter selfcheck ok', 'source adapter PowerShell selfcheck')
+    run_powershell_selfcheck('operational-readiness-selfcheck.ps1', 'operational readiness selfcheck ok', 'operational readiness PowerShell selfcheck')
 
 logs=[x for x in (root/'app/logs').glob('*') if x.name!='.gitkeep'] if (root/'app/logs').exists() else []
 if logs: raise SystemExit('runtime logs must not be distributed')
@@ -838,17 +907,19 @@ _job = server.split('function Invoke-RenderJobFromFile', 1)[1].split('\nfunction
 if '$deferredAnalyses' not in _job or 'Invoke-PostRenderAnalysis' not in _job:
     raise SystemExit('batch render job must run the deferred visual-hash analysis')
 
-# PS 5.1 turns native stderr into a terminating error under $ErrorActionPreference='Stop'.
-# PDFBox writes font warnings to stderr, so every Java call must go through the helper.
+# 外部コマンドの起動はすべて Invoke-NativeCapture を通す。PDFBox が stderr へ出す
+# フォント警告を失敗と誤認しないことに加え、待ち時間に上限を持たせるため。上限が
+# 無いと、PDFをラスタライズする java (PdfPageAnalyzer) が Windows の AWT ツール
+# キット初期化で止まったときに、呼び出し元ごと永久に固まる。
 if 'function Invoke-NativeCapture' not in server:
     raise SystemExit('missing Invoke-NativeCapture')
 _nc = server.split('function Invoke-NativeCapture', 1)[1].split('\nfunction ', 1)[0]
-if "$ErrorActionPreference = 'Continue'" not in _nc:
-    raise SystemExit('Invoke-NativeCapture must relax ErrorActionPreference around the call')
+for needed in ['[int]$TimeoutSeconds', 'WaitForExit(', 'Stop-ReportBinderProcessTree',
+               'NATIVE_TIMEOUT', 'RedirectStandardInput']:
+    if needed not in _nc:
+        raise SystemExit('Invoke-NativeCapture must bound the wait and kill the tree: ' + needed)
 for line_no, line in enumerate(server.splitlines(), 1):
     if '2>&1' in line and 'Invoke-NativeCapture' not in line and not line.strip().startswith('#'):
-        if '$lines = @(& $FilePath' in line:
-            continue
         raise SystemExit(f'raw native 2>&1 capture outside Invoke-NativeCapture at line {line_no}')
 
 # The one workspace may restart its own stale UI process, never worker processes.
@@ -1157,7 +1228,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v169', 'style.css?v=20260809_v104']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260809_v175', 'style.css?v=20260809_v105']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1212,7 +1283,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260809_v169' not in html:
+if 'app.js?v=20260809_v175' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1238,7 +1309,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260809_v169' not in html:
+if 'app.js?v=20260809_v175' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1358,7 +1429,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.09.11':
+if runtime_version != '2026.08.09.17':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 for needed in ['id="confirm-modal"', 'id="file-context-bar"', 'id="workbook-context-bar"', 'id="source-first-run"', 'data-progress-view="excel"', '提出用PDF']:
     if needed not in html:
