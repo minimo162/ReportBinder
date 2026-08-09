@@ -205,7 +205,15 @@ function setActiveView(view, options = {}) {
   // opened - so a fresh launch showed "提出用PDF 未出力" for a pack that was
   // already output. Fetch it once for the active pack whatever the view.
   if (state && !finalReadinessLoaded()) {
-    void loadFinalReadiness({render:false}).then(()=>{renderGlobalHeader();renderNavBadges();renderDashboardOverview();});
+    void loadFinalReadiness({render:false}).then(()=>{
+      renderGlobalHeader();renderNavBadges();renderDashboardOverview();
+      // Repaint the output cards unconditionally, not just while the final view
+      // is showing. At boot activePackId is not resolved yet, so this late load
+      // is often the first one that succeeds; skipping the cards left them at
+      // 0ページ until the user opened the screen, and the correction was then
+      // visible as a flash right after the panel appeared.
+      renderFinalOverview();renderVolumeLinks();
+    });
   }
   if (activeView === 'final' && state) {
     // These three used to be fired here unguarded. renderAll() calls
@@ -4976,6 +4984,17 @@ async function loadInitialAppState(button=null) {
       try{await loadFilesSilently();}
       catch(e){log('原稿一覧の初期読み込みでエラー',e.detail||e.stack||e.message);}
     }
+    // Paint once to reconcile the active pack (renderAll does that), then fetch
+    // readiness, then paint again. Both happen while .app-layout is still
+    // visibility:hidden, so the user only ever sees the settled result. Fetching
+    // before the first renderAll does not work: activePackId is not resolved yet
+    // and loadFinalReadiness() bails out, which left the header and the output
+    // cards showing 未出力 / 0ページ until something else repainted them.
+    renderAll();
+    try{
+      if(activeView==='final')await loadFinalPanels({render:false});
+      else await loadFinalReadiness({render:false});
+    }catch(e){log('提出用PDF状態の初期読み込みでエラー',e.detail||e.message);}
     renderAll();
     if(layout){layout.removeAttribute('aria-hidden');layout.removeAttribute('inert');}
     document.body.classList.remove('app-initializing','app-load-failed');
