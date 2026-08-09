@@ -579,3 +579,12 @@ tr.page-row input,tr.page-row select,tr.page-row button{cursor:auto}
 
 /* The current step must stay marked even when it also warns. */
 .step-state.current{border-color:var(--accent);background:var(--accent);color:#fff}
+
+/* Output card action hierarchy. Before: three same-weight buttons in a row with
+   space-between, so nothing said what to do after a successful output. Once the
+   PDF exists, "open it" leads and "output again" is pushed to the far right. */
+.final-card .card-actions{flex-wrap:wrap;justify-content:flex-start}
+.final-card.has-output .card-actions [data-final-open]{order:-1}
+.final-card.has-output .card-actions [data-final-publish]{order:0}
+.final-card.has-output .card-actions [data-final-build]{order:1;margin-left:auto}
+@media(max-width:760px){.final-card.has-output .card-actions [data-final-build]{margin-left:0}}

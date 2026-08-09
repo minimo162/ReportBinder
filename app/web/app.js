@@ -201,9 +201,11 @@ function setActiveView(view, options = {}) {
     void loadHistoryPanels({force:!!options.reloadPanels});
   }
   if (activeView === 'final' && state) {
-    void loadFinalReadiness();
-    void loadFinalArchives();
-    void loadPackReview();
+    // These three used to be fired here unguarded. renderAll() calls
+    // setActiveView(), so every repaint restarted all three, and each one
+    // repainted on its own when its request landed - the screen visibly
+    // reshuffled a few hundred ms after it had already been drawn.
+    if(viewChanged||options.reloadPanels||!finalReadinessLoaded())void loadFinalPanels({force: !!options.reloadPanels});
   }
   if (activeView === 'excel' && state?.configured) void loadAutoStateDetail();
 }
@@ -913,6 +915,34 @@ function startUpdateMonitor() {
 }
 
 let finalReadinessInFlight = null;
+let finalPanelsInFlight=null;
+function finalReadinessKey(){
+  const pack=activePackRecord();
+  if(!pack?.packId)return '';
+  return pack.category?activePreset:String(pack.packId);
+}
+// True once readiness for the active pack is actually in state. Used instead of
+// a "loaded" flag: an early call during boot can bail before fetching anything,
+// and a flag set up-front would then suppress every later attempt, leaving the
+// screen showing 0 ページ forever.
+function finalReadinessLoaded(){
+  const key=finalReadinessKey();
+  if(!key)return true;
+  return !!state?.finalReadiness?.[key];
+}
+// Load everything the final screen needs, then paint once.
+async function loadFinalPanels(options = {}){
+  if(!finalPanelsInFlight){
+    finalPanelsInFlight=Promise.allSettled([
+      loadFinalReadiness({render:false}),
+      loadFinalArchives(),
+      loadPackReview({render:false})
+    ]).finally(()=>{finalPanelsInFlight=null;});
+  }
+  await finalPanelsInFlight;
+  if(options.render===false) return;
+  if(activeView==='final'){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();renderPackReview();}
+}
 async function loadFinalReadiness(options = {}){
   if(!state||!configured())return;
   const pack=activePackRecord(),preset=activePreset,key=pack?.category?preset:String(pack?.packId||activePackId);
@@ -1218,7 +1248,13 @@ function renderFinalOverview() {
   const preflight=renderFinalPreflight(entries);
   const unassigned=Number(preflight?.unassigned||0);
   const visibleEntries=entries.filter(entry=>entry.target?.required!==false||Number(entry.ready?.pageCount||0)>0);
-  const grid=$('final-target-grid');if(grid)grid.innerHTML=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const grid=$('final-target-grid');
+  // Skip the rebuild when nothing changed. loadFinalPanels() repaints once after
+  // its fetch, and blowing away innerHTML for an identical result made the cards
+  // blink for no reason. Same signature trick renderPages() uses.
+  const gridHtml=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const gridChanged=!grid||grid.dataset.signature!==gridHtml;
+  if(grid&&gridChanged){grid.innerHTML=gridHtml;grid.dataset.signature=gridHtml;}
   const renderFreshness=(ready,card)=>{
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
     const blockers=asArray(ready.blockers),reasons=asArray(ready.staleReasons).slice(0,3);const display=String(ready.displayState||'not-built');
@@ -1234,7 +1270,9 @@ function renderFinalOverview() {
     if(btn)btn.disabled=Number(ready.pageCount||0)===0||blockers.length>0;
     if(fix)fix.classList.toggle('hidden',blockers.length===0||Number(ready.pageCount||0)===0);
   };
-  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
+  // Bind only when the markup was actually replaced: re-running addEventListener
+  // on surviving nodes would stack duplicate handlers and fire a second build.
+  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
   const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;allBtn.classList.toggle('busy',!!activeFinalJobId);allBtn.className=`btn ${activeFinalJobId?'primary busy':'primary'}`;allBtn.textContent=hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力';}
   const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));history.innerHTML=rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>';}
   renderPackReview();
@@ -1341,7 +1379,7 @@ async function refreshFinalPreflight(btn) {
     if(configured())await api('/api/scan-updates',{method:'POST',body:{force:true}});
     state=normalizeStatePayload(await api('/api/state'));
     if(configured())await loadFiles(null);
-    await loadFinalReadiness();
+    await loadFinalPanels({force:true, render:false});
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
     renderAll();
     showMessage('ok','出力前チェックを更新しました','原稿・変換PDF・ページ構成・出力設定を最新状態で確認しました。');
@@ -1637,11 +1675,18 @@ function renderVolumeLinks() {
     const volume=String(card.dataset.finalVolume||''),a=card.querySelector('[data-final-open]'),publish=card.querySelector('[data-final-publish]'),r=volumeReadiness(volume);
     const available=!!(r.outputPdf && r.outputPdfExists);
     const publishable=available&&String(r.displayState||'')==='built';
+    // Three equal-weight buttons side by side gave no clue what to do next.
+    // Once the PDF exists, checking it is the next step, so it becomes the
+    // primary action and moves to the front; re-outputting drops to tertiary.
+    const fresh=available&&String(r.displayState||'')==='built';
     if(a){
-      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;const fresh=r.displayState==='built';a.textContent=fresh?'出力したPDFを開く':'前回出力を開く';a.className=fresh?'btn secondary':'btn ghost';a.classList.remove('hidden');}
+      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;a.textContent=fresh?'出力したPDFを開く':'前回出力を開く';a.className=fresh?'btn primary':'btn secondary';a.classList.remove('hidden');}
       else{a.removeAttribute('href');a.classList.add('hidden');}
     }
-    if(publish){publish.classList.toggle('hidden',!publishable);publish.disabled=!publishable;}
+    const buildBtn=card.querySelector('[data-final-build]');
+    if(buildBtn)buildBtn.className=fresh?'btn ghost':'btn primary';
+    if(publish){publish.classList.toggle('hidden',!publishable);publish.disabled=!publishable;publish.className=`btn secondary${publishable?'':' hidden'}`;}
+    card.classList.toggle('has-output',fresh);
   });
 }
 
@@ -2335,13 +2380,13 @@ function diffFilteredSheets(){
   return filtered;
 }
 
-async function loadPackReview(){
+async function loadPackReview(options = {}){
   const pack=activePackRecord();if(!state||!configured()||!pack?.packId)return;
   const packId=String(pack.packId);
   if(packReviewInFlight)return packReviewInFlight;
   packReviewInFlight=api(`/api/v2/packs/${encodeURIComponent(packId)}/review`).then(response=>{
     if(String(activePackRecord()?.packId||'')!==packId)return;
-    packReviewState=response.review||null;renderPackReview();
+    packReviewState=response.review||null;if(options.render!==false)renderPackReview();
   }).catch(error=>{log('レビュー状態の確認でエラー',error.detail||error.message);}).finally(()=>{packReviewInFlight=null;});
   return packReviewInFlight;
 }
@@ -4616,7 +4661,7 @@ async function runFinalBuildJob(targetIds){
           // network round trip later, with the progress panel still up and then
           // vanishing - three visual states in a row, seen as flicker.
           await refresh({render:false});
-          await loadFinalReadiness({render:false});
+          await loadFinalPanels({force:true, render:false});
           hideProgressPanel();
           renderAll();
           return job;
