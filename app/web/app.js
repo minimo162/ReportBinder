@@ -4543,8 +4543,13 @@ function focusFinalOutputs(){
   if(first){first.setAttribute('tabindex','-1');first.focus({preventScroll:true});}
 }
 async function openFinalVolume(volume, category=activePreset) {
-  let blank=null;try{blank=window.open('about:blank','_blank');}catch{}if(blank){try{blank.opener=null;}catch{}}
-  try{const custom=!activePackIsBuiltIn(),path=custom?'/api/v2/outputs/file':'/api/final/file',body=custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category};const objectUrl=await fetchPdfObjectUrl(path,body);if(blank&&!blank.closed)blank.location.href=objectUrl;else window.open(objectUrl,'_blank');}
+  // 名前付きターゲットにして同じタブを使い回す。'_blank' だと開くたびにタブが増え、
+  // どれが今見ているPDFなのか分からなくなる。
+  let blank=null;try{blank=window.open('about:blank','reportbinder-pdf');}catch{}if(blank){try{blank.opener=null;}catch{}}
+  try{const custom=!activePackIsBuiltIn(),path=custom?'/api/v2/outputs/file':'/api/final/file',body=custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category};const objectUrl=await fetchPdfObjectUrl(path,body);if(blank&&!blank.closed)blank.location.href=objectUrl;else window.open(objectUrl,'reportbinder-pdf');
+    // PDFは別タブで開く。戻り方が分からず迷う人がいるため、こちら側に案内を残す。
+    // 自動では消さない(利用者は別タブへ行っており、戻ってきたときに読めないと意味がない)。
+    showMessage('ok','別のタブでPDFを開きました','確認が終わったら、ブラウザのタブを切り替えてこの画面（ReportBinder）に戻ってください。',null,[],0);}
   catch(e){if(blank){try{blank.close();}catch{}}showMessage('danger','PDFを開けません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
 }
 

@@ -24,6 +24,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      # Defender はワークスペースへ書かれたばかりのファイルを走査する。同梱JREとjarは
+      # 毎回展開されるため、スイートで最初に起動するJVMがその費用を全部被っていた。
+      # 実測では同一ジョブ内で1本目が約65秒、2本目以降が約1.6秒。除外を入れて平す。
+      # 失敗してもジョブは続ける(権限が無い環境でも壊さない)。
+      - name: Exclude the workspace from realtime scanning
+        shell: powershell
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath '${{ github.workspace }}' -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess 'java.exe' -ErrorAction Stop
+            Write-Output 'Defender exclusions added.'
+          } catch {
+            Write-Output "Defender exclusions unavailable: $($_.Exception.Message)"
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
