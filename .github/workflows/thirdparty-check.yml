@@ -15,6 +15,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+  # 手動だけにすると、重いスイートを自動で走らせる経路が一つも無くなる
+  # (release.yml も workflow_dispatch のみ)。壊れたことに気づくのがリリース直前に
+  # なるため、週1で回す。日曜18:00 UTC = 月曜03:00 JST。
+  schedule:
+    - cron: '0 18 * * 0'
 
 concurrency:
   group: reportbinder-ci-${{ github.workflow }}-${{ github.ref }}
@@ -49,9 +54,9 @@ jobs:
         shell: powershell
         run: .\app\tools\ci-selfcheck.ps1 -Scope Fast
 
-  # 手動実行のときだけ。所要は約10分。
+  # 手動実行と週1の定期実行だけ。所要は約10分。
   full-suite:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: windows-latest
     timeout-minutes: 35
     steps:

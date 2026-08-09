@@ -160,6 +160,9 @@ try {
     if ($Scope -eq 'Fast') {
         Remove-CiGeneratedFiles
         Invoke-Checked 'Repository selfcheck (static)' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py'),'--static-only'))
+        # structure.json のスキーマ移行だけは変更ごとに見る。利用者データを不可逆に
+        # 壊しうる唯一の種類で、しかも外部依存ゼロの1.7秒で確かめられるため。
+        Invoke-Checked 'Schema migration regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'schema-v3-selfcheck.ps1'))
         Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
         Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
         # 何を見ていないかを結果に残す。通った表示だけが後から参照されるため。
@@ -181,6 +184,26 @@ try {
     Invoke-Checked 'Pack lifecycle regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-lifecycle-selfcheck.ps1'))
     Invoke-Checked 'History logic regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'history-logic-selfcheck.ps1'))
     Invoke-Checked 'Custom pack workflow regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'custom-pack-workflow-selfcheck.ps1'))
+    # この3本は書かれていたのに、どのCI経路からも呼ばれていなかった。原稿アダプタは
+    # V5で汎用化した経路そのもので、回帰網に穴が空いたままだった。
+    Invoke-Checked 'PDF source adapter regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pdf-source-adapter-selfcheck.ps1'))
+    Invoke-Checked 'History generalization regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'history-generalization-selfcheck.ps1'))
+    # Word のアダプタ検証だけは DOCX の実物と、実際の Word による変換が要る
+    # (他のアダプタ検証と違い、変換を差し替えていない)。Office の入っている開発機では
+    # 実行し、入っていないCIランナーでは飛ばす。飛ばしたことは必ず出力に残す。
+    if ($null -eq [Type]::GetTypeFromProgID('Word.Application')) {
+        Write-Output '== Word source adapter regression =='
+        Write-Output 'SKIPPED: Word is not installed on this machine, so the real conversion path cannot run here.'
+    } else {
+        $wordFixtureDir = Join-Path ([IO.Path]::GetTempPath()) ('ReportBinderWordFixtures_' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $wordFixtureDir -Force | Out-Null
+        try {
+            Invoke-Checked 'Word adapter fixtures' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'create-word-adapter-fixtures.py'),'--output-dir',$wordFixtureDir))
+            Invoke-Checked 'Word source adapter regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'word-source-adapter-selfcheck.ps1'),'-FixtureV1',(Join-Path $wordFixtureDir 'word-fixture-v1.docx'),'-FixtureV2',(Join-Path $wordFixtureDir 'word-fixture-v2.docx'))
+        } finally {
+            Remove-Item -LiteralPath $wordFixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     if (-not $SkipPackageSmoke) {
         New-Item -ItemType Directory -Path $PackageOutputDir -Force | Out-Null

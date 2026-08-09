@@ -587,6 +587,11 @@ tr.page-row input,tr.page-row select,tr.page-row button{cursor:auto}
 .final-card.has-output .card-actions [data-final-open]{order:-1}
 .final-card.has-output .card-actions [data-final-publish]{order:0}
 .final-card.has-output .card-actions [data-final-build]{order:1;margin-left:auto}
+/* 保存先は折り返して全体を見せる。省略すると、どのフォルダーか分からないという
+   元の問題がそのまま残る。 */
+.final-path{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;margin:8px 0 0;font-size:13px;line-height:1.5}
+.final-path-label{flex:none;color:var(--text-tertiary)}
+.final-path-value{flex:1 1 240px;min-width:0;color:var(--text-secondary);word-break:break-all}
 @media(max-width:760px){.final-card.has-output .card-actions [data-final-build]{margin-left:0}}
 
 /* Sticky bars must not carry backdrop-filter. Their backgrounds are opaque, so

@@ -1298,7 +1298,7 @@ function renderFinalOverview() {
   // Skip the rebuild when nothing changed. loadFinalPanels() repaints once after
   // its fetch, and blowing away innerHTML for an identical result made the cards
   // blink for no reason. Same signature trick renderPages() uses.
-  const gridHtml=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const gridHtml=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="final-path hidden" data-final-path></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><button class="btn secondary hidden" type="button" data-final-reveal>保存先フォルダーを開く</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
   const gridChanged=setHtmlIfChanged(grid,gridHtml);
   const renderFreshness=(ready,card)=>{
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
@@ -1317,7 +1317,7 @@ function renderFinalOverview() {
   };
   // Bind only when the markup was actually replaced: re-running addEventListener
   // on surviving nodes would stack duplicate handlers and fire a second build.
-  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
+  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-reveal]')?.addEventListener('click',event=>revealFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
   const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;setClassIfChanged(allBtn,`btn ${activeFinalJobId?'primary busy':'primary'}`);setTextIfChanged(allBtn,hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力');}
   const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));setHtmlIfChanged(history,rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>');}
   renderPackReview();
@@ -1737,6 +1737,14 @@ function renderVolumeLinks() {
     const buildBtn=card.querySelector('[data-final-build]');
     setClassIfChanged(buildBtn,fresh?'btn ghost':'btn primary');
     if(publish){publish.disabled=!publishable;setClassIfChanged(publish,`btn secondary${publishable?'':' hidden'}`);}
+    // 出力したPDFは別タブで見るだけでは掴めない。メールに添付する・共有フォルダーへ
+    // 置くには実体が要るので、保存先そのものを画面に出し、フォルダーを開けるようにする。
+    const pathBox=card.querySelector('[data-final-path]'),reveal=card.querySelector('[data-final-reveal]');
+    if(pathBox){
+      if(available){setHtmlIfChanged(pathBox,`<span class="final-path-label">保存先</span><span class="final-path-value" title="${escapeAttr(String(r.outputPdf||''))}">${escapeHtml(String(r.outputPdf||''))}</span>`);pathBox.classList.remove('hidden');}
+      else{pathBox.classList.add('hidden');}
+    }
+    if(reveal){reveal.dataset.volume=volume;setClassIfChanged(reveal,`btn secondary${available?'':' hidden'}`);}
     card.classList.toggle('has-output',fresh);
   });
 }
@@ -4552,6 +4560,15 @@ async function openFinalVolume(volume, category=activePreset) {
     showMessage('ok','別のタブでPDFを開きました','確認が終わったら、ブラウザのタブを切り替えてこの画面（ReportBinder）に戻ってください。',null,[],0);}
   catch(e){if(blank){try{blank.close();}catch{}}showMessage('danger','PDFを開けません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
 }
+// 別タブのPDFは見るだけで、掴んで持ち出せない。メールに添付する・共有フォルダーへ
+// 置くには実体が要るので、保存先のフォルダーをエクスプローラーで開いて選択状態にする。
+async function revealFinalVolume(volume, trigger=null) {
+  await runBusy(trigger,async()=>{
+    const custom=!activePackIsBuiltIn();
+    await api('/api/v2/outputs/reveal',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
+    showMessage('ok','保存先フォルダーを開きました','エクスプローラーでPDFが選択された状態になっています。そこからメールに添付したり、共有フォルダーへコピーしたりできます。');
+  });
+}
 
 
 function pathElementValue(id) {
@@ -4671,6 +4688,15 @@ async function savePaths(btn) {
     continueFirstRunAfterFolderSelection();
   });
 }
+// 控え(アーカイブ)の作成に失敗したことをサーバーは archiveError で返していたが、
+// どこからも読まれておらず画面に一切出ていなかった。控えは、出力の元になった原稿の
+// 版を後日の掃除から守る仕組みと同じ経路にあるため、黙って落とすと後から追えなくなる。
+function showBuildArchiveWarning(job) {
+  const failed=asArray(job?.built).filter(item=>String(item?.archiveError||'').trim());
+  if(!failed.length)return;
+  const detail=String(failed[0].archiveError||'');
+  setTimeout(()=>showMessage('warn','提出用PDFは出力しましたが、控えを保存できませんでした',`${detail} 提出用PDF自体は保存されています。出力フォルダーの空き容量とアクセス権を確認してから、もう一度出力してください。`,failed,[],0),700);
+}
 function showPostBuildWarning(volume) {
   const after=volumeReadiness(volume),blockers=asArray(after.blockers);
   if(blockers.length){setTimeout(()=>showMessage('warn','提出用PDFは出力しましたが、追加対応が必要です',blockers[0]?.message||'変換PDFを作成し直してから、提出用PDFを再出力してください。',blockers,[{label:'原稿・変換PDFへ',view:'excel'}],0),900);}
@@ -4690,7 +4716,10 @@ async function buildVolume(volume, btn) {
       return;
     }
     const built=asArray(job.built)[0];
-    showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf?`${outputFileName(built.outputPdf)} を保存しました。「PDFを開く」で内容を確認できます。`:'出力フォルダーを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)}],0);
+    showMessage('ok',`${volumeLabel(volume)}PDFを出力しました`,built?.outputPdf?`${String(built.outputPdf)} に保存しました。`:'出力フォルダーを確認してください。',built,[{label:'PDFを開く',primary:true,handler:()=>openFinalVolume(volume,activePreset)},{label:'保存先フォルダーを開く',handler:()=>revealFinalVolume(volume)}],0);
+    // 控えの作成に失敗しても提出用PDF自体はできている。ただし黙って進むと、
+    // 出力の元になった原稿の版がいつ消えたか誰にも分からなくなる。
+    showBuildArchiveWarning(job);
     showPostBuildWarning(volume);
   },false);
 }
@@ -4810,6 +4839,7 @@ async function buildAllVolumes(btn) {
         ? [{label:'出力したPDFを開く',primary:true,handler:()=>openFinalVolume(String(openable[0].volume))}]
         : [{label:'出力したPDFを確認',primary:true,handler:()=>{setActiveView('final');focusFinalOutputs();}}];
       showMessage('ok','提出用PDFを出力しました', detailText, {built, skipped}, actions, 0);
+      showBuildArchiveWarning(job);
     } else {
       showMessage('warn','出力対象がありません','ページ構成で本体または補足にページを設定してください。');
     }

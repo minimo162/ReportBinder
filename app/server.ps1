@@ -79,6 +79,26 @@ $Script:WordRenderProfileVersion = 2026080601
 $Script:WordRenderTimeoutSeconds = 120
 $Script:PowerPointRenderProfileVersion = 2026080701
 $Script:PowerPointRenderTimeoutSeconds = 120
+# Excel は同一プロセス内の同期COM呼び出しなので、Word/PowerPoint のようにワーカーごと
+# 落とす方法が使えない。進捗が止まってからの猶予として長めに取る(大きなブックは
+# 1シートに数十秒かかる)。詳細は Start-ExcelRenderWatchdog を参照。
+$Script:ExcelRenderTimeoutSeconds = 300
+$Script:ExcelWatchdogProcess = $null
+$Script:ExcelWatchdogHeartbeatPath = ''
+$Script:ExcelWatchdogKilledPath = ''
+$Script:OwnedExcelProcessId = 0
+# 外部コマンド(呼び先はすべて java)の上限。用途ごとに分ける。
+# 2026-08-10: 上限を導入した時点、9箇所すべてが既定の120秒で走っていた。120秒は
+# Word/PowerPoint の COM 変換に合わせた値で、java の実計算に流用できるものではない。
+# 分割はコード自身が2000ページのPDFを許容し、組版の出力先は共有フォルダーにもなる。
+# どちらも120秒に触れ得るのに、呼び出し側が時間切れと異常終了を区別していなかったため、
+# 健全な入力に「破損していないか確認してください」と表示していた。
+$Script:JavaProbeTimeoutSeconds = 30
+$Script:PdfSplitTimeoutSeconds = 900
+$Script:FinalComposeTimeoutSeconds = 900
+# 解析はPDF作成のクリティカルパス外(Invoke-PostRenderAnalysis)。上限を設けた元の理由が
+# ここの AWT 初期化の無限待ちなので、他より短く抑える。
+$Script:PdfAnalyzeTimeoutSeconds = 300
 $Script:FinalPdfComposerProfileVersion = 20260806
 $Script:RenderEnvironmentCache = $null
 $Script:RenderEnvironmentCompared = $false
@@ -279,6 +299,14 @@ namespace ReportBinderNative {
                 return write;
             }
         }
+    }
+
+    // 起動した Office アプリのプロセスIDを、そのウィンドウハンドルから引く。
+    // 利用者が自分で開いている Excel を巻き添えにしないため、こちらが起動した
+    // 1つだけを特定する必要がある。
+    public static class OfficeWindows {
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     }
 }
 '@
@@ -2874,8 +2902,13 @@ function Invoke-PdfSourceSplit([string]$PdfPath, [string]$OutputDir) {
     if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
     $prefix = Join-Path $OutputDir 'page'
     $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-    $run = Invoke-NativeCapture ([string]$tool.javaExe) @('-jar', $pdfboxJar, 'PDFSplit', '-split', '1', '-outputPrefix', $prefix, $PdfPath)
+    $run = Invoke-NativeCapture ([string]$tool.javaExe) @('-jar', $pdfboxJar, 'PDFSplit', '-split', '1', '-outputPrefix', $prefix, $PdfPath) $Script:PdfSplitTimeoutSeconds
     $message = [string]$run.text
+    # 時間切れを異常終了と混ぜない。健全な大きいPDFに「破損」と言ってしまうと、
+    # 利用者は打つ手が無くなる。
+    if ($run.timedOut) {
+        throw ('このPDFの読み込みが{0}分以内に終わりませんでした。ページ数の多いPDFは分割してから登録してください。' -f [int]($Script:PdfSplitTimeoutSeconds / 60))
+    }
     if ([int]$run.exitCode -ne 0) {
         if ($message -match 'password|encrypted|decrypt|InvalidPassword') { throw 'パスワード保護されたPDFは登録できません。保護を解除したPDFを使用してください。' }
         throw ('PDFを安全に読み込めませんでした。破損していないか確認してください。' + $(if ($message) { " 詳細: $message" } else { '' }))
@@ -4271,7 +4304,7 @@ function Apply-StandardPrintSettings($Worksheet, $Excel = $null, [bool]$DeferPri
 
         try { $Worksheet.DisplayPageBreaks = $false } catch { }
         $ps = $Worksheet.PageSetup
-        # 暫定PDFは左右1.2cmを基準にする。最終PDFでは奇数/偶数ページを0.2cmだけ内側へ寄せる(パンチ側1.4cm/外側1.0cm)。
+        # 暫定PDFは左右1.2cmを基準にする。提出用PDFでは奇数/偶数ページを0.2cmだけ内側へ寄せる(パンチ側1.4cm/外側1.0cm)。
         $ps.TopMargin = Convert-CmToPt 0.8
         $ps.BottomMargin = Convert-CmToPt 0.8
         $ps.LeftMargin = Convert-CmToPt 1.2
@@ -4319,11 +4352,12 @@ function Split-BatchPdfToSheets([string]$BatchPdf, $SheetInfos, [string]$TmpDir)
         $pageNo++
     }
     Write-Utf8NoBomFile $mapPath ([string]::Join("`n", $lines))
-    $run = Invoke-NativeCapture ([string]$tool.javaExe) @('-cp', [string]$tool.classPath, 'BatchPdfSplitter', '--source', $BatchPdf, '--map', $mapPath)
+    $run = Invoke-NativeCapture ([string]$tool.javaExe) @('-cp', [string]$tool.classPath, 'BatchPdfSplitter', '--source', $BatchPdf, '--map', $mapPath) $Script:PdfSplitTimeoutSeconds
     $output = @($run.output)
     $global:LASTEXITCODE = [int]$run.exitCode
     $exit = $LASTEXITCODE
     $outputText = ($output -join "`n")
+    if ($run.timedOut) { return [ordered]@{ ok = $false; reason = 'split-timeout'; message = ('PDFの分割が{0}分以内に終わりませんでした。' -f [int]($Script:PdfSplitTimeoutSeconds / 60)) } }
     if ($exit -ne 0) { return [ordered]@{ ok = $false; reason = 'split-failed'; message = $outputText } }
     foreach ($info in @($SheetInfos)) {
         if (-not (Test-Path -LiteralPath ([string]$info.outPdf))) { return [ordered]@{ ok = $false; reason = 'split-missing-output'; message = "分割後PDFが見つかりません: $($info.outPdf)" } }
@@ -4410,10 +4444,17 @@ function Export-WorksheetToPdfSafe($Excel, $Workbook, $Worksheet, [string]$OutPd
         try { $Worksheet.Activate() | Out-Null } catch { }
         try { $Worksheet.Select($true) | Out-Null } catch { }
         # Type=0 xlTypePDF, Quality=0 xlQualityStandard, IgnorePrintAreas=false.
+        # 1シートごとに心拍を打つ。止まったまま一定時間が過ぎたら監視プロセスが
+        # こちらの Excel を終了させ、この呼び出しは RPC の失敗として戻る。
+        Update-ExcelRenderHeartbeat
         $Worksheet.ExportAsFixedFormat(0, $OutPdf, 0, $true, $false, $missing, $missing, $false, $missing)
+        Update-ExcelRenderHeartbeat
         return (Wait-ForPdfOutput $OutPdf $SheetName)
     } catch {
         $directError = $_.Exception.Message
+        if (Test-ExcelRenderWatchdogFired) {
+            throw ("Excelでの変換が{0}分以上進まなかったため中止しました: シート {1}。Excelの画面に確認のダイアログが出ていないか確かめてから、もう一度お試しください。" -f [int]($Script:ExcelRenderTimeoutSeconds / 60), $SheetName)
+        }
         throw "ExcelでPDF化できませんでした: シート $SheetName / 直接出力=[$directError]"
     } finally {
         try { $Workbook.Activate() | Out-Null } catch { }
@@ -4446,6 +4487,91 @@ function Get-PdfPageCount([string]$PdfPath) {
 }
 
 
+# Excel の PDF 書き出しは同一プロセス内の同期COM呼び出しで、Word/PowerPoint のような
+# 別プロセスのワーカーを通らない。固まると呼び出し元ごと止まり、「PDF作成を中止」も
+# 現在の原稿が終わるまで効かないため、利用者にはタスクマネージャー以外の脱出手段が無い。
+# PowerShell のタイマーやイベントでは救えない(COM呼び出しでパイプラインが塞がっている
+# 間、ハンドラは実行されない)。そこで外部の監視プロセスに見張らせる。
+# 進捗があるたびに心拍ファイルを更新し、一定時間更新が止まったら、こちらが起動した
+# Excel だけを終了させる。COM呼び出しは RPC の失敗として戻り、既存の失敗処理に載る。
+function Get-OwnedExcelProcessId($Excel) {
+    if (-not ('ReportBinderNative.OfficeWindows' -as [type])) { return 0 }
+    try {
+        [uint32]$pidValue = 0
+        [void][ReportBinderNative.OfficeWindows]::GetWindowThreadProcessId([IntPtr][int]$Excel.Hwnd, [ref]$pidValue)
+        return [int]$pidValue
+    } catch { return 0 }
+}
+
+function Update-ExcelRenderHeartbeat {
+    if ([string]::IsNullOrWhiteSpace($Script:ExcelWatchdogHeartbeatPath)) { return }
+    try { [IO.File]::WriteAllText($Script:ExcelWatchdogHeartbeatPath, [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())) } catch { }
+}
+
+function Start-ExcelRenderWatchdog($Excel) {
+    $Script:ExcelWatchdogProcess = $null
+    $Script:ExcelWatchdogHeartbeatPath = ''
+    $Script:ExcelWatchdogKilledPath = ''
+    $Script:OwnedExcelProcessId = 0
+    if ($Script:ExcelRenderTimeoutSeconds -le 0) { return }
+    $excelPid = Get-OwnedExcelProcessId $Excel
+    if ($excelPid -le 0) { return }
+    $Script:OwnedExcelProcessId = $excelPid
+    $runDir = Join-Path ([IO.Path]::GetTempPath()) 'ReportBinderExcelWatchdog'
+    try { New-Item -ItemType Directory -Path $runDir -Force | Out-Null } catch { return }
+    $runId = [Guid]::NewGuid().ToString('N')
+    $Script:ExcelWatchdogHeartbeatPath = Join-Path $runDir ("beat-$runId.txt")
+    $Script:ExcelWatchdogKilledPath = Join-Path $runDir ("killed-$runId.txt")
+    Update-ExcelRenderHeartbeat
+    $beatEscaped = $Script:ExcelWatchdogHeartbeatPath.Replace("'", "''")
+    $killedEscaped = $Script:ExcelWatchdogKilledPath.Replace("'", "''")
+    $limit = [int]$Script:ExcelRenderTimeoutSeconds
+    # 心拍ファイルが消えたら仕事が終わった合図。監視も終える。
+    $command = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+while (`$true) {
+    Start-Sleep -Seconds 2
+    if (-not (Test-Path -LiteralPath '$beatEscaped')) { break }
+    `$raw = ''
+    try { `$raw = [IO.File]::ReadAllText('$beatEscaped') } catch { continue }
+    `$last = 0
+    if (-not [long]::TryParse(`$raw.Trim(), [ref]`$last)) { continue }
+    if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - `$last) -lt $limit) { continue }
+    `$target = Get-Process -Id $excelPid -ErrorAction SilentlyContinue
+    if (`$null -eq `$target -or `$target.ProcessName -ne 'EXCEL') { break }
+    try { [IO.File]::WriteAllText('$killedEscaped', 'timeout') } catch { }
+    Stop-Process -Id $excelPid -Force -ErrorAction SilentlyContinue
+    break
+}
+"@
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+    try {
+        $Script:ExcelWatchdogProcess = Start-HiddenPowerShellChild $psExe $command (Join-Path $runDir "out-$runId.log") (Join-Path $runDir "err-$runId.log")
+    } catch { $Script:ExcelWatchdogProcess = $null }
+}
+
+function Test-ExcelRenderWatchdogFired {
+    if ([string]::IsNullOrWhiteSpace($Script:ExcelWatchdogKilledPath)) { return $false }
+    return (Test-Path -LiteralPath $Script:ExcelWatchdogKilledPath)
+}
+
+function Stop-ExcelRenderWatchdog {
+    if (-not [string]::IsNullOrWhiteSpace($Script:ExcelWatchdogHeartbeatPath)) {
+        Remove-Item -LiteralPath $Script:ExcelWatchdogHeartbeatPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $Script:ExcelWatchdogProcess) {
+        try { if (-not $Script:ExcelWatchdogProcess.WaitForExit(3000)) { Stop-ReportBinderProcessTree ([int]$Script:ExcelWatchdogProcess.Id) } } catch { }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Script:ExcelWatchdogKilledPath)) {
+        Remove-Item -LiteralPath $Script:ExcelWatchdogKilledPath -Force -ErrorAction SilentlyContinue
+    }
+    $Script:ExcelWatchdogProcess = $null
+    $Script:ExcelWatchdogHeartbeatPath = ''
+    $Script:ExcelWatchdogKilledPath = ''
+    $Script:OwnedExcelProcessId = 0
+}
+
 function New-ExcelApplicationForRender {
     $excel = New-Object -ComObject Excel.Application
     $excel.Visible = $false
@@ -4461,10 +4587,12 @@ function New-ExcelApplicationForRender {
     try { $excel.EnableAnimations = $false } catch { }
     try { $excel.UserControl = $false } catch { }
     try { $excel.Calculation = -4135 } catch { } # xlCalculationManual
+    Start-ExcelRenderWatchdog $excel
     return $excel
 }
 
 function Close-ExcelApplicationForRender($Excel) {
+    Stop-ExcelRenderWatchdog
     if ($Excel) {
         try { $Excel.Quit() } catch { }
         Invoke-ComRelease $Excel
@@ -6795,7 +6923,7 @@ function Resolve-JavaExe {
     if ($cmd) { return [string]$cmd.Source }
     $cmd2 = Get-Command java -ErrorAction SilentlyContinue
     if ($cmd2) { return [string]$cmd2.Source }
-    throw ("最終PDFの作成に必要なJava Runtimeが見つかりません(探した場所: {0})。この場所にjava.exeがあるのにこのエラーが出る場合は、server.ps1の置き場所(AppRoot)がずれています。app\logs\startup-*-latest.log の AppRoot 行を確認してください。java.exe自体がない場合は app\tools\install-thirdparty.cmd を実行してから、もう一度PDFを出力してください。" -f $direct)
+    throw ("提出用PDFの作成に必要なJava Runtimeが見つかりません(探した場所: {0})。この場所にjava.exeがあるのにこのエラーが出る場合は、server.ps1の置き場所(AppRoot)がずれています。app\logs\startup-*-latest.log の AppRoot 行を確認してください。java.exe自体がない場合は app\tools\install-thirdparty.cmd を実行してから、もう一度PDFを出力してください。" -f $direct)
 }
 
 function Get-JavaRuntimeSignature {
@@ -6806,9 +6934,12 @@ function Get-JavaRuntimeSignature {
     try {
         $java = Resolve-JavaExe
         # `java -version` はバージョン情報を stderr に出すため 2>&1 で取り込む。
-        $out = [string](Invoke-NativeCapture $java @('-version')).text
+        $probe = Invoke-NativeCapture $java @('-version') $Script:JavaProbeTimeoutSeconds
+        $out = [string]$probe.text
         $norm = ($out -replace '\s+', ' ').Trim()
-        if (-not [string]::IsNullOrWhiteSpace($norm)) { $sig = (Get-Sha256Text $norm).Substring(0, 16) }
+        # 起動に失敗すると例外メッセージが text として返る。それを版の署名にすると、
+        # 実行できないJavaの「版が変わった」を延々と記録し続けることになる。
+        if ([int]$probe.exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($norm)) { $sig = (Get-Sha256Text $norm).Substring(0, 16) }
     } catch { $sig = 'unknown' }
     $Script:JavaRuntimeSignature = $sig
     return $sig
@@ -6951,7 +7082,10 @@ function Get-SystemDiagnostics([string]$Language) {
     $pdfjsMain = Join-Path $Script:WebRoot 'pdfjs\pdf.min.mjs'
     $pdfjsWorker = Join-Path $Script:WebRoot 'pdfjs\pdf.worker.min.mjs'
     $javaPath = ''; $javaVersion = ''; $javaReady = $false
-    try { $javaPath = Resolve-JavaExe; $javaVersion = ([string](Invoke-NativeCapture $javaPath @('-version')).text -replace '\s+', ' ').Trim(); $javaReady = -not [string]::IsNullOrWhiteSpace($javaVersion) } catch { $javaVersion = $_.Exception.Message }
+    # exitCode を見ずにテキストの有無だけで判定すると、実行を禁止されている java や
+    # 展開が不完全な同梱JREでも「使える」と診断してしまう。診断画面が最も頼られるのは
+    # まさにその場面なので、終了コードまで確認する。
+    try { $javaPath = Resolve-JavaExe; $javaProbe = Invoke-NativeCapture $javaPath @('-version') $Script:JavaProbeTimeoutSeconds; $javaVersion = ([string]$javaProbe.text -replace '\s+', ' ').Trim(); $javaReady = ([int]$javaProbe.exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($javaVersion)) } catch { $javaVersion = $_.Exception.Message }
     $coreReady = ($javaReady -and (Test-Path -LiteralPath $composer) -and (Test-Path -LiteralPath $pdfbox) -and (Test-Path -LiteralPath $pdfjsMain) -and (Test-Path -LiteralPath $pdfjsWorker))
     $paths = Get-Paths
     $officeReady = ([bool]$excel.available -and [bool]$word.available -and [bool]$powerPoint.available)
@@ -6977,7 +7111,7 @@ function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty
 function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[string]$Category,[bool]$CheckOutputExists = $true) {
     $scope=Resolve-DocumentPackScope $Structure $Category $false;$packId=[string]$scope.packId;$snap=Get-FinalBuildInputSnapshot $Structure $Language $Volume $packId;$v=Get-PackOutputState $Structure $Language $packId $Volume $false;if($null -eq $v){$v=New-EmptyVolumeState};$built=[string](Get-DataProperty $v 'builtFingerprint' '');$current=[string]$snap.fingerprint;$out=[string](Get-DataProperty $v 'outputPdf' '');$exists=(-not [string]::IsNullOrWhiteSpace($out));if($exists -and $CheckOutputExists){$exists=Test-Path -LiteralPath $out};$status='not-built';if($built){if($built -ne $current -or $snap.blockers.Count -gt 0){$status='needs-rebuild'}else{$status='built'}};$display=if($snap.blockers.Count -gt 0){'blocked'}elseif(-not $built){'not-built'}elseif($built -ne $current){'needs-rebuild'}elseif(-not $exists){'output-missing'}else{'built'}
     Set-NoteProperty $v 'status' $status
-    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='最終PDFの入力が変更されました'})}
+    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='提出用PDFの入力が変更されました'})}
     return [ordered]@{packId=$packId;targetId=(Get-TargetIdFromLegacyVolume $Volume);canBuild=($snap.blockers.Count -eq 0 -and $snap.pageCount -gt 0);pageCount=$snap.pageCount;status=$status;displayState=$display;builtFingerprint=$built;currentFingerprint=$current;outputPdf=$out;outputPdfExists=[bool]$exists;lastBuiltAt=(Get-DataProperty $v 'lastBuiltAt' $null);blockers=@($snap.blockers);staleReasons=@($reasons);snapshot=$snap}
 }
 
@@ -7319,10 +7453,10 @@ function Build-FinalPdfLegacy([string]$Language,[string]$Volume,[string]$Categor
         $snapshotBefore=Update-StructureLocked $Language {param($st) Apply-DefaultNumberingPerVolume $Language $st $cat;return Get-FinalBuildInputSnapshot $st $Language $Volume $cat}
         if($snapshotBefore.blockers.Count -gt 0){throw [InvalidOperationException]::new([string]$snapshotBefore.blockers[0].message)}
         $fpBefore=[string]$snapshotBefore.fingerprint;$projectId=[string]$snapshotBefore.projectId;$outName=[string]$snapshotBefore.outputFileName;$outPath=Join-Path ([string]$paths.outputDir) $outName;$tmp=Join-Path ([string]$paths.outputDir) "~building_${Volume}_${cat}.pdf";if(Test-Path $tmp){Remove-Item $tmp -Force -ErrorAction SilentlyContinue}
-        if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の最終PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
+        if(Test-Path $outPath){$f=$null;try{$f=[IO.File]::Open($outPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{throw "出力先の提出用PDFが開かれているため上書きできません: $outName"}finally{if($f){$f.Dispose()}}}
         $manifest=[ordered]@{schemaVersion=3;language=$Language;category=$cat;volume=$Volume;projectId=$projectId;inputFingerprint=$fpBefore;outputPdf=$tmp;createdAt=New-NowIso;document=$snapshotBefore.document;pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true};physicalPages=$snapshotBefore.physicalPages;pages=$snapshotBefore.manifestPages};$manifestPath=Join-Path $workspace "exports\manifest_${Volume}_${cat}.json";Write-JsonFile $manifestPath $manifest
-        $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath);$exit=[int]$run.exitCode;$text=[string]$run.text;if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '最終PDFを作成できませんでした。'}
-        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'source-updated' '元原稿が更新されたため、変換PDFを再作成後に最終PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
+        $java=Resolve-JavaExe;$run=Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath) $Script:FinalComposeTimeoutSeconds;$exit=[int]$run.exitCode;$text=[string]$run.text;if($run.timedOut){throw ('PDFの結合が{0}分以内に終わりませんでした。出力先がネットワーク上のフォルダーの場合は、いったんPC内のフォルダーに出力してみてください。' -f [int]($Script:FinalComposeTimeoutSeconds / 60))};if($exit -ne 0){throw "PDFBox組版に失敗しました。exit=$exit`n$text"};if(-not(Test-Path $tmp)-or(Get-Item $tmp).Length -le 0){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw '提出用PDFを作成できませんでした。'}
+        $commit=Update-StructureLocked $Language {param($st)$after=Get-FinalBuildInputSnapshot $st $Language $Volume $cat;if([string]$after.fingerprint -ne $fpBefore){return [ordered]@{changed=$true;after=$after}};Move-Item -LiteralPath $tmp -Destination $outPath -Force;$key=Get-VolumeStateKey $Volume $cat;$v=Get-DataProperty $st.volumes $key $null;if($null -eq $v){$v=New-EmptyVolumeState;Set-NoteProperty $st.volumes $key $v};Set-NoteProperty $v 'builtFingerprint' $fpBefore;Set-NoteProperty $v 'lastBuiltAt' (New-NowIso);Set-NoteProperty $v 'outputPdf' $outPath;Set-NoteProperty $v 'staleReasons' @();Set-NoteProperty $v 'message' $text;$ready=Get-FinalBuildReadiness $st $Language $Volume $cat;if($ready.blockers.Count -gt 0){Set-NoteProperty $v 'status' 'needs-rebuild';Add-StaleReason $v 'source-updated' '元原稿が更新されたため、変換PDFを再作成後に提出用PDFを再出力してください'}else{Set-NoteProperty $v 'status' 'built'};return [ordered]@{changed=$false;readiness=$ready}}
         if($commit.changed){Remove-Item $tmp -Force -ErrorAction SilentlyContinue;throw 'PDF作成中にページ構成またはPDF入力が変更されました。最新の状態で再度出力してください。'}
         $manifest.outputPdf=$outPath;Write-JsonFile $manifestPath $manifest
         return [ordered]@{volume=$Volume;category=$cat;outputPdf=$outPath;inputFingerprint=$fpBefore;message=$text;readiness=$commit.readiness}
@@ -7420,7 +7554,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         if (Test-Path -LiteralPath $outputPath) {
             $handle = $null
             try { $handle = [IO.File]::Open($outputPath,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) }
-            catch { throw "出力先の最終PDFが開かれているため上書きできません: $outputName" }
+            catch { throw "出力先の提出用PDFが開かれているため上書きできません: $outputName" }
             finally { if ($handle) { $handle.Dispose() } }
         }
         $manifest = [ordered]@{
@@ -7433,9 +7567,10 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         Write-JsonFile $manifestPath $manifest
         Report-FinalBuildPhase ('ページを結合しています（' + [string]$snapshotBefore.pageCount + 'ページ）')
         $java = Resolve-JavaExe
-        $run = Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath)
+        $run = Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath) $Script:FinalComposeTimeoutSeconds
+        if ($run.timedOut) { throw ('PDFの結合が{0}分以内に終わりませんでした。出力先がネットワーク上のフォルダーの場合は、いったんPC内のフォルダーに出力してみてください。' -f [int]($Script:FinalComposeTimeoutSeconds / 60)) }
         if ([int]$run.exitCode -ne 0) { throw "PDFBox組版に失敗しました。exit=$([int]$run.exitCode)`n$([string]$run.text)" }
-        if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '最終PDFを作成できませんでした。' }
+        if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
         Report-FinalBuildPhase '出力先へ保存しています'
         $buildId = New-RbId
         $commit = Update-StructureLocked $Language {
@@ -7462,7 +7597,19 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         $archivePath = ''
         $archiveError = ''
         try { $archivePath = New-FinalArchive $Language ([string]$scope.packId) $volume $buildId $outputPath $manifest $snapshotBefore }
-        catch { $archiveError = $_.Exception.Message }
+        catch {
+            $archiveError = $_.Exception.Message
+            # PDFは既に出力先へ書けているので、ここで作成そのものを失敗にはしない。
+            # ただしアーカイブが作れなかったときに黙って進むと、出力の元になった版が
+            # 保持期間の猶予なしに掃除で消える。保護(pin)だけは作り直す。
+            try {
+                Set-FinalPdfSnapshotPins $Language ([string]$scope.packId) '' $volume $buildId (Get-DataProperty $snapshotBefore 'sourceWorkbooks' @()) ''
+            } catch {
+                $archiveError = $archiveError + ' / ' + $_.Exception.Message
+            }
+            # 握りつぶさない。利用者にも記録にも残す。
+            Write-HistoryEvent $Language 'final.archive.failed' ([ordered]@{ packId=[string]$scope.packId; targetId=$TargetId; volume=$volume; buildId=$buildId; message=$archiveError })
+        }
         Write-HistoryEvent $Language 'final.built' ([ordered]@{ packId=[string]$scope.packId; category=''; targetId=$TargetId; volume=$volume; buildId=$buildId; outputPdf=$outputPath; archivePath=$archivePath; archiveError=$archiveError })
         return [ordered]@{ packId=[string]$scope.packId; targetId=$TargetId; volume=$volume; outputPdf=$outputPath; inputFingerprint=$fingerprint; buildId=$buildId; archivePath=$archivePath; archiveError=$archiveError; message=[string]$run.text; readiness=$commit.readiness }
     }
@@ -7874,7 +8021,7 @@ function Serve-ContentPdfFromBody($Context, [string]$Language, $Body) {
 
 function Serve-FinalPdfByVolume($Context,[string]$Language,[string]$Volume,[string]$Category) {
     if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('不正な成果物です。')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw '最終PDFはまだ作成されていません。'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw '出力フォルダ外のPDFは表示できません。'};if(-not(Test-Path $full)){throw '最終PDFファイルが見つかりません。'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
+    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('不正な成果物です。')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw '提出用PDFはまだ作成されていません。'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw '出力フォルダ外のPDFは表示できません。'};if(-not(Test-Path $full)){throw '提出用PDFファイルが見つかりません。'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
 }
 
 function Serve-FinalPdf($Context,[string]$Language) {
@@ -7888,14 +8035,52 @@ function Serve-DocumentPackPdf($Context, [string]$Language, [string]$PackId, [st
     $volume = Get-LegacyVolumeFromTargetId $Language $TargetId
     $state = Get-PackOutputState $structure $Language ([string]$scope.packId) $volume $false
     $output = [string](Get-DataProperty $state 'outputPdf' '')
-    if ([string]::IsNullOrWhiteSpace($output)) { throw '最終PDFはまだ作成されていません。' }
+    if ([string]::IsNullOrWhiteSpace($output)) { throw '提出用PDFはまだ作成されていません。' }
     $paths = Get-Paths
     $full = [IO.Path]::GetFullPath($output)
     $root = [IO.Path]::GetFullPath([string]$paths.outputDir)
     if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
     if (-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw '出力フォルダ外のPDFは表示できません。' }
-    if (-not (Test-Path -LiteralPath $full)) { throw '最終PDFファイルが見つかりません。' }
+    if (-not (Test-Path -LiteralPath $full)) { throw '提出用PDFファイルが見つかりません。' }
     Write-FileResponse $Context 200 $full 'application/pdf'
+}
+
+# 出力したPDFの保存先をエクスプローラーで開き、そのファイルを選択状態にする。
+# ブラウザの別タブでは中身を見られるだけで、添付やコピーのために実体を掴めないため。
+# 出力フォルダーの外は開かない(パスは structure 由来だが、確認は Serve と同じ形で行う)。
+function Resolve-OutputPdfForReveal([string]$Language, [string]$PackOrCategory, [string]$TargetId, [string]$Volume) {
+    $structure = Get-Structure $Language
+    # Resolve-DocumentPackScope は packId と category のどちらでも受ける。組み込みパックは
+    # 画面が category と volume を送るため、targetId が無いときは volume をそのまま使う。
+    $scope = Resolve-DocumentPackScope $structure $PackOrCategory $true
+    if (-not [string]::IsNullOrWhiteSpace($TargetId)) {
+        $resolvedTarget = Assert-PackTargetId $Language $scope.pack $TargetId
+        $volume = Get-LegacyVolumeFromTargetId $Language $resolvedTarget
+    } else {
+        $volume = ([string]$Volume).Trim()
+        if (@(Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $volume) { throw [ArgumentException]::new('不正な出力先です。') }
+    }
+    $state = Get-PackOutputState $structure $Language ([string]$scope.packId) $volume $false
+    $output = [string](Get-DataProperty $state 'outputPdf' '')
+    if ([string]::IsNullOrWhiteSpace($output)) { throw '提出用PDFはまだ作成されていません。' }
+    $paths = Get-Paths
+    $full = [IO.Path]::GetFullPath($output)
+    $root = [IO.Path]::GetFullPath([string]$paths.outputDir)
+    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+    if (-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { throw '出力フォルダーの外にあるPDFは開けません。' }
+    if (-not (Test-Path -LiteralPath $full)) { throw '提出用PDFファイルが見つかりません。出力フォルダーから移動または削除された可能性があります。' }
+    return $full
+}
+
+function Open-OutputPdfLocation([string]$FullPath) {
+    # /select は引数を1つのまとまりとして渡す必要がある。ArgumentList に分けて渡すと
+    # explorer.exe がパスを解釈できず、既定でドキュメントフォルダーを開いてしまう。
+    $argument = '/select,"' + $FullPath + '"'
+    [void][Diagnostics.Process]::Start((New-Object Diagnostics.ProcessStartInfo -Property @{
+        FileName = 'explorer.exe'
+        Arguments = $argument
+        UseShellExecute = $true
+    }))
 }
 
 function Get-SafePublishUserName {
@@ -7927,18 +8112,18 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [st
     $cat = [string]$scope.category
     $ready = Get-FinalBuildReadiness $structure $Language $Volume $packId
     if ([string]$ready.displayState -ne 'built') {
-        throw '最終PDFが最新ではありません。最新状態で再出力してから共有発行してください。'
+        throw '提出用PDFが最新ではありません。最新状態で再出力してから共有発行してください。'
     }
     $source = [string]$ready.outputPdf
     if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        throw '共有発行できる最終PDFがありません。先に最終PDFを出力してください。'
+        throw '共有発行できる提出用PDFがありません。先に提出用PDFを出力してください。'
     }
 
     $localOutputRoot = [IO.Path]::GetFullPath([string]$paths.outputDir)
     if (-not $localOutputRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $localOutputRoot += [IO.Path]::DirectorySeparatorChar }
     $sourceFull = [IO.Path]::GetFullPath($source)
     if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        throw '共有発行元が利用者ローカルの出力フォルダー外です。最終PDFを再出力してください。'
+        throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
     }
 
     $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -8251,6 +8436,15 @@ function Handle-Api($Context) {
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/file') {
             $body = Read-BodyJson $Context.Request
             Serve-DocumentPackPdf $Context $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' 'main')); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/reveal') {
+            $body = Read-BodyJson $Context.Request
+            $revealPackId = [string](Get-DataProperty $body 'packId' '')
+            $revealTargetId = [string](Get-DataProperty $body 'targetId' '')
+            if ([string]::IsNullOrWhiteSpace($revealPackId)) { $revealPackId = [string](Get-DataProperty $body 'category' '') }
+            $revealPath = Resolve-OutputPdfForReveal $language $revealPackId $revealTargetId ([string](Get-DataProperty $body 'volume' ''))
+            Open-OutputPdfLocation $revealPath
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; path=$revealPath }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/publish') {
             $body = Read-BodyJson $Context.Request
@@ -10414,7 +10608,7 @@ function Invoke-PdfPageAnalyzer([hashtable[]]$Sheets) {
                 rasterDirectory = [string](Get-DataProperty $_ 'rasterDirectory' '')
             }
         }) })
-        $run = Invoke-NativeCapture $javaExe @('-Djava.awt.headless=true', '-cp', $cp, 'PdfPageAnalyzer', '--input', $req, '--output', $res, '--dpi', [string]$Script:VisualHashDpi)
+        $run = Invoke-NativeCapture $javaExe @('-Djava.awt.headless=true', '-cp', $cp, 'PdfPageAnalyzer', '--input', $req, '--output', $res, '--dpi', [string]$Script:VisualHashDpi) $Script:PdfAnalyzeTimeoutSeconds
         if ([int]$run.exitCode -ne 0 -or -not (Test-Path -LiteralPath $res)) {
             return [ordered]@{ ok = $false; message = ("exit=" + [string]$run.exitCode + "`n" + [string]$run.text) }
         }
@@ -10892,7 +11086,7 @@ function Set-ComparisonUnitMappingResult($Result, $Mappings) {
 }
 
 function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]$CurrentSnapshotId, [string]$CurrentVersionId) {
-    # 表現は「見落としなし」ではなく「最終PDFの見た目を基準とした高精度な判定」。
+    # 表現は「見落としなし」ではなく「提出用PDFの見た目を基準とした高精度な判定」。
     $result = [ordered]@{
         schemaVersion = 3; status = 'unavailable'
         scope = 'automatic'
@@ -11350,7 +11544,31 @@ function Restore-LayoutSnapshot([string]$Language, [string]$PackIdOrCategory, [s
     return [ordered]@{ packId = [string]$scope.packId; category = [string]$scope.category; appliedPageCount = [int]$restoreResult.applied; undoSnapshotId = [string]$restoreResult.undoSnapshotId; invalidVolumePageCount = [int]$restoreResult.invalidVolumePageCount }
 }
 
-# ---- 最終PDFアーカイブ (V5-§4.1) -----------------------------------
+# ---- 提出用PDFアーカイブ (V5-§4.1) -----------------------------------
+
+# pin は、提出用PDFが参照している source / content-pdf を後日の掃除から守る唯一の
+# 仕組みである(Invoke-InputHistoryCleanup を参照。pin が無い版は保持期間の猶予なしに
+# 削除の対象になる)。アーカイブの作成に失敗しても、この保護だけは残す必要があるため、
+# アーカイブ本体から切り離してある。
+function Set-FinalPdfSnapshotPins([string]$Language, [string]$PackId, [string]$Category, [string]$Volume, [string]$BuildId, $SourceWorkbooks, [string]$ArchivePath) {
+    foreach ($sw in @(Get-Array $SourceWorkbooks)) {
+        $wbId = [string](Get-DataProperty $sw 'workbookId' '')
+        $snapshotId = [string](Get-DataProperty $sw 'snapshotId' '')
+        $versionId = [string](Get-DataProperty $sw 'versionId' '')
+        if ([string]::IsNullOrWhiteSpace($wbId) -or [string]::IsNullOrWhiteSpace($snapshotId)) { continue }
+        $pinOk = New-SnapshotPin $Language $wbId $snapshotId ("final-pdf_{0}" -f $BuildId) ([ordered]@{
+            buildId = $BuildId; snapshotId = $snapshotId; versionId = $versionId
+            volume = $Volume; packId = $PackId; category = $Category; archivePath = $ArchivePath
+        })
+        if (-not $pinOk) { throw ("スナップショット保護(pin)を作成できませんでした: {0} / {1}" -f $wbId, $snapshotId) }
+        if ($versionId) {
+            $cpPinOk = New-ContentPdfPin (Get-WorkspacePath $Language) $wbId $versionId ("final-pdf_{0}" -f $BuildId) ([ordered]@{
+                buildId = $BuildId; volume = $Volume; packId = $PackId; category = $Category
+            })
+            if (-not $cpPinOk) { throw ("content-pdf 保護(pin)を作成できませんでした: {0} / {1}" -f $wbId, $versionId) }
+        }
+    }
+}
 
 function New-FinalArchive([string]$Language, [string]$Category, [string]$Volume, [string]$BuildId, [string]$OutputPdf, $Manifest, $Snapshot) {
     # 冪等: 一時フォルダで完成させてから buildId フォルダへ移動する。
@@ -11394,32 +11612,13 @@ function New-FinalArchive([string]$Language, [string]$Category, [string]$Volume,
 
         # V5-P0: pin はアーカイブが正式フォルダへ移動できてから作る。
         # 先に作ると、移動に失敗したときにアーカイブが無いのに pin だけ残る。
-        foreach ($sw in $sourceWorkbooks) {
-            $wbId = [string](Get-DataProperty $sw 'workbookId' '')
-            $snapshotId = [string](Get-DataProperty $sw 'snapshotId' '')
-            $versionId = [string](Get-DataProperty $sw 'versionId' '')
-            if ([string]::IsNullOrWhiteSpace($wbId) -or [string]::IsNullOrWhiteSpace($snapshotId)) { continue }
-            # V5-P0(#4): pin を作れなければトランザクションを失敗させる。
-            # pin は正式PDFが参照する source/content-pdf を後日の掃除から守る唯一の仕組みであり、
-            # 作成に失敗したまま completed にすると、参照先が削除され得る。
-            $pinOk = New-SnapshotPin $Language $wbId $snapshotId ("final-pdf_{0}" -f $BuildId) ([ordered]@{
-                buildId = $BuildId; snapshotId = $snapshotId; versionId = $versionId
-                volume = $Volume; packId = $archivePackId; category = $archiveCategory; archivePath = $target
-            })
-            if (-not $pinOk) { throw ("スナップショット保護(pin)を作成できませんでした: {0} / {1}" -f $wbId, $snapshotId) }
-            if ($versionId) {
-                $cpPinOk = New-ContentPdfPin (Get-WorkspacePath $Language) $wbId $versionId ("final-pdf_{0}" -f $BuildId) ([ordered]@{
-                    buildId = $BuildId; volume = $Volume; packId = $archivePackId; category = $archiveCategory
-                })
-                if (-not $cpPinOk) { throw ("content-pdf 保護(pin)を作成できませんでした: {0} / {1}" -f $wbId, $versionId) }
-            }
-        }
+        Set-FinalPdfSnapshotPins $Language $archivePackId $archiveCategory $Volume $BuildId $sourceWorkbooks $target
         Write-HistoryEvent $Language 'final.archive.created' ([ordered]@{ packId = $archivePackId; category = $archiveCategory; targetId = (Get-TargetIdFromLegacyVolume $Volume); volume = $Volume; buildId = $BuildId; path = $target })
         return $target
     } catch {
         # V5-P0: 握りつぶさない。呼出元がロールバックする。
         try { if (Test-Path -LiteralPath ($target + '.staging')) { Remove-Item -LiteralPath ($target + '.staging') -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
-        throw ("最終PDFのアーカイブに失敗しました: " + $_.Exception.Message)
+        throw ("提出用PDFのアーカイブに失敗しました: " + $_.Exception.Message)
     }
 }
 
@@ -11499,7 +11698,7 @@ function Get-JournalTarget($Journal, [string]$Volume) {
 }
 
 function Assert-FinalBuildSourcesUnchanged($Snapshots, [string[]]$Volumes) {
-    # 最終PDFの対象になったExcelだけを、共有フォルダー上のサイズ・更新時刻で確認する。
+    # 提出用PDFの対象になったExcelだけを、共有フォルダー上のサイズ・更新時刻で確認する。
     # Scan-Updates は全登録Excelを走査して structure.json もブックごとに更新するため、
     # 最終出力のたびに呼ぶ必要はない。
     $paths = Get-Paths
@@ -11626,7 +11825,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 if (Test-Path -LiteralPath $outPath) {
                     $f = $null
                     try { $f = [IO.File]::Open($outPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-                    catch { throw "出力先の最終PDFが開かれているため上書きできません: $outName" }
+                    catch { throw "出力先の提出用PDFが開かれているため上書きできません: $outName" }
                     finally { if ($f) { $f.Dispose() } }
                 }
             }
@@ -11644,14 +11843,14 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 try {
                     Write-JsonFile $manifestPath $manifest
                     $java = Resolve-JavaExe
-                    $run = Invoke-NativeCapture $java @('-cp', "$composerJar;$pdfboxJar", 'ReportPdfComposer', '--manifest', $manifestPath)
+                    $run = Invoke-NativeCapture $java @('-cp', "$composerJar;$pdfboxJar", 'ReportPdfComposer', '--manifest', $manifestPath) $Script:FinalComposeTimeoutSeconds
                     $exit = [int]$run.exitCode
                     $text = [string]$run.text
                     if ($exit -ne 0) { throw "PDFBox組版に失敗しました。exit=$exit`n$text" }
                 } finally {
                     if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }
                 }
-                if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -le 0) { throw '最終PDFを作成できませんでした。' }
+                if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
                 Set-NoteProperty $t 'newPdfHash' (Normalize-FileHash (New-Sha256 $tmp))
                 Set-NoteProperty $t 'manifest' $manifest
             }
@@ -13432,7 +13631,7 @@ $config0 = Get-AppConfig
 $config0 = Initialize-LocalProjectConfig $config0
 try { $startupPaths=Get-Paths; if($startupPaths.dataDir -and (Test-Path -LiteralPath ([string]$startupPaths.dataDir))){Ensure-Package $startupPaths -Languages @((Get-EffectiveLanguage))} } catch { Write-Warning $_.Exception.Message }
 
-# 未完了の最終PDFトランザクションだけは、UI操作を受け付ける前に復旧する。
+# 未完了の提出用PDFトランザクションだけは、UI操作を受け付ける前に復旧する。
 try { Invoke-StartupRecovery (Get-EffectiveLanguage) } catch { Write-Warning $_.Exception.Message }
 
 $prefix = "http://127.0.0.1:$Port/"

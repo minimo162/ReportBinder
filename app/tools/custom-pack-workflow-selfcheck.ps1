@@ -248,6 +248,40 @@ $duplicateError = ''
 try { [void](Get-LayoutRestorePreview 'ja' $packId $duplicateSnapshotId) } catch { $duplicateError = $_.Exception.Message }
 Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($duplicateError)) 'A corrupted layout snapshot with duplicate page IDs was accepted.'
 
+# 控えの作成に失敗しても、出力の元になった版を守る pin は残ること。
+# pin が無い版は保持期間の猶予なしに掃除の対象になるため、ここが崩れると
+# 提出したPDFの元原稿が黙って消える。
+$snapshotForPins = Add-FinalSnapshotSourceWorkbooks (Get-Structure 'ja') (Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' $mainVolume $packId)
+$pinSourceWorkbooks = @(Get-Array (Get-DataProperty $snapshotForPins 'sourceWorkbooks' @()))
+Assert-CustomPackTest ($pinSourceWorkbooks.Count -gt 0) 'The build snapshot carried no source workbooks, so the pin test proves nothing.'
+$pinBuildId = 'archivefailure' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+Set-FinalPdfSnapshotPins 'ja' $packId '' $mainVolume $pinBuildId $pinSourceWorkbooks ''
+$pinMissing = @()
+foreach ($sw in $pinSourceWorkbooks) {
+    $pinWbId = [string](Get-DataProperty $sw 'workbookId' '')
+    $pinSnapshotId = [string](Get-DataProperty $sw 'snapshotId' '')
+    if ([string]::IsNullOrWhiteSpace($pinWbId) -or [string]::IsNullOrWhiteSpace($pinSnapshotId)) { continue }
+    if (@(Get-SnapshotPins 'ja' $pinWbId $pinSnapshotId) -notcontains ("final-pdf_{0}" -f $pinBuildId)) { $pinMissing += $pinWbId }
+}
+Assert-CustomPackTest ($pinMissing.Count -eq 0) 'Snapshot pins were not created without an archive.'
+
+# 出力したPDFの保存先を返せること。エクスプローラーは開かない(解決だけを見る)。
+$revealPath = Resolve-OutputPdfForReveal 'ja' $packId 'main' ''
+Assert-CustomPackTest ((Test-Path -LiteralPath $revealPath) -and $revealPath -eq ([IO.Path]::GetFullPath([string]$built.outputPdf))) 'Reveal did not resolve to the produced PDF.'
+$revealOutsideError = ''
+# 実在するファイルを出力フォルダーの外に置く。存在しないパスで試すと、境界の検査を
+# 外しても「ファイルが見つかりません」で例外になり、検査を外したことに気付けない。
+$outsidePdf = Join-Path ([IO.Path]::GetTempPath()) ('rb-outside-' + [Guid]::NewGuid().ToString('N') + '.pdf')
+Copy-Item -LiteralPath ([string]$built.outputPdf) -Destination $outsidePdf -Force
+$revealOriginalPdf = [string]$built.outputPdf
+try {
+    [void](Update-StructureLocked 'ja' { param($st) Set-NoteProperty (Get-PackOutputState $st 'ja' $packId 'main' $false) 'outputPdf' $outsidePdf })
+    [void](Resolve-OutputPdfForReveal 'ja' $packId 'main' '')
+} catch { $revealOutsideError = $_.Exception.Message }
+[void](Update-StructureLocked 'ja' { param($st) Set-NoteProperty (Get-PackOutputState $st 'ja' $packId 'main' $false) 'outputPdf' $revealOriginalPdf })
+Remove-Item -LiteralPath $outsidePdf -Force -ErrorAction SilentlyContinue
+Assert-CustomPackTest ($revealOutsideError -like '*出力フォルダーの外*') 'Reveal accepted a path outside the output folder.'
+
 Write-Output "custom-pack workflow selfcheck ok ($($pages.Count) source pages -> $([int]$ready.pageCount) output pages)"
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)
