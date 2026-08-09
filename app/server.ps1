@@ -3540,6 +3540,135 @@ function Get-SourceChangeSummary([string]$Language, [string]$SourceId, $Source =
     throw [System.ArgumentException]::new("差分要約に対応していない原稿形式です: $($context.sourceType)")
 }
 
+# 原稿ファイルの名前変更・移動に対応する。日本の事務では版をファイル名で管理する
+# (〜_v2.xlsx など)ため、複数回使う利用者はいずれ必ず当たる。
+#
+# workbookId は据え置く。これは content-pdf\<workbookId>\ や input-history\<workbookId>\、
+# locks\ のディレクトリ名そのもので、変えると変換PDFと履歴が孤児になる。ID から
+# ファイル名を逆算している箇所は無い(New-Slug の呼び出しは登録時の4箇所だけ)ので、
+# 参照先だけ差し替えれば、ページの並び順も出力先の振り分けも保たれる。
+# 登録解除→再登録はページを丸ごと消すため、これが唯一の無害な直し方になる。
+function Get-RelinkCandidates([string]$Language, [string]$SourceId) {
+    $structure = Get-Structure $Language
+    $workbook = @(Get-Array (Get-DataProperty $structure 'workbooks' @()) | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $SourceId } | Select-Object -First 1)
+    if ($workbook.Count -eq 0) { throw '指定された原稿が見つかりません。' }
+    $w = $workbook[0]
+    $sourceType = ([string](Get-DataProperty $w 'sourceType' 'excel')).ToLowerInvariant()
+    $packId = [string](Get-WorkbookPackId $w)
+    # 同じ資料パック内で既に使われているファイルは候補にしない(重複参照になる)。
+    $taken = @{}
+    foreach ($other in @(Get-Array (Get-DataProperty $structure 'workbooks' @()))) {
+        if ([string](Get-DataProperty $other 'workbookId' '') -eq $SourceId) { continue }
+        if ([string](Get-WorkbookPackId $other) -ne $packId) { continue }
+        $rel = ([string](Get-DataProperty $other 'relativePath' '')).Replace('\', '/').ToLowerInvariant()
+        if ($rel) { $taken[$rel] = $true }
+    }
+    $previousSize = [int64](Get-DataProperty $w 'currentExcelSize' -1)
+    $previousHash = Normalize-FileHash ([string](Get-DataProperty $w 'currentExcelHash' ''))
+    $renderedHash = Normalize-FileHash ([string](Get-DataProperty $w 'lastRenderedExcelHash' ''))
+    $paths = Get-Paths
+    $candidates = @()
+    foreach ($candidate in @(Get-SourceCandidates @($sourceType))) {
+        $rel = [string](Get-DataProperty $candidate 'relativePath' '')
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        if ($taken.ContainsKey($rel.Replace('\', '/').ToLowerInvariant())) { continue }
+        $full = Join-Safe ([string]$paths.submissionDir) $rel
+        $size = -1
+        try { $size = [int64](Get-Item -LiteralPath $full -ErrorAction Stop).Length } catch { $size = -1 }
+        # 中身が同じかどうかは、まず大きさで絞ってからハッシュする。共有フォルダー上で
+        # 全候補をハッシュすると待たされるため(Scan-Updates と同じ考え方)。
+        $sameContent = $false
+        if ($size -ge 0 -and ($size -eq $previousSize)) {
+            $hash = Normalize-FileHash (New-StableHash $full)
+            if ($hash -and (($hash -eq $previousHash) -or ($hash -eq $renderedHash))) { $sameContent = $true }
+        }
+        $candidates += [ordered]@{
+            relativePath = $rel
+            fileName = [string](Get-DataProperty $candidate 'fileName' '')
+            modifiedAt = [string](Get-DataProperty $candidate 'modifiedAt' '')
+            size = $size
+            sameContent = $sameContent
+        }
+    }
+    return [ordered]@{
+        sourceId = $SourceId
+        sourceType = $sourceType
+        fileName = [string](Get-DataProperty $w 'fileName' '')
+        relativePath = [string](Get-DataProperty $w 'relativePath' '')
+        candidates = @($candidates | Sort-Object -Property @{Expression={ -[int]$_.sameContent }}, @{Expression={ [string]$_.modifiedAt }; Descending=$true})
+    }
+}
+
+function Relink-Source([string]$Language, [string]$SourceId, [string]$RelativePath) {
+    $id = ([string]$SourceId).Trim()
+    if ([string]::IsNullOrWhiteSpace($id)) { throw '付け替える原稿が指定されていません。' }
+    $rel = ([string]$RelativePath).Trim()
+    if ([string]::IsNullOrWhiteSpace($rel)) { throw '付け替え先のファイルが指定されていません。' }
+    $paths = Get-Paths
+    return Update-StructureLocked $Language {
+        param($structure)
+        $workbook = @(Get-Array (Get-DataProperty $structure 'workbooks' @()) | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $id } | Select-Object -First 1)
+        if ($workbook.Count -eq 0) { throw '指定された原稿が見つかりません。' }
+        $w = $workbook[0]
+        if ([string](Get-DataProperty $w 'status' '') -ne 'missing') {
+            throw 'この原稿のファイルは見つかっています。付け替えは、ファイルが見つからない原稿にだけ行えます。'
+        }
+        $sourceType = ([string](Get-DataProperty $w 'sourceType' 'excel')).ToLowerInvariant()
+        # 形式をまたぐ付け替えは許さない。ID接頭辞・unitKind・adapterId・
+        # renderProfileVersion の意味が同時に壊れる。
+        $checked = Test-SourceCandidate ([pscustomobject]@{ relativePath = $rel; sourceType = '' })
+        if ([string]$checked.sourceType -ne $sourceType) {
+            throw ('同じ種類の原稿にだけ付け替えられます（今は {0}、選んだファイルは {1}）。' -f $sourceType, [string]$checked.sourceType)
+        }
+        $packId = [string](Get-WorkbookPackId $w)
+        foreach ($other in @(Get-Array (Get-DataProperty $structure 'workbooks' @()))) {
+            if ([string](Get-DataProperty $other 'workbookId' '') -eq $id) { continue }
+            if ([string](Get-WorkbookPackId $other) -ne $packId) { continue }
+            if (([string](Get-DataProperty $other 'relativePath' '')).Replace('\','/').ToLowerInvariant() -eq $rel.Replace('\','/').ToLowerInvariant()) {
+                throw 'そのファイルは、この資料パックの別の原稿として登録済みです。'
+            }
+        }
+        $full = Join-Safe ([string]$paths.submissionDir) $rel
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw '付け替え先のファイルが見つかりません。' }
+        $item = Get-Item -LiteralPath $full
+        # 取り消せる場所を作ってから触る（シート構成の変化と同じ扱い）。
+        [void](Save-LayoutSnapshot $Language $packId 'source-relinked' $structure)
+        $hash = Normalize-FileHash (New-StableHash $full)
+        $renderedHash = Normalize-FileHash ([string](Get-DataProperty $w 'lastRenderedExcelHash' ''))
+        Set-NoteProperty $w 'relativePath' $rel
+        Set-NoteProperty $w 'fileName' $item.Name
+        Set-NoteProperty $w 'displayName' $item.Name
+        Set-NoteProperty $w 'currentExcelModifiedAt' ($item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz'))
+        Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' ([string]$item.LastWriteTimeUtc.Ticks)
+        Set-NoteProperty $w 'currentExcelSize' $item.Length
+        Set-NoteProperty $w 'currentExcelHash' $hash
+        # 旧ファイルの検知版を指したままにしない。次の走査が新しい版を作る。
+        Set-NoteProperty $w 'currentSnapshotId' ''
+        Set-NoteProperty $w 'lastError' ''
+        $sameContent = ($hash -and $renderedHash -and $hash -eq $renderedHash)
+        if ($sameContent) {
+            # 名前が変わっただけ。変換PDFはそのまま使えるので、作り直しは要らない。
+            Set-NoteProperty $w 'status' 'rendered-unchecked'
+        } else {
+            Set-NoteProperty $w 'status' (Get-SourceUpdatedStatus $w)
+            # 中身が違うのに古い変換PDFが提出用PDFに載らないよう、ページを古い印にする。
+            foreach ($page in @(Get-Array (Get-DataProperty $structure 'pages' @()))) {
+                if ([string](Get-DataProperty $page 'workbookId' '') -ne $id) { continue }
+                if ([string](Get-DataProperty $page 'contentPdf' '')) { Set-NoteProperty $page 'status' 'stale' }
+            }
+            $affected = @(Get-Array (Get-DataProperty $structure 'pages' @()) |
+                Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $id } |
+                ForEach-Object { [string](Get-DataProperty $_ 'volume' '') } |
+                Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+            Mark-VolumeNeedsRebuild $structure $Language $packId $affected 'source-updated' '原稿の参照先を付け替えました'
+        }
+        # 自動処理の安定待ちは旧ファイル基準なので捨てる。
+        try { Remove-Item -LiteralPath (Join-Path (Get-WorkspacePath $Language) ("state\auto-render\{0}.json" -f $id)) -Force -ErrorAction SilentlyContinue } catch { }
+        Write-HistoryEvent $Language 'source.relinked' ([ordered]@{ sourceId = $id; packId = $packId; relativePath = $rel; sameContent = $sameContent })
+        return [ordered]@{ sourceId = $id; relativePath = $rel; fileName = $item.Name; sameContent = $sameContent; status = [string](Get-DataProperty $w 'status' '') }
+    }
+}
+
 function Update-SourceMetadata([string]$Language, [string]$SourceId, $Patch) {
     $id = ([string]$SourceId).Trim()
     if ([string]::IsNullOrWhiteSpace($id)) { throw '原稿IDが指定されていません。' }
@@ -8501,6 +8630,15 @@ function Handle-Api($Context) {
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/file') {
             $body = Read-BodyJson $Context.Request
             Serve-DocumentPackPdf $Context $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' 'main')); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/sources/relink-candidates') {
+            $relinkFor = [string]$Context.Request.QueryString['sourceId']
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=(Get-RelinkCandidates $language $relinkFor) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/sources/relink') {
+            $body = Read-BodyJson $Context.Request
+            $relinkResult = Relink-Source $language ([string](Get-DataProperty $body 'sourceId' '')) ([string](Get-DataProperty $body 'relativePath' ''))
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$relinkResult }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/reveal') {
             $body = Read-BodyJson $Context.Request

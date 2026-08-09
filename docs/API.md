@@ -12,6 +12,23 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 
 新UI向けの汎用ドメインAPIは`/api/v2`に置きます。APIの`v2`はHTTP契約、レスポンスの`domainSchemaVersion: 3`は保存ドメインの版を表します。
 
+> **現行UIが使っていない経路について（2026-08-10 時点の実態）**
+>
+> 書き込み系はほぼV2へ移行済みですが、**読み取り系は現行UIが旧APIを使い続けています**。現行UIは`workbooks / pages`形式を前提としており、`GET /api/v2/state`はそれを返さないためです（`app/web/app.js`の`registerSelectedFiles`付近のコメントを参照）。
+>
+> 次の6件は**画面から一度も呼ばれていません**。実装は既存関数への別名で、動作確認は行われていない前提で扱ってください。
+>
+> | 未使用の経路 | 現行UIが代わりに使うもの |
+> | --- | --- |
+> | `GET /api/v2/state` | `GET /api/state` |
+> | `GET /api/v2/pack-templates` | `/api/state`の`packTemplates` |
+> | `GET /api/v2/source-candidates` | `GET /api/submission-files` |
+> | `POST /api/v2/sources/unregister` | `POST /api/workbooks/unregister` |
+> | `POST /api/v2/sources/scan-updates` | `POST /api/scan-updates` |
+> | `PATCH /api/v2/items/{itemId}` | `POST /api/pages/update` |
+>
+> **`PATCH /api/v2/items/{itemId}`は`baseLayout`を受け取りません。** 現行の`POST /api/pages/update`はレイアウト指紋による楽観ロックを行い、競合時に409 `structure-conflict`を返しますが、V2側はその検査を素通りします。2つのタブで同時にページ設定を変えると、後の変更が黙って前の変更を上書きします。V2へ移行する際は先に`baseLayout`の転記を追加してください。
+
 - `GET /api/v2/state`: `packs / sources / units / items / artifacts / outputs / packProgress`を返す。`packProgress`は未提出必須原稿に加え、`overdueRequiredCount / dueSoonRequiredCount / nearestRequiredDueDate`で期限超過・7日以内・次の期限を集計する
 - `GET /api/v2/pack-templates`: 組み込みテンプレートと利用者定義ひな形を返す
 - `POST /api/v2/pack-templates`: 利用者定義ひな形を作成する
@@ -34,7 +51,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する
 - `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する
 - `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする
-- `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する
+- `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する（**現行UIは未使用。`baseLayout`による競合検出に非対応**）
 - `GET /api/v2/layout/snapshots?packId={packId}`: 資料パックの保存済みページ構成を返す
 - `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
 - `POST /api/v2/layout/restore`: 保存済みのページ構成を同じ資料パックへ復元する

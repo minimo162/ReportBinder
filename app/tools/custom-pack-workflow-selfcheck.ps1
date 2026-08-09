@@ -248,6 +248,47 @@ $duplicateError = ''
 try { [void](Get-LayoutRestorePreview 'ja' $packId $duplicateSnapshotId) } catch { $duplicateError = $_.Exception.Message }
 Assert-CustomPackTest (-not [string]::IsNullOrWhiteSpace($duplicateError)) 'A corrupted layout snapshot with duplicate page IDs was accepted.'
 
+# 原稿ファイルの名前を変えても、付け替えでページの並び順と出力先が保たれること。
+# 登録解除→再登録はページを丸ごと消すので、これが唯一の無害な直し方になる。
+Write-CustomPackStage 'renaming the source file and relinking'
+$relinkPagesBefore = @(Get-Array (Get-Structure 'ja').pages | Where-Object { [string]$_.workbookId -eq $sourceId } |
+    ForEach-Object { ('{0}|{1}|{2}' -f (Resolve-PageId $_), [string]$_.volume, [string]$_.order) })
+Assert-CustomPackTest ($relinkPagesBefore.Count -gt 0) 'The relink test needs pages on the source to prove anything.'
+$relinkOldPath = Join-Path $submissionDir 'department-report.pdf'
+$relinkNewName = 'department-report_v2.pdf'
+Rename-Item -LiteralPath $relinkOldPath -NewName $relinkNewName
+[void](Scan-Updates 'ja')
+$relinkWorkbook = @(Get-Array (Get-Structure 'ja').workbooks | Where-Object { [string]$_.workbookId -eq $sourceId })[0]
+Assert-CustomPackTest ([string]$relinkWorkbook.status -eq 'missing') 'A renamed source was not detected as missing.'
+
+$relinkCandidates = Get-RelinkCandidates 'ja' $sourceId
+$relinkPick = @($relinkCandidates.candidates | Where-Object { [string]$_.fileName -eq $relinkNewName })
+Assert-CustomPackTest ($relinkPick.Count -eq 1) 'The renamed file was not offered as a relink candidate.'
+Assert-CustomPackTest ([bool]$relinkPick[0].sameContent) 'A pure rename was not recognised as the same content.'
+
+$relinkResult = Relink-Source 'ja' $sourceId ([string]$relinkPick[0].relativePath)
+Assert-CustomPackTest ([bool]$relinkResult.sameContent) 'Relink did not report the content as unchanged.'
+$relinkStructure = Get-Structure 'ja'
+$relinkWorkbookAfter = @(Get-Array $relinkStructure.workbooks | Where-Object { [string]$_.workbookId -eq $sourceId })
+Assert-CustomPackTest ($relinkWorkbookAfter.Count -eq 1) 'Relink must not change the workbookId.'
+Assert-CustomPackTest ([string]$relinkWorkbookAfter[0].fileName -eq $relinkNewName) 'Relink did not point at the new file.'
+Assert-CustomPackTest ([string]$relinkWorkbookAfter[0].status -ne 'missing') 'Relink left the source marked as missing.'
+$relinkPagesAfter = @(Get-Array $relinkStructure.pages | Where-Object { [string]$_.workbookId -eq $sourceId } |
+    ForEach-Object { ('{0}|{1}|{2}' -f (Resolve-PageId $_), [string]$_.volume, [string]$_.order) })
+Assert-CustomPackTest (($relinkPagesBefore -join ',') -eq ($relinkPagesAfter -join ',')) 'Relink lost the page order or the output assignment.'
+
+# 見つかっている原稿は付け替えられない（取り違えを防ぐ）。
+$relinkGuardError = ''
+try { [void](Relink-Source 'ja' $sourceId ([string]$relinkPick[0].relativePath)) } catch { $relinkGuardError = $_.Exception.Message }
+Assert-CustomPackTest ($relinkGuardError -like '*見つかっています*') 'Relink was allowed on a source whose file exists.'
+
+# 後続のテストのために元の名前へ戻す。戻した時点では参照先が見つからないので、
+# 走査で missing にしてから付け替える(付け替えは missing のときだけ許される)。
+Rename-Item -LiteralPath (Join-Path $submissionDir $relinkNewName) -NewName 'department-report.pdf'
+[void](Scan-Updates 'ja')
+[void](Relink-Source 'ja' $sourceId 'department-report.pdf')
+[void](Scan-Updates 'ja')
+
 # 控えの作成に失敗しても、出力の元になった版を守る pin は残ること。
 # pin が無い版は保持期間の猶予なしに掃除の対象になるため、ここが崩れると
 # 提出したPDFの元原稿が黙って消える。

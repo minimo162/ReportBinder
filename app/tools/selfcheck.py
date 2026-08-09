@@ -988,6 +988,76 @@ if server.count('$Script:NativeCancelProbe = $null') < 2:
 for line_no, line in enumerate(server.splitlines(), 1):
     if '2>&1' in line and 'Invoke-NativeCapture' not in line and not line.strip().startswith('#'):
         raise SystemExit(f'raw native 2>&1 capture outside Invoke-NativeCapture at line {line_no}')
+# 画面が使っていない経路を「正式仕様」として区別なく並べると、次に触る人がそれを
+# 採用して競合検出の無い経路にはまる。実態と、baseLayout を受けないことを明記する。
+_apidoc = (root/'docs/API.md').read_text(encoding='utf-8')
+for needed in ['現行UIが使っていない経路について', 'baseLayout']:
+    if needed not in _apidoc:
+        raise SystemExit(f'the API document must say which v2 routes the UI never calls: {needed}')
+# 実装が変わったら注記も見直す。PATCH items が baseLayout を受けるようになったら、
+# ここで気付けるようにしておく。
+_patch_items = server.split("$path -match '^/api/v2/items/([^/]+)$'", 1)[1][:600]
+if 'baseLayout' in _patch_items:
+    raise SystemExit('PATCH /api/v2/items now takes baseLayout; update the warning in docs/API.md')
+
+# 原稿ファイルの名前変更・移動に付け替えで対応する。登録解除→再登録はページを
+# 丸ごと消すため、それしか手が無い状態にしてはいけない。
+for needed in ["'/api/v2/sources/relink'", "'/api/v2/sources/relink-candidates'",
+               'function Relink-Source', 'function Get-RelinkCandidates']:
+    if needed not in server:
+        raise SystemExit(f'renaming a source must be recoverable without losing the page layout: {needed}')
+_relink = server.split('function Relink-Source', 1)[1].split('\nfunction ', 1)[0]
+# workbookId は content-pdf / input-history / locks のディレクトリ名そのもの。
+# 変えると変換PDFと履歴が孤児になる。
+if "Set-NoteProperty $w 'workbookId'" in _relink:
+    raise SystemExit('relink must keep the workbookId; it names the content-pdf and history folders')
+# 中身が違うのに古い変換PDFが提出用PDFへ載らないようにする。
+if "Set-NoteProperty $w 'lastRenderedExcelHash'" in _relink:
+    raise SystemExit('relink must not pretend the new file was already rendered')
+for needed in ["'source-relinked'", 'Save-LayoutSnapshot', 'Test-SourceCandidate',
+               "'stale'", 'Mark-VolumeNeedsRebuild', "Set-NoteProperty $w 'currentExcelHash'"]:
+    if needed not in _relink:
+        raise SystemExit(f'relink is missing a required step: {needed}')
+# 見つかっている原稿を取り違えて付け替えない。
+if "-ne 'missing'" not in _relink:
+    raise SystemExit('relink must only apply to a source whose file is missing')
+# 画面側: missing を正しく出し、そこから付け替えへ行けること。
+_cell = appjs.split('function workbookPdfStatusCell(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["=== 'missing'", 'ファイルなし', 'data-relink-source']:
+    if needed not in _cell:
+        raise SystemExit(f'a missing source must say so and offer the way out: {needed}')
+_hint = appjs.split('function updateRenderTargetUi(', 1)[1].split('\nfunction ', 1)[0]
+if 'missingCount' not in _hint:
+    raise SystemExit('the render hint must not claim everything is up to date while sources are missing')
+
+# 絞り込みは app.js に実装済みなのに入力欄がHTMLに無く、到達不能なコードだった。
+if 'file-filter' not in html:
+    raise SystemExit('the unregistered-source filter has code but no input to drive it')
+# 空表示が「全部登録済み」だけを意味しないようにする。3つの状況を言い分ける。
+_empty = appjs.split('if (!selectable.length) {', 1)[1].split('\n  }', 1)[0]
+for needed in ['サブフォルダーの中は探しません', 'この資料パックが受け付けない形式']:
+    if needed not in _empty:
+        raise SystemExit(f'an empty source list must say why it is empty: {needed}')
+
+# サーバーは30分の無操作やスリープで自ら終了する。fetch の失敗を素通りさせると
+# 英語の "Failed to fetch" だけが出て、戻り方(cmdの再実行)が画面のどこにも無い。
+if 'SERVER_GONE_MESSAGE' not in appjs:
+    raise SystemExit('a dead local server must be explained in Japanese')
+if '資料をPDFにまとめる.cmd' not in appjs:
+    raise SystemExit('the way back must name the launcher the user double-clicks')
+# api() と PDF取得の両方を包む。どちらか一方だと、片方の操作で英語のまま出る。
+for _fn, _label in [('async function api(', 'api'), ('async function fetchPdfObjectUrl(', 'fetchPdfObjectUrl')]:
+    _body = appjs.split(_fn, 1)[1].split('\nasync function ', 1)[0]
+    if 'SERVER_GONE_MESSAGE' not in _body:
+        raise SystemExit(f'{_label} must turn a dead server into the Japanese guidance')
+    if "'AbortError'" not in _body:
+        raise SystemExit(f'{_label} must let a deliberate abort through unchanged')
+# 押すまで気付けないのでは遅い。続けて落ちたら知らせる。
+_hb = appjs.split('async function sendHeartbeat(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['heartbeatFailures++', 'showServerGoneScreen()']:
+    if needed not in _hb:
+        raise SystemExit(f'heartbeat failures must not be swallowed silently: {needed}')
+
 # Excel の監視は「Excelを起動してからの経過」ではなく「進捗が止まってからの経過」を
 # 測る。心拍が主経路に無いと、正常に動いている大きなブックを終了させてしまう。
 if 'Update-ExcelRenderHeartbeat' not in server:
@@ -1358,7 +1428,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v177', 'style.css?v=20260810_v106']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v178', 'style.css?v=20260810_v107']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1413,7 +1483,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260810_v177' not in html:
+if 'app.js?v=20260810_v178' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1439,7 +1509,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260810_v177' not in html:
+if 'app.js?v=20260810_v178' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1585,7 +1655,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.10.1':
+if runtime_version != '2026.08.10.2':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 # 成果物の呼称は「提出用PDF」に統一する。サーバーの日本語 throw は加工されずに画面へ
 # 出るため、ここに旧称が残ると利用者が画面に無い言葉を見せられる。
