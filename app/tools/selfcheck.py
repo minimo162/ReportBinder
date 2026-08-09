@@ -1497,9 +1497,10 @@ if 'archiveError' not in appjs:
 _reveal = server.split('function Resolve-OutputPdfForReveal', 1)[1].split('\nfunction ', 1)[0]
 if 'StartsWith($root' not in _reveal:
     raise SystemExit('reveal must refuse paths outside the output folder')
-# /select は1つのまとまりとして渡す。分けると explorer が既定のフォルダーを開く。
+# 実測: `/select` 直後のカンマを空白にすると窓が出ない。パスを引用しないと、カンマを
+# 含むファイル名(出力名は利用者が編集できるパターン由来)で窓が出ない。
 if """'/select,"' + $FullPath + '"'""" not in server:
-    raise SystemExit('reveal must pass /select and the path as a single argument')
+    raise SystemExit('reveal needs the comma after /select and the path quoted, or Explorer opens nothing')
 # 保存先は省略せず全体を出す。省略するとどのフォルダーか分からないままになる。
 if 'word-break:break-all' not in css.split('.final-path-value', 1)[1].split('}', 1)[0]:
     raise SystemExit('the saved location must wrap instead of being truncated')

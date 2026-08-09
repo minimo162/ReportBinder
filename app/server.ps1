@@ -8073,8 +8073,11 @@ function Resolve-OutputPdfForReveal([string]$Language, [string]$PackOrCategory, 
 }
 
 function Open-OutputPdfLocation([string]$FullPath) {
-    # /select は引数を1つのまとまりとして渡す必要がある。ArgumentList に分けて渡すと
-    # explorer.exe がパスを解釈できず、既定でドキュメントフォルダーを開いてしまう。
+    # 実測(2026-08-10)で確かめた形。どちらを崩してもエクスプローラーは何も開かない。
+    #   - `/select` の直後のカンマは必須。空白にすると窓が出ない。
+    #   - パスの引用符も必須。出力ファイル名は利用者が編集できるパターン
+    #     ({packName}_{targetName}_{yyyyMMdd}.pdf)から作られるためカンマを含みうる。
+    #     引用しないと、カンマを含む名前で窓が出ない。
     $argument = '/select,"' + $FullPath + '"'
     [void][Diagnostics.Process]::Start((New-Object Diagnostics.ProcessStartInfo -Property @{
         FileName = 'explorer.exe'
