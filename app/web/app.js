@@ -451,6 +451,10 @@ function pagePdfSubtext(p) {
   if (wb && !isLatestPdfWorkbook(wb)) return '先にPDF作成してください';
   return p?.contentPdf ? 'クリックで確認' : 'PDF作成してください';
 }
+// サーバーが居なくなったときの案内。fetch の失敗は素の "Failed to fetch" で、
+// 何が起きたのかも、どう戻ればよいのかも分からない。30分の無操作やノートPCの
+// スリープで自動終了する仕様なので、これは事故ではなく日常の状態。
+const SERVER_GONE_MESSAGE = 'ReportBinderが終了しています。デスクトップの「資料をPDFにまとめる.cmd」をもう一度実行してから、この画面を読み込み直してください。（30分間操作がないと自動で終了します）';
 function userFriendlyError(message) {
   const text = String(message || '');
   const raw = text.length > 300 ? text.slice(0, 300) + '…' : text;
@@ -631,14 +635,24 @@ async function api(path, options = {}) {
   const rawBody = hasBody ? options.body : undefined;
   const isBinaryBody = hasBody && (rawBody instanceof FormData || rawBody instanceof Blob);
   if (hasBody && !isBinaryBody) headers['Content-Type'] = 'application/json';
-  const res = await fetch(withToken(path), {
-    method: options.method || 'GET',
-    headers,
-    body: hasBody ? (isBinaryBody ? rawBody : JSON.stringify(rawBody ?? {})) : undefined,
-    keepalive: !!options.keepalive,
-    signal: options.signal,
-    cache: 'no-store'
-  });
+  let res;
+  try{
+    res = await fetch(withToken(path), {
+      method: options.method || 'GET',
+      headers,
+      body: hasBody ? (isBinaryBody ? rawBody : JSON.stringify(rawBody ?? {})) : undefined,
+      keepalive: !!options.keepalive,
+      signal: options.signal,
+      cache: 'no-store'
+    });
+  }catch(e){
+    // 中止(AbortController)は呼び出し側が扱うので、そのまま通す。
+    if(e && e.name === 'AbortError') throw e;
+    // それ以外の fetch の失敗は、ほぼ常に「ローカルサーバーが終了している」。
+    // 30分の無操作やスリープで自動終了するため日常的に起きるが、既定では
+    // 英語の "Failed to fetch" しか出ず、戻り方が画面のどこにも無かった。
+    throw new Error(SERVER_GONE_MESSAGE);
+  }
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = {ok: false, error: text}; }
@@ -848,12 +862,18 @@ async function fetchPdfObjectUrl(path, params={}) {
   const postPdf = (path === '/api/file' || path === '/api/final/file' || path === '/api/v2/outputs/file');
   const headers = {'X-ReportBinder-Token': token, 'Accept': 'application/pdf,application/json'};
   if (postPdf) headers['Content-Type'] = 'application/json';
-  const res = await fetch(apiUrl(path, postPdf ? {} : params), {
-    method: postPdf ? 'POST' : 'GET',
-    cache: 'no-store',
-    headers,
-    body: postPdf ? JSON.stringify(params || {}) : undefined
-  });
+  let res;
+  try{
+    res = await fetch(apiUrl(path, postPdf ? {} : params), {
+      method: postPdf ? 'POST' : 'GET',
+      cache: 'no-store',
+      headers,
+      body: postPdf ? JSON.stringify(params || {}) : undefined
+    });
+  }catch(e){
+    if(e && e.name === 'AbortError') throw e;
+    throw new Error(SERVER_GONE_MESSAGE);
+  }
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
   if (!res.ok || contentType.includes('application/json')) {
     let detail = null;
@@ -1485,6 +1505,53 @@ function closeConfirmModal(accepted=false) {
   confirmResolver=null;confirmReturnFocus=null;
   if(focusTarget?.isConnected&&typeof focusTarget.focus==='function')focusTarget.focus();
   if(resolve)resolve(accepted);
+}
+// ファイル名を変えた・移動した原稿を、ページの並び順や出力先の振り分けを保ったまま
+// 別のファイルへ結び直す。登録解除→再登録はページを丸ごと消してしまうため。
+let relinkSourceId='';
+async function openRelinkDialog(sourceId, trigger=null) {
+  if(!sourceId)return;
+  await runBusy(trigger,async()=>{
+    const res=await api(`/api/v2/sources/relink-candidates?sourceId=${encodeURIComponent(sourceId)}`);
+    const info=res?.result||{};
+    const candidates=asArray(info.candidates);
+    const select=$('relink-candidate');
+    if(!candidates.length){
+      showMessage('warn','付け替えられるファイルがありません',`原稿フォルダーの直下に、まだ登録されていない同じ種類のファイルが見つかりません。ファイルを別の場所へ移した場合は、元のフォルダーに戻してからもう一度お試しください。`);
+      return;
+    }
+    relinkSourceId=sourceId;
+    setTextIfChanged($('relink-message'),`「${info.fileName||sourceId}」が見つかりません。どのファイルに付け替えますか。`);
+    select.innerHTML=candidates.map(c=>`<option value="${escapeAttr(c.relativePath)}">${escapeHtml(c.fileName||c.relativePath)}${c.sameContent?'（中身が同じ）':''}</option>`).join('');
+    const same=candidates.find(c=>c.sameContent);
+    if(same)select.value=String(same.relativePath);
+    updateRelinkNote(candidates);
+    select.onchange=()=>updateRelinkNote(candidates);
+    $('relink-modal').classList.remove('hidden');
+    select.focus();
+  });
+}
+function updateRelinkNote(candidates) {
+  const select=$('relink-candidate');
+  const chosen=asArray(candidates).find(c=>String(c.relativePath)===String(select?.value||''));
+  setTextIfChanged($('relink-note'),chosen?.sameContent
+    ? '中身が同じファイルです。名前が変わっただけなので、変換PDFを作り直す必要はありません。'
+    : '中身が異なるファイルです。付け替えたあと、変換PDFの作成と提出用PDFの再出力が必要になります。ページの並び順と出力先はそのまま残ります。');
+}
+function closeRelinkDialog() { $('relink-modal')?.classList.add('hidden'); relinkSourceId=''; }
+async function submitRelink(btn) {
+  const relativePath=String($('relink-candidate')?.value||'');
+  if(!relinkSourceId||!relativePath)return;
+  const sourceId=relinkSourceId;
+  await runBusy(btn,async()=>{
+    const res=await api('/api/v2/sources/relink',{method:'POST',body:{sourceId,relativePath}});
+    closeRelinkDialog();
+    await refresh();
+    const r=res?.result||{};
+    showMessage('ok','原稿を付け替えました',r.sameContent
+      ? `${r.fileName} に付け替えました。中身は同じなので、変換PDFはそのまま使えます。`
+      : `${r.fileName} に付け替えました。ページの並び順と出力先はそのままです。変換PDFを作成し直してください。`);
+  });
 }
 function confirmAction({title='操作を実行しますか？',message='',detail='',confirmLabel='実行する',danger=false}={}) {
   if(isConfirmModalOpen())closeConfirmModal(false);
@@ -2220,7 +2287,14 @@ function renderFileList(files) {
   const selectedCount = () => [...selectedFiles].filter(id => allSelectable.some(f => String(f.relativePath || '') === id)).length;
   if (!selectable.length) {
     box.className = 'table-shell empty-state';
-    box.innerHTML = allSelectable.length ? '<div><strong>検索条件に一致する未登録原稿はありません。</strong></div>' : '<div><strong>未登録の原稿はありません。</strong></div>';
+    // 「未登録の原稿はありません。」は3つの別の状況で出ていた: 全部登録済み、
+    // フォルダー直下に対応形式が無い、資料パックの受け入れ形式で弾かれた。
+    // どれも「作業完了」と読めるため、原因に気付けず黙って先へ進んでしまう。
+    box.innerHTML = allSelectable.length
+      ? '<div><strong>検索条件に一致する未登録原稿はありません。</strong></div>'
+      : (files.length
+        ? `<div><strong>この資料パックに登録できる原稿はありません。</strong></div><div class="subtext">フォルダーには ${files.length} 件ありますが、すべて登録済みか、この資料パックが受け付けない形式です。</div>`
+        : '<div><strong>このフォルダーの直下に原稿が見つかりません。</strong></div><div class="subtext">対応する形式は .xlsx / .xlsm / .docx / .pptx / .pdf です。サブフォルダーの中は探しません。</div>');
     if (!allSelectable.length) { selectedFiles.clear(); lastFileRangeAnchor = ''; }
     setFileSelectionSummary(allSelectable.length, selectedCount());
     syncFileSelectionUi(files);
@@ -2378,6 +2452,12 @@ function workbookPdfStatusCell(w){
   const detail = latestPdfDetailForWorkbook(w);
   if (status === 'render-error') {
     return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('PDF作成エラー','danger')}</div><div class="pdf-status-detail">${escapeHtml(detail || '差分を確認できません')}</div></div>`;
+  }
+  if (status === 'missing') {
+    // ファイルが見つからない原稿を「原稿更新あり／PDFを再作成してください」と
+    // 案内していた。その指示どおり押しても、対象の絞り込みが missing を外すため
+    // 何も起きず、同時にヒントは「すべての変換PDFは最新です。」と出ていた。
+    return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('ファイルなし','danger')}</div><div class="pdf-status-detail">原稿フォルダーにこのファイルがありません。名前を変えた・移動した・削除した場合は、下のボタンで別のファイルに付け替えてください。</div><div class="pdf-status-actions"><button class="btn secondary" type="button" data-relink-source="${escapeAttr(w?.workbookId||'')}">別のファイルに付け替える</button></div></div>`;
   }
   if (status === 'rendering') {
     return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('PDF作成中','attention')}</div><div class="pdf-status-detail">完了後に差分を判定します</div></div>`;
@@ -3691,6 +3771,7 @@ function renderWorkbooks() {
   box.className='table-shell';box.innerHTML=`<table class="data-table workbook-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-workbooks ${allSelected?'checked':''} aria-label="登録済み原稿をすべて選択"></th><th>原稿ファイル</th><th class="pdf-status-col">変換PDFの状態</th></tr></thead><tbody>${list.map(w=>{const id=String(w.workbookId||''),checked=selectedWorkbooks.has(id),renderedAt=formatDateTime(w.lastRenderedAt||'');return `<tr data-workbook-row class="${checked?'selected-row':''} ${w.status==='render-error'?'error-row':''}"><td class="check-col"><input type="checkbox" data-workbook-check value="${escapeAttr(id)}" ${checked?'checked':''} aria-label="${escapeAttr(workbookDisplayName(w))}を選択"></td><td><div class="file-name-cell"><span class="file-icon ${escapeAttr(sourceTypeValue(w))}">${iconUse(sourceIconId(w))}</span><div class="source-file-detail"><div class="source-name-line"><strong title="${escapeAttr(workbookDisplayName(w))}">${escapeHtml(workbookDisplayName(w))}</strong>${sourceTypeBadge(w)}</div><div class="file-meta" title="最後に変換PDFを作成した日時">変換PDF作成日時：${escapeHtml(renderedAt)}</div>${sourceSettingsHtml(w)}</div></div></td><td class="pdf-status-col">${workbookPdfStatusCell(w)}</td></tr>`;}).join('')}</tbody></table>`;
   if(summary)summary.textContent=`${list.length}件中 ${selectedWorkbooks.size}件を選択`;const selectAll=box.querySelector('[data-select-all-workbooks]');if(selectAll){selectAll.indeterminate=someSelected&&!allSelected;selectAll.addEventListener('change',e=>{selectedWorkbooks=e.target.checked?new Set(list.map(w=>String(w.workbookId||'')).filter(Boolean)):new Set();lastWorkbookRangeAnchor='';syncWorkbookSelectionUi();renderWorkbooks();});}
   box.querySelectorAll('[data-workbook-check]').forEach(ch=>ch.addEventListener('click',e=>{e.stopPropagation();handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));box.querySelectorAll('[data-open-history]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();openWorkbookComparisonHistory(btn.dataset.openHistory||'');}));
+  box.querySelectorAll('[data-relink-source]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();openRelinkDialog(btn.dataset.relinkSource||'',btn);}));
   box.querySelectorAll('[data-source-owner]').forEach(input=>input.addEventListener('change',()=>saveSourceMetadata(input.dataset.sourceOwner,{ownerDepartment:input.value},input)));
   box.querySelectorAll('[data-source-required]').forEach(input=>input.addEventListener('change',()=>saveSourceMetadata(input.dataset.sourceRequired,{required:input.checked},input)));
   box.querySelectorAll('[data-source-default-target]').forEach(select=>select.addEventListener('change',()=>saveSourceMetadata(select.dataset.sourceDefaultTarget,{defaultTargetId:select.value},select)));
@@ -3766,6 +3847,7 @@ function updateRenderTargetUi() {
   if (!hint && !btn) return;
   const info = getWorkbookRenderTargetInfo();
   const activeCount = workbooksForActivePreset().filter(w => String(w.status || '') !== 'missing').length;
+  const missingCount = workbooksForActivePreset().filter(w => String(w.status || '') === 'missing').length;
   if (btn) {
     btn.disabled = info.mode === 'none';
     if (info.mode === 'selected') btn.textContent = `選択した${info.count}件の変換PDFを作成`;
@@ -3777,6 +3859,9 @@ function updateRenderTargetUi() {
     hint.classList.add(info.mode === 'selected' ? 'target-selected' : (info.mode === 'needed' ? 'target-needed' : 'target-none'));
     if (info.mode === 'selected') hint.textContent = `${presetLabel()}で選択中: ${info.count}件の変換PDFを作成します。`;
     else if (info.mode === 'needed') hint.textContent = `${presetLabel()}で変換PDFの作成が必要な原稿は${info.count}件です。ボタンを押すと必要な分だけ作成します。`;
+    // 見つからない原稿を数えずに「すべて最新」と言うと、赤い「ファイルなし」が
+    // 並んでいる横で矛盾した案内が出る。件数を先に伝える。
+    else if (missingCount) hint.textContent = `${missingCount}件の原稿はファイルが見つかりません。付け替えるか、登録を解除してください。残りの変換PDFは最新です。`;
     else hint.textContent = activeCount ? 'すべての変換PDFは最新です。' : `${presetLabel()}の登録済み原稿はありません。`;
   }
 }
@@ -4864,7 +4949,29 @@ async function runBusy(btn, fn, showProcessing=true) {
 }
 
 
-async function sendHeartbeat() { try { await api('/api/heartbeat', {method:'POST', body:{clientId}, keepalive:true}); } catch { } }
+// ハートビートの失敗を黙って捨てると、画面は正常に見えたまま、次にボタンを押した
+// 瞬間に初めて壊れたと分かる。続けて落ちたらサーバーは居ないと判断して知らせる。
+// 1回だけの失敗では出さない（一時的な取りこぼしで驚かせないため）。
+let heartbeatFailures = 0;
+async function sendHeartbeat() {
+  try {
+    await api('/api/heartbeat', {method:'POST', body:{clientId}, keepalive:true});
+    heartbeatFailures = 0;
+  } catch {
+    heartbeatFailures++;
+    if (heartbeatFailures === 3) showServerGoneScreen();
+  }
+}
+function showServerGoneScreen() {
+  const screen=$('shutdown-screen');
+  // 利用者が自分で終了した場合は既に出ている。その文言（このタブを閉じてください）を
+  // 上書きしない。押した本人にとっては事故ではないため。
+  if(!screen || !screen.classList.contains('hidden')) return;
+  setTextIfChanged($('shutdown-title'), 'ReportBinderが終了しました');
+  setTextIfChanged($('shutdown-detail'), SERVER_GONE_MESSAGE);
+  screen.classList.remove('hidden');
+  screen.focus();
+}
 function notifyClientClosing() {
   try {
     const payload = new Blob([JSON.stringify({clientId})], {type:'application/json'});
@@ -4890,6 +4997,9 @@ document.querySelectorAll('[data-view-nav]').forEach(btn=>btn.addEventListener('
 bind('pages-next-final','click',()=>setActiveView('final'));
 document.querySelectorAll('[data-view-shortcut]').forEach(btn=>btn.addEventListener('click',()=>setActiveView(btn.dataset.viewShortcut)));
 setActiveView(activeView,{noScroll:true,instant:true});
+$('relink-cancel')?.addEventListener('click',closeRelinkDialog);
+$('relink-accept')?.addEventListener('click',event=>submitRelink(event.currentTarget));
+$('relink-modal')?.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();closeRelinkDialog();}});
 const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEventListener('input',()=>{fileFilterText=fileFilterInput.value||'';renderFileList(availableFiles);});
 bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('excel');setTimeout(()=>$('change-source-folder-btn')?.focus(),0);}else if(action==='create-pack'){openPackEditor('create');}else if(action==='render'){setActiveView('excel');await renderUpdated($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
 bind('notice-close','click',hideMessage);bind('error-close','click',hideErrorPanel);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));

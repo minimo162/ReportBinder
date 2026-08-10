@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260810_v106">
+  <link rel="stylesheet" href="style.css?v=20260810_v107">
 </head>
 <body class="app-initializing">
   <a class="skip-link" href="#main-content">本文へ移動</a>
@@ -123,6 +123,7 @@
             <section class="card table-card unregistered-card">
               <div class="card-head"><div><h3>未登録原稿</h3><p id="file-selection-summary" class="caption">0件中 0件を選択</p></div></div>
               <div id="file-context-bar" class="list-action-bar contextual-action-bar" role="group" aria-label="未登録原稿の操作"><div class="toolbar"><span id="file-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-files-btn" class="btn ghost selection-only" type="button">選択解除</button></div><button id="register-selected-btn" class="btn primary" type="button" disabled>選択した原稿を登録</button></div>
+              <div class="file-filter-row"><label class="sr-only" for="file-filter">未登録原稿を絞り込む</label><input id="file-filter" type="search" class="input" placeholder="ファイル名で絞り込む" autocomplete="off"></div>
               <div id="file-list"></div>
             </section>
             <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済み原稿</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div></div><div id="source-requirement-status" class="source-requirement-status hidden"></div><div id="workbook-context-bar" class="list-action-bar contextual-action-bar" role="group" aria-label="登録済み原稿の操作"><div class="toolbar"><span id="workbook-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-workbooks-btn" class="btn ghost selection-only" type="button">選択解除</button></div><div class="toolbar"><button id="render-selected-btn" class="btn primary" type="button" disabled>変換PDFを作成</button><button id="unregister-selected-btn" class="btn danger selection-only" type="button">登録解除</button></div></div><div id="workbook-list"></div></section>
@@ -213,8 +214,11 @@
     </form>
   </div>
 
-  <div id="shutdown-screen" class="shutdown-screen hidden" role="status" tabindex="-1" aria-live="polite"><div class="shutdown-card"><span class="shutdown-mark"><svg class="icon"><use href="#i-check"/></svg></span><h2>ReportBinderを終了しました</h2><p>このタブを閉じてください。</p></div></div>
+  <div id="shutdown-screen" class="shutdown-screen hidden" role="status" tabindex="-1" aria-live="polite"><div class="shutdown-card"><span class="shutdown-mark"><svg class="icon"><use href="#i-check"/></svg></span><h2 id="shutdown-title">ReportBinderを終了しました</h2><p id="shutdown-detail">このタブを閉じてください。</p></div></div>
 
+  <div id="relink-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="relink-title" aria-describedby="relink-message">
+    <div class="modal-card confirm-dialog"><div class="modal-head"><div><span class="eyebrow">原稿の付け替え</span><h2 id="relink-title">別のファイルに付け替える</h2></div></div><div class="confirm-body"><p id="relink-message"></p><label class="field"><span>付け替え先のファイル</span><select id="relink-candidate"></select></label><p id="relink-note" class="caption"></p></div><div class="confirm-actions"><button id="relink-cancel" class="btn secondary" type="button">キャンセル</button><button id="relink-accept" class="btn primary" type="button">このファイルに付け替える</button></div></div>
+  </div>
   <div id="confirm-modal" class="modal hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
     <div class="modal-card confirm-dialog"><div class="modal-head"><div><span class="eyebrow">確認</span><h2 id="confirm-title"></h2></div></div><div class="confirm-body"><p id="confirm-message"></p><div id="confirm-detail" class="confirm-detail hidden"></div></div><div class="confirm-actions"><button id="confirm-cancel" class="btn secondary" type="button">キャンセル</button><button id="confirm-accept" class="btn primary" type="button">実行する</button></div></div>
   </div>
@@ -266,6 +270,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" role="group" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" role="group" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260810_v177"></script>
+  <script src="app.js?v=20260810_v178"></script>
 </body>
 </html>
