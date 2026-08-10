@@ -1124,6 +1124,34 @@ if 'targetStateSuffix' not in appjs:
 if 'document.title' not in appjs:
     raise SystemExit('a long job must show progress where a busy person can see it')
 
+# 10) 「複製」は設定だけをコピーする。何が引き継がれないかを言わずに押させない。
+_dup = appjs.split('async function duplicatePack(', 1)[1].split(chr(10) + 'async function ', 1)[0]
+for _needed in ['confirmAction', '引き継ぎません']:
+    if _needed not in _dup:
+        raise SystemExit(f'duplicating a pack must say what it does not carry over: {_needed}')
+if '>設定だけ複製<' not in appjs:
+    raise SystemExit('the duplicate button must say it copies settings only')
+# 11) 見つからない原稿が複数あるとき、1件ずつ付け替えさせない。ただし自動確定はしない。
+# 入口はHTML側に、処理はJS側にあること。片方だけ見ると、要素が消えても素通りする。
+for _needed in ['id="relink-all-btn"', 'id="relink-bulk-modal"']:
+    if _needed not in html:
+        raise SystemExit(f'relinking many sources needs its entry point in the page: {_needed}')
+for _needed in ['function openRelinkBulkDialog', 'function submitRelinkBulk']:
+    if _needed not in appjs:
+        raise SystemExit(f'relinking many sources must be possible in one pass: {_needed}')
+_bulk = appjs.split('async function submitRelinkBulk(', 1)[1].split(chr(10) + 'function ', 1)[0]
+if 'document.querySelectorAll' not in _bulk:
+    raise SystemExit('the bulk relink must confirm what the person actually saw, not recompute it')
+_open_bulk = appjs.split('async function openRelinkBulkDialog(', 1)[1].split(chr(10) + 'function ', 1)[0]
+if 'relink-bulk-modal' not in _open_bulk:
+    raise SystemExit('the bulk relink must show the mapping before anything is changed')
+# 12) 「ひな形管理」は一式の切り替えメニューから外す。押した結果が予測できなかった。
+_pack_head = html.split('class="pack-menu-head-actions"', 1)[1].split('</div>', 1)[0]
+if 'manage-pack-templates-btn' in _pack_head:
+    raise SystemExit('template management must not sit next to creating a pack')
+if 'manage-pack-templates-btn' not in html:
+    raise SystemExit('template management must still be reachable from the app menu')
+
 # 絞り込みは app.js に実装済みなのに入力欄がHTMLに無く、到達不能なコードだった。
 if 'file-filter' not in html:
     raise SystemExit('the unregistered-source filter has code but no input to drive it')
@@ -1522,7 +1550,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v179', 'style.css?v=20260810_v108']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v180', 'style.css?v=20260810_v109']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1577,7 +1605,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260810_v179' not in html:
+if 'app.js?v=20260810_v180' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1603,7 +1631,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260810_v179' not in html:
+if 'app.js?v=20260810_v180' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1749,7 +1777,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.10.3':
+if runtime_version != '2026.08.10.4':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 # 成果物の呼称は「提出用PDF」に統一する。サーバーの日本語 throw は加工されずに画面へ
 # 出るため、ここに旧称が残ると利用者が画面に無い言葉を見せられる。
