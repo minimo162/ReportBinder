@@ -1635,6 +1635,64 @@ function updateRelinkNote(candidates) {
     ? '中身が同じファイルです。名前が変わっただけなので、変換PDFを作り直す必要はありません。'
     : '中身が異なるファイルです。付け替えたあと、変換PDFの作成と提出用PDFの再出力が必要になります。ページの並び順と出力先はそのまま残ります。');
 }
+// ファイル名が毎月変わる運用だと、登録済みが全部「ファイルなし」になる。
+// 1件ずつだと30件で90〜120クリックになるので、対応表を一度に見せて1回で確定する。
+// 自動では確定しない。誤った対応付けは、提出物の中身そのものを誤らせるため。
+let relinkBulkRows=[];
+function missingWorkbooks(){return workbooksForActivePreset().filter(w=>String(w?.status||'')==='missing');}
+function updateRelinkAllButton(){
+  const btn=$('relink-all-btn'); if(!btn) return;
+  const count=missingWorkbooks().length;
+  btn.classList.toggle('hidden',count<2);
+  btn.textContent=`見つからない${count}件をまとめて付け替える`;
+}
+async function openRelinkBulkDialog(trigger=null){
+  const targets=missingWorkbooks();
+  if(!targets.length) return;
+  await runBusy(trigger,async()=>{
+    const rows=[];
+    for(const w of targets){
+      const id=String(w?.workbookId||'');
+      const res=await api(`/api/v2/sources/relink-candidates?sourceId=${encodeURIComponent(id)}`);
+      const info=res?.result||{};
+      rows.push({sourceId:id,fileName:String(info.fileName||id),candidates:asArray(info.candidates)});
+    }
+    relinkBulkRows=rows;
+    const withCandidates=rows.filter(r=>r.candidates.length);
+    if(!withCandidates.length){
+      showMessage('warn','付け替えられるファイルがありません','原稿フォルダーの直下に、まだ登録されていない同じ種類のファイルが見つかりません。ファイルを別の場所へ移した場合は、元のフォルダーに戻してからお試しください。');
+      return;
+    }
+    setTextIfChanged($('relink-bulk-message'),`${withCandidates.length}件の対応を確認してください。そのままでよければ、下のボタンで一度に付け替えます。`);
+    $('relink-bulk-list').innerHTML=rows.map((row,index)=>{
+      if(!row.candidates.length){
+        return `<div class="relink-bulk-row"><span class="relink-from">${escapeHtml(row.fileName)}</span><span class="caption">候補が見つかりません（このまま残します）</span></div>`;
+      }
+      const same=row.candidates.find(c=>c.sameContent);
+      const options=row.candidates.map(c=>`<option value="${escapeAttr(c.relativePath)}"${same&&c.relativePath===same.relativePath?' selected':''}>${escapeHtml(c.fileName||c.relativePath)}${c.sameContent?'（中身が同じ）':''}</option>`).join('');
+      return `<div class="relink-bulk-row"><span class="relink-from">${escapeHtml(row.fileName)}</span><select data-relink-bulk="${index}">${options}</select>${same?'<span class="relink-same">中身が同じ</span>':'<span class="caption">中身が異なります</span>'}</div>`;
+    }).join('');
+    $('relink-bulk-modal').classList.remove('hidden');
+    $('relink-bulk-list').querySelector('select')?.focus();
+  });
+}
+function closeRelinkBulkDialog(){$('relink-bulk-modal')?.classList.add('hidden');relinkBulkRows=[];}
+async function submitRelinkBulk(btn){
+  const selects=[...document.querySelectorAll('[data-relink-bulk]')];
+  const plan=selects.map(sel=>({row:relinkBulkRows[Number(sel.dataset.relinkBulk)],relativePath:String(sel.value||'')})).filter(x=>x.row&&x.relativePath);
+  if(!plan.length){closeRelinkBulkDialog();return;}
+  await runBusy(btn,async()=>{
+    let done=0,failed=0;
+    for(const item of plan){
+      try{await api('/api/v2/sources/relink',{method:'POST',body:{sourceId:item.row.sourceId,relativePath:item.relativePath}});done++;}
+      catch{failed++;}
+    }
+    closeRelinkBulkDialog();
+    await refresh();
+    if(failed)showMessage('warn','一部を付け替えられませんでした',`${done}件を付け替え、${failed}件は失敗しました。残った行は個別に付け替えてください。`);
+    else showMessage('ok','まとめて付け替えました',`${done}件の参照先を差し替えました。ページの並び順と出力先はそのままです。`);
+  });
+}
 function closeRelinkDialog() { $('relink-modal')?.classList.add('hidden'); relinkSourceId=''; }
 async function submitRelink(btn) {
   const relativePath=String($('relink-candidate')?.value||'');
@@ -1783,7 +1841,7 @@ function populateTemplateManager(){
   setValue('template-name',t?.displayName||'');setValue('template-description',t?.description||'');setChecked('template-source-excel',t?sourceTypes.includes('excel'):true);setChecked('template-source-word',t?sourceTypes.includes('word'):true);setChecked('template-source-powerpoint',t?sourceTypes.includes('powerpoint'):true);setChecked('template-source-pdf',t?sourceTypes.includes('pdf'):true);
   renderTemplateTargets(targets,builtIn);renderTemplateDestinationOptions(rules.newItemDestination||'unassigned');setValue('template-output-pattern',output.fileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');setChecked('template-block-stale',t?rules.blockBuildWhenRequiredSourceIsStale:true);setChecked('template-block-failed',t?rules.blockBuildWhenRequiredSourceFailed:true);
   renderTemplateRequirements(t?.sourceRequirements||[],builtIn);
-  templateManagerFieldIds.forEach(id=>{const el=$(id);if(el)el.disabled=builtIn;});const save=$('template-manager-save'),remove=$('template-manager-delete'),duplicate=$('template-manager-duplicate'),exportButton=$('template-manager-export'),stateText=$('template-manager-state'),usageCount=t?asArray(packAdminPacks.length?packAdminPacks:state?.packs).filter(pack=>String(pack?.templateId||'')===String(t.templateId||'')).length:0;if(save){save.disabled=builtIn;save.textContent=t?'変更を保存':'作成';}if(remove)remove.classList.toggle('hidden',!t||builtIn);if(duplicate)duplicate.classList.toggle('hidden',!t);if(exportButton)exportButton.classList.toggle('hidden',!t);if(stateText)stateText.textContent=builtIn?`組み込みひな形・使用中 ${usageCount}件。内容を基にする場合は「複製」を選んでください。`:(t?`バージョン ${Number(t.templateVersion||1)}・使用中 ${usageCount}件・変更は新しく作る一式から反映されます。`:'新しいひな形を作成します。');
+  templateManagerFieldIds.forEach(id=>{const el=$(id);if(el)el.disabled=builtIn;});const save=$('template-manager-save'),remove=$('template-manager-delete'),duplicate=$('template-manager-duplicate'),exportButton=$('template-manager-export'),stateText=$('template-manager-state'),usageCount=t?asArray(packAdminPacks.length?packAdminPacks:state?.packs).filter(pack=>String(pack?.templateId||'')===String(t.templateId||'')).length:0;if(save){save.disabled=builtIn;save.textContent=t?'このひな形を保存':'ひな形を作成';}if(remove)remove.classList.toggle('hidden',!t||builtIn);if(duplicate)duplicate.classList.toggle('hidden',!t);if(exportButton)exportButton.classList.toggle('hidden',!t);if(stateText)stateText.textContent=builtIn?`組み込みひな形・使用中 ${usageCount}件。内容を基にする場合は「複製」を選んでください。`:(t?`バージョン ${Number(t.templateVersion||1)}・使用中 ${usageCount}件・変更は新しく作る一式から反映されます。`:'新しいひな形を作成します。');
   const addRequirement=$('template-add-requirement'),addTarget=$('template-add-target');if(addRequirement)addRequirement.disabled=builtIn;if(addTarget)addTarget.disabled=builtIn;
 }
 function openTemplateManager(){const modal=$('template-manager-modal');if(!modal)return;templateManagerReturnFocus=$('manage-pack-templates-btn')||document.activeElement;closePackMenu();modal.classList.remove('hidden');renderTemplateManagerSelect('');requestAnimationFrame(()=>$('template-name')?.focus());}
@@ -1804,7 +1862,16 @@ async function importManagedTemplateFile(file,btn){if(!file)return;try{const bod
 async function duplicatePack(packId,btn) {
   const pack=findPackForManagement(packId);if(!pack)return;
   closePackMenu();
-  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/duplicate`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','一式を複製しました',`${response?.result?.displayName||pack.displayName}を新しい一式として作成しました。`);},false);
+  // 複製されるのは設定だけで、登録した原稿もページの並びも引き継がない（仕様）。
+  // 「先月と同じ体裁で今月分を」と考えて押すと、登録もページの振り分けも
+  // 全部やり直しになる。押す前に、正しい進め方を示す。
+  const accepted=await confirmAction({
+    title:'設定だけを複製しますか？',
+    message:`「${pack.displayName||'一式'}」の設定（必要な原稿の種類・出力先・ファイル名の付け方）だけをコピーした、空の一式を作ります。`,
+    detail:'登録した原稿とページの並び順は引き継ぎません。毎月同じ資料をまとめるなら、複製せずに同じ一式を使い続けてください。ファイル名が変わった原稿は「別のファイルに付け替える」で差し替えると、ページの並びが残ります。',
+    confirmLabel:'設定だけ複製する'});
+  if(!accepted) return;
+  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/duplicate`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','設定だけを複製しました',`${response?.result?.displayName||pack.displayName}を新しい一式として作成しました。原稿とページの並びは入っていません。`);},false);
 }
 async function archivePack(packId) {
   const pack=findPackForManagement(packId);if(!pack)return;
@@ -2085,7 +2152,7 @@ function packMenuRow(pack, archived=false) {
   const archiveAction=!archived&&pack?.archivable?`<button class="danger" type="button" data-pack-action="archive" data-pack-id="${escapeAttr(id)}">アーカイブ</button>`:'';
   const restoreAction=archived?`<button type="button" data-pack-action="restore" data-pack-id="${escapeAttr(id)}">復元</button>`:'';
   const templateUpgrade=!archived&&pack?.templateUpdateAvailable?`<button class="attention" type="button" data-pack-action="template-upgrade" data-pack-id="${escapeAttr(id)}">ひな形更新</button>`:'';
-  return `<div class="pack-menu-row" data-pack-row="${escapeAttr(id)}"><button class="pack-option${active?' active':''}" type="button" ${selectAttrs} ${active?'aria-current="true"':''}><span class="pack-option-marker" aria-hidden="true"></span><span class="pack-option-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(status)}${pack?.templateUpdateAvailable?`・ひな形 v${Number(pack.availableTemplateVersion||1)}あり`:''}</small></span></button><div class="pack-row-actions">${restoreAction}${templateUpgrade}<button type="button" data-pack-action="duplicate" data-pack-id="${escapeAttr(id)}">複製</button><button type="button" data-pack-action="rename" data-pack-id="${escapeAttr(id)}">名前を変更</button>${archiveAction}</div></div>`;
+  return `<div class="pack-menu-row" data-pack-row="${escapeAttr(id)}"><button class="pack-option${active?' active':''}" type="button" ${selectAttrs} ${active?'aria-current="true"':''}><span class="pack-option-marker" aria-hidden="true"></span><span class="pack-option-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(status)}${pack?.templateUpdateAvailable?`・ひな形 v${Number(pack.availableTemplateVersion||1)}あり`:''}</small></span></button><div class="pack-row-actions">${restoreAction}${templateUpgrade}<button type="button" data-pack-action="duplicate" data-pack-id="${escapeAttr(id)}">設定だけ複製</button><button type="button" data-pack-action="rename" data-pack-id="${escapeAttr(id)}">名前を変更</button>${archiveAction}</div></div>`;
 }
 function renderPackSwitcher() {
   const selected=activePackRecord();
@@ -2373,6 +2440,7 @@ function syncSourcePanelDensity() {
   unregisteredCard.classList.toggle('hidden',!showUnregistered);
   registeredCard.classList.toggle('hidden',!showRegistered);
   grid.classList.toggle('single-panel',showUnregistered!==showRegistered);
+  updateRelinkAllButton();
   const next=$('source-next-action'),needsPdf=workbooksForActivePreset().filter(workbook=>!isLatestPdfWorkbook(workbook)).length;
   // 「次に、使うページと順番を確認します。」は、出力まで終わっている一式でも
   // 出しっぱなしになっていた（判定に振り分け済み・出力済みが入っていなかった）。
@@ -5135,6 +5203,10 @@ document.querySelectorAll('[data-view-nav]').forEach(btn=>btn.addEventListener('
 bind('pages-next-final','click',()=>setActiveView('final'));
 document.querySelectorAll('[data-view-shortcut]').forEach(btn=>btn.addEventListener('click',()=>setActiveView(btn.dataset.viewShortcut)));
 setActiveView(activeView,{noScroll:true,instant:true});
+$('relink-all-btn')?.addEventListener('click',event=>openRelinkBulkDialog(event.currentTarget));
+$('relink-bulk-cancel')?.addEventListener('click',closeRelinkBulkDialog);
+$('relink-bulk-accept')?.addEventListener('click',event=>submitRelinkBulk(event.currentTarget));
+$('relink-bulk-modal')?.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();closeRelinkBulkDialog();}});
 $('relink-cancel')?.addEventListener('click',closeRelinkDialog);
 $('relink-accept')?.addEventListener('click',event=>submitRelink(event.currentTarget));
 $('relink-modal')?.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();closeRelinkDialog();}});

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20260810_v108">
+  <link rel="stylesheet" href="style.css?v=20260810_v109">
 </head>
 <body class="app-initializing">
   <a class="skip-link" href="#main-content">本文へ移動</a>
@@ -65,7 +65,7 @@
               <span id="active-pack-name">未作成</span><svg class="icon"><use href="#i-chevron-down"/></svg>
             </button>
             <div id="pack-menu" class="pack-menu hidden" role="dialog" aria-label="一式の選択と管理">
-              <div class="pack-menu-head"><div><strong>一式</strong><span>使用するパックを選択します</span></div><div class="pack-menu-head-actions"><button id="manage-pack-templates-btn" class="btn secondary compact" type="button">ひな形管理</button><button id="create-pack-btn" class="btn primary compact" type="button">新規作成</button></div></div>
+              <div class="pack-menu-head"><div><strong>一式</strong><span>使用するパックを選択します</span></div><div class="pack-menu-head-actions"><button id="create-pack-btn" class="btn primary compact" type="button">新規作成</button></div></div>
               <div id="pack-menu-list" class="pack-menu-list"></div>
               <button id="toggle-archived-packs" class="pack-archive-toggle hidden" type="button" aria-expanded="false"></button>
               <div id="archived-pack-list" class="pack-menu-list archived hidden"></div>
@@ -75,7 +75,7 @@
         <button id="global-final-status" class="global-status" type="button" data-view-shortcut="final"></button>
         <div class="app-menu-wrap language-wrap">
           <button id="app-menu-button" class="app-menu-button language-select" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="app-menu-popover">メニュー <svg class="icon"><use href="#i-chevron-down"/></svg></button>
-          <div id="app-menu-popover" class="popover hidden" role="dialog" aria-label="アプリメニュー"><strong>ReportBinder</strong><p>作業する一式は画面上部で切り替えます。</p><div class="popover-actions"><button id="app-exit-button" class="popover-action danger" type="button"><svg class="icon"><use href="#i-close"/></svg><span>ReportBinderを終了</span></button></div></div>
+          <div id="app-menu-popover" class="popover hidden" role="dialog" aria-label="アプリメニュー"><strong>ReportBinder</strong><p>作業する一式は画面上部で切り替えます。</p><div class="popover-actions"><button id="manage-pack-templates-btn" class="popover-action" type="button"><svg class="icon"><use href="#i-list"/></svg><span>一式のひな形を編集（必要な原稿・出力先の初期設定）</span></button><button id="app-exit-button" class="popover-action danger" type="button"><svg class="icon"><use href="#i-close"/></svg><span>ReportBinderを終了</span></button></div></div>
         </div>
       </header>
       <nav class="step-bar" aria-label="作成の進捗">
@@ -126,7 +126,7 @@
               <div class="file-filter-row"><label class="sr-only" for="file-filter">未登録原稿を絞り込む</label><input id="file-filter" type="search" class="input" placeholder="ファイル名で絞り込む" autocomplete="off"></div>
               <div id="file-list"></div>
             </section>
-            <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済み原稿</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div></div><div id="source-requirement-status" class="source-requirement-status hidden"></div><div id="workbook-context-bar" class="list-action-bar contextual-action-bar" role="group" aria-label="登録済み原稿の操作"><div class="toolbar"><span id="workbook-context-count" class="context-count selection-only">0件を選択中</span><button id="clear-selected-workbooks-btn" class="btn ghost selection-only" type="button">選択解除</button></div><div class="toolbar"><button id="render-selected-btn" class="btn primary" type="button" disabled>変換PDFを作成</button><button id="unregister-selected-btn" class="btn danger selection-only" type="button">登録解除</button></div></div><div id="workbook-list"></div></section>
+            <section class="card table-card registered-card"><div class="card-head workbook-card-head"><div><h3>登録済み原稿</h3><p id="workbook-selection-summary" class="caption">0件中 0件を選択</p><p id="render-target-hint" class="caption render-target-hint"></p></div></div><div id="source-requirement-status" class="source-requirement-status hidden"></div><div id="workbook-context-bar" class="list-action-bar contextual-action-bar" role="group" aria-label="登録済み原稿の操作"><div class="toolbar"><span id="workbook-context-count" class="context-count selection-only">0件を選択中</span><button id="relink-all-btn" class="btn secondary hidden" type="button">見つからない原稿をまとめて付け替える</button><button id="clear-selected-workbooks-btn" class="btn ghost selection-only" type="button">選択解除</button></div><div class="toolbar"><button id="render-selected-btn" class="btn primary" type="button" disabled>変換PDFを作成</button><button id="unregister-selected-btn" class="btn danger selection-only" type="button">登録解除</button></div></div><div id="workbook-list"></div></section>
           </div>
           <section id="auto-status" class="auto-status hidden"></section>
         </section>
@@ -216,6 +216,9 @@
 
   <div id="shutdown-screen" class="shutdown-screen hidden" role="status" tabindex="-1" aria-live="polite"><div class="shutdown-card"><span class="shutdown-mark"><svg class="icon"><use href="#i-check"/></svg></span><h2 id="shutdown-title">ReportBinderを終了しました</h2><p id="shutdown-detail">このタブを閉じてください。</p></div></div>
 
+  <div id="relink-bulk-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="relink-bulk-title" aria-describedby="relink-bulk-message">
+    <div class="modal-card"><div class="modal-head"><div><span class="eyebrow">原稿の付け替え</span><h2 id="relink-bulk-title">まとめて付け替える</h2></div></div><div class="modal-body"><p id="relink-bulk-message"></p><div id="relink-bulk-list" class="relink-bulk-list"></div><p class="caption">「中身が同じ」と表示された行は、名前が変わっただけのファイルです。変換PDFの作り直しは要りません。</p></div><div class="confirm-actions"><button id="relink-bulk-cancel" class="btn secondary" type="button">キャンセル</button><button id="relink-bulk-accept" class="btn primary" type="button">この内容で付け替える</button></div></div>
+  </div>
   <div id="relink-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="relink-title" aria-describedby="relink-message">
     <div class="modal-card confirm-dialog"><div class="modal-head"><div><span class="eyebrow">原稿の付け替え</span><h2 id="relink-title">別のファイルに付け替える</h2></div></div><div class="confirm-body"><p id="relink-message"></p><label class="field"><span>付け替え先のファイル</span><select id="relink-candidate"></select></label><p id="relink-note" class="caption"></p></div><div class="confirm-actions"><button id="relink-cancel" class="btn secondary" type="button">キャンセル</button><button id="relink-accept" class="btn primary" type="button">このファイルに付け替える</button></div></div>
   </div>
@@ -270,6 +273,6 @@
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
     <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" role="group" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" role="group" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20260810_v179"></script>
+  <script src="app.js?v=20260810_v180"></script>
 </body>
 </html>
