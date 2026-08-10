@@ -1118,8 +1118,8 @@ function Get-WorkspacePath([string]$Language, [string]$DataDir = '') {
         $resolvedDataDir = ([string]$paths.dataDir).Trim()
     }
     if ([string]::IsNullOrWhiteSpace($resolvedDataDir)) { throw '管理データフォルダが未設定です。提出フォルダを選んでください。' }
-    # 資料パックを唯一の管理単位とし、すべてのパックを同じワークスペースに保存する。
-    # 言語は保存領域を分割する設定ではなく、資料パックやひな形の属性として扱う。
+    # 一式を唯一の管理単位とし、すべてのパックを同じワークスペースに保存する。
+    # 言語は保存領域を分割する設定ではなく、一式やひな形の属性として扱う。
     return Join-Path $resolvedDataDir 'workspace'
 }
 
@@ -1205,9 +1205,9 @@ function New-BuiltinPack([string]$Category, [string]$Language, $Existing = $null
 
 function ConvertTo-PackDisplayName([string]$DisplayName) {
     $name = ([string]$DisplayName).Trim()
-    if ([string]::IsNullOrWhiteSpace($name)) { throw [ArgumentException]::new('資料パック名を入力してください。') }
-    if ($name.Length -gt 120) { throw [ArgumentException]::new('資料パック名は120文字以内で入力してください。') }
-    if ($name -match '[\x00-\x1f\x7f]') { throw [ArgumentException]::new('資料パック名に制御文字は使用できません。') }
+    if ([string]::IsNullOrWhiteSpace($name)) { throw [ArgumentException]::new('一式名を入力してください。') }
+    if ($name.Length -gt 120) { throw [ArgumentException]::new('一式名は120文字以内で入力してください。') }
+    if ($name -match '[\x00-\x1f\x7f]') { throw [ArgumentException]::new('一式名に制御文字は使用できません。') }
     return $name
 }
 
@@ -1219,7 +1219,7 @@ function Get-PackRecord($Structure, [string]$PackId) {
     $id = ([string]$PackId).Trim()
     if ([string]::IsNullOrWhiteSpace($id)) { throw [ArgumentException]::new('packId が必要です。') }
     $matches = @(Get-Array (Get-DataProperty $Structure 'packs' @()) | Where-Object { [string](Get-DataProperty $_ 'packId' '') -eq $id } | Select-Object -First 1)
-    if ($matches.Count -eq 0) { throw [ArgumentException]::new('指定された資料パックが見つかりません。') }
+    if ($matches.Count -eq 0) { throw [ArgumentException]::new('指定された一式が見つかりません。') }
     return $matches[0]
 }
 
@@ -1239,8 +1239,8 @@ function Resolve-DocumentPackScope($Structure, [string]$PackIdOrCategory, [bool]
     $matches = @(Get-Array (Get-DataProperty $Structure 'packs' @()) | Where-Object { [string](Get-DataProperty $_ 'packId' '') -eq $packId } | Select-Object -First 1)
     if ($matches.Count -gt 0) { $pack = $matches[0] }
     elseif (-not [string]::IsNullOrWhiteSpace($category)) { $pack = New-BuiltinPack $category ([string](Get-DataProperty $Structure 'language' 'ja')) }
-    else { throw [ArgumentException]::new('指定された資料パックが見つかりません。') }
-    if ((Test-PackArchived $pack) -and -not $AllowArchived) { throw [InvalidOperationException]::new('アーカイブ済みの資料パックは操作できません。復元してからやり直してください。') }
+    else { throw [ArgumentException]::new('指定された一式が見つかりません。') }
+    if ((Test-PackArchived $pack) -and -not $AllowArchived) { throw [InvalidOperationException]::new('アーカイブ済みの一式は操作できません。復元してからやり直してください。') }
     return [pscustomobject][ordered]@{
         packId = $packId
         category = Get-CategoryFromBuiltinPackId $packId
@@ -1256,7 +1256,7 @@ function Test-WorkbookPack($Workbook, [string]$PackId) {
 function Get-PackOutputState($Structure, [string]$Language, [string]$PackId, [string]$Volume, [bool]$Create = $false) {
     $targetId = Get-TargetIdFromLegacyVolume $Volume
     $scope = Resolve-DocumentPackScope $Structure $PackId $true
-    if (@(Get-PackTargetIds $Language $scope.pack) -notcontains $targetId) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
+    if (@(Get-PackTargetIds $Language $scope.pack) -notcontains $targetId) { throw [ArgumentException]::new('この一式に存在しない出力先です。') }
     $category = Get-CategoryFromBuiltinPackId $PackId
     if (-not [string]::IsNullOrWhiteSpace($category)) {
         $state = Get-DataProperty $Structure.volumes (Get-VolumeStateKey $Volume $category) $null
@@ -1287,7 +1287,7 @@ function Assert-PackDisplayNameAvailable($Structure, [string]$DisplayName, [stri
     foreach ($pack in @(Get-Array (Get-DataProperty $Structure 'packs' @()))) {
         if ([string](Get-DataProperty $pack 'packId' '') -eq $ExceptPackId) { continue }
         if ([string]::Equals(([string](Get-DataProperty $pack 'displayName' '')).Trim(), $name, [StringComparison]::OrdinalIgnoreCase)) {
-            throw [ArgumentException]::new('同じ名前の資料パックが既にあります。別の名前を入力してください。')
+            throw [ArgumentException]::new('同じ名前の一式が既にあります。別の名前を入力してください。')
         }
     }
     return $name
@@ -1308,7 +1308,7 @@ function Get-UniquePackDisplayName($Structure, [string]$BaseName, [string]$Langu
         ).Count -gt 0
         if (-not $exists) { return $candidate }
     }
-    throw '複製した資料パックに一意な名前を付けられませんでした。'
+    throw '複製した一式に一意な名前を付けられませんでした。'
 }
 
 function New-CustomPackId($Structure) {
@@ -1317,7 +1317,7 @@ function New-CustomPackId($Structure) {
         $id = 'pack_' + ([Guid]::NewGuid().ToString('N').Substring(0,16))
         if (-not $existing.ContainsKey($id)) { return $id }
     }
-    throw '一意な資料パックIDを生成できませんでした。'
+    throw '一意な一式IDを生成できませんでした。'
 }
 
 function Get-DefaultPackSettings([string]$Language, [string]$DisplayName) {
@@ -1585,7 +1585,7 @@ function Remove-PackTemplate([string]$Language, [string]$TemplateId) {
             Where-Object { [string](Get-DataProperty $_ 'templateId' '') -eq $id }
     )
     if ($packsUsingTemplate.Count -gt 0) {
-        throw [ArgumentException]::new('このテンプレートを使用している資料パックがあります。先に対象パックを変更またはアーカイブしてください。')
+        throw [ArgumentException]::new('このテンプレートを使用している一式があります。先に対象パックを変更またはアーカイブしてください。')
     }
     $path = Join-Path (Get-PackTemplateDir $Language) ($id + '.json')
     if (-not (Test-Path -LiteralPath $path)) { throw [ArgumentException]::new('削除するテンプレートが見つかりません。') }
@@ -1658,7 +1658,7 @@ function Update-PackTemplateSnapshot([string]$Language, [string]$PackId) {
         Set-NoteProperty $pack 'templateVersion' $latestVersion
         Set-NoteProperty $pack 'updatedAt' (New-NowIso)
         Add-PackOutputStates $structure $pack $latest
-        Mark-VolumeNeedsRebuild $structure $Language ([string]$pack.packId) @(Get-PackVolumeList $Language $pack $false) 'template-updated' '資料パックのひな形を更新しました'
+        Mark-VolumeNeedsRebuild $structure $Language ([string]$pack.packId) @(Get-PackVolumeList $Language $pack $false) 'template-updated' '一式のひな形を更新しました'
         return [pscustomobject][ordered]@{ packId=[string]$pack.packId; templateId=[string]$pack.templateId; fromVersion=$currentVersion; toVersion=$latestVersion; removedTargetIds=@($removedTargetIds); unassignedPageCount=$unassignedPageCount; templateConfig=(New-PackTemplateSnapshot $Language $latest) }
     }
 }
@@ -1673,8 +1673,8 @@ function Get-PackTemplateCatalog([string]$Language) {
         templateId = 'builtin-generic-department-pack'
         templateVersion = 1
         packId = ''
-        displayName = $(if ($Language -eq 'en') { 'Department document pack' } else { '部門資料パック' })
-        description = $(if ($Language -eq 'en') { 'A general-purpose pack for Excel, Word, PowerPoint, and PDF source documents' } else { 'Excel・Word・PowerPoint・PDFをまとめる汎用資料パック' })
+        displayName = $(if ($Language -eq 'en') { 'Department document pack' } else { '部門一式' })
+        description = $(if ($Language -eq 'en') { 'A general-purpose pack for Excel, Word, PowerPoint, and PDF source documents' } else { 'Excel・Word・PowerPoint・PDFをまとめる汎用一式' })
         acceptedSourceTypes = @('excel','word','pdf','powerpoint')
         targets = @($genericTargets)
         rules = [pscustomobject][ordered]@{ newItemDestination='unassigned'; retainManualOrder=$true; blockBuildWhenRequiredSourceIsStale=$true; blockBuildWhenRequiredSourceFailed=$true }
@@ -1764,7 +1764,7 @@ function Get-AllowedPackVolumes($Structure, [string]$Language, [string]$PackIdOr
 
 function Assert-PackTargetId([string]$Language, $Pack, [string]$TargetId) {
     $id = ([string]$TargetId).Trim().ToLowerInvariant()
-    if (@(Get-PackTargetIds $Language $Pack) -notcontains $id) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
+    if (@(Get-PackTargetIds $Language $Pack) -notcontains $id) { throw [ArgumentException]::new('この一式に存在しない出力先です。') }
     return $id
 }
 
@@ -1851,7 +1851,7 @@ function Get-PackTemplateRecord([string]$Language, [string]$TemplateId) {
         }
     }
     $matches = @(Get-PackTemplateCatalog $Language | Where-Object { [string](Get-DataProperty $_ 'templateId' '') -eq $id } | Select-Object -First 1)
-    if ($matches.Count -eq 0) { throw [ArgumentException]::new('指定された資料パックテンプレートが見つかりません。') }
+    if ($matches.Count -eq 0) { throw [ArgumentException]::new('指定された一式テンプレートが見つかりません。') }
     return $matches[0]
 }
 
@@ -1939,7 +1939,7 @@ function Set-DocumentPackArchived([string]$Language, [string]$PackId, [bool]$Arc
         param($structure)
         $pack = Get-PackRecord $structure $PackId
         if (-not [string]::IsNullOrWhiteSpace((Get-CategoryFromBuiltinPackId ([string](Get-DataProperty $pack 'packId' ''))))) {
-            throw [ArgumentException]::new('組み込み資料パックはアーカイブできません。')
+            throw [ArgumentException]::new('組み込み一式はアーカイブできません。')
         }
         if (-not $Archived) {
             [void](Assert-PackDisplayNameAvailable $structure ([string](Get-DataProperty $pack 'displayName' '')) ([string](Get-DataProperty $pack 'packId' '')))
@@ -2327,7 +2327,7 @@ function ConvertTo-StructureV3($Structure, [string]$Language, [string]$Workspace
     foreach ($wb in @(Get-Array $Structure.workbooks)) {
         $category = Normalize-WorkbookCategory ([string](Get-DataProperty $wb 'category' '')) ([string](Get-DataProperty $wb 'fileName' ''))
         if ([string]::IsNullOrWhiteSpace($category)) {
-            $issues += [pscustomobject][ordered]@{ code = 'category-unresolved'; sourceId = [string](Get-DataProperty $wb 'workbookId' ''); relativePath = [string](Get-DataProperty $wb 'relativePath' ''); message = '既存カテゴリを判定できませんでした。ECMとして互換移行した後、資料パックを確認してください。' }
+            $issues += [pscustomobject][ordered]@{ code = 'category-unresolved'; sourceId = [string](Get-DataProperty $wb 'workbookId' ''); relativePath = [string](Get-DataProperty $wb 'relativePath' ''); message = '既存カテゴリを判定できませんでした。ECMとして互換移行した後、一式を確認してください。' }
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($Workspace)) {
@@ -3555,7 +3555,7 @@ function Get-RelinkCandidates([string]$Language, [string]$SourceId) {
     $w = $workbook[0]
     $sourceType = ([string](Get-DataProperty $w 'sourceType' 'excel')).ToLowerInvariant()
     $packId = [string](Get-WorkbookPackId $w)
-    # 同じ資料パック内で既に使われているファイルは候補にしない(重複参照になる)。
+    # 同じ一式内で既に使われているファイルは候補にしない(重複参照になる)。
     $taken = @{}
     foreach ($other in @(Get-Array (Get-DataProperty $structure 'workbooks' @()))) {
         if ([string](Get-DataProperty $other 'workbookId' '') -eq $SourceId) { continue }
@@ -3625,7 +3625,7 @@ function Relink-Source([string]$Language, [string]$SourceId, [string]$RelativePa
             if ([string](Get-DataProperty $other 'workbookId' '') -eq $id) { continue }
             if ([string](Get-WorkbookPackId $other) -ne $packId) { continue }
             if (([string](Get-DataProperty $other 'relativePath' '')).Replace('\','/').ToLowerInvariant() -eq $rel.Replace('\','/').ToLowerInvariant()) {
-                throw 'そのファイルは、この資料パックの別の原稿として登録済みです。'
+                throw 'そのファイルは、この一式の別の原稿として登録済みです。'
             }
         }
         $full = Join-Safe ([string]$paths.submissionDir) $rel
@@ -3697,7 +3697,7 @@ function Update-SourceMetadata([string]$Language, [string]$SourceId, $Patch) {
                     Where-Object { [string](Get-DataProperty $_ 'requirementId' '') -eq $requirementId } |
                     Select-Object -First 1
             )
-            if ($matches.Count -eq 0) { throw '指定された必要原稿枠がこの資料パックにありません。' }
+            if ($matches.Count -eq 0) { throw '指定された必要原稿枠がこの一式にありません。' }
             $requirement = $matches[0]
             $sourceType = ([string](Get-DataProperty $current 'sourceType' 'excel')).ToLowerInvariant()
             if ($sourceType -notin @(Get-Array (Get-DataProperty $requirement 'acceptedSourceTypes' @('excel','word','pdf','powerpoint')))) { throw 'この必要原稿枠では選択した原稿形式を利用できません。' }
@@ -5534,6 +5534,11 @@ function Unregister-Workbook([string]$Language, [string]$WorkbookId) {
         $cat=Get-WorkbookPackId $found[0]
         $removedPages=@(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId })
         $affected=@($removedPages | ForEach-Object {[string]$_.volume} | Where-Object {$_ -and $_ -ne 'none'} | Select-Object -Unique)
+        # 取り消せる場所を作ってから消す。ページの振り分け・並び順・ページ名がまとめて
+        # 失われる操作なのに、ここだけスナップショットを取っていなかった(他の破壊的な
+        # 操作はすべて取っている)。復元プレビューは「過去にだけ存在するページ」を
+        # 適用しないので、これが無いと戻す手段が一つも無い。
+        if ($removedPages.Count -gt 0) { [void](Save-LayoutSnapshot $Language $cat 'pre-unregister' $structure) }
         $structure.workbooks=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -ne $WorkbookId })
         $structure.pages=@(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -ne $WorkbookId })
         Mark-VolumeNeedsRebuild $structure $Language $cat $affected 'unregister' 'Excelを1件登録解除しました'
@@ -6461,7 +6466,7 @@ function Start-FinalBuildJob([string]$Language, [string]$PackId, [string[]]$Targ
     $requested = @($TargetIds | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
     if ($requested.Count -eq 0) { $requested = @($allowed[0]) }
     foreach ($targetId in $requested) {
-        if ($allowed -notcontains $targetId) { throw [ArgumentException]::new('この資料パックに存在しない出力先です。') }
+        if ($allowed -notcontains $targetId) { throw [ArgumentException]::new('この一式に存在しない出力先です。') }
     }
     $jobId = 'final_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
     $jobDir = Get-RenderJobDir $Language
@@ -7024,7 +7029,7 @@ function Update-Page([string]$Language, $Body) {
         if ($page.Count -eq 0) { throw "Pageが見つかりません: $($Body.pageId)" }
         $p = $page[0]
         $workbook = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$p.workbookId } | Select-Object -First 1)
-        if ($workbook.Count -eq 0 -or -not (Test-WorkbookPack $workbook[0] $cat)) { throw [ArgumentException]::new('指定された資料パックのページではありません。') }
+        if ($workbook.Count -eq 0 -or -not (Test-WorkbookPack $workbook[0] $cat)) { throw [ArgumentException]::new('指定された一式のページではありません。') }
         $beforeVol = [string]$p.volume
         $structural = $false
         $layoutRequested = @('title','volume','numberingMode','numberingManual','resetNumbering','pageRange','clearPageRange','enabled') | Where-Object { Test-ConfigHasKey $Body $_ }
@@ -7865,7 +7870,7 @@ function Get-StatePayload([string]$Language) {
     $packTemplates = @(Get-PackTemplateCatalog $Language)
     $publicPacks = @(Get-PublicPackList $structure $Language)
     $packProgress = [pscustomobject][ordered]@{ packs=@(); totalCount=0; completeCount=0; attentionCount=0; missingRequiredCount=0; overdueRequiredCount=0; dueSoonRequiredCount=0; needsRenderCount=0; unassignedPageCount=0 }
-    if ($configured -and -not $structureLoadError) { try { $packProgress = Get-PackProgressDashboard $structure $Language } catch { Write-Warning ('資料パック進捗を集計できません: ' + $_.Exception.Message) } }
+    if ($configured -and -not $structureLoadError) { try { $packProgress = Get-PackProgressDashboard $structure $Language } catch { Write-Warning ('一式進捗を集計できません: ' + $_.Exception.Message) } }
     # ページ構成の楽観ロック用。画面はこれを baseLayout として送り返す。
     $layoutFingerprints = [ordered]@{}
     if ($configured -and -not $structureLoadError) {
@@ -11654,8 +11659,8 @@ function Read-LayoutSnapshot([string]$Language, [string]$PackIdOrCategory, [stri
     if (-not [string]::IsNullOrWhiteSpace($recordedLanguage) -and $recordedLanguage -ne $Language) { throw '別の言語のページ構成履歴は復元できません。' }
     $recordedPackId = [string](Get-DataProperty $snapshot 'packId' '')
     $recordedCategory = [string](Get-DataProperty $snapshot 'category' '')
-    if (-not [string]::IsNullOrWhiteSpace($recordedPackId) -and $recordedPackId -ne [string]$scope.packId) { throw '別の資料パックのページ構成履歴は復元できません。' }
-    if ([string]::IsNullOrWhiteSpace($recordedPackId) -and -not [bool]$scope.builtIn) { throw '旧形式のページ構成履歴は任意資料パックへ復元できません。' }
+    if (-not [string]::IsNullOrWhiteSpace($recordedPackId) -and $recordedPackId -ne [string]$scope.packId) { throw '別の一式のページ構成履歴は復元できません。' }
+    if ([string]::IsNullOrWhiteSpace($recordedPackId) -and -not [bool]$scope.builtIn) { throw '旧形式のページ構成履歴は任意一式へ復元できません。' }
     if ([string]::IsNullOrWhiteSpace($recordedPackId) -and $recordedCategory -ne [string]$scope.category) { throw '別のカテゴリのページ構成履歴は復元できません。' }
     return $snapshot
 }

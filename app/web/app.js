@@ -28,7 +28,18 @@ let state = null;
 let availableFiles = [];
 let availableFilesScannedAt = '';
 let activePreset = '';
-let activePackId = (() => { try { return sessionStorage.getItem('ReportBinderPackId') || ''; } catch { return ''; } })();
+// 一式の選択はタブを越えて覚える。起動は毎回「新しいタブ」なので sessionStorage
+// だけだと空になり、既定が「作成順の先頭」＝最も古い一式になっていた。1か月ぶりに
+// 開いた人が、先月以前の一式に今月の原稿を登録し、提出用PDFを開くまで気づかない。
+let activePackId = (() => {
+  try { return sessionStorage.getItem('ReportBinderPackId') || localStorage.getItem('ReportBinderPackId') || ''; } catch { return ''; }
+})();
+function rememberActivePack(packId) {
+  try {
+    if (packId) { sessionStorage.setItem('ReportBinderPackId', packId); localStorage.setItem('ReportBinderPackId', packId); }
+    else { sessionStorage.removeItem('ReportBinderPackId'); localStorage.removeItem('ReportBinderPackId'); }
+  } catch {}
+}
 let packAdminPacks = [];
 let archivedPacksExpanded = false;
 let packEditorMode = 'create';
@@ -92,7 +103,16 @@ let packReviewState = null;
 let packReviewInFlight = null;
 let autoStateInFlight = null;
 const seenAutoNotificationIds = new Set();
-let activeView = (() => { try { const stored=sessionStorage.getItem('ReportBinderView')||'excel'; return stored==='folders'?'excel':stored; } catch { return 'excel'; } })();
+// 同じタブでの移動は覚える。新しいタブ（＝.cmd からの起動）は「ホーム」に着地させる。
+// 以前は毎回ステップ1に降りていたため、1か月ぶりに開いた人が「前回どこまで
+// 終わったか」を示すカードに一度もたどり着けなかった。
+let activeView = (() => {
+  try {
+    const stored=sessionStorage.getItem('ReportBinderView');
+    if(!stored) return 'dashboard';
+    return stored==='folders'?'excel':stored;
+  } catch { return 'dashboard'; }
+})();
 let fileFilterText = '';
 const pdfObjectUrls = new Set();
 let noticeTimer = null;
@@ -371,6 +391,12 @@ function volumeReadiness(volume, preset=activePreset) {
 function activeReadinessItems() {
   return activeTargetVolumes().map(volume => ({volume, ready:volumeReadiness(volume)})).filter(x => Number(x.ready.pageCount || 0) > 0);
 }
+// 出力先チップは色だけで3つの警告状態を分けていた。加齢による色の見分けにくさと
+// 正面衝突するので、状態を語で添える。
+function targetStateSuffix(displayState){
+  const map={'needs-rebuild':'・要再出力','output-missing':'・ファイルなし','not-built':'・未出力'};
+  return map[String(displayState||'')]||'';
+}
 function aggregateFinalState() {
   const items = activeReadinessItems();
   if (!items.length) return {state:'not-built', text:'提出用PDFは未出力'};
@@ -571,6 +597,8 @@ function extractErrorItems(detail, fallbackMessage='') {
   }
   return items.filter(Boolean).slice(0, 8);
 }
+let lastErrorSignature='';
+let dismissedErrorSignature='';
 function showErrorPanel(title, summary, detail, actions=[]) {
   const panel = $('error-panel');
   if (!panel) return;
@@ -579,6 +607,13 @@ function showErrorPanel(title, summary, detail, actions=[]) {
   // Reveal before writing: a display:none region is not rendered, so screen
   // readers never picked up the text change and every failure was announced
   // as silence.
+  // 同じ内容を何度も開き直さない。5分ごとの自動更新のたびに復活し、入力中でも
+  // フォーカスとスクロールを奪っていたため、「閉じ方が分からない」「壊した」と
+  // 受け取られていた。内容が変わったときだけ、改めて開く。
+  const signature = `${title}||${summary}||${asArray(detail).length||String(detail||'').length}`;
+  if (dismissedErrorSignature === signature) return;
+  const wasHidden = panel.classList.contains('hidden');
+  lastErrorSignature = signature;
   panel.classList.remove('hidden');
   $('error-title').textContent = title || 'エラーがあります';
   $('error-summary').textContent = friendlySummary || '内容を確認してください。';
@@ -614,12 +649,16 @@ function showErrorPanel(title, summary, detail, actions=[]) {
   }
   // Pull the viewport and focus to the panel; it sits at the top of <main> and
   // was routinely off-screen when a failure happened deep in the page board.
-  panel.scrollIntoView({block:'nearest'});
-  panel.focus({preventScroll:true});
+  // 新しく開いたときだけ移動する。既に出ているパネルへ自動更新のたびに
+  // 飛ばされると、入力中の手が止まる。
+  if (wasHidden) { panel.scrollIntoView({block:'nearest'}); panel.focus({preventScroll:true}); }
 }
-function hideErrorPanel() {
+function hideErrorPanel(dismissedByUser=false) {
   const panel = $('error-panel');
   if (panel) panel.classList.add('hidden');
+  // 利用者が閉じたときだけ「この内容は見た」と覚える。状態が直って消える
+  // 場合まで覚えると、次に本当に起きた失敗を出せなくなる。
+  dismissedErrorSignature = dismissedByUser ? lastErrorSignature : '';
 }
 
 function log(message, obj) {
@@ -694,6 +733,24 @@ function announceProgressMilestone(pct, status, terminal, total, done) {
   lastProgressAnnounceKey = key;
   box.textContent = text;
 }
+function estimateRemainingText(job, done, total) {
+  const startedAt = Date.parse(String(job?.startedAt || ''));
+  if (!Number.isFinite(startedAt) || done < 2 || !total || done >= total) return '';
+  const elapsed = Date.now() - startedAt;
+  if (elapsed <= 0) return '';
+  const remainMs = (elapsed / done) * (total - done);
+  const minutes = Math.ceil(remainMs / 60000);
+  if (!Number.isFinite(minutes) || minutes <= 0) return '';
+  return minutes <= 1 ? '・残り 1分ほど' : `・残り ${minutes}分ほど`;
+}
+function updateDocumentTitle(status, pct) {
+  const base = 'ReportBinder';
+  if (status === 'completed') document.title = `完了 - ${base}`;
+  else if (status === 'completed-with-errors' || status === 'failed') document.title = `要確認 - ${base}`;
+  else if (status === 'cancelled') document.title = `中止 - ${base}`;
+  else document.title = `(${pct}%) PDF作成中 - ${base}`;
+}
+function resetDocumentTitle() { document.title = 'ReportBinder'; }
 function updateProgressPanel(job) {
   const panel = $('progress-panel');
   if (!panel || !job) return;
@@ -715,7 +772,12 @@ function updateProgressPanel(job) {
   panel.style.setProperty('--progress', `${pct}%`);
   $('progress-percent').textContent = `${pct}%`;
   const countLabel = $('progress-count-label');
-  if (countLabel) countLabel.textContent = total ? `${Math.min(done, total)} / ${total}件` : '';
+  // 残り時間を出す。40件で数分かかる処理に「あと何分か」が無く、会議に出るか
+  // 待つかを判断できなかった。序盤は誤差が大きいので2件終わってから出す。
+  const remainText = estimateRemainingText(job, done, total);
+  if (countLabel) countLabel.textContent = total ? `${Math.min(done, total)} / ${total}件${remainText}` : '';
+  // 会議中はタブしか見えない。タイトルに進捗を出すのがいちばん安く効く。
+  updateDocumentTitle(status, pct);
   $('progress-fill').style.width = `${pct}%`;
   const currentSource = getWorkbook(job.currentWorkbookId);
   const target = job.currentSheet ? `${job.currentWorkbookName || ''} / ${sourceUnitReference(currentSource, job.currentSheet)}` : (job.currentWorkbookName || '');
@@ -742,6 +804,7 @@ function updateProgressPanel(job) {
 function hideProgressPanel() {
   const panel = $('progress-panel');
   if (panel) panel.classList.add('hidden');
+  resetDocumentTitle();
   lastProgressAnnounceKey = '';
   const box = $('progress-announce');
   if (box) box.textContent = '';
@@ -1063,7 +1126,7 @@ async function refreshAll(btn=null) {
 async function scanAndRefresh(btn) {
   await runBusy(btn, async () => {
     if (!configured()) { await refresh(); return; }
-    showMessage('', '原稿の更新を確認しています', '登録済み原稿の保存日時・サイズ・内容を確認します。');
+    showMessage('', '原稿の更新を確認しています', '登録済み原稿の保存日時・サイズ・内容を確認します。数十秒かかることがあります。', null, [], 0);
     const r = await api('/api/scan-updates', {method:'POST', body:{force:true}});
     state = normalizeStatePayload(await api('/api/state'));
     if (configured()) await loadFiles(null);
@@ -1104,7 +1167,7 @@ function renderAll(options={}) {
     renderPages();
   }
   if (state.structureLoadError) {
-    showMessage('danger', '管理データを読み込めません', userFriendlyError(state.structureLoadError), state.structureLoadError);
+    showMessage('danger', '保存された作業内容を読み込めません', userFriendlyError(state.structureLoadError), state.structureLoadError);
     return;
   }
   const errors = Number(state.summary?.renderErrors || 0);
@@ -1112,7 +1175,8 @@ function renderAll(options={}) {
   else if (errors > 0) {
     const recent = asArray(state.recentErrors);
     const first = recent[0];
-    showMessage('danger', 'PDF作成でエラーがあります', first?.message || `${errors}件の原稿をPDF変換できません。`, recent);
+    showMessage('danger', 'PDF作成でエラーがあります', first?.message || `${errors}件の原稿をPDF変換できません。`, recent,
+      [{label:'動作環境を診断',primary:true,handler:()=>runSystemDiagnostics($('run-diagnostics-btn'))},{label:'原稿を確認',view:'excel'}], 0);
   } else hideErrorPanel();
 }
 
@@ -1162,13 +1226,13 @@ function renderPackRequiredState(){
     button.disabled=false;
     button.classList.toggle('nav-locked',locked);
     button.setAttribute('aria-disabled',String(locked));
-    button.title=locked?'先に原稿フォルダーを設定し、資料パックを作成してください':'';
+    button.title=locked?'先に原稿フォルダーを設定し、一式を作成してください':'';
   });
   if(!hasPack&&!PACK_FREE_VIEWS.includes(activeView))setActiveView('dashboard',{noScroll:true});
 }
 function explainPackRequired(){
   setActiveView('dashboard');
-  showMessage('warn','先に資料パックを作成してください','原稿フォルダーを選び、今回まとめる資料パックに名前を付けると、ページ構成と提出用PDFに進めます。',null,[{label:'原稿フォルダーを選ぶ',primary:true,handler:()=>setActiveView('excel')}],0);
+  showMessage('warn','先に一式を作成してください','原稿フォルダーを選び、今回まとめる一式に名前を付けると、ページ構成と提出用PDFに進めます。',null,[{label:'原稿フォルダーを選ぶ',primary:true,handler:()=>setActiveView('excel')}],0);
 }
 function setStepState(id, kind, fallback) {
   const el=$(id); if(!el) return;
@@ -1196,7 +1260,12 @@ function renderNavBadges() {
   const unresolved=unresolvedPageCount();
   const excel=$('nav-excel-count'); if(excel){excel.textContent=needs;excel.classList.toggle('hidden',needs===0);}
   const pages=$('nav-pages-count'); if(pages){pages.textContent=`未振り分け ${unresolved}`;pages.classList.toggle('hidden',unresolved===0);}
-  const agg=aggregateFinalState(); const dot=$('nav-final-dot'); if(dot) dot.classList.toggle('hidden',!['blocked','needs-rebuild','output-missing'].includes(agg.state));
+  const agg=aggregateFinalState(); const dot=$('nav-final-dot');
+  // 色の点だけでは、要対応であることも、3状態の違いも伝わらない。文字を出す。
+  if(dot){const warn=['blocked','needs-rebuild','output-missing'].includes(agg.state);
+    dot.classList.toggle('hidden',!warn);
+    if(warn){setTextIfChanged(dot,'要対応');dot.setAttribute('title',agg.text);dot.setAttribute('aria-label',agg.text);}
+    else{setTextIfChanged(dot,'');dot.removeAttribute('title');dot.removeAttribute('aria-label');}}
 }
 
 function renderSummary() {
@@ -1262,7 +1331,7 @@ function renderPackProgressDashboard(){
   const priority={'overdue-source':0,blocked:1,'missing-source':2,'needs-render':3,unassigned:4,'needs-output':5,'review-stale':6,'review-changes':7,'review-draft':8,'in-review':9,'no-pages':10,'not-started':11,complete:12};let rows=asArray(progress.packs);if(packProgressAttentionOnly)rows=rows.filter(pack=>String(pack.state)!=='complete');rows=[...rows].sort((a,b)=>(priority[String(a.state)]??13)-(priority[String(b.state)]??13)||String(a.displayName||'').localeCompare(String(b.displayName||''),'ja'));
   const stateInfo=value=>({complete:['完了','ok'],'not-started':['未着手','neutral'],'overdue-source':['期限超過','danger'],'missing-source':['必須原稿待ち','danger'],'needs-render':['変換待ち','attention'],unassigned:['未振り分け','attention'],blocked:['出力不可','danger'],'no-pages':['ページ構成待ち','attention'],'needs-output':['出力が必要','attention'],'review-draft':['未確認','neutral'],'in-review':['未確認','neutral'],'review-changes':['未確認','neutral'],'review-stale':['確認後に変更あり','attention']}[String(value)]||['要確認','attention']);
   if(!rows.length){box.innerHTML=packProgressAttentionOnly?'<div class="empty-state">対応が必要な一式はありません。</div>':`<div class="pack-progress-empty"><div><strong>${configured()?'今回まとめる一式はまだありません':'まだ作業は始まっていません'}</strong><span>${configured()?'上の「次にやること」から名前を付けます。':'上の「はじめる」から原稿フォルダーを選びます。'}</span></div></div>`;return;}
-  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・期限7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${formatDateOnly(nearestDue)}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'資料パック')}</strong>${badge(status,cls)}${reviewChip(pack.reviewStatus)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}ページ</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
+  box.innerHTML=rows.map(pack=>{const [status,cls]=stateInfo(pack.state),required=Number(pack.requiredSourceCount||0),submitted=Number(pack.submittedRequiredSourceCount||0),overdue=Number(pack.overdueRequiredSourceCount||0),dueSoon=Number(pack.dueSoonRequiredSourceCount||0),nearestDue=String(pack.nearestRequiredDueDate||''),targets=asArray(pack.targets),action=String(pack.nextAction||'excel'),actionLabel=action==='pages'?'ページ構成':action==='final'?'提出用PDF':'原稿を確認',dueText=overdue?`・期限超過 ${overdue}件`:dueSoon?`・期限7日以内 ${dueSoon}件`:nearestDue?`・次の期限 ${formatDateOnly(nearestDue)}`:'';return `<article class="pack-progress-row ${String(pack.packId||'')===String(activePackId)?'active':''}"><div class="pack-progress-main"><div><strong>${escapeHtml(pack.displayName||pack.packId||'一式')}</strong>${badge(status,cls)}${reviewChip(pack.reviewStatus)}</div><span>原稿 ${Number(pack.sourceCount||0)}件${required?`・必須 ${submitted}/${required}`:''}${dueText}・未振り分け ${Number(pack.unassignedPageCount||0)}ページ</span></div><div class="pack-progress-targets">${targets.map(target=>`<span class="pack-target-chip ${escapeAttr(target.displayState||'not-built')}">${escapeHtml(target.displayName||target.targetId)} ${Number(target.pageCount||0)}ページ${targetStateSuffix(target.displayState)}</span>`).join('')}</div><button class="btn ${String(pack.state)==='complete'?'ghost':'secondary'} compact" type="button" data-pack-progress-open="${escapeAttr(pack.packId||'')}" data-pack-progress-action="${escapeAttr(action)}">${escapeHtml(actionLabel)}</button></article>`;}).join('');
   box.querySelectorAll('[data-pack-progress-open]').forEach(button=>button.addEventListener('click',async()=>{await applyPresetSelection(String(button.dataset.packProgressOpen||''));setActiveView(String(button.dataset.packProgressAction||'excel'));}));
 }
 
@@ -1281,7 +1350,7 @@ function renderDiagnosticsResult(){
   const statusLabel=value=>({ready:'利用可能',limited:'一部利用可能',blocked:'修復が必要','not-installed':'未導入',unsupported:'非対応版',unavailable:'起動不可'})[String(value||'')]||'要確認';
   const statusClass=value=>String(value)==='ready'?'neutral':String(value)==='blocked'?'danger':'attention';
   const appRow=app=>{const item=app||{},detail=item.available?`Version ${item.version||'16'}${item.build?` / Build ${item.build}`:''}`:(item.userAction||'利用できません。');return`<div class="diagnostic-row"><div><strong>${escapeHtml(item.displayName||'Office')}</strong><span>${escapeHtml(detail)}</span></div>${badge(statusLabel(item.status),statusClass(item.status))}</div>`;};
-  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDF処理エンジン</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>ローカル保存容量</strong><span>管理データ ${formatCapacity(storage.dataFreeBytes)} / 出力 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
+  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDFを作る機能</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>このPCの使用容量</strong><span>管理データ ${formatCapacity(storage.dataFreeBytes)} / 出力 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
 }
 
 async function runSystemDiagnostics(btn){
@@ -1307,7 +1376,16 @@ function renderPageOverview() {
 }
 function renderFinalOverview() {
   const settings=packForPreset()?.settings||{};
-  const setValue=(id,value)=>{const el=$(id);if(el)el.value=String(value??'');};
+  // 5分ごとの自動更新でここが無条件に上書きされ、打ちかけの出力ファイル名が
+  // 警告なく元に戻っていた。会議から戻った人は打ったつもりのまま保存を押す。
+  // 触っている最中と、保存前の変更があるときは上書きしない。
+  const setValue=(id,value)=>{
+    const el=$(id); if(!el) return;
+    const next=String(value??'');
+    const dirty=el.dataset.savedValue!==undefined&&el.value!==el.dataset.savedValue;
+    if(document.activeElement===el||dirty){el.dataset.savedValue=next;markUnsavedField(id);return;}
+    el.value=next; el.dataset.savedValue=next; markUnsavedField(id);
+  };
   const setChecked=(id,value)=>{const el=$(id);if(el)el.checked=!!value;};
   setValue('pack-output-pattern',settings.outputFileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');
   const entries=activeTargetDefinitions().map(target=>({target,volume:targetVolume(target.targetId),ready:volumeReadiness(targetVolume(target.targetId))}));
@@ -1441,7 +1519,7 @@ async function performPackReviewAction(action,button){
     if($('pack-review-note'))$('pack-review-note').value='';
     renderAll();renderPackReview();
     const labels={approve:'確認済みとして記録しました',reopen:'確認の記録を取り消しました'};
-    showMessage(action==='request-changes'?'warn':'ok',labels[action]||'レビュー状態を更新しました',pack.displayName||'資料パック');
+    showMessage(action==='request-changes'?'warn':'ok',labels[action]||'レビュー状態を更新しました',pack.displayName||'一式');
   },false);
 }
 
@@ -1458,10 +1536,29 @@ async function refreshFinalPreflight(btn) {
 }
 
 
+// 保存前の変更があることを、その場で見えるようにする。黙って元に戻すのも、
+// 黙って保持するのも、どちらも「打ったはずなのに違う」を生む。
+function markUnsavedField(id) {
+  const el=$(id); if(!el) return;
+  const dirty=el.dataset.savedValue!==undefined&&el.value!==el.dataset.savedValue;
+  el.classList.toggle('has-unsaved',dirty);
+  const note=document.getElementById(`${id}-unsaved`);
+  if(note)note.classList.toggle('hidden',!dirty);
+}
 function updateBulkSelectionLabel() {
   const count = selectedPages.size;
   const el = $('bulk-selected-count');
   if (el) el.textContent = count ? `${count}ページ選択中。移動先を押してください` : 'ページをクリックして選ぶと移動できます';
+  // 新しいページは既定で全部「未振り分け」に入る。1枚ずつクリックさせないために、
+  // 何ページ選ぶことになるのかを書いたボタンを常に見える場所へ出す。
+  // (以前は閉じた折りたたみ「表示・絞り込み・並び」の中にしか無かった)
+  const selectAll = $('select-all-visible-pages-btn');
+  if (selectAll) {
+    const visible = visiblePageSelectionValues().length;
+    const remaining = visiblePageSelectionValues().filter(id => !selectedPages.has(id)).length;
+    selectAll.textContent = visible ? `表示中の${visible}ページをすべて選ぶ` : '選べるページがありません';
+    selectAll.disabled = pageMutationBusy || remaining === 0;
+  }
   const bar = $('page-command-bar');
   if (bar) bar.classList.toggle('has-selection', count > 0);
   document.querySelectorAll('[data-bulk-target],#bulk-none-btn,#clear-selected-pages-btn').forEach(button=>{
@@ -1476,7 +1573,7 @@ function updateBulkSelectionLabel() {
 }
 
 async function savePackSettings(btn){
-  const pack=packForPreset();if(!pack?.packId){showMessage('danger','資料パック設定を保存できません','対象の資料パックが見つかりません。');return;}
+  const pack=packForPreset();if(!pack?.packId){showMessage('danger','一式設定を保存できません','対象の一式が見つかりません。');return;}
   const body={outputFileNamePattern:String($('pack-output-pattern')?.value||'').trim()};
   if(!body.outputFileNamePattern){showMessage('warn','出力ファイル名を入力してください','使用できる変数は {packName}・{targetName}・{yyyyMMdd} です。');$('pack-output-pattern')?.focus();return;}
   await runBusy(btn,async()=>{try{const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}`,{method:'PATCH',body});state=normalizeStatePayload(response.state||await api('/api/state'));renderAll();showMessage('ok','資料の仕上げ設定を保存しました','次回の提出用PDF出力から反映されます。');}catch(error){showMessage('danger','資料の仕上げ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
@@ -1610,7 +1707,7 @@ function findPackForManagement(packId) {
 function updatePackTemplateDescription() {
   const templateId=String($('pack-editor-template')?.value||'');
   const template=asArray(state?.packTemplates).find(item=>String(item?.templateId||'')===templateId);
-  const description=$('pack-editor-template-description');if(description)description.textContent=String(template?.description||'Excel・Word・PowerPoint・PDFをまとめる資料パックです。');
+  const description=$('pack-editor-template-description');if(description)description.textContent=String(template?.description||'Excel・Word・PowerPoint・PDFをまとめる一式です。');
 }
 function openPackEditor(mode='create',packId='') {
   const modal=$('pack-editor-modal');if(!modal)return;
@@ -1621,7 +1718,7 @@ function openPackEditor(mode='create',packId='') {
     return;
   }
   const pack=findPackForManagement(packId);
-  if(mode==='rename'&&!pack){showMessage('warn','資料パックが見つかりません','一覧を読み込み直してください。');return;}
+  if(mode==='rename'&&!pack){showMessage('warn','一式が見つかりません','一覧を読み込み直してください。');return;}
   packEditorMode=mode==='rename'?'rename':'create';packEditorPackId=packEditorMode==='rename'?String(pack.packId||''):'';packEditorReturnFocus=$('pack-menu-button')||document.activeElement;
   $('pack-editor-title').textContent=packEditorMode==='rename'?'一式の名前を変更':'今回まとめる一式に名前を付ける';
   $('pack-editor-description').textContent=packEditorMode==='rename'?'登録した原稿やページの順番はそのまま、表示する名前だけを変更します。':'会議名や提出先など、あとで見つけやすい名前を付けます。';
@@ -1646,7 +1743,7 @@ async function refreshPacksAfterMutation() {
 }
 async function submitPackEditor(btn) {
   const name=String($('pack-editor-name')?.value||'').trim();
-  if(!name){showMessage('warn','資料パック名を入力してください','用途が分かる名前を入力してください。');$('pack-editor-name')?.focus();return;}
+  if(!name){showMessage('warn','一式名を入力してください','用途が分かる名前を入力してください。');$('pack-editor-name')?.focus();return;}
   await runBusy(btn,async()=>{
     let response;
     if(packEditorMode==='rename')response=await api(`/api/v2/packs/${encodeURIComponent(packEditorPackId)}`,{method:'PATCH',body:{displayName:name}});
@@ -1686,7 +1783,7 @@ function populateTemplateManager(){
   setValue('template-name',t?.displayName||'');setValue('template-description',t?.description||'');setChecked('template-source-excel',t?sourceTypes.includes('excel'):true);setChecked('template-source-word',t?sourceTypes.includes('word'):true);setChecked('template-source-powerpoint',t?sourceTypes.includes('powerpoint'):true);setChecked('template-source-pdf',t?sourceTypes.includes('pdf'):true);
   renderTemplateTargets(targets,builtIn);renderTemplateDestinationOptions(rules.newItemDestination||'unassigned');setValue('template-output-pattern',output.fileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf');setChecked('template-block-stale',t?rules.blockBuildWhenRequiredSourceIsStale:true);setChecked('template-block-failed',t?rules.blockBuildWhenRequiredSourceFailed:true);
   renderTemplateRequirements(t?.sourceRequirements||[],builtIn);
-  templateManagerFieldIds.forEach(id=>{const el=$(id);if(el)el.disabled=builtIn;});const save=$('template-manager-save'),remove=$('template-manager-delete'),duplicate=$('template-manager-duplicate'),exportButton=$('template-manager-export'),stateText=$('template-manager-state'),usageCount=t?asArray(packAdminPacks.length?packAdminPacks:state?.packs).filter(pack=>String(pack?.templateId||'')===String(t.templateId||'')).length:0;if(save){save.disabled=builtIn;save.textContent=t?'変更を保存':'作成';}if(remove)remove.classList.toggle('hidden',!t||builtIn);if(duplicate)duplicate.classList.toggle('hidden',!t);if(exportButton)exportButton.classList.toggle('hidden',!t);if(stateText)stateText.textContent=builtIn?`組み込みひな形・使用中 ${usageCount}件。内容を基にする場合は「複製」を選んでください。`:(t?`バージョン ${Number(t.templateVersion||1)}・使用中 ${usageCount}件・変更は新しく作る資料パックから反映されます。`:'新しいひな形を作成します。');
+  templateManagerFieldIds.forEach(id=>{const el=$(id);if(el)el.disabled=builtIn;});const save=$('template-manager-save'),remove=$('template-manager-delete'),duplicate=$('template-manager-duplicate'),exportButton=$('template-manager-export'),stateText=$('template-manager-state'),usageCount=t?asArray(packAdminPacks.length?packAdminPacks:state?.packs).filter(pack=>String(pack?.templateId||'')===String(t.templateId||'')).length:0;if(save){save.disabled=builtIn;save.textContent=t?'変更を保存':'作成';}if(remove)remove.classList.toggle('hidden',!t||builtIn);if(duplicate)duplicate.classList.toggle('hidden',!t);if(exportButton)exportButton.classList.toggle('hidden',!t);if(stateText)stateText.textContent=builtIn?`組み込みひな形・使用中 ${usageCount}件。内容を基にする場合は「複製」を選んでください。`:(t?`バージョン ${Number(t.templateVersion||1)}・使用中 ${usageCount}件・変更は新しく作る一式から反映されます。`:'新しいひな形を作成します。');
   const addRequirement=$('template-add-requirement'),addTarget=$('template-add-target');if(addRequirement)addRequirement.disabled=builtIn;if(addTarget)addTarget.disabled=builtIn;
 }
 function openTemplateManager(){const modal=$('template-manager-modal');if(!modal)return;templateManagerReturnFocus=$('manage-pack-templates-btn')||document.activeElement;closePackMenu();modal.classList.remove('hidden');renderTemplateManagerSelect('');requestAnimationFrame(()=>$('template-name')?.focus());}
@@ -1698,42 +1795,42 @@ function templateManagerRequest(){
 async function submitTemplateManager(btn){
   const body=templateManagerRequest(),selected=templateManagerSelected();if(!body.displayName){showMessage('warn','ひな形名を入力してください','用途が分かる名前を入力してください。');$('template-name')?.focus();return;}if(!body.acceptedSourceTypes.length){showMessage('warn','原稿形式を選んでください','Excel・Word・PowerPoint・PDFから1つ以上選択してください。');return;}
   const invalidTarget=body.targets.find(target=>!target.targetId||!target.displayName||!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(target.targetId));if(!body.targets.length||invalidTarget||new Set(body.targets.map(target=>target.targetId)).size!==body.targets.length){showMessage('warn','出力先の設定を確認してください','出力先IDは英小文字・数字・ハイフン・アンダースコアで重複なく入力し、表示名も設定してください。');return;}const invalidRequirement=body.sourceRequirements.find(item=>!item.displayName||!item.acceptedSourceTypes.length);if(invalidRequirement){showMessage('warn','必要原稿の設定を確認してください','原稿名を入力し、扱う形式を1つ以上選択してください。');return;}
-  await runBusy(btn,async()=>{const response=await api(selected?`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`:'/api/v2/pack-templates',{method:selected?'PATCH':'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok',selected?'ひな形を更新しました':'ひな形を作成しました','新しく作る資料パックで選択できます。');},false);
+  await runBusy(btn,async()=>{const response=await api(selected?`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`:'/api/v2/pack-templates',{method:selected?'PATCH':'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok',selected?'ひな形を更新しました':'ひな形を作成しました','新しく作る一式で選択できます。');},false);
 }
-async function deleteManagedTemplate(btn){const selected=templateManagerSelected();if(!selected||selected.builtIn)return;const accepted=await confirmAction({title:'このひな形を削除しますか？',message:`「${selected.displayName||'ひな形'}」を削除します。`,detail:'このひな形からすでに作った資料パックは、そのまま使えます（原稿・ページ構成・出力先の設定は残ります）。削除すると、今後の資料パック作成でこのひな形を選べなくなり、必要原稿リストと出力条件の設定は元に戻せません。',confirmLabel:'削除',danger:true});if(!accepted)return;await runBusy(btn,async()=>{const response=await api(`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`,{method:'DELETE'});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect('');showMessage('ok','ひな形を削除しました','資料パック作成時の一覧から削除しました。');},false);}
+async function deleteManagedTemplate(btn){const selected=templateManagerSelected();if(!selected||selected.builtIn)return;const accepted=await confirmAction({title:'このひな形を削除しますか？',message:`「${selected.displayName||'ひな形'}」を削除します。`,detail:'このひな形からすでに作った一式は、そのまま使えます（原稿・ページ構成・出力先の設定は残ります）。削除すると、今後の一式作成でこのひな形を選べなくなり、必要原稿リストと出力条件の設定は元に戻せません。',confirmLabel:'削除',danger:true});if(!accepted)return;await runBusy(btn,async()=>{const response=await api(`/api/v2/pack-templates/${encodeURIComponent(selected.templateId)}`,{method:'DELETE'});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect('');showMessage('ok','ひな形を削除しました','一式作成時の一覧から削除しました。');},false);}
 async function duplicateManagedTemplate(btn){const selected=templateManagerSelected();if(!selected)return;const body=templateManagerRequest();body.displayName=`${body.displayName||selected.displayName||'ひな形'}（コピー）`;await runBusy(btn,async()=>{const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形を複製しました','用途に合わせて名前や必要原稿を編集できます。');},false);}
 function exportManagedTemplate(){const selected=templateManagerSelected();if(!selected)return;const data=templateManagerRequest();data.templateSchemaVersion=1;const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`ReportBinder-template-${String(selected.displayName||'template').replace(/[\\/:*?"<>|]/g,'_')}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showMessage('ok','ひな形ひな形をファイルに書き出しました','別のPCや利用者へ渡して読み込めます。');}
-async function importManagedTemplateFile(file,btn){if(!file)return;try{const body=JSON.parse(await file.text());delete body.templateId;delete body.templateVersion;const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形ひな形をファイルから読み込みました','内容を確認してから資料パックを作成してください。');}catch(error){showMessage('danger','ひな形ひな形を読み込めません',userFriendlyError(error.message),error.detail||error.message);}finally{if(btn)btn.value='';}}
+async function importManagedTemplateFile(file,btn){if(!file)return;try{const body=JSON.parse(await file.text());delete body.templateId;delete body.templateVersion;const response=await api('/api/v2/pack-templates',{method:'POST',body});state.packTemplates=asArray(response.packTemplates);renderTemplateManagerSelect(String(response?.result?.templateId||''));showMessage('ok','ひな形ひな形をファイルから読み込みました','内容を確認してから一式を作成してください。');}catch(error){showMessage('danger','ひな形ひな形を読み込めません',userFriendlyError(error.message),error.detail||error.message);}finally{if(btn)btn.value='';}}
 async function duplicatePack(packId,btn) {
   const pack=findPackForManagement(packId);if(!pack)return;
   closePackMenu();
-  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/duplicate`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','資料パックを複製しました',`${response?.result?.displayName||pack.displayName}を新しい資料パックとして作成しました。`);},false);
+  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/duplicate`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','一式を複製しました',`${response?.result?.displayName||pack.displayName}を新しい一式として作成しました。`);},false);
 }
 async function archivePack(packId) {
   const pack=findPackForManagement(packId);if(!pack)return;
   closePackMenu();
-  const accepted=await confirmAction({title:'資料パックをアーカイブしますか？',message:`「${pack.displayName||'資料パック'}」を通常の一覧から隠します。`,detail:'登録情報は削除されず、アーカイブ済み一覧から復元できます。',confirmLabel:'アーカイブ',danger:true});
+  const accepted=await confirmAction({title:'一式をアーカイブしますか？',message:`「${pack.displayName||'一式'}」を通常の一覧から隠します。`,detail:'登録情報は削除されず、アーカイブ済み一覧から復元できます。',confirmLabel:'アーカイブ',danger:true});
   if(!accepted)return;
-  await runBusy(null,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/archive`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','資料パックをアーカイブしました','必要になったら資料パック一覧から復元できます。');},false);
+  await runBusy(null,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/archive`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','一式をアーカイブしました','必要になったら一式一覧から復元できます。');},false);
 }
 async function restorePack(packId,btn) {
   const pack=findPackForManagement(packId);if(!pack)return;
   closePackMenu();
-  await runBusy(btn,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/restore`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','資料パックを復元しました',`${pack.displayName||'資料パック'}を通常の一覧へ戻しました。`);},false);
+  await runBusy(btn,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/restore`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','一式を復元しました',`${pack.displayName||'一式'}を通常の一覧へ戻しました。`);},false);
 }
 async function upgradePackTemplate(packId,btn){
   closePackMenu();
   try{
     const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}/template-upgrade`),preview=response.preview||{},changes=asArray(preview.changes);
-    if(!preview.updateAvailable){showMessage('ok','ひな形は最新です','この資料パックに適用できる更新はありません。');return;}
-    const accepted=await confirmAction({title:'新しいひな形を適用しますか？',message:`${preview.packName||'資料パック'}を v${Number(preview.fromVersion||1)} から v${Number(preview.toVersion||1)} へ更新します。`,detail:[...changes.map(item=>`・${item}`),'','既存原稿とページ構成は保持され、提出用PDFは再出力が必要になります。'].join('\n'),confirmLabel:'ひな形を更新'});
+    if(!preview.updateAvailable){showMessage('ok','ひな形は最新です','この一式に適用できる更新はありません。');return;}
+    const accepted=await confirmAction({title:'新しいひな形を適用しますか？',message:`${preview.packName||'一式'}を v${Number(preview.fromVersion||1)} から v${Number(preview.toVersion||1)} へ更新します。`,detail:[...changes.map(item=>`・${item}`),'','既存原稿とページ構成は保持され、提出用PDFは再出力が必要になります。'].join('\n'),confirmLabel:'ひな形を更新'});
     if(!accepted)return;
     await runBusy(btn,async()=>{await api(`/api/v2/packs/${encodeURIComponent(packId)}/template-upgrade`,{method:'POST',body:{}});await refreshPacksAfterMutation();showMessage('ok','ひな形を更新しました','必要原稿リストと出力条件を更新しました。既存の原稿・ページ構成は保持しています。');},false);
   }catch(error){showMessage('danger','ひな形を更新できません',userFriendlyError(error.message),error.detail||error.message);}
 }
 function handlePackMenuAction(event) {
   const select=event.target.closest('[data-pack-select]');if(select){void applyPresetSelection(select.dataset.packSelect);closePackMenu();return;}
-  const unavailable=event.target.closest('[data-pack-unavailable]');if(unavailable){showMessage('warn','この資料パックは利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
+  const unavailable=event.target.closest('[data-pack-unavailable]');if(unavailable){showMessage('warn','この一式は利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
   const action=event.target.closest('[data-pack-action]');if(!action)return;
   const packId=String(action.dataset.packId||'');
   if(action.dataset.packAction==='rename')openPackEditor('rename',packId);
@@ -1902,23 +1999,24 @@ function reconcileActivePackSelection() {
   const workflowPacks = asArray(state?.packs).filter(pack => pack?.workflowAvailable && !pack?.archived);
   let selected = workflowPacks.find(pack => String(pack?.packId || '') === activePackId)
     || workflowPacks.find(pack => String(pack?.category || '').toLowerCase() === String(activePreset || '').toLowerCase())
-    || workflowPacks[0]
+    // 覚えていた一式が無いときは、作成順の先頭（＝最も古い）ではなく、最後に更新された
+    // ものを選ぶ。古い一式に今月の原稿を積んでしまう事故を避けるため。
+    || packsByRecency(workflowPacks)[0]
     || null;
   if (!selected) {
     activePackId='';activePreset='';
-    try { sessionStorage.removeItem('ReportBinderPackId');sessionStorage.removeItem('ReportBinderCategory'); } catch {}
+    rememberActivePack('');
+    try { sessionStorage.removeItem('ReportBinderCategory'); } catch {}
     return null;
   }
   activePackId = String(selected.packId || '');
   activePreset = String(selected.category||'').toLowerCase();
-  try {
-    sessionStorage.setItem('ReportBinderPackId', activePackId);
-    sessionStorage.setItem('ReportBinderCategory', activePreset);
-  } catch {}
+  rememberActivePack(activePackId);
+  try { sessionStorage.setItem('ReportBinderCategory', activePreset); } catch {}
   return selected;
 }
 function presetLabel(preset = activePreset) {
-  return String(packForPreset(preset)?.displayName || '資料パック未作成');
+  return String(packForPreset(preset)?.displayName || '一式未作成');
 }
 function sourceTypeValue(source) {
   const explicit = String(source?.sourceType || '').trim().toLowerCase();
@@ -1970,10 +2068,19 @@ function updatePresetTabs() {
   renderPackSwitcher();
   updateCategoryLabels();
 }
+// 新しく使ったものから並べる。12か月分たまると、名前だけの同じ見た目の行が
+// 12本並び、どれが今月のものか分からなくなる。
+function packRecencyValue(pack){
+  const raw=String(pack?.updatedAt||pack?.createdAt||'');
+  const t=raw?Date.parse(raw):NaN;
+  return Number.isFinite(t)?t:0;
+}
+function packsByRecency(packs){return asArray(packs).slice().sort((a,b)=>packRecencyValue(b)-packRecencyValue(a));}
 function packMenuRow(pack, archived=false) {
   const id=String(pack?.packId||''),name=String(pack?.displayName||'名称未設定'),workflow=!!pack?.workflowAvailable;
   const active=!archived&&workflow&&id===activePackId;
-  const status=archived?'アーカイブ済み':(workflow?(active?'利用中':'選択して使用'):'現在は利用できません');
+  const when=packRecencyValue(pack)?`・最終更新 ${formatDateTime(pack?.updatedAt||pack?.createdAt)}`:'';
+  const status=(archived?'アーカイブ済み':(workflow?(active?'利用中':'選択して使用'):'現在は利用できません'))+when;
   const selectAttrs=archived?'disabled':(workflow?`data-pack-select="${escapeAttr(id)}"`:`data-pack-unavailable="${escapeAttr(id)}"`);
   const archiveAction=!archived&&pack?.archivable?`<button class="danger" type="button" data-pack-action="archive" data-pack-id="${escapeAttr(id)}">アーカイブ</button>`:'';
   const restoreAction=archived?`<button type="button" data-pack-action="restore" data-pack-id="${escapeAttr(id)}">復元</button>`:'';
@@ -1984,10 +2091,11 @@ function renderPackSwitcher() {
   const selected=activePackRecord();
   const label=$('active-pack-name'),button=$('pack-menu-button');
   if(label)label.textContent=String(selected?.displayName||(configured()?'名前を付ける':'未作成'));
-  if(button){button.disabled=!configured()&&!selected;button.classList.toggle('empty',!selected);button.setAttribute('aria-label',selected?`資料パック「${String(selected.displayName||'名称未設定')}」を切り替え・管理`:(configured()?'今回まとめる資料パックに名前を付ける':'原稿フォルダーを設定すると資料パックを作成できます'));button.setAttribute('aria-haspopup',selected?'dialog':'true');}
+  if(button){button.disabled=!configured()&&!selected;button.classList.toggle('empty',!selected);button.setAttribute('aria-label',selected?`一式「${String(selected.displayName||'名称未設定')}」を切り替え・管理`:(configured()?'今回まとめる一式に名前を付ける':'原稿フォルダーを設定すると一式を作成できます'));button.setAttribute('aria-haspopup',selected?'dialog':'true');}
   const all=packAdminPacks.length?packAdminPacks:asArray(state?.packs);
-  const active=all.filter(pack=>!pack?.archived),archived=all.filter(pack=>!!pack?.archived);
-  const list=$('pack-menu-list');if(list)list.innerHTML=active.length?active.map(pack=>packMenuRow(pack,false)).join(''):'<div class="pack-menu-empty">使用できる資料パックがありません。</div>';
+  // 新しく使ったものを上に。作成順のままだと、毎月増えるほど今月の一式が下へ沈む。
+  const active=packsByRecency(all.filter(pack=>!pack?.archived)),archived=packsByRecency(all.filter(pack=>!!pack?.archived));
+  const list=$('pack-menu-list');if(list)list.innerHTML=active.length?active.map(pack=>packMenuRow(pack,false)).join(''):'<div class="pack-menu-empty">使用できる一式がありません。</div>';
   const toggle=$('toggle-archived-packs');
   if(toggle){toggle.classList.toggle('hidden',archived.length===0);toggle.textContent=`アーカイブ済み（${archived.length}件）${archivedPacksExpanded?'を閉じる':'を表示'}`;toggle.setAttribute('aria-expanded',String(archivedPacksExpanded));}
   const archivedList=$('archived-pack-list');
@@ -2028,7 +2136,7 @@ async function togglePackMenu() {
   if(!activePackRecord()&&!asArray(state?.packs).length){openPackEditor('create');return;}
   if(!menu.classList.contains('hidden')){closePackMenu(true);return;}
   menu.classList.remove('hidden');button.setAttribute('aria-expanded','true');renderPackSwitcher();
-  try{await loadPackAdminPacks();}catch(error){showMessage('danger','資料パック一覧を読み込めません',userFriendlyError(error.message),error.detail||error.message);}
+  try{await loadPackAdminPacks();}catch(error){showMessage('danger','一式一覧を読み込めません',userFriendlyError(error.message),error.detail||error.message);}
   // role="dialog" + aria-modal announces "dialog" but focus stayed on the
   // trigger, so Tab walked straight past the menu into the page behind it.
   // Must run after loadPackAdminPacks(), which rebuilds the list innerHTML.
@@ -2266,7 +2374,12 @@ function syncSourcePanelDensity() {
   registeredCard.classList.toggle('hidden',!showRegistered);
   grid.classList.toggle('single-panel',showUnregistered!==showRegistered);
   const next=$('source-next-action'),needsPdf=workbooksForActivePreset().filter(workbook=>!isLatestPdfWorkbook(workbook)).length;
-  if(next)next.classList.toggle('hidden',registeredCount===0||needsPdf>0);
+  // 「次に、使うページと順番を確認します。」は、出力まで終わっている一式でも
+  // 出しっぱなしになっていた（判定に振り分け済み・出力済みが入っていなかった）。
+  // まだ何か残っていると誤解させるので、本当に次の手がある間だけ出す。
+  const unassignedLeft=pagesForActivePreset().filter(page=>String(page?.volume||'none')==='none'&&page?.enabled!==false).length;
+  const finalDone=String(aggregateFinalState().state||'')==='built';
+  if(next)next.classList.toggle('hidden',registeredCount===0||needsPdf>0||(unassignedLeft===0&&finalDone));
 }
 function renderFileList(files) {
   queueMicrotask(syncSourcePanelDensity);
@@ -2288,12 +2401,12 @@ function renderFileList(files) {
   if (!selectable.length) {
     box.className = 'table-shell empty-state';
     // 「未登録の原稿はありません。」は3つの別の状況で出ていた: 全部登録済み、
-    // フォルダー直下に対応形式が無い、資料パックの受け入れ形式で弾かれた。
+    // フォルダー直下に対応形式が無い、一式の受け入れ形式で弾かれた。
     // どれも「作業完了」と読めるため、原因に気付けず黙って先へ進んでしまう。
     box.innerHTML = allSelectable.length
       ? '<div><strong>検索条件に一致する未登録原稿はありません。</strong></div>'
       : (files.length
-        ? `<div><strong>この資料パックに登録できる原稿はありません。</strong></div><div class="subtext">フォルダーには ${files.length} 件ありますが、すべて登録済みか、この資料パックが受け付けない形式です。</div>`
+        ? `<div><strong>この一式に登録できる原稿はありません。</strong></div><div class="subtext">フォルダーには ${files.length} 件ありますが、すべて登録済みか、この一式が受け付けない形式です。</div>`
         : '<div><strong>このフォルダーの直下に原稿が見つかりません。</strong></div><div class="subtext">対応する形式は .xlsx / .xlsm / .docx / .pptx / .pdf です。サブフォルダーの中は探しません。</div>');
     if (!allSelectable.length) { selectedFiles.clear(); lastFileRangeAnchor = ''; }
     setFileSelectionSummary(allSelectable.length, selectedCount());
@@ -2305,7 +2418,7 @@ function renderFileList(files) {
   const someSelected = selectable.some(f => selectedFiles.has(String(f.relativePath || '')));
   box.className = 'table-shell';
   box.innerHTML = `<table class="data-table file-table">
-    <thead><tr><th class="check-col"><input type="checkbox" data-select-all-files ${allSelected ? 'checked' : ''} aria-label="表示中の未登録原稿をすべて選択"></th><th>原稿ファイル</th></tr></thead>
+    <thead><tr><th class="check-col"><label class="check-tap"><input type="checkbox" data-select-all-files ${allSelected ? 'checked' : ''} aria-label="表示中の未登録原稿をすべて選択"></label></th><th>原稿ファイル</th></tr></thead>
     <tbody>${selectable.map(f => {
       const rel = String(f.relativePath || '');
       const checked = selectedFiles.has(rel);
@@ -2351,15 +2464,15 @@ function renderFileList(files) {
 async function applyPresetSelection(presetOrButton) {
   // Switching packs mid-job made the finishing job apply its results (selection,
   // highlights, progress counts) to whichever pack happened to be active.
-  if(renderJobActive||activeFinalJobId){showMessage('warn','処理中は資料パックを切り替えられません','PDFの作成が終わってから切り替えてください。中止する場合は進捗パネルの「中止」を押してください。');return;}
+  if(renderJobActive||activeFinalJobId){showMessage('warn','処理中は一式を切り替えられません','PDFの作成が終わってから切り替えてください。中止する場合は進捗パネルの「中止」を押してください。');return;}
   const requested=typeof presetOrButton==='string'?presetOrButton:(presetOrButton?.dataset?.packSelect||presetOrButton?.dataset?.preset||activePackId||activePreset);
   const pack=asArray(state?.packs).find(item=>String(item?.packId||'')===String(requested))
     || asArray(state?.packs).find(item=>String(item?.category||'').toLowerCase()===String(requested||'').toLowerCase());
-  if(!pack?.workflowAvailable){showMessage('warn','この資料パックは利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
+  if(!pack?.workflowAvailable){showMessage('warn','この一式は利用できません','アーカイブ済みの場合は復元してから選択してください。');return;}
   const preset=String(pack.category||'').toLowerCase();
   const nextPackId=String(pack.packId||'');const presetChanged=preset!==activePreset||nextPackId!==activePackId;
   if(presetChanged&&pendingPageLayoutUndo){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}await saveBoardOrder();}
-  activePreset=preset;activePackId=nextPackId;try{sessionStorage.setItem('ReportBinderCategory',activePreset);sessionStorage.setItem('ReportBinderPackId',activePackId);}catch{}
+  activePreset=preset;activePackId=nextPackId;rememberActivePack(activePackId);try{sessionStorage.setItem('ReportBinderCategory',activePreset);}catch{}
   selectedFiles.clear();selectedWorkbooks.clear();selectedPages.clear();lastFileRangeAnchor='';lastWorkbookRangeAnchor='';lastPageRangeAnchor='';lastPageBoardRenderSignature='';
   if(presetChanged)clearPageLayoutHistory();else updateBulkSelectionLabel();pageVolumeCollapseOverrides.clear();
   if(configured()&&!availableFiles.length)await loadFilesSilently();
@@ -2373,7 +2486,7 @@ async function applyPresetSelection(presetOrButton) {
 
 async function registerSelected(btn) {
   const rels=[...selectedFiles];if(!rels.length){showMessage('warn','原稿を選択してください','登録するExcel・Word・PowerPoint・PDFにチェックを入れてください。');return;}
-  // 資料パック未作成のまま送ると、サーバーが内部互換用の識別子(ecm/bod/dmm)を含む
+  // 一式未作成のまま送ると、サーバーが内部互換用の識別子(ecm/bod/dmm)を含む
   // 例外を返し、対処のわからないエラーだけが残る。手前で必要な操作へ案内する。
   if(!activePackRecord()){
     showMessage('warn','先に「今回まとめる一式」に名前を付けてください',
@@ -2397,7 +2510,20 @@ async function registerSelected(btn) {
 async function unregisterSelected(btn) {
   const ids = [...selectedWorkbooks];
   if (!ids.length) { showMessage('warn', '原稿を選択してください', '登録解除する原稿にチェックを入れてください。'); return; }
-  const accepted=await confirmAction({title:'原稿の登録を解除しますか？',message:`選択した${ids.length}件をReportBinderの管理対象から外します。`,detail:'作成済みの変換PDFと元の原稿ファイルは削除されません。',confirmLabel:'登録を解除',danger:true});
+  function pagesForWorkbooks(workbookIds){const set=new Set(workbookIds.map(String));return asArray(state?.pages).filter(p=>set.has(String(p?.workbookId||''))).length;}
+  // 消えるのはページ構成のほうなのに、以前の文言は「変換PDFと元ファイルは削除され
+  // ません」としか言わず、逆の安心を与えていた。何が失われるかを先に伝える。
+  const losingPages=pagesForWorkbooks(ids);
+  const accepted=await confirmAction({
+    title:'原稿の登録を解除しますか？',
+    message:losingPages
+      ? `選択した${ids.length}件と、その${losingPages}ページの並び順・出力先・ページ名が削除されます。`
+      : `選択した${ids.length}件をReportBinderの管理対象から外します。`,
+    detail:losingPages
+      ? 'ファイル名を変えた・移動しただけなら、「別のファイルに付け替える」を使うと、ページの並びを保ったまま差し替えられます。元の原稿ファイルと作成済みの変換PDFは削除されません。'
+      : '元の原稿ファイルと作成済みの変換PDFは削除されません。',
+    confirmLabel:losingPages?`登録を解除（${losingPages}ページを削除）`:'登録を解除',
+    danger:true});
   if (!accepted) return;
   await runBusy(btn, async () => {
     for (const workbookId of ids) await api('/api/workbooks/unregister', {method:'POST', body:{workbookId}});
@@ -2487,7 +2613,7 @@ function pageChangeBadge(p){
   const name = String(p?.sheetName||'');
   if (changedSheetSet(p.workbookId).has(name)) return badge('変更あり','attention');
   if (addedSheetSet(p.workbookId).has(name)) return badge('追加','attention');
-  if (unknownSheetSet(p.workbookId).has(name)) return badge('判定不能','neutral');
+  if (unknownSheetSet(p.workbookId).has(name)) return badge('見比べできません','neutral');
   return '';
 }
 function pageIsChanged(p){
@@ -2507,7 +2633,7 @@ function diffKindMeta(kind){
     modified:{label:'変更',mark:'M'},
     added:{label:'追加',mark:'A'},
     removed:{label:'削除',mark:'D'},
-    unknown:{label:'判定不能',mark:'?'},
+    unknown:{label:'見比べできません',mark:'?'},
     unchanged:{label:'変更なし',mark:'—'}
   };
   return map[String(kind||'')]||map.unknown;
@@ -3413,7 +3539,7 @@ function renderDiffSummary(){
     ['modified','変更',Number(summary.changed||0)],
     ['added','追加',Number(summary.added||0)],
     ['removed','削除',Number(summary.removed||0)],
-    ['unknown','判定不能',Number(summary.unknown||0)],
+    ['unknown','見比べできません',Number(summary.unknown||0)],
     ['unchanged','変更なし',Number(summary.unchanged||0)],
     ['confirmed','確認済み',Number(summary.confirmed||0)]
   ];
@@ -3543,7 +3669,10 @@ function renderDiffRegionLayer(side,regions){
     const kind=String(region?.kind||'modified');
     return kind==='modified'||kind==='unknown'||(kind==='added'&&side==='after')||(kind==='removed'&&side==='before');
   });
-  const showModifiedTags=visible.length<=12;
+  // 以前は領域が13個以上のとき modified のタグを省いていた。するとその状態では
+  // 「琥珀の実線枠」と「青の実線枠」を色だけで見分けることになり、加齢による
+  // 青と黄の識別低下と正面衝突する。常に文字を出し、密集分は枠の内側に置く。
+  const denseRegions=visible.length>12;
   for(const region of visible){
     const kind=['modified','added','removed','unknown'].includes(String(region?.kind||''))?String(region.kind):'modified';
     const geometry=region?.[side]||region;
@@ -3554,8 +3683,8 @@ function renderDiffRegionLayer(side,regions){
     const width=Math.max(0,Math.min(1-x,Number(geometry?.width||0)));
     const height=Math.max(0,Math.min(1-y,Number(geometry?.height||0)));
     box.style.left=`${x*100}%`;box.style.top=`${y*100}%`;box.style.width=`${width*100}%`;box.style.height=`${height*100}%`;
-    if(y<.018)box.classList.add('tag-inside');
-    if(kind!=='modified'||showModifiedTags){
+    if(y<.018||denseRegions)box.classList.add('tag-inside');
+    {
       const tag=document.createElement('span');
       tag.className='diff-region-tag';
       tag.textContent=kind==='added'?'A':kind==='removed'?'D':kind==='unknown'?'?':'M';
@@ -3768,7 +3897,7 @@ function renderWorkbooks() {
   renderSourceRequirementStatus(list);
   if(!list.length){box.className='table-shell empty-state';box.textContent=`${presetLabel()}の登録済み原稿はまだありません。`;selectedWorkbooks.clear();lastWorkbookRangeAnchor='';if(summary)summary.textContent='0件中 0件を選択';syncWorkbookSelectionUi();return;}
   selectedWorkbooks=new Set([...selectedWorkbooks].filter(id=>list.some(w=>String(w.workbookId)===String(id))));const allSelected=list.every(w=>selectedWorkbooks.has(String(w.workbookId||''))),someSelected=list.some(w=>selectedWorkbooks.has(String(w.workbookId||'')));
-  box.className='table-shell';box.innerHTML=`<table class="data-table workbook-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-workbooks ${allSelected?'checked':''} aria-label="登録済み原稿をすべて選択"></th><th>原稿ファイル</th><th class="pdf-status-col">変換PDFの状態</th></tr></thead><tbody>${list.map(w=>{const id=String(w.workbookId||''),checked=selectedWorkbooks.has(id),renderedAt=formatDateTime(w.lastRenderedAt||'');return `<tr data-workbook-row class="${checked?'selected-row':''} ${w.status==='render-error'?'error-row':''}"><td class="check-col"><input type="checkbox" data-workbook-check value="${escapeAttr(id)}" ${checked?'checked':''} aria-label="${escapeAttr(workbookDisplayName(w))}を選択"></td><td><div class="file-name-cell"><span class="file-icon ${escapeAttr(sourceTypeValue(w))}">${iconUse(sourceIconId(w))}</span><div class="source-file-detail"><div class="source-name-line"><strong title="${escapeAttr(workbookDisplayName(w))}">${escapeHtml(workbookDisplayName(w))}</strong>${sourceTypeBadge(w)}</div><div class="file-meta" title="最後に変換PDFを作成した日時">変換PDF作成日時：${escapeHtml(renderedAt)}</div>${sourceSettingsHtml(w)}</div></div></td><td class="pdf-status-col">${workbookPdfStatusCell(w)}</td></tr>`;}).join('')}</tbody></table>`;
+  box.className='table-shell';box.innerHTML=`<table class="data-table workbook-table"><thead><tr><th class="check-col"><label class="check-tap"><input type="checkbox" data-select-all-workbooks ${allSelected?'checked':''} aria-label="登録済み原稿をすべて選択"></label></th><th>原稿ファイル</th><th class="pdf-status-col">変換PDFの状態</th></tr></thead><tbody>${list.map(w=>{const id=String(w.workbookId||''),checked=selectedWorkbooks.has(id),renderedAt=formatDateTime(w.lastRenderedAt||'');return `<tr data-workbook-row class="${checked?'selected-row':''} ${w.status==='render-error'?'error-row':''}"><td class="check-col"><input type="checkbox" data-workbook-check value="${escapeAttr(id)}" ${checked?'checked':''} aria-label="${escapeAttr(workbookDisplayName(w))}を選択"></td><td><div class="file-name-cell"><span class="file-icon ${escapeAttr(sourceTypeValue(w))}">${iconUse(sourceIconId(w))}</span><div class="source-file-detail"><div class="source-name-line"><strong title="${escapeAttr(workbookDisplayName(w))}">${escapeHtml(workbookDisplayName(w))}</strong>${sourceTypeBadge(w)}</div><div class="file-meta" title="最後に変換PDFを作成した日時">変換PDF作成日時：${escapeHtml(renderedAt)}</div>${sourceSettingsHtml(w)}</div></div></td><td class="pdf-status-col">${workbookPdfStatusCell(w)}</td></tr>`;}).join('')}</tbody></table>`;
   if(summary)summary.textContent=`${list.length}件中 ${selectedWorkbooks.size}件を選択`;const selectAll=box.querySelector('[data-select-all-workbooks]');if(selectAll){selectAll.indeterminate=someSelected&&!allSelected;selectAll.addEventListener('change',e=>{selectedWorkbooks=e.target.checked?new Set(list.map(w=>String(w.workbookId||'')).filter(Boolean)):new Set();lastWorkbookRangeAnchor='';syncWorkbookSelectionUi();renderWorkbooks();});}
   box.querySelectorAll('[data-workbook-check]').forEach(ch=>ch.addEventListener('click',e=>{e.stopPropagation();handleWorkbookCheckboxToggle(ch,e.shiftKey);renderWorkbooks();}));box.querySelectorAll('[data-open-history]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();openWorkbookComparisonHistory(btn.dataset.openHistory||'');}));
   box.querySelectorAll('[data-relink-source]').forEach(btn=>btn.addEventListener('click',e=>{e.stopPropagation();openRelinkDialog(btn.dataset.relinkSource||'',btn);}));
@@ -3814,7 +3943,8 @@ async function renderWorkbookIds(ids, btn, options={}) {
     const msg=summarizeRenderResults(finished.results||[]);const hasErrors=finished.status==='failed'||finished.status==='completed-with-errors'||asArray(finished.errors).length>0;
     if(finished.status==='cancelled'){showMessage('warn','PDF作成を中止しました',finished.message||'未処理の原稿を残して停止しました。',finished.results||finished);setTimeout(hideProgressPanel,2400);}
     else if(finished.status==='failed')showMessage('danger','PDF作成が停止しました',userFriendlyError(finished.message||'PDF作成を完了できませんでした。'),finished.errors||finished);
-    else if(asArray(finished.errors).length)showMessage('danger','PDF作成でエラーがあります',`${finished.failed||finished.errors.length}件の原稿をPDF変換できませんでした。`,finished.errors);
+    else if(asArray(finished.errors).length)showMessage('danger','PDF作成でエラーがあります',`${finished.failed||finished.errors.length}件の原稿をPDF変換できませんでした。`,finished.errors,
+      [{label:'動作環境を診断',primary:true,handler:()=>runSystemDiagnostics($('run-diagnostics-btn'))},{label:'原稿を確認',view:'excel'}], 0);
     else{const endCount=asArray(finished.results).reduce((n,r)=>n+Number(r?.sheetSync?.insertedAtEndCount||0),0);const suffix=endCount?`\n新しい${endCount}ページを末尾に追加しました。`:'';const actions=[{label:'ページ構成を確認',primary:true,view:'pages',handler:endCount?scrollToHighlightedPages:null}];if(endCount)actions.push({label:'原稿内の順序に整える',view:'pages',handler:sortPagesBySheet});else actions.push({label:'提出用PDFへ',view:'final'});showMessage(msg.kind,msg.title,msg.message+suffix,msg.detail,actions,0);setTimeout(hideProgressPanel,1800);}
     if(hasErrors)updateProgressPanel(finished);
   },false);}finally{renderJobActive=false;activeRenderJobId='';activeRenderCancelRequested=false;activeRenderJobStatus=null;const cancel=$('progress-cancel');if(cancel)cancel.hidden=true;updateRenderTargetUi();}
@@ -3995,7 +4125,7 @@ function renderPages() {
 }
 function dynamicVolumePanelHtml(panel,allPages,visibleIds){
   const volume=panel.volume,first=activeTargetVolumes()[0]||mainVolume(),pages=allPages.filter(page=>volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||first)===volume&&page.enabled!==false)),visibleCount=pages.filter(page=>visibleIds.has(resolvedPageId(page))).length,collapsed=pageVolumeCollapseOverrides.has(volume)?!!pageVolumeCollapseOverrides.get(volume):(pageBoardView==='detail'&&pages.length===0),filtering=(showChangedOnly&&state?.inputHistoryEnabled)||!!String(pageFilterText||'').trim(),countText=filtering?`${visibleCount} / ${pages.length}ページ`:`${pages.length}ページ`;
-  const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<div class="empty-row page-empty-drop">ここへドロップ</div>'}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="check-col"><input type="checkbox" data-select-all-pages="${escapeAttr(volume)}" aria-label="${escapeAttr(panel.title)}をすべて選択"></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="6">ここへドロップ</td></tr>'}</tbody></table></div>`;
+  const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<div class="empty-row page-empty-drop">ここへドロップ</div>'}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="check-col"><label class="check-tap"><input type="checkbox" data-select-all-pages="${escapeAttr(volume)}" aria-label="${escapeAttr(panel.title)}をすべて選択"></label></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="6">ここへドロップ</td></tr>'}</tbody></table></div>`;
   return `<section class="volume-panel ${volume==='none'?'inbox':''} ${volume===activePageVolume?'active-volume':'inactive-volume'} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
 }
 // 絞り込みで隠れるページは、中身を作らず data-page-id だけの器にする。
@@ -4760,7 +4890,7 @@ async function restorePreviousSubmissionFolder(previousFolder) {
 async function savePaths(btn) {
   const submissionDir = pathElementValue('submissionDir').trim();
   if (!submissionDir) {
-    showMessage('warn', '原稿フォルダーを入力してください', 'フォルダーのパスを入力するか、「フォルダーを選ぶ」を使用してください。');
+    showMessage('warn', '原稿フォルダーを入力してください', 'フォルダーの場所を入力するか、「フォルダーを選ぶ」を使用してください。');
     $('submissionDir')?.focus();
     return;
   }
@@ -4939,8 +5069,16 @@ async function runBusy(btn, fn, showProcessing=true) {
   const btnId=btn?.id||'';
   const hadFocus=!!btn&&document.activeElement===btn;
   if(btn){btn.disabled=true;btn.classList.add('busy');btn.setAttribute('aria-busy','true');}
-  if(showProcessing)showMessage('','処理中です','完了すると画面が更新されます。');
-  try{await fn();}catch(e){hideProgressPanel();showMessage('danger','処理できませんでした',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+  if(showProcessing)showMessage('','処理中です','完了すると画面が更新されます。',null,[],0);
+  // ほぼ全ての操作の失敗がここに落ちる。以前はボタンが1つも無く、
+  // 「押してはいけないものを押したのか」と考えて手が止まっていた。
+  // 少なくとも「もう一度試す」と、原因を調べる入口は常に出す。
+  try{await fn();}catch(e){
+    hideProgressPanel();
+    const actions=[{label:'もう一度試す',primary:true,handler:()=>runBusy((btnId&&$(btnId))||btn,fn,showProcessing)},
+                   {label:'動作環境を診断',handler:()=>runSystemDiagnostics($('run-diagnostics-btn'))}];
+    showMessage('danger','処理できませんでした',userFriendlyError(e.message),e.detail||e.stack||e.message,actions,0);
+  }
   finally{
     const back=(btnId&&$(btnId))||btn;
     if(back){back.disabled=false;back.classList.remove('busy');back.removeAttribute('aria-busy');}
@@ -5000,9 +5138,10 @@ setActiveView(activeView,{noScroll:true,instant:true});
 $('relink-cancel')?.addEventListener('click',closeRelinkDialog);
 $('relink-accept')?.addEventListener('click',event=>submitRelink(event.currentTarget));
 $('relink-modal')?.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();closeRelinkDialog();}});
+$('pack-output-pattern')?.addEventListener('input',()=>markUnsavedField('pack-output-pattern'));
 const fileFilterInput=$('file-filter');if(fileFilterInput)fileFilterInput.addEventListener('input',()=>{fileFilterText=fileFilterInput.value||'';renderFileList(availableFiles);});
 bind('dashboard-action-btn','click',async()=>{const action=$('dashboard-action-btn')?.dataset.dashboardAction||'excel';if(action==='folder'){setActiveView('excel');setTimeout(()=>$('change-source-folder-btn')?.focus(),0);}else if(action==='create-pack'){openPackEditor('create');}else if(action==='render'){setActiveView('excel');await renderUpdated($('render-selected-btn'));}else setActiveView(action==='pages'?'pages':action==='final'?'final':'excel');});
-bind('notice-close','click',hideMessage);bind('error-close','click',hideErrorPanel);bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));
+bind('notice-close','click',hideMessage);bind('error-close','click',()=>hideErrorPanel(true));bind('scan-btn','click',()=>scanAndRefresh($('scan-btn')));
 bind('app-load-retry','click',()=>loadInitialAppState($('app-load-retry')));
 bind('progress-cancel','click',()=>{if(activeFinalJobId)return void cancelActiveFinalJob();void cancelActiveRenderJob();});
 bind('run-diagnostics-btn','click',()=>runSystemDiagnostics($('run-diagnostics-btn')));
@@ -5015,7 +5154,7 @@ bind('pack-editor-cancel','click',()=>closePackEditor());bind('pack-editor-templ
 bind('template-manager-cancel','click',()=>closeTemplateManager());bind('template-manager-select','change',populateTemplateManager);bind('template-add-requirement','click',()=>renderTemplateRequirements([...collectTemplateRequirements(),newTemplateRequirement()],false));bind('template-manager-delete','click',()=>deleteManagedTemplate($('template-manager-delete')));bind('template-manager-duplicate','click',()=>duplicateManagedTemplate($('template-manager-duplicate')));bind('template-manager-export','click',exportManagedTemplate);bind('template-manager-import','click',()=>$('template-manager-import-file')?.click());bind('template-manager-import-file','change',event=>importManagedTemplateFile(event.target.files?.[0],event.target));const templateManagerForm=$('template-manager-form');if(templateManagerForm)templateManagerForm.addEventListener('submit',event=>{event.preventDefault();void submitTemplateManager($('template-manager-save'));});const templateManagerModal=$('template-manager-modal');if(templateManagerModal)templateManagerModal.addEventListener('click',event=>{if(event.target===templateManagerModal)closeTemplateManager();});
 document.addEventListener('click',event=>{if(!$('pack-menu')?.classList.contains('hidden')&&!event.target.closest('.pack-select-wrap'))closePackMenu();if(!$('app-menu-popover')?.classList.contains('hidden')&&!event.target.closest('.app-menu-wrap'))closeAppMenu();});
 bind('use-submission-path-btn','click',()=>savePaths($('use-submission-path-btn')));bind('submissionDir','keydown',event=>{if(event.key==='Enter'){event.preventDefault();savePaths($('use-submission-path-btn'));}});
-bind('clear-selected-files-btn','click',clearVisibleFilesSelection);bind('clear-selected-workbooks-btn','click',clearWorkbookSelection);bind('select-all-pages-btn','click',selectAllActivePages);bind('clear-selected-pages-btn','click',clearActivePageSelection);
+bind('clear-selected-files-btn','click',clearVisibleFilesSelection);bind('clear-selected-workbooks-btn','click',clearWorkbookSelection);bind('select-all-visible-pages-btn','click',selectAllActivePages);bind('select-all-pages-btn','click',selectAllActivePages);bind('clear-selected-pages-btn','click',clearActivePageSelection);
 bind('page-view-thumbnail-btn','click',()=>setPageBoardView('thumbnail'));bind('page-view-detail-btn','click',()=>setPageBoardView('detail'));bind('page-layout-undo-btn','click',()=>undoLastPageLayout($('page-layout-undo-btn')));bind('page-layout-redo-btn','click',()=>redoLastPageLayout($('page-layout-redo-btn')));bind('page-layout-revisions-btn','click',()=>openPageLayoutRevisions());
 bind('page-layout-revisions-refresh','click',()=>loadLayoutSnapshots());bind('page-layout-revisions-close','click',()=>closePageLayoutRevisions());const pageLayoutRevisionsModal=$('page-layout-revisions-modal');if(pageLayoutRevisionsModal)pageLayoutRevisionsModal.addEventListener('click',event=>{if(event.target===pageLayoutRevisionsModal)closePageLayoutRevisions();});
 const pageSearchInput=$('page-search-input'),pageSearchClear=$('page-search-clear');
@@ -5154,7 +5293,7 @@ async function loadInitialAppState(button=null) {
     document.body.classList.add('app-load-failed');
     if(screen)screen.setAttribute('aria-live','assertive');
     if(title)title.textContent='資料を読み込めませんでした';
-    if(message)message.textContent='接続を確認して、もう一度読み込んでください。';
+    if(message)message.textContent=SERVER_GONE_MESSAGE;
     if(button){button.classList.remove('hidden');button.disabled=false;}
   }
 }
@@ -5190,12 +5329,12 @@ function renderAutoStatus(){
     const wb=getWorkbook(it.workbookId);
     const name=wb?workbookDisplayName(wb):String(it.workbookId||'');
     const reason={'excel-in-use':'Excelが使用されています','job-busy':'他のPDF作成が実行中です','start-failed':'開始できませんでした','file-missing':'ファイルが見つかりません','retry-backoff':`${Number(it.retryCount||0)}回目の再試行待ち（${formatDateTime(it.nextRetryAt)}）`,'retry-exhausted':it.lastError||'再試行回数の上限に達しました','disk-low':'空き容量が不足しています','job-status-missing':'実行状態を再確認しています'}[String(it.deferReason||'')]||'';
-    const label={idle:it.lastResult==='completed'?'完了':'待機中',waiting:'変更を検知（静止待ち）',deferred:'保留中',rendering:'PDF作成中',ready:'実行待ち','retry-wait':'再試行待ち',failed:'自動処理失敗'}[String(it.state||'')]||String(it.state||'');
+    const label={idle:it.lastResult==='completed'?'完了':'待機中',waiting:'変更を検知（保存が落ち着くまで待つ時間）',deferred:'保留中',rendering:'PDF作成中',ready:'実行待ち','retry-wait':'再試行待ち',failed:'自動処理失敗'}[String(it.state||'')]||String(it.state||'');
     const retryable=['deferred','retry-wait','failed'].includes(String(it.state||''));return `<div class="auto-row"><span>${escapeHtml(name)}</span><span>${escapeHtml(label)}</span><span class="subtext">${escapeHtml(reason||it.lastResultAt?`${reason}${reason?'・':''}${formatDateTime(it.lastResultAt)}`:'')}</span>${retryable?`<button class="btn ghost compact" type="button" data-auto-run="${escapeAttr(it.workbookId)}">今すぐ実行</button>`:''}</div>`;
   }).join('');
   const attentionCount=items.filter(item=>!['idle',''].includes(String(item.state||''))).length;
   const statusText=attentionCount?`${attentionCount}件に対応が必要`:auto.enabled?`有効・変更後 ${Math.round(Number(auto.quietPeriodSeconds||180)/60)}分待機`:'無効';
-  box.innerHTML=`<details class="secondary-disclosure auto-disclosure"><summary><span>自動PDF作成</span><small>${escapeHtml(statusText)}</small></summary><div class="secondary-disclosure-body"><div class="disclosure-actions"><p>${attentionCount?'保留中または再試行待ちの原稿があります。':'原稿更新後のPDF作成を自動化できます。'}</p><button class="btn ghost compact" type="button" data-auto-settings-toggle>設定を変更</button></div><div class="auto-settings" data-auto-settings hidden><label><input id="auto-enabled" type="checkbox" ${auto.enabled?'checked':''}> 自動PDF作成を有効にする</label><label>静止待ち<select id="auto-quiet-seconds">${[[60,'1分'],[180,'3分'],[300,'5分'],[600,'10分']].map(([value,label])=>`<option value="${value}" ${Number(auto.quietPeriodSeconds||180)===value?'selected':''}>${label}</option>`).join('')}</select></label><label>失敗時の再試行<select id="auto-max-retries">${[0,1,3,5].map(value=>`<option value="${value}" ${Number(auto.maxRetryCount||3)===value?'selected':''}>${value}回</option>`).join('')}</select></label><label>必要な空き容量<select id="auto-min-free">${[[512,'0.5 GB'],[1024,'1 GB'],[2048,'2 GB'],[5120,'5 GB']].map(([value,label])=>`<option value="${value}" ${Number(auto.minFreeMegabytes||1024)===value?'selected':''}>${label}</option>`).join('')}</select></label><label><input id="auto-notify-success" type="checkbox" ${auto.notifyOnCompletion!==false?'checked':''}> 完了を通知</label><label><input id="auto-notify-failure" type="checkbox" ${auto.notifyOnFailure!==false?'checked':''}> 失敗を通知</label><button class="btn primary compact" type="button" data-auto-settings-save>保存</button></div>`
+  box.innerHTML=`<details class="secondary-disclosure auto-disclosure"><summary><span>自動PDF作成</span><small>${escapeHtml(statusText)}</small></summary><div class="secondary-disclosure-body"><div class="disclosure-actions"><p>${attentionCount?'保留中または再試行待ちの原稿があります。':'原稿更新後のPDF作成を自動化できます。'}</p><button class="btn ghost compact" type="button" data-auto-settings-toggle>設定を変更</button></div><div class="auto-settings" data-auto-settings hidden><label><input id="auto-enabled" type="checkbox" ${auto.enabled?'checked':''}> 自動PDF作成を有効にする</label><label>保存が落ち着くまで待つ時間<select id="auto-quiet-seconds">${[[60,'1分'],[180,'3分'],[300,'5分'],[600,'10分']].map(([value,label])=>`<option value="${value}" ${Number(auto.quietPeriodSeconds||180)===value?'selected':''}>${label}</option>`).join('')}</select></label><label>失敗時の再試行<select id="auto-max-retries">${[0,1,3,5].map(value=>`<option value="${value}" ${Number(auto.maxRetryCount||3)===value?'selected':''}>${value}回</option>`).join('')}</select></label><label>必要な空き容量<select id="auto-min-free">${[[512,'0.5 GB'],[1024,'1 GB'],[2048,'2 GB'],[5120,'5 GB']].map(([value,label])=>`<option value="${value}" ${Number(auto.minFreeMegabytes||1024)===value?'selected':''}>${label}</option>`).join('')}</select></label><label><input id="auto-notify-success" type="checkbox" ${auto.notifyOnCompletion!==false?'checked':''}> 完了を通知</label><label><input id="auto-notify-failure" type="checkbox" ${auto.notifyOnFailure!==false?'checked':''}> 失敗を通知</label><button class="btn primary compact" type="button" data-auto-settings-save>保存</button></div>`
     +(items.length?`<div class="auto-list">${lines}</div>`:'<div class="caption">自動処理の待ち行列は空です。原稿を更新すると、ここに検知した変更が並びます。</div>')
     +(overCap?`<p class="warn-strip">変更履歴の使用量が ${size}MB です（上限の目安 ${cap}MB）。</p>`:'')
     +'</div></details>';
@@ -5289,7 +5428,7 @@ function volumeLabel(v){
 async function loadFinalArchives(){
   const box=$('final-archive-history');
   if(!box)return;
-  if(!activePackRecord()?.packId){box.innerHTML='<div class="caption">資料パックを作成すると出力履歴が表示されます。</div>';return;}
+  if(!activePackRecord()?.packId){box.innerHTML='<div class="caption">一式を作成すると出力履歴が表示されます。</div>';return;}
   try{
     const r=await api(activePackIsBuiltIn()?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(activePackId)}`);
     const list=asArray(r.archives);
