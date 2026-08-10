@@ -1000,6 +1000,19 @@ _patch_items = server.split("$path -match '^/api/v2/items/([^/]+)$'", 1)[1][:600
 if 'baseLayout' in _patch_items:
     raise SystemExit('PATCH /api/v2/items now takes baseLayout; update the warning in docs/API.md')
 
+# このリポジトリで繰り返し事故が起きた箇所の決まりごと。消えると同じ失敗を繰り返す。
+_rules_path = root/'docs/DEVELOPMENT_RULES.md'
+if not _rules_path.exists():
+    raise SystemExit('docs/DEVELOPMENT_RULES.md is missing; the lessons that cost the most would be lost')
+_rules = _rules_path.read_text(encoding='utf-8')
+for needed in ['新しい仕組みを足したら、それを疑う工程を必ず挟む',
+               '追加した検査は、必ず落ちることを確かめる',
+               'サブフォルダー探索', '旧形式']:
+    if needed not in _rules:
+        raise SystemExit(f'the development rules must keep this section: {needed}')
+if 'DEVELOPMENT_RULES.md' not in (root/'README.md').read_text(encoding='utf-8'):
+    raise SystemExit('README must point at the development rules; an unreferenced document is not read')
+
 # 原稿ファイルの名前変更・移動に付け替えで対応する。登録解除→再登録はページを
 # 丸ごと消すため、それしか手が無い状態にしてはいけない。
 for needed in ["'/api/v2/sources/relink'", "'/api/v2/sources/relink-candidates'",
