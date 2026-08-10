@@ -1043,12 +1043,93 @@ _hint = appjs.split('function updateRenderTargetUi(', 1)[1].split('\nfunction ',
 if 'missingCount' not in _hint:
     raise SystemExit('the render hint must not claim everything is up to date while sources are missing')
 
+# 62歳・IT不慣れ・老眼・多忙という前提で入れた手当て。数値と導線を固定する。
+# 1) 同じものを3通りに呼ばない。画面に「資料パック」が戻ると、同じ物か確信が持てなくなる。
+for _stale in ['資料パック', '監査履歴', '静止待ち', '判定不能', 'PDF処理エンジン']:
+    if _stale in html or _stale in appjs:
+        raise SystemExit(f'this wording was replaced with plain Japanese; it must not come back: {_stale}')
+# 2) 13px以下の日本語は読ませない（この方針は style.css 自身に書いてある）。
+_small = re.findall(r'font-size:(\d+)px', css) + re.findall(r'font:[^;{}]*?(\d+)px', css)
+_too_small = sorted({int(v) for v in _small if int(v) < 14})
+if _too_small:
+    raise SystemExit(f'font sizes below 14px are unreadable for the intended users: {_too_small}')
+# 3) 画面より高いモーダルは、閉じるボタンごと画面外に出る（1366x768では上下各47px）。
+_diff_dialog = css.split('.diff-dialog{', 1)[1].split('}', 1)[0]
+if 'min-height:min(' not in _diff_dialog:
+    raise SystemExit('the diff dialog must never claim more height than the screen has')
+# 4) 起動のたびに最も古い一式を選ぶと、先月の一式に今月の原稿を積んでしまう。
+for needed in ['localStorage', 'packsByRecency', 'function rememberActivePack']:
+    if needed not in appjs:
+        raise SystemExit(f'the last used pack must survive a restart: {needed}')
+if 'workflowPacks[0]' in appjs:
+    raise SystemExit('falling back to the first pack picks the oldest one')
+# 5) 一括選択は常に見える場所に。全ページが既定で未振り分けに入るため。
+if 'select-all-visible-pages-btn' not in html:
+    raise SystemExit('selecting every visible page must not be hidden inside a closed disclosure')
+# 6) 失敗したら次の一手を出す。ほぼ全操作の失敗が runBusy の catch に落ちる。
+_run_busy = appjs.split('async function runBusy(', 1)[1].split(chr(10) + 'async function ', 1)[0]
+if "label:'もう一度試す'" not in _run_busy:  # コメント中の同じ語に一致しないよう、コードの形で見る
+    raise SystemExit('a failed operation must offer a way forward')
+# 7) 登録解除で消えるのはページ構成。何が失われるかを言わずに実行させない。
+if 'ページを削除' not in appjs:
+    raise SystemExit('unregistering must say that the page layout is what gets deleted')
+_unregister = server.split('function Unregister-Workbook', 1)[1].split(chr(10) + 'function ', 1)[0]
+if 'Save-LayoutSnapshot' not in _unregister:
+    raise SystemExit('unregistering must leave a restore point; it is the only way back')
+# 8) 色だけで状態を伝えない。
+if 'targetStateSuffix' not in appjs:
+    raise SystemExit('output chips must name their state, not only colour it')
+# 9) 会議中に見えるのはタブだけ。進捗をタイトルに出す。
+if 'document.title' not in appjs:
+    raise SystemExit('a long job must show progress where a busy person can see it')
+
+# 62歳・IT不慣れ・老眼・多忙という前提で入れた手当て。数値と導線を固定する。
+# 1) 同じものを3通りに呼ばない。画面に「資料パック」が戻ると、同じ物か確信が持てなくなる。
+for _stale in ['資料パック', '監査履歴', '静止待ち', '判定不能', 'PDF処理エンジン']:
+    if _stale in html or _stale in appjs:
+        raise SystemExit(f'this wording was replaced with plain Japanese; it must not come back: {_stale}')
+# 2) 13px以下の日本語は読ませない。この方針は style.css 自身のコメントに書いてある。
+_small = [int(v) for v in re.findall(r'font-size:(\d+)px', css)]
+_small += [int(v) for v in re.findall(r'font:[^;{}]*?(\d+)px', css)]
+_too_small = sorted({v for v in _small if v < 14})
+if _too_small:
+    raise SystemExit(f'font sizes below 14px are unreadable for the intended users: {_too_small}')
+# 3) 画面より高いモーダルは、閉じるボタンごと画面外に出る（1366x768では上下各47px）。
+_diff_dialog = css.split('.diff-dialog{', 1)[1].split('}', 1)[0]
+if 'min-height:min(' not in _diff_dialog:
+    raise SystemExit('the diff dialog must never claim more height than the screen has')
+# 4) 起動のたびに最も古い一式を選ぶと、先月の一式に今月の原稿を積んでしまう。
+for _needed in ['localStorage', 'packsByRecency', 'function rememberActivePack']:
+    if _needed not in appjs:
+        raise SystemExit(f'the last used pack must survive a restart: {_needed}')
+if 'workflowPacks[0]' in appjs:
+    raise SystemExit('falling back to the first pack picks the oldest one')
+# 5) 一括選択は常に見える場所に。新しいページは全部「未振り分け」に入るため。
+if 'select-all-visible-pages-btn' not in html:
+    raise SystemExit('selecting every visible page must not be hidden inside a closed disclosure')
+# 6) 失敗したら次の一手を出す。ほぼ全操作の失敗が runBusy の catch に落ちる。
+_run_busy = appjs.split('async function runBusy(', 1)[1].split(chr(10) + 'async function ', 1)[0]
+if 'もう一度試す' not in _run_busy:
+    raise SystemExit('a failed operation must offer a way forward')
+# 7) 登録解除で消えるのはページ構成。何が失われるかを言わずに実行させない。
+if 'ページを削除' not in appjs:
+    raise SystemExit('unregistering must say that the page layout is what gets deleted')
+_unregister = server.split('function Unregister-Workbook', 1)[1].split(chr(10) + 'function ', 1)[0]
+if 'Save-LayoutSnapshot' not in _unregister:
+    raise SystemExit('unregistering must leave a restore point; it is the only way back')
+# 8) 色だけで状態を伝えない。
+if 'targetStateSuffix' not in appjs:
+    raise SystemExit('output chips must name their state, not only colour it')
+# 9) 会議中に見えるのはタブだけ。進捗をタイトルに出す。
+if 'document.title' not in appjs:
+    raise SystemExit('a long job must show progress where a busy person can see it')
+
 # 絞り込みは app.js に実装済みなのに入力欄がHTMLに無く、到達不能なコードだった。
 if 'file-filter' not in html:
     raise SystemExit('the unregistered-source filter has code but no input to drive it')
 # 空表示が「全部登録済み」だけを意味しないようにする。3つの状況を言い分ける。
 _empty = appjs.split('if (!selectable.length) {', 1)[1].split('\n  }', 1)[0]
-for needed in ['サブフォルダーの中は探しません', 'この資料パックが受け付けない形式']:
+for needed in ['サブフォルダーの中は探しません', 'この一式が受け付けない形式']:
     if needed not in _empty:
         raise SystemExit(f'an empty source list must say why it is empty: {needed}')
 
@@ -1441,7 +1522,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v178', 'style.css?v=20260810_v107']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v179', 'style.css?v=20260810_v108']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1496,7 +1577,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260810_v178' not in html:
+if 'app.js?v=20260810_v179' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1522,7 +1603,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260810_v178' not in html:
+if 'app.js?v=20260810_v179' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1668,7 +1749,7 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.10.2':
+if runtime_version != '2026.08.10.3':
     raise SystemExit('release quality gate must bump the immutable runtime version')
 # 成果物の呼称は「提出用PDF」に統一する。サーバーの日本語 throw は加工されずに画面へ
 # 出るため、ここに旧称が残ると利用者が画面に無い言葉を見せられる。
@@ -1704,7 +1785,7 @@ for needed in ['$proc.WaitForExit(60000)', '$proc.Kill()', '画面でパスを�
 # 2026-08-08 first-time novice onboarding -----------------------------------
 for needed in ['ReportBinderでできること', '複数の原稿を、必要な順番で1つのPDFにまとめる',
                'id="dashboard-onboarding"', '原稿を集める', '順番を整える', '1つのPDFにする',
-               'フォルダーを選べない場合', '保存先の詳しい説明']:
+               'フォルダーの指定と、うまくPDFにならないときの確認', '保存先の詳しい説明']:
     if needed not in html:
         raise SystemExit(f'first-time purpose/onboarding copy is missing: {needed}')
 for needed in ['はじめる：原稿が入ったフォルダーを選ぶ', "action.textContent='はじめる'",
@@ -1906,9 +1987,21 @@ for needed in ['ページをクリックして選ぶ', '移動先を押す', '�
                'createPageDragGhost', 'directCardDrag', 'page-drag-ghost']:
     if needed not in html + appjs + css:
         raise SystemExit(f'direct page movement UX missing: {needed}')
-for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・絞り込み・並び</summary>', '.page-command-bar:not(.has-selection) .page-destination-actions{opacity:.55}']:
+for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・絞り込み・並び</summary>',
+               '.page-command-bar:not(.has-selection) .page-destination-actions{opacity:1}']:
     if needed not in html + css:
         raise SystemExit(f'page composition progressive disclosure missing: {needed}')
+# 選択前でも移動先の操作を見せる、という判断を守る検査。以前は opacity:.55 で
+# 「見せる」を実現していたが、無効ボタンが1.96:1、ラベルが2.17:1まで沈んでいた。
+# 隠さないことが本旨なので、非表示と、読めない濃さの両方を禁じる。
+for _bar in ['.page-command-bar:not(.has-selection) .page-destination-actions',
+             '#file-context-bar:not(.has-selection)']:
+    # 最後の規則が勝つ。前方一致で最初の宣言だけを見ると、上書き済みの死んだ規則を判定してしまう。
+    _decl = css.rsplit(_bar + '{', 1)[1].split('}', 1)[0]
+    if 'display:none' in _decl:
+        raise SystemExit(f'the bulk actions must stay visible before a selection: {_bar}')
+    if 'opacity:.' in _decl or 'opacity:0' in _decl:
+        raise SystemExit(f'dimming the bulk actions drops them below readable contrast: {_bar}')
 if "pages: 'ページ構成'" not in appjs:
     raise SystemExit('page composition view name must match the navigation label')
 if 'grid-template-columns:repeat(3,minmax(0,1fr))' not in css:
@@ -2110,7 +2203,7 @@ for needed in ['id="error-actions"', 'id="error-close"', 'class="error-panel-bod
 for needed in ['function showErrorPanel(title, summary, detail, actions=[])',
                'showErrorPanel(title, message, detail || message, actions)',
                "const actionBox = $('error-actions')",
-               "bind('error-close','click',hideErrorPanel)"]:
+               "bind('error-close','click',()=>hideErrorPanel(true))"]:
     if needed not in appjs:
         raise SystemExit(f'error panel action/dismiss behavior missing: {needed}')
 for needed in ['.error-actions{', '.error-panel-body{']:
