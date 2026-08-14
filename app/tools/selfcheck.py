@@ -2472,4 +2472,45 @@ if "!=='ready'" not in _release:
 if 'pageThumbnailObserver.unobserve' in appjs:
     raise SystemExit('the thumbnail observer must keep watching so re-entry redraws released canvases')
 
+# --- はじめて開いた人が最初に見る画面で見つかった欠陥 (2026-08-15) ---
+
+# .modal-card は width:min(1100px,92vw);height:88vh を持つ。個別ダイアログの寸法を
+# 単一クラスで書くと、CSSの後勝ちで .modal-card が勝ってしまう。実際に
+# .pack-editor-dialog がこれで無効化され、名前を1つ入れるだけの一式作成が
+# 1100x88vh の箱で開き、ボタンの下に空白が370px残っていた。順序に依存しない
+# 書き方(.modal-card との2クラス)を強制する。
+_modal_variants = sorted({m for m in re.findall(r'class="modal-card ([a-z0-9-]+)"', html)})
+if not _modal_variants:
+    raise SystemExit('modal-card variants must exist for the dialog sizing check to mean anything')
+for _variant in _modal_variants:
+    if not re.search(r'\.' + re.escape(_variant) + r'\{[^}]*(?:width|height)\s*:', css):
+        continue  # 寸法を上書きしていないダイアログ(.modal-card の既定で開く)は対象外
+    if not re.search(r'\.modal-card\.' + re.escape(_variant) + r'\{', css):
+        raise SystemExit(f'.{_variant} sizes a modal but is not written as .modal-card.{_variant}, so .modal-card wins by source order')
+
+# 一度もPDF化していない原稿に「原稿更新あり／再作成」と出していた。登録直後の全件が
+# これになるため、はじめて使う人は身に覚えのない更新を告げられる。
+_pdf_cell = appjs.split('function workbookPdfStatusCell(', 1)[1].split('\nfunction ', 1)[0]
+if "badge('変換PDF未作成'" not in _pdf_cell:
+    raise SystemExit('a source that was never rendered must not be reported as an update to re-apply')
+# 説明の文中にも同じ語が出るので、実際に描く badge() の位置どうしで順序を見る。
+if _pdf_cell.index("badge('変換PDF未作成'") > _pdf_cell.index("badge('原稿更新あり'"):
+    raise SystemExit('the never-rendered branch must come before the stale-render branch')
+
+# ページを動かしたあとに上のステップ表示だけが取り残され、全ページを出力先へ移しても
+# 「!」、全ページを未振り分けへ戻しても「✓」のままだった。
+_mutation = appjs.split('function applyPageMutationResult(', 1)[1].split('\nfunction ', 1)[0]
+if 'renderStepBar()' not in _mutation:
+    raise SystemExit('moving pages must refresh the step bar, not only the nav badges')
+
+# 空配列を式のまま JSON へ渡すと PowerShell が $null へ展開し "files":{} になる。
+# 画面は asArray() で1件と数え、0件のときだけ出る案内へ到達できなくなる。
+_files_route = server.split("$path -eq '/api/submission-files'", 1)[1].split('return', 1)[0]
+if 'Get-SourceCandidates' in _files_route and '$null -eq' not in _files_route:
+    raise SystemExit('/api/submission-files must guard the empty list so it serializes as [] and not {}')
+
+# 診断の容量は AvailableFreeSpace(空き容量)。「使用容量」と書くと逆の意味になる。
+if '使用容量' in appjs:
+    raise SystemExit('free disk space must not be labelled as used capacity')
+
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

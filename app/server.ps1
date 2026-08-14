@@ -8681,7 +8681,13 @@ function Handle-Api($Context) {
             Write-JsonResponse $Context 200 ([ordered]@{ok=$true;category=$cat;volumes=$vols});return
         }
         if ($method -eq 'GET' -and $path -eq '/api/submission-files') {
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; scannedAt = (New-NowIso); files = (Get-SourceCandidates @('excel','word','pdf','powerpoint')) }); return
+            # 空の配列を式のまま渡すと PowerShell が展開して $null になり、
+            # ConvertTo-Json が "files":{} を返す。受け取った画面は asArray() で
+            # 要素1件と数え、原稿が0件のときだけ出るはずの案内
+            # (「サブフォルダーの中は探しません」)へ決して到達しなかった。
+            $sourceFiles = Get-SourceCandidates @('excel','word','pdf','powerpoint')
+            if ($null -eq $sourceFiles) { $sourceFiles = @() }
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; scannedAt = (New-NowIso); files = $sourceFiles }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/submission/select-and-start') {
             $body = Read-BodyJson $Context.Request
