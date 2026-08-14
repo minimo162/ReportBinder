@@ -226,7 +226,7 @@ function setActiveView(view, options = {}) {
   // already output. Fetch it once for the active pack whatever the view.
   if (state && !finalReadinessLoaded()) {
     void loadFinalReadiness({render:false}).then(()=>{
-      renderGlobalHeader();renderNavBadges();renderDashboardOverview();
+      renderGlobalHeader();renderNavBadges();renderStepBar();renderDashboardOverview();
       // Repaint the output cards unconditionally, not just while the final view
       // is showing. At boot activePackId is not resolved yet, so this late load
       // is often the first one that succeeds; skipping the cards left them at
@@ -1056,7 +1056,7 @@ async function loadFinalPanels(options = {}){
   }
   await finalPanelsInFlight;
   if(options.render===false) return;
-  if(activeView==='final'){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
+  if(activeView==='final'){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
 }
 async function loadFinalReadiness(options = {}){
   if(!state||!configured())return;
@@ -1069,7 +1069,7 @@ async function loadFinalReadiness(options = {}){
     const volumes=r.volumes||Object.fromEntries(Object.entries(r.targets||{}).map(([targetId,ready])=>[targetVolume(targetId),ready]));
     state.finalReadiness[key]={volumes};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
-    if(options.render!==false&&activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderFinalOverview();renderVolumeLinks();}
+    if(options.render!==false&&activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
   }).catch(e=>log('提出用PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
   return finalReadinessInFlight;
 }
@@ -1350,7 +1350,7 @@ function renderDiagnosticsResult(){
   const statusLabel=value=>({ready:'利用可能',limited:'一部利用可能',blocked:'修復が必要','not-installed':'未導入',unsupported:'非対応版',unavailable:'起動不可'})[String(value||'')]||'要確認';
   const statusClass=value=>String(value)==='ready'?'neutral':String(value)==='blocked'?'danger':'attention';
   const appRow=app=>{const item=app||{},detail=item.available?`Version ${item.version||'16'}${item.build?` / Build ${item.build}`:''}`:(item.userAction||'利用できません。');return`<div class="diagnostic-row"><div><strong>${escapeHtml(item.displayName||'Office')}</strong><span>${escapeHtml(detail)}</span></div>${badge(statusLabel(item.status),statusClass(item.status))}</div>`;};
-  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDFを作る機能</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>このPCの使用容量</strong><span>管理データ ${formatCapacity(storage.dataFreeBytes)} / 出力 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
+  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDFを作る機能</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>このPCの空き容量</strong><span>管理データの保存先 ${formatCapacity(storage.dataFreeBytes)} / 出力先 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
 }
 
 async function runSystemDiagnostics(btn){
@@ -2471,10 +2471,13 @@ function renderFileList(files) {
     // 「未登録の原稿はありません。」は3つの別の状況で出ていた: 全部登録済み、
     // フォルダー直下に対応形式が無い、一式の受け入れ形式で弾かれた。
     // どれも「作業完了」と読めるため、原因に気付けず黙って先へ進んでしまう。
+    // files.length をそのまま数えると、壊れた応答の1件を「フォルダーには1件あります」と
+    // 言ってしまい、0件のときだけ出る案内へ行けない。実体のある行だけを数える。
+    const foundCount = asArray(files).filter(f => String(f?.relativePath || '').trim()).length;
     box.innerHTML = allSelectable.length
       ? '<div><strong>検索条件に一致する未登録原稿はありません。</strong></div>'
-      : (files.length
-        ? `<div><strong>この一式に登録できる原稿はありません。</strong></div><div class="subtext">フォルダーには ${files.length} 件ありますが、すべて登録済みか、この一式が受け付けない形式です。</div>`
+      : (foundCount
+        ? `<div><strong>この一式に登録できる原稿はありません。</strong></div><div class="subtext">フォルダーの直下には ${foundCount} 件ありますが、すべて登録済みか、この一式が受け付けない形式です。対応する形式は .xlsx / .xlsm / .docx / .pptx / .pdf です。サブフォルダーの中は探しません。</div>`
         : '<div><strong>このフォルダーの直下に原稿が見つかりません。</strong></div><div class="subtext">対応する形式は .xlsx / .xlsm / .docx / .pptx / .pdf です。サブフォルダーの中は探しません。</div>');
     if (!allSelectable.length) { selectedFiles.clear(); lastFileRangeAnchor = ''; }
     setFileSelectionSummary(allSelectable.length, selectedCount());
@@ -2655,6 +2658,13 @@ function workbookPdfStatusCell(w){
   }
   if (status === 'rendering') {
     return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('PDF作成中','attention')}</div><div class="pdf-status-detail">完了後に差分を判定します</div></div>`;
+  }
+  // 一度もPDFにしていない原稿を「原稿更新あり／PDFを再作成して更新を反映して
+  // ください」と案内していた。登録した直後の全件がこれになるため、はじめて使う人は
+  // 身に覚えのない更新と、存在しないPDFの再作成を指示される。作成日時の欄は「—」、
+  // 押すボタンは「変換PDFを作成」なので、画面の中でも食い違っていた。
+  if (!String(w?.lastRenderedAt || '').trim()) {
+    return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('変換PDF未作成','attention')}</div><div class="pdf-status-detail">まだPDFにしていません。「変換PDFを作成」を押すと作成します</div></div>`;
   }
   if (!isLatestPdfWorkbook(w)) {
     return `<div class="pdf-status-stack"><div class="pdf-status-line">${badge('原稿更新あり','attention')}</div><div class="pdf-status-detail">PDFを再作成して更新を反映してください</div></div>`;
@@ -4656,7 +4666,10 @@ function applyPageMutationResult(payload){
   state.summary.uncheckedPages=pages.filter(p=>['rendered','stale','not-rendered'].includes(String(p.status||''))).length;
   state.summary.pdfReadyPages=pages.filter(p=>String(p.contentPdf||'').trim()).length;
   lastPageBoardRenderSignature='';
-  renderNavBadges();renderPageOverview();renderFinalOverview();renderPages();if(isModalOpen())syncPreviewOrganizerControls();
+  // 左ナビのバッジだけを更新し、上のステップ表示を置き去りにしていた。全ページを
+  // 出力先へ移しても「!」のまま、全ページを未振り分けへ戻しても「✓」のままになり、
+  // 画面を読み込み直すまで直らない。判断の材料がそこにあるので、同時に更新する。
+  renderNavBadges();renderStepBar();renderPageOverview();renderFinalOverview();renderPages();if(isModalOpen())syncPreviewOrganizerControls();
 }
 
 function scheduleBoardSave(undo=null) {
@@ -5514,10 +5527,14 @@ let lastSnapshotHistoryWorkbook = '';
 try { lastSnapshotHistoryWorkbook = sessionStorage.getItem('ReportBinderSnapshotWorkbook') || ''; } catch {}
 let snapshotHistoryState = { workbookId:lastSnapshotHistoryWorkbook, snapshots:[], fromId:'', toId:'' };
 
+const SINGLE_SNAPSHOT_HINT='この原稿の版はまだ1つだけです。比較には2つの版が必要です。原稿を更新して変換PDFを作り直すと、更新前と更新後をここで見比べられます。';
 function renderSnapshotHistorySelectionHint(){
   const box=$('snapshot-history-diff');if(!box)return;
   const from=snapshotHistoryState.snapshots.find(s=>String(s.snapshotId)===String(snapshotHistoryState.fromId));
   const to=snapshotHistoryState.snapshots.find(s=>String(s.snapshotId)===String(snapshotHistoryState.toId));
+  // 版が1つしかないときも「比較元と比較先を選んでください」とだけ出ていた。選べる
+  // ものが1つしか無いので、はじめて使う人はここで手が止まる。理由と次の一手を言う。
+  if(snapshotHistoryState.snapshots.length===1){box.innerHTML=`<div class="caption">${SINGLE_SNAPSHOT_HINT}</div>`;return;}
   if(!from||!to){box.innerHTML='<div class="caption">比較可能な版から比較元と比較先を選んでください。</div>';return;}
   const same=String(from.snapshotId)===String(to.snapshotId);
   const unavailable=!from.visualCompareReady||!to.visualCompareReady;
@@ -5639,6 +5656,7 @@ async function loadSnapshotDiff(workbookId){
   const from=String(snapshotHistoryState.fromId||''), to=String(snapshotHistoryState.toId||'');
   const fromItem=snapshotHistoryState.snapshots.find(s=>String(s.snapshotId)===from);
   const toItem=snapshotHistoryState.snapshots.find(s=>String(s.snapshotId)===to);
+  if(snapshotHistoryState.snapshots.length===1){diffBox.innerHTML=`<div class="caption">${SINGLE_SNAPSHOT_HINT}</div>`;return;}
   if(!from||!to){diffBox.innerHTML='<div class="caption">比較可能な版から比較元と比較先を選んでください。</div>';return;}
   if(from===to){diffBox.innerHTML='<div class="caption">異なる2版を選んでください。</div>';return;}
   if(!fromItem?.visualCompareReady||!toItem?.visualCompareReady){diffBox.innerHTML='<div class="caption">この2つの版は比較できません。どちらかの版が古く、比較に使うPDFが残っていないためです。新しい2つの版を選び直してください。</div>';return;}
