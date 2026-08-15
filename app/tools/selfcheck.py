@@ -2508,6 +2508,23 @@ if 'renderStepBar()' not in _mutation:
 _files_route = server.split("$path -eq '/api/submission-files'", 1)[1].split('return', 1)[0]
 if 'Get-SourceCandidates' in _files_route and '$null -eq' not in _files_route:
     raise SystemExit('/api/submission-files must guard the empty list so it serializes as [] and not {}')
+# ガードを書いてあることだけを見ていると、応答側が別の式へ戻された改変を素通りする。
+# 実際に files へ渡している値が、ガードを通った変数そのものであることまで固定する。
+if 'files = $sourceFiles }' not in _files_route:
+    raise SystemExit('/api/submission-files must return the guarded variable, not a fresh expression')
+
+# 同じ展開が「フォルダーを選ぶ」の経路にも残っていた。こちらが利用者の主経路で、
+# 1件と数えられると app.js の `if (!availableFiles.length) await loadFilesSilently()`
+# が偽になり、取り直しもされないまま存在しない1件が並ぶ。
+# 取り消し分岐の return より後ろにあるため、次の経路までを範囲にする。
+_select_route = server.split("$path -eq '/api/submission/select-and-start'", 1)[1].split(
+    "$path -eq '/api/dialog/folder'", 1)[0]
+if 'Get-SourceCandidates' not in _select_route:
+    raise SystemExit('/api/submission/select-and-start must list the folder it just selected')
+if '$null -eq $selectedFiles' not in _select_route:
+    raise SystemExit('/api/submission/select-and-start must guard the empty list so it serializes as [] and not {}')
+if 'files = $selectedFiles }' not in _select_route:
+    raise SystemExit('/api/submission/select-and-start must return the guarded variable, not a fresh expression')
 
 # 診断の容量は AvailableFreeSpace(空き容量)。「使用容量」と書くと逆の意味になる。
 if '使用容量' in appjs:
