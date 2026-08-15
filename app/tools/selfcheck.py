@@ -1550,7 +1550,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260810_v180', 'style.css?v=20260810_v109']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260815_v181', 'style.css?v=20260815_v110']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1605,7 +1605,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260810_v180' not in html:
+if 'app.js?v=20260815_v181' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1631,7 +1631,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260810_v180' not in html:
+if 'app.js?v=20260815_v181' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1777,8 +1777,23 @@ for needed in ['id="manage-pack-templates-btn"', 'id="template-manager-modal"',
         raise SystemExit(f'user template UI is missing: {needed}')
 
 # 2026-08-03 two-axis comparison and quiet startup --------------------------
-if runtime_version != '2026.08.10.4':
-    raise SystemExit('release quality gate must bump the immutable runtime version')
+# ここには `runtime_version != '2026.08.10.4'` が置かれていた。「版番号を上げよ」と
+# 書いてありながら、実際には版番号をその値に固定する検査で、上げたときだけ落ちる。
+# 上げ忘れは素通りするため、配布対象を変えた #59 #60 を通してしまい、既に同じ版を
+# 持つPCへ修正が届かない状態になっていた。
+# 上げ忘れの判定には基準との差分が要るので ci-selfcheck.ps1 側に置いた。ここでは
+# その門と、門が働く前提が消えていないことだけを見る。
+if 'function Assert-RuntimeVersionBumped' not in ci_selfcheck:
+    raise SystemExit('ci-selfcheck.ps1 must keep the runtime version bump gate')
+if ci_selfcheck.count('Assert-RuntimeVersionBumped') < 2:
+    raise SystemExit('the runtime version bump gate must be called, not only defined')
+# 除外一覧を写しで持つと片方だけ直されてずれる。門は package-release.ps1 から読む。
+if 'function Get-ReleaseExcludedPaths' not in ci_selfcheck or 'Remove-ReleaseDevelopmentFiles' not in ci_selfcheck:
+    raise SystemExit('the bump gate must read the exclusion list from package-release.ps1')
+# 履歴が浅いと門は基準を解決できず、SKIPPED のまま通る。fast-gate だけ全履歴を取る。
+_fast_gate_job = ci_workflow.split('fast-gate:', 1)[1].split('full-suite:', 1)[0]
+if 'fetch-depth: 0' not in _fast_gate_job:
+    raise SystemExit('fast-gate must check out full history, or the bump gate silently skips')
 # 成果物の呼称は「提出用PDF」に統一する。サーバーの日本語 throw は加工されずに画面へ
 # 出るため、ここに旧称が残ると利用者が画面に無い言葉を見せられる。
 for _old_name in ['最終PDF', '正式版PDF']:

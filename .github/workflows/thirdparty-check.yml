@@ -36,6 +36,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          # 既定の fetch-depth: 1 では基準との差分が取れず、版番号の上げ忘れを見る
+          # 門(Assert-RuntimeVersionBumped)が「基準を解決できません」で素通りする。
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6

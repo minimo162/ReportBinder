@@ -114,8 +114,16 @@ function Remove-ReleaseDevelopmentFiles([string]$StageRoot) {
         'app\tools\scale-benchmark.ps1', 'docs\SCALE_BENCHMARK.md', 'docs\benchmarks',
         'app\tools\ci-selfcheck.ps1', 'app\tools\history-logic-selfcheck.ps1',
         'app\tools\create-pdf-diff-corpus.py', 'app\tools\pdf-diff-corpus-selfcheck.ps1',
-        'tests\pdf-diff-corpus.mjs', 'docs\PDF_DIFF_CORPUS.md',
+        'docs\PDF_DIFF_CORPUS.md',
         'app\tools\ci-requirements.txt',
+        # tests は丸ごと開発専用。ファイルを1本ずつ並べていたため
+        # tests\diff-regression.mjs が漏れて配布物に入っていた。追加のたびに
+        # ここへ書き足す形だと同じ取りこぼしが繰り返される。
+        'tests',
+        # ci-selfcheck.ps1 からしか呼ばれない開発専用。配布物へ混入していたうえ、
+        # 版番号の門から見ると「配布対象が変わった」と判定され、利用者の挙動が
+        # 1バイトも変わらない変更にまで版番号の更新を強いていた。
+        'app\tools\pack-lifecycle-selfcheck.ps1', 'app\tools\custom-pack-workflow-selfcheck.ps1',
         'app\tools\package-release.ps1'
     )) { Remove-PathIfExists (Join-Path $StageRoot $relativePath) }
 }

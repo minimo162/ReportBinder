@@ -106,13 +106,156 @@ function Assert-VersionDocumented {
     Write-Output ("Runtime version documented: {0}" -f $version)
 }
 
+# 配布物に入るファイルが変わったのに版番号が据え置きだと、既にその版を持つPCは
+# 共有フォルダーを読まずローカルコピーで起動し続ける。launch.ps1 の「ローカル版は
+# 最新か」の判定は installed.json / server.ps1 / web\app.js の**存在**だけを見て
+# おり、内容も日付も比べない。実際に #59 #60 の修正が届かない状態になっていた。
+#
+# 除外の判断は package-release.ps1 の除外一覧をその場で読んで行う。ここに写しを
+# 置くと、片方だけ直されたときに黙って判定がずれる。
+function Get-ReleaseExcludedPaths {
+    $packager = Join-Path $toolsRoot 'package-release.ps1'
+    $source = Get-Content -LiteralPath $packager -Raw -Encoding UTF8
+    $start = $source.IndexOf('function Remove-ReleaseDevelopmentFiles', [StringComparison]::Ordinal)
+    if ($start -lt 0) { throw 'package-release.ps1 に Remove-ReleaseDevelopmentFiles が見つかりません。除外一覧を読めないため版番号の門を判定できません。' }
+    # 終端は「次の関数定義」で切る。`)) {` のような書式そのものを目印にすると、
+    # 整形を1文字変えただけで窓が次の関数まで伸び、無関係な文字列を除外一覧として
+    # 拾ってしまう（'app' を拾うと全変更が除外され、門は緑のまま素通りする）。
+    $end = $source.IndexOf("`nfunction ", $start + 1, [StringComparison]::Ordinal)
+    if ($end -lt 0) { $end = $source.Length }
+    $paths = @([regex]::Matches($source.Substring($start, $end - $start), "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+    # 読み取りに失敗したまま「除外0件」で進むと全変更が配布対象扱いになり、逆に
+    # 一覧を広く拾いすぎると全変更が除外されて門が素通りする。どちらも黙って
+    # 起きるため、一覧が想定の形をしていることを錨で確かめてから使う。
+    foreach ($anchor in @('app\tools\selfcheck.py', 'app\tools\package-release.ps1', '.github')) {
+        if ($paths -notcontains $anchor) { throw "package-release.ps1 の除外一覧を正しく読み取れませんでした（$anchor が見つかりません／$($paths.Count) 件）。" }
+    }
+    # 読み取り窓が次の関数まで伸びて 'app' のような語を拾うと、app/ 配下が丸ごと
+    # 除外され、門は「配布対象の変更なし」と言って緑のまま素通りする。錨だけでは
+    # 拾いすぎを検知できない（錨も同じ一覧の中にあるため）ので、門を無力化する
+    # 項目そのものを名指しで拒む。tests のような正当な最上位ディレクトリは通す。
+    foreach ($path in $paths) {
+        if ($path.TrimEnd('\') -eq 'app') { throw 'package-release.ps1 の除外一覧が app 全体を指しています。読み取り範囲がずれている可能性があります。' }
+    }
+    return $paths
+}
+
+# 版番号は 2026.08.15.1 形式。数値の組にして大小を比べる。文字列比較だと
+# 2026.08.09.10 < 2026.08.09.9 になり、連番が2桁へ乗った日に判定が反転する。
+function ConvertTo-RuntimeVersionTuple([string]$Version) {
+    $m = [regex]::Match($Version, '^(\d{4})\.(\d{2})\.(\d{2})\.(\d+)$')
+    if (-not $m.Success) { return $null }
+    return @([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value, [int]$m.Groups[4].Value)
+}
+
+function Compare-RuntimeVersion($Left, $Right) {
+    for ($i = 0; $i -lt 4; $i++) {
+        if ($Left[$i] -ne $Right[$i]) { return ($Left[$i] - $Right[$i]) }
+    }
+    return 0
+}
+
+function Assert-RuntimeVersionBumped {
+    $baseRef = 'origin/main'
+    if (-not [string]::IsNullOrWhiteSpace($env:REPORTBINDER_BASE_REF)) { $baseRef = [string]$env:REPORTBINDER_BASE_REF }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_BASE_REF)) { $baseRef = 'origin/' + [string]$env:GITHUB_BASE_REF }
+
+    # native コマンドの stderr を 2>&1 で成功ストリームへ流すと、PowerShell 5.1 は
+    # 各行を ErrorRecord にする。$ErrorActionPreference='Stop' の下ではそれが終端
+    # エラーになり、下の SKIPPED 分岐へ一度も到達しない（.git の無いコピー、
+    # dubious ownership、git が PATH に無いときに必ず起きる）。混ぜないこと。
+    & git -C $repoRoot rev-parse --verify --quiet ($baseRef + '^{commit}') | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        # 解決できないまま素通りさせると門が無いのと同じになる。飛ばしたことを必ず出す。
+        Write-Output ("SKIPPED: runtime version bump gate ({0} を解決できません。履歴の取得設定を確認してください)" -f $baseRef)
+        return
+    }
+
+    # 三点は「基準から分岐したあとの変更」。squash マージ運用では、先行PRがマージ
+    # された時点で後続PRの merge-base が分岐元まで戻り、先行PRの変更が混ざる。
+    # 二点との積を取ると、基準側に既に同じ内容が入っているファイルが落ちる。
+    $threeDot = @(& git -C $repoRoot diff --name-only ($baseRef + '...HEAD') -- 'app/')
+    if ($LASTEXITCODE -ne 0) { throw '版番号の門: git diff (three-dot) に失敗しました。' }
+    $twoDot = @(& git -C $repoRoot diff --name-only $baseRef 'HEAD' -- 'app/')
+    if ($LASTEXITCODE -ne 0) { throw '版番号の門: git diff (two-dot) に失敗しました。' }
+    $changed = @($threeDot | Where-Object { $twoDot -contains $_ })
+
+    if ($changed.Count -eq 0) {
+        # app/ を触っていない変更まで、除外一覧の読み取り失敗で巻き添えにしない。
+        Write-Output ("Runtime version gate: app/ の変更なし（基準 {0}）" -f $baseRef)
+        return
+    }
+
+    $excluded = Get-ReleaseExcludedPaths
+    $shipping = @()
+    foreach ($entry in $changed) {
+        $rel = ([string]$entry).Trim()
+        if ($rel -eq '' -or $rel -eq 'app/runtime-version.json') { continue }
+        $win = $rel.Replace('/', '\')
+        $isExcluded = $false
+        foreach ($ex in $excluded) {
+            if ($win -eq $ex -or $win.StartsWith($ex + '\', [StringComparison]::OrdinalIgnoreCase)) { $isExcluded = $true; break }
+        }
+        if (-not $isExcluded) { $shipping += $rel }
+    }
+    if ($shipping.Count -eq 0) {
+        Write-Output ("Runtime version gate: 配布対象の変更なし（基準 {0}）" -f $baseRef)
+        return
+    }
+
+    $baseJson = (& git -C $repoRoot show ($baseRef + ':app/runtime-version.json'))
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output ("Runtime version gate: 基準 {0} に runtime-version.json がないため比較を省略します" -f $baseRef)
+        return
+    }
+    # HEAD 側もコミット済みの内容から読む。片方を作業ツリーから読むと、ローカルで
+    # 緑になった判定が push した途端に CI で落ちる（逆も起きる）。
+    $headJson = (& git -C $repoRoot show 'HEAD:app/runtime-version.json')
+    if ($LASTEXITCODE -ne 0) { throw '版番号の門: HEAD の runtime-version.json を読めませんでした。' }
+    $baseVersion = ([string](($baseJson -join "`n" | ConvertFrom-Json).version)).Trim()
+    $headVersion = ([string](($headJson -join "`n" | ConvertFrom-Json).version)).Trim()
+
+    $shown = ($shipping | Select-Object -First 10) -join ', '
+    if ($shipping.Count -gt 10) { $shown += (' ほか {0} 件' -f ($shipping.Count - 10)) }
+    $howTo = "app\runtime-version.json を上げ、CHANGELOG_V5.md に RuntimeVersion ``<新版>`` を書いてください。" +
+             "先行PRのマージ後に出た場合は、基準ブランチを取り込み直す(rebase)と消えることがあります。" +
+             ("`n対象: {0}" -f $shown)
+
+    $baseTuple = ConvertTo-RuntimeVersionTuple $baseVersion
+    $headTuple = ConvertTo-RuntimeVersionTuple $headVersion
+    if ($null -eq $baseTuple -or $null -eq $headTuple) {
+        throw ("版番号の門: 版番号を数値として読めません（基準 {0} / HEAD {1}）。" -f $baseVersion, $headVersion)
+    }
+    # 「変わっていれば通す」だと、巻き戻し(過去の版へ戻す)が素通りする。既にその版を
+    # 起動したPCには同名のローカルコピーがあり、launch.ps1 はそれを使い続けるため、
+    # 巻き戻しは据え置きと同じ結果になる。真に新しいことを要求する。
+    if ((Compare-RuntimeVersion $headTuple $baseTuple) -le 0) {
+        throw ("配布対象のファイルが変わりましたが、RuntimeVersion {0} は基準の {1} より新しくありません。" -f $headVersion, $baseVersion) +
+              "既にその版を起動したPCにはローカルコピーが残っており、共有フォルダーを読まないため変更は届きません。" + $howTo
+    }
+    # 同じ日に2つのPRが同じ連番を選ぶと、両方ともこの門を通り、後からマージされた
+    # 側の変更が永久に届かなくなる（#59 #60 と同じ結末）。基準時点の CHANGELOG に
+    # 既に書かれている版番号は、他のPRが使い終えたものとみなして拒む。
+    $baseChangelog = (& git -C $repoRoot show ($baseRef + ':CHANGELOG_V5.md'))
+    if ($LASTEXITCODE -eq 0) {
+        $needle = 'RuntimeVersion `' + $headVersion + '`'
+        if (($baseChangelog -join "`n").Contains($needle)) {
+            throw ("RuntimeVersion {0} は基準 {1} の CHANGELOG_V5.md に既にあります。" -f $headVersion, $baseRef) +
+                  "同じ版番号を2度使うと、先に配った側を起動したPCへ後の変更が届きません。次の連番を使ってください。" + $howTo
+        }
+    }
+    Write-Output ("Runtime version gate: {0} -> {1}（配布対象 {2} 件）" -f $baseVersion, $headVersion, $shipping.Count)
+}
+
 function Assert-PackageContents([string]$OutputRoot) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
     $forbiddenFragments = @(
         'app/tools/selfcheck.py', 'app/tools/ci-selfcheck.ps1', 'app/tools/ci-requirements.txt', 'app/tools/fixtures/',
         'app/tools/scale-benchmark.ps1', 'app/tools/history-logic-selfcheck.ps1',
         'app/tools/create-pdf-diff-corpus.py', 'app/tools/pdf-diff-corpus-selfcheck.ps1',
-        'tests/pdf-diff-corpus.mjs', 'docs/PDF_DIFF_CORPUS.md', 'docs/benchmarks/', '.github/'
+        'app/tools/pack-lifecycle-selfcheck.ps1', 'app/tools/custom-pack-workflow-selfcheck.ps1',
+        'tests/',
+        'docs/PDF_DIFF_CORPUS.md', 'docs/benchmarks/', '.github/'
     )
     $archives = @(Get-ChildItem -LiteralPath $OutputRoot -File -Filter '*.zip')
     if ($archives.Count -ne 2) { throw "Expected two ZIP releases, found $($archives.Count)." }
@@ -156,6 +299,7 @@ $node = (Get-Command node.exe -ErrorAction Stop).Source
 try {
     Assert-PowerShellSyntax
     Assert-VersionDocumented
+    Assert-RuntimeVersionBumped
 
     if ($Scope -eq 'Fast') {
         Remove-CiGeneratedFiles
