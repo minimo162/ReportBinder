@@ -116,6 +116,10 @@ let activeView = (() => {
 let fileFilterText = '';
 const pdfObjectUrls = new Set();
 let noticeTimer = null;
+// hideMessage() のフェードアウト完了タイマー。取り消せないままだと、直後に出した
+// 通知を180ms後に消してしまう（setActiveView が hideMessage を呼ぶため、画面遷移を
+// 伴う案内がこれに当たる）。showMessage 側で必ず取り消す。
+let noticeHideTimer = null;
 let lastPageBoardRenderSignature = '';
 let modalReturnFocus = null;
 let confirmReturnFocus = null;
@@ -524,6 +528,7 @@ function hasUsefulDetail(detail) {
 function showMessage(type, title, message, detail, actions=[], autoHideMs=null) {
   const box = $('notice');
   if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+  if (noticeHideTimer) { clearTimeout(noticeHideTimer); noticeHideTimer = null; }
   if (type === 'danger') {
     if (box) box.classList.add('hidden');
     showErrorPanel(title, message, detail || message, actions);
@@ -572,7 +577,8 @@ function hideMessage() {
   const box = $('notice');
   if (!box || box.classList.contains('hidden')) return;
   box.classList.add('fade-out');
-  setTimeout(() => box.classList.add('hidden'), 180);
+  if (noticeHideTimer) clearTimeout(noticeHideTimer);
+  noticeHideTimer = setTimeout(() => { noticeHideTimer = null; box.classList.add('hidden'); }, 180);
 }
 
 function extractErrorItems(detail, fallbackMessage='') {
@@ -1226,13 +1232,21 @@ function renderPackRequiredState(){
     button.disabled=false;
     button.classList.toggle('nav-locked',locked);
     button.setAttribute('aria-disabled',String(locked));
-    button.title=locked?'先に原稿フォルダーを設定し、一式を作成してください':'';
+    // 鍵の条件は「一式が無い」だけなのに、文言は常に原稿フォルダーの設定から要求していた。
+    // フォルダーを選び終えた直後の人には、済ませた手順をもう一度やれと読める。
+    button.title=locked?(configured()?'先に今回まとめる一式に名前を付けてください':'先に原稿フォルダーを設定し、一式を作成してください'):'';
   });
   if(!hasPack&&!PACK_FREE_VIEWS.includes(activeView))setActiveView('dashboard',{noScroll:true});
 }
 function explainPackRequired(){
   setActiveView('dashboard');
-  showMessage('warn','先に一式を作成してください','原稿フォルダーを選び、今回まとめる一式に名前を付けると、ページ構成と提出用PDFに進めます。',null,[{label:'原稿フォルダーを選ぶ',primary:true,handler:()=>setActiveView('excel')}],0);
+  // 案内も次の一手も、まだ済んでいない手順だけを指す。フォルダー設定済みで
+  // 「原稿フォルダーを選ぶ」へ送ると、既に埋まっている画面に着いて手が止まる。
+  const ready=configured();
+  showMessage('warn','先に一式を作成してください',
+    ready?'今回まとめる一式に名前を付けると、ページ構成と提出用PDFに進めます。':'原稿フォルダーを選び、今回まとめる一式に名前を付けると、ページ構成と提出用PDFに進めます。',
+    null,
+    [ready?{label:'一式に名前を付ける',primary:true,handler:()=>openPackEditor('create')}:{label:'原稿フォルダーを選ぶ',primary:true,handler:()=>setActiveView('excel')}],0);
 }
 function setStepState(id, kind, fallback) {
   const el=$(id); if(!el) return;
@@ -5098,8 +5112,13 @@ async function publishFinalVolume(volume,btn) {
     const custom=!activePackIsBuiltIn();
     const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
     const result=response.result||{};
+    // 発行フォルダー名だけでは、どのドライブのどこに出来たのか画面から辿れない。
+    // 第4引数の detail は danger 以外では描かれないので、そこに載せても出ない。
+    // sharedPath はサーバーが返しているので、ローカル出力の通知と同じ形に揃える。
     showMessage('ok',`${volumeLabel(volume)}PDFを共有用フォルダーにコピーしました`,
-      `${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
+      result.sharedPath
+        ?`${String(result.sharedPath)} に保存しました。`
+        :`${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
       result,[],0);
   });
 }

@@ -8693,7 +8693,9 @@ function Handle-Api($Context) {
             $body = Read-BodyJson $Context.Request
             $initial = [string]$body.initialDir
             if ([string]::IsNullOrWhiteSpace($initial)) { $initial = [string](Get-Paths).submissionDir }
-            $selected = Select-FolderDialog '提出フォルダを選択' $initial
+            # 画面はこのフォルダーを一貫して「原稿フォルダー」と呼ぶ。押したボタンと
+            # 開いたダイアログで呼び名が変わると、選ぶ対象を取り違える。
+            $selected = Select-FolderDialog '原稿フォルダーを選ぶ' $initial
             if ([string]::IsNullOrWhiteSpace($selected)) {
                 Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; cancelled = $true; state = (Get-StatePayload $language) }); return
             }
@@ -8705,7 +8707,12 @@ function Handle-Api($Context) {
             $config.lastDataDir = [string]$newPaths.dataDir
             $config.lastOutputDir = [string]$newPaths.outputDir
             Save-AppConfig $config
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; migration = $migration; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = (Get-SourceCandidates @('excel','word','pdf','powerpoint')) }); return
+            # /api/submission-files と同じ空配列の展開が起きる。こちらが「フォルダーを
+            # 選ぶ」を押した人が通る主経路で、原稿0件のフォルダーを選ぶと files が
+            # {} になり、画面側は1件と数えて再取得(loadFilesSilently)も飛ばしていた。
+            $selectedFiles = Get-SourceCandidates @('excel','word','pdf','powerpoint')
+            if ($null -eq $selectedFiles) { $selectedFiles = @() }
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; paths = $newPaths; path = [string]$newPaths.submissionDir; migration = $migration; state = (Get-StatePayload $language); scannedAt = (New-NowIso); files = $selectedFiles }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/dialog/folder') {
             $body = Read-BodyJson $Context.Request
