@@ -3042,8 +3042,13 @@ function New-WorkbookObject([string]$RelativePath, [string]$Language, [string]$C
         displayName = $item.Name
         category = $categoryNormalized
         sourceType = 'excel'
-        excelSheetSelectionMode = 'all-visible'
-        lastRenderedSheetSelectionMode = 'all-visible'
+        # New Excel registrations follow the operational convention that only
+        # half-width digit sheet names are submission pages.  Keep the mode
+        # explicit in the persisted record so older records (which may not
+        # have this property at all) can retain their legacy all-visible
+        # behavior during Repair-StructurePages.
+        excelSheetSelectionMode = 'numeric-only'
+        lastRenderedSheetSelectionMode = 'numeric-only'
         currentExcelModifiedAt = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz')
         currentExcelLastWriteUtcTicks = [string]$item.LastWriteTimeUtc.Ticks
         currentExcelSize = $item.Length
@@ -3491,6 +3496,65 @@ function Test-StrictNumericSheetName([string]$SheetName) {
     return ($raw.Length -gt 0 -and $raw -match '^[0-9]+$' -and $raw -notmatch '[\r\n]')
 }
 
+function Get-NumericSheetSortRank($Page, $WorkbookMap) {
+    $workbookId = [string](Get-DataProperty $Page 'workbookId' '')
+    $workbook = if ($null -ne $WorkbookMap -and $WorkbookMap.ContainsKey($workbookId)) { $WorkbookMap[$workbookId] } else { $null }
+    $sourceType = [string](Get-DataProperty $workbook 'sourceType' 'excel')
+    $sheetName = [string](Get-DataProperty $Page 'sheetName' '')
+    $sheetHidden = [bool](Get-DataProperty $Page 'sheetHidden' $false)
+    if ($sourceType -ne 'excel' -or $sheetHidden -or -not (Test-StrictNumericSheetName $sheetName)) {
+        return [pscustomobject]@{ rank = 1; length = 999999; ordinal = ''; fileOrder = 999999; fileName = ''; sheetIndex = (Get-PageSheetIndex $Page); pageId = (Resolve-PageId $Page) }
+    }
+    # Do not cast to Int64/Double: workbook conventions can use arbitrary
+    # digit lengths. Canonical length then ordinal comparison gives 2 < 10
+    # and remains correct for 31+ digit sheet names.
+    $ordinal = ($sheetName -replace '^0+', '')
+    if ([string]::IsNullOrWhiteSpace($ordinal)) { $ordinal = '0' }
+    return [pscustomobject]@{
+        rank = 0
+        length = $ordinal.Length
+        ordinal = $ordinal
+        fileOrder = Get-FileOrderNumber ([string](Get-DataProperty $workbook 'fileName' ''))
+        fileName = [string](Get-DataProperty $workbook 'fileName' '')
+        sheetIndex = (Get-PageSheetIndex $Page)
+        pageId = (Resolve-PageId $Page)
+    }
+}
+
+function Sort-PagesByNumericDefault($Pages, $WorkbookMap) {
+    $items = @($Pages)
+    if ($items.Count -le 1) { return $items }
+    return @($items | Sort-Object `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).rank }; Ascending=$true}, `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).length }; Ascending=$true}, `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).ordinal }; Ascending=$true}, `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).fileOrder }; Ascending=$true}, `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).fileName }; Ascending=$true}, `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).sheetIndex }; Ascending=$true}, `
+        @{Expression={ (Get-NumericSheetSortRank $_ $WorkbookMap).pageId }; Ascending=$true})
+}
+
+function Sort-NumericPagesWithinAnchors($Pages, $WorkbookMap) {
+    # Explicit re-sorting is intentionally narrower than the old tab-order
+    # action: only numeric Excel pages move. Word/PDF pages, non-numeric Excel
+    # pages, and other in-lane anchors stay in their existing slots.
+    $items = @($Pages)
+    $numeric = @($items | Where-Object { (Get-NumericSheetSortRank $_ $WorkbookMap).rank -eq 0 })
+    if ($numeric.Count -le 1) { return $items }
+    $sortedNumeric = @(Sort-PagesByNumericDefault $numeric $WorkbookMap)
+    $result = New-Object System.Collections.Generic.List[object]
+    $numericIndex = 0
+    foreach ($item in $items) {
+        if ((Get-NumericSheetSortRank $item $WorkbookMap).rank -eq 0) {
+            [void]$result.Add($sortedNumeric[$numericIndex])
+            $numericIndex++
+        } else {
+            [void]$result.Add($item)
+        }
+    }
+    return $result.ToArray()
+}
+
 function Set-ExcludedSheetPagesNotRendered($Structure, [string]$WorkbookId, [string[]]$ExcludedSheetNames, [string]$SelectionMode = 'numeric-only') {
     if ((Normalize-ExcelSheetSelection $SelectionMode) -ne 'numeric-only') { return }
     $excluded = @($ExcludedSheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -3931,33 +3995,63 @@ function Renumber-VolumeOrder($Structure, [string]$Volume, [string]$Category) {
 function Insert-PageInSheetOrder($Structure, $NewPage, [string]$Volume, [string]$Category) {
     $scope = Resolve-DocumentPackScope $Structure $Category $true
     $existing = @(Renumber-VolumeOrder $Structure $Volume ([string]$scope.packId))
-    $manual = @($existing | Where-Object { [bool](Get-DataProperty $_ 'orderManual' $false) }).Count -gt 0
+    $workbookMap = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks)) { $workbookMap[[string](Get-DataProperty $wb 'workbookId' '')] = $wb }
+    $newRank = Get-NumericSheetSortRank $NewPage $workbookMap
+    $newIsNumeric = $newRank.rank -eq 0
+    $numericExisting = @($existing | Where-Object { (Get-NumericSheetSortRank $_ $workbookMap).rank -eq 0 })
+    $numericSorted = @(Sort-PagesByNumericDefault $numericExisting $workbookMap)
     $ordered = New-Object System.Collections.Generic.List[object]
-    foreach ($p in $existing) { [void]$ordered.Add($p) }
-    $insertedAtEnd = $manual
-    if ($manual -or $existing.Count -eq 0) {
-        [void]$ordered.Add($NewPage)
-    } else {
-        $newWb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$NewPage.workbookId } | Select-Object -First 1)
-        $newFile = if ($newWb.Count) { [string]$newWb[0].fileName } else { '' }
-        $newFileOrder = Get-FileOrderNumber $newFile
-        $newSheetIndex = Get-PageSheetIndex $NewPage
-        $at = $existing.Count
-        for ($i=0; $i -lt $existing.Count; $i++) {
-            $p = $existing[$i]
-            $wb = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$p.workbookId } | Select-Object -First 1)
-            $file = if ($wb.Count) { [string]$wb[0].fileName } else { '' }
-            $fileOrder = Get-FileOrderNumber $file
-            $sheetIndex = Get-PageSheetIndex $p
-            $fileCompare = [StringComparer]::OrdinalIgnoreCase.Compare($file, $newFile)
-            if ($fileOrder -gt $newFileOrder -or
-                ($fileOrder -eq $newFileOrder -and $fileCompare -gt 0) -or
-                ($fileOrder -eq $newFileOrder -and $fileCompare -eq 0 -and $sheetIndex -gt $newSheetIndex)) {
-                $at = $i
-                break
+    $insertedAtEnd = $false
+    if ($newIsNumeric) {
+        # A cover/Word/PDF page is an anchor. Replace only existing numeric
+        # slots with the sorted numeric sequence; if the new page creates one
+        # extra numeric item, put it directly after the last numeric slot (or
+        # at the end when this lane had no numeric slot at all).
+        $manualNumeric = (($numericExisting | ForEach-Object { Resolve-PageId $_ }) -join "`n") -ne (($numericSorted | ForEach-Object { Resolve-PageId $_ }) -join "`n")
+        if ($manualNumeric) {
+            foreach ($p in $existing) { [void]$ordered.Add($p) }
+            [void]$ordered.Add($NewPage)
+            $insertedAtEnd = $true
+        } else {
+            $withNew = @($numericExisting) + @($NewPage)
+            $sortedWithNew = @(Sort-PagesByNumericDefault $withNew $workbookMap)
+            $numericIndex = 0
+            $lastNumericSlot = -1
+            foreach ($p in $existing) {
+                if ((Get-NumericSheetSortRank $p $workbookMap).rank -eq 0) {
+                    [void]$ordered.Add($sortedWithNew[$numericIndex]); $numericIndex++; $lastNumericSlot = $ordered.Count - 1
+                } else { [void]$ordered.Add($p) }
             }
+            if ($numericIndex -lt $sortedWithNew.Count) {
+                $ordered.Insert($lastNumericSlot + 1, $sortedWithNew[$numericIndex])
+            }
+            $insertedAtEnd = ($numericExisting.Count -eq 0)
         }
-        $ordered.Insert($at, $NewPage)
+    } else {
+        # Preserve the legacy deterministic insertion behavior for nonnumeric
+        # Excel and non-Excel pages; only numeric Excel pages use the numeric
+        # convention above.
+        $manual = @($existing | Where-Object { [bool](Get-DataProperty $_ 'orderManual' $false) }).Count -gt 0
+        foreach ($p in $existing) { [void]$ordered.Add($p) }
+        if ($manual -or $existing.Count -eq 0) {
+            [void]$ordered.Add($NewPage); $insertedAtEnd = $true
+        } else {
+            $newWorkbook = if ($workbookMap.ContainsKey([string](Get-DataProperty $NewPage 'workbookId' ''))) { $workbookMap[[string](Get-DataProperty $NewPage 'workbookId' '')] } else { $null }
+            $newFileOrder = Get-FileOrderNumber ([string](Get-DataProperty $newWorkbook 'fileName' ''))
+            $newFileName = [string](Get-DataProperty $newWorkbook 'fileName' '')
+            $newSheetIndex = Get-PageSheetIndex $NewPage
+            $at = $existing.Count
+            for ($i=0; $i -lt $existing.Count; $i++) {
+                $p = $existing[$i]; $wb = if ($workbookMap.ContainsKey([string](Get-DataProperty $p 'workbookId' ''))) { $workbookMap[[string](Get-DataProperty $p 'workbookId' '')] } else { $null }
+                $compare = Get-FileOrderNumber ([string](Get-DataProperty $wb 'fileName' '')) - $newFileOrder
+                if ($compare -eq 0) { $compare = [StringComparer]::OrdinalIgnoreCase.Compare([string](Get-DataProperty $wb 'fileName' ''), $newFileName) }
+                if ($compare -eq 0) { $compare = (Get-PageSheetIndex $p) - $newSheetIndex }
+                if ($compare -eq 0) { $compare = [StringComparer]::Ordinal.Compare((Resolve-PageId $p), (Resolve-PageId $NewPage)) }
+                if ($compare -gt 0) { $at = $i; break }
+            }
+            $ordered.Insert($at, $NewPage)
+        }
     }
     for ($i=0; $i -lt $ordered.Count; $i++) { Set-NoteProperty $ordered[$i] 'order' (($i+1)*10) }
     return [ordered]@{ insertedAtEnd=$insertedAtEnd; pages=$ordered.ToArray() }
@@ -4360,6 +4454,26 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
     }
 
     $pagePack = (Resolve-DocumentPackScope $Structure $packId $true).pack
+    # New workbooks start in the numeric-sheet convention. On an untouched
+    # lane, normalize existing pages as well as newly inserted pages so the
+    # first page-composition view is numeric without changing any assignment.
+    # Once a user has manually arranged a lane, preserve that lane verbatim on
+    # later PDF refreshes.
+    $workbookMap = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $packId })) {
+        $workbookMap[[string](Get-DataProperty $wb 'workbookId' '')] = $wb
+    }
+    foreach ($volume in @(Get-PackVolumeList $Language $pagePack $true)) {
+        $lane = @(Get-Array $Structure.pages | Where-Object {
+            $workbookMap.ContainsKey([string](Get-DataProperty $_ 'workbookId' '')) -and (
+                ($volume -eq 'none' -and ([string](Get-DataProperty $_ 'volume' 'none') -eq 'none' -or (Get-DataProperty $_ 'enabled' $true) -eq $false)) -or
+                ($volume -ne 'none' -and [string](Get-DataProperty $_ 'volume' '') -eq $volume -and (Get-DataProperty $_ 'enabled' $true) -ne $false)
+            )
+        } | Sort-Object @{Expression={ [double](Get-DataProperty $_ 'order' 0) };Ascending=$true}, @{Expression={ Resolve-PageId $_ };Ascending=$true})
+        if ($lane.Count -eq 0 -or @($lane | Where-Object { [bool](Get-DataProperty $_ 'orderManual' $false) }).Count -gt 0) { continue }
+        $sortedLane = @(Sort-NumericPagesWithinAnchors $lane $workbookMap)
+        for ($i = 0; $i -lt $sortedLane.Count; $i++) { Set-NoteProperty $sortedLane[$i] 'order' (($i + 1) * 10) }
+    }
     foreach ($volume in @(Get-PackVolumeList $Language $pagePack $true)) { [void](Renumber-VolumeOrder $Structure $volume $packId) }
     if ($removed.Count -gt 0) {
         $affected = @($removed | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
@@ -7281,8 +7395,9 @@ function Confirm-Page([string]$Language, $Body) {
 }
 
 
-function Sort-PagesBySheet([string]$Language, $Body) {
+function Sort-PagesByNumericSheet([string]$Language, $Body) {
     $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
+    $baseLayout = Get-RequestedBaseLayout $Body
     return Update-StructureLocked $Language {
         param($structure)
         $cat = [string](Resolve-DocumentPackScope $structure $requestedScope $false).packId
@@ -7306,17 +7421,18 @@ function Sort-PagesBySheet([string]$Language, $Body) {
                     ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
                 )
             } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_})
-            $sorted = @($current | Sort-Object @{Expression={Get-FileOrderNumber ([string]$wbMap[[string]$_.workbookId].fileName)};Ascending=$true}, @{Expression={[string]$wbMap[[string]$_.workbookId].fileName};Ascending=$true}, @{Expression={Get-PageSheetIndex $_};Ascending=$true}, @{Expression={[string]$_.sheetName};Ascending=$true}, @{Expression={Resolve-PageId $_};Ascending=$true})
+            $sorted = @(Sort-NumericPagesWithinAnchors $current $wbMap)
             $beforeIds = @($current | ForEach-Object { Resolve-PageId $_ })
             $afterIds = @($sorted | ForEach-Object { Resolve-PageId $_ })
+            # A sequence-equal lane is a true no-op, even if an older reorder
+            # request left orderManual markers behind. Resetting flags alone
+            # would create a misleading history entry and an undo with no
+            # visible layout to restore.
             $inputChanged = (($beforeIds -join [Environment]::NewLine) -ne ($afterIds -join [Environment]::NewLine))
-            if ($inputChanged -and [string]::IsNullOrWhiteSpace($layoutSnapshotId)) { $layoutSnapshotId = Save-LayoutSnapshot $Language $cat 'sort-by-sheet' $structure }
+            if (-not $inputChanged) { continue }
+            if ([string]::IsNullOrWhiteSpace($layoutSnapshotId)) { $layoutSnapshotId = Save-LayoutSnapshot $Language $cat 'sort-by-numeric-sheet' $structure }
             for ($i=0; $i -lt $sorted.Count; $i++) {
                 $expected = ($i + 1) * 10
-                if ([double](Get-DataProperty $sorted[$i] 'order' 0) -ne $expected) {
-                    if ([string]::IsNullOrWhiteSpace($layoutSnapshotId)) { $layoutSnapshotId = Save-LayoutSnapshot $Language $cat 'sort-by-sheet' $structure }
-                    $inputChanged = $true
-                }
                 Set-NoteProperty $sorted[$i] 'order' $expected
                 Set-NoteProperty $sorted[$i] 'orderManual' $false
                 Set-NoteProperty $sorted[$i] 'updatedAt' (New-NowIso)
@@ -7325,10 +7441,10 @@ function Sort-PagesBySheet([string]$Language, $Body) {
         }
         Apply-DefaultNumberingPerVolume $Language $structure $cat
         if ($affected.Count -gt 0) {
-            Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページをExcelのシート順に並べ替えました'
+            Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページを半角数字シート順に並べ替えました'
         }
         return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; packId=$cat; category=(Get-CategoryFromBuiltinPackId $cat); affectedVolumes=@($affected); layoutSnapshotId=$layoutSnapshotId }
-    }
+    } $baseLayout $requestedScope
 }
 
 function Resolve-JavaExe {
@@ -9039,9 +9155,12 @@ function Handle-Api($Context) {
             $body = Read-BodyJson $Context.Request
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Reorder-Pages $language $body) }); return
         }
-        if ($method -eq 'POST' -and $path -eq '/api/pages/sort-by-sheet') {
+        if ($method -eq 'POST' -and $path -in @('/api/pages/sort-by-numeric-sheet','/api/pages/sort-by-sheet')) {
             $body=Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 ([ordered]@{ok=$true;result=(Sort-PagesBySheet $language $body)});return
+            # Keep the old route as a compatibility alias. Its behavior is now
+            # explicitly half-width numeric-sheet ordering rather than Excel
+            # tab order.
+            Write-JsonResponse $Context 200 ([ordered]@{ok=$true;result=(Sort-PagesByNumericSheet $language $body)});return
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/update') {
             $body = Read-BodyJson $Context.Request
