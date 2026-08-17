@@ -296,6 +296,7 @@ def test_page_composition_ui_contracts():
     app = (root / "app/web/app.js").read_text(encoding="utf-8")
     html = (root / "app/web/index.html").read_text(encoding="utf-8")
     css = (root / "app/web/style.css").read_text(encoding="utf-8")
+    server = (root / "app/server.ps1").read_text(encoding="utf-8-sig")
     sort_action = extract_js_function(app, "sortPagesByNumericSheet")
     assert "if(numericBefore)" in sort_action
     assert "hasManualFlags" not in sort_action
@@ -361,6 +362,8 @@ def test_page_composition_ui_contracts():
     assert "pages.length>=12?'high-volume':''" not in app
     assert ".volume-panel.high-volume" not in css
     assert "grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1fr))" in css
+    assert ".volume-panel:not(.inbox) .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}" in css
+    assert ".volume-panel.inbox .thumbnail-grid{grid-template-columns:1fr}" in css
     assert ".thumbnail-board .page-thumb-card,.detail-board .page-row{-webkit-user-select:none;user-select:none}" in css
     assert '[contenteditable="true"]){-webkit-user-select:text;user-select:text}' in css
     assert "requestBaseLayout=activeLayoutFingerprint(requestPackId)" in app
@@ -369,6 +372,24 @@ def test_page_composition_ui_contracts():
     assert "if(requestBaseLayout)body.baseLayout=requestBaseLayout" in collect_action
     assert "waitForQueuedPageLayoutMutation" in app
     assert "pageMutationBusy=true;updateBulkSelectionLabel()" in app
+    assert "function pageChangeBadge" not in app
+    assert "function reviewChip" not in app
+    assert "変換PDFの更新が必要" in app
+    assert "function deletePack" in app
+    assert 'data-pack-action="delete"' in app
+    assert "method:'DELETE'" in app
+    assert "提出フォルダーへ出力済みのPDFは削除しません" in app
+
+    remove_pack = server.split("function Remove-DocumentPack", 1)[1].split("\nfunction ", 1)[0]
+    assert "if (-not (Test-PackArchived $pack))" in remove_pack
+    assert "sourceFilesDeleted=$false" in remove_pack
+    assert "Set-NoteProperty $structure 'packs'" in remove_pack
+    assert "Set-NoteProperty $structure 'workbooks'" in remove_pack
+    assert "Set-NoteProperty $structure 'pages'" in remove_pack
+    assert "Set-NoteProperty $structure 'outputs'" in remove_pack
+    assert "if ($method -eq 'DELETE' -and $path -match '^/api/v2/packs/([^/]+)$')" in server
+    pack_dashboard = server.split("function Get-PackProgressDashboard", 1)[1].split("\nfunction ", 1)[0]
+    assert "Test-WorkbookRenderIsCurrent" in pack_dashboard
 
 
 if __name__ == "__main__":

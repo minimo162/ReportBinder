@@ -255,8 +255,15 @@ for needed in ["^/api/v2/packs/([^/]+)/review$", 'function Get-PackReviewSnapsho
     review_sources = server + (root/'app/web/index.html').read_text(encoding='utf-8') + (root/'app/web/app.js').read_text(encoding='utf-8-sig')
     if needed not in review_sources: raise SystemExit(f'personal confirmation record UI missing: {needed}')
 for needle in ['function New-DocumentPack', 'function Copy-DocumentPack', 'function Set-DocumentPackArchived',
-               "^/api/v2/packs/([^/]+)/duplicate$", "^/api/v2/packs/([^/]+)/archive$", "^/api/v2/packs/([^/]+)/restore$"]:
+               'function Remove-DocumentPack', "^/api/v2/packs/([^/]+)/duplicate$", "^/api/v2/packs/([^/]+)/archive$",
+               "^/api/v2/packs/([^/]+)/restore$", "^/api/v2/packs/([^/]+)$"]:
     if needle not in server: raise SystemExit(f'pack lifecycle API missing: {needle}')
+_remove_pack = server.split('function Remove-DocumentPack', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['if (-not (Test-PackArchived $pack))', "sourceFilesDeleted=$false",
+               "Set-NoteProperty $structure 'packs'", "Set-NoteProperty $structure 'workbooks'",
+               "Set-NoteProperty $structure 'pages'", "Set-NoteProperty $structure 'outputs'"]:
+    if needed not in _remove_pack:
+        raise SystemExit(f'archived pack deletion safety contract missing: {needed}')
 for needle in [
     'Update-StructureLocked','Read-StructureUnlocked','Write-StructureUnlocked','Initialize-Or-MigrateStructure','structure.json.v1.bak',
     'Get-VolumeStateKey','builtFingerprint','Get-FinalBuildInputSnapshot','contentPdfLastWriteUtcTicks','contentPdfSize',
@@ -328,8 +335,20 @@ if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commi
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
 for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','sortPagesByNumericSheet','/api/pages/sort-by-numeric-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor','data-thumb-page-range','savePackSettings','pack-output-pattern']:
     if needle not in appjs: raise SystemExit(f'ui feature not found: {needle}')
-for needle in ['function renderPackSwitcher', 'function openPackEditor', 'function submitPackEditor', 'function duplicatePack', 'function archivePack', 'function restorePack', 'includeArchived=true', 'ReportBinderPackId']:
+for needle in ['function renderPackSwitcher', 'function openPackEditor', 'function submitPackEditor', 'function duplicatePack', 'function archivePack', 'function restorePack', 'function deletePack', 'includeArchived=true', 'ReportBinderPackId']:
     if needle not in appjs: raise SystemExit(f'pack management UI behavior missing: {needle}')
+for needed in ['data-pack-action="delete"', "method:'DELETE'", '提出フォルダーへ出力済みのPDFは削除しません']:
+    if needed not in appjs:
+        raise SystemExit(f'archived pack deletion UI missing: {needed}')
+if 'function reviewChip' in appjs or '${reviewChip(' in appjs:
+    raise SystemExit('the unclear personal 未確認 chip must not appear on Home')
+if 'function pageChangeBadge' in appjs:
+    raise SystemExit('page cards must not show the redundant 変更あり tag')
+if '変換PDFの更新が必要' not in appjs:
+    raise SystemExit('Home must describe render freshness as an actionable PDF update')
+_pack_dashboard = server.split('function Get-PackProgressDashboard', 1)[1].split('\nfunction ', 1)[0]
+if 'Test-WorkbookRenderIsCurrent' not in _pack_dashboard:
+    raise SystemExit('Home render status must use the canonical workbook freshness check')
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
 if "body:{volumes:collectBoardVolumes()}" in appjs: raise SystemExit('page reorder must send category')
@@ -360,7 +379,9 @@ css=(root/'app/web/style.css').read_text(encoding='utf-8')
 for needed in ['grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1fr))',
                '.thumbnail-board .page-thumb-card,.detail-board .page-row{-webkit-user-select:none;user-select:none}',
                '[contenteditable="true"]){-webkit-user-select:text;user-select:text}',
-               '.thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}']:
+               '.thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}',
+               '.volume-panel:not(.inbox) .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}',
+               '.volume-panel.inbox .thumbnail-grid{grid-template-columns:1fr}']:
     if needed not in appjs + css:
         raise SystemExit(f'20-page lane density or pointer scrolling contract missing: {needed}')
 if "pages.length>=12?'high-volume':''" in appjs or '.volume-panel.high-volume' in css:
@@ -1568,7 +1589,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v188', 'style.css?v=20260817_v118']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v189', 'style.css?v=20260817_v119']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1623,7 +1644,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260817_v188' not in html:
+if 'app.js?v=20260817_v189' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1649,7 +1670,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260817_v188' not in html:
+if 'app.js?v=20260817_v189' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
