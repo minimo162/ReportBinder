@@ -333,10 +333,10 @@ for needle in ['function renderPackSwitcher', 'function openPackEditor', 'functi
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
 if "body:{volumes:collectBoardVolumes()}" in appjs: raise SystemExit('page reorder must send category')
-if 'class="drag-handle page-thumb-drag"' in appjs:
-    raise SystemExit('thumbnail drag handle must not cover the page preview')
-if 'class="sr-only" type="checkbox" data-page-check' not in appjs:
-    raise SystemExit('thumbnail selection must remain keyboard-accessible without a visible overlay')
+if 'class="drag-handle page-thumb-drag"' not in appjs or 'if (!fromHandle) return' not in appjs:
+    raise SystemExit('thumbnail drag must start from its explicit handle only')
+if 'class="page-thumb-check"' not in appjs or 'type="checkbox" data-page-check' not in appjs:
+    raise SystemExit('thumbnail selection must use an explicit checkbox')
 
 html=(root/'app/web/index.html').read_text(encoding='utf-8')
 for needle in ['workspace-top','step-bar','id="pack-menu-button"','id="pack-menu-list"','id="create-pack-btn"','id="pack-editor-modal"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','id="final-target-grid"','id="bulk-target-buttons"','notice-actions','app-menu-popover','<symbol id="i-home"','<symbol id="i-edit"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"','id="page-view-thumbnail-btn"','id="page-layout-undo-btn"','id="page-command-bar"','id="page-search-input"','id="page-thumbnail-size"']:
