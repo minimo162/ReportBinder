@@ -48,9 +48,9 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/sources/register-batch`: 複数形式の原稿を一括登録する
 - `POST /api/v2/sources/unregister`: `sourceId`で登録解除する
 - `POST /api/v2/sources/scan-updates`: 登録済み原稿の更新を検出する
-- `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する
-- `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する
-- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。`baseLayout`を指定した場合は競合を検出する
+- `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する。Excelは保存済みの`excelSheetSelectionMode`（`all-visible`既定、または`numeric-only`）をジョブへ固定する。必要ならリクエストにも同名項目を指定できる
+- `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する。Excelでは`excelSheetSelectionMode`も指定でき、`numeric-only`はシート名がstrictな`^[0-9]+$`の表示シートだけをPDF化する。対象が0件の場合はPDF・ページ構成を変更せずエラーにする
+- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。ページ画面の「半角数字シートをまとめる」はこのAPIを使い、Excelのstrictな半角数字シートを数字順に指定先へ集め、非該当Excelを未振り分けへ戻す。`baseLayout`を指定した場合は競合を検出する
 - `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する（現行UIは未使用）。`baseLayout`を指定した場合は競合を検出する
 - `GET /api/v2/layout/snapshots?packId={packId}`: 資料パックの保存済みページ構成を返す
 - `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
@@ -68,9 +68,12 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 {
   "ownerDepartment": "経理部",
   "required": true,
-  "defaultTargetId": "appendix"
+  "defaultTargetId": "appendix",
+  "excelSheetSelectionMode": "numeric-only"
 }
 ```
+
+`numeric-only`のPDF作成では、非該当または非表示の既存Excelページの`pageId`・ページ名・番号・使用範囲などの設定を保持したまま、`contentPdf`を消去し、`status=not-rendered`、`sheetSelectionExcluded=true`、`volume=none`、`enabled=false`にする。`all-visible`へ戻すと再び表示シートをPDF化する。PDF化時のシート順はExcelのタブ順で、数字順への変更はページ構成画面の一括操作だけが行う。
 
 既存のECM/BOD/DMM操作は引き続きV4 APIと互換です。組み込みテンプレートの`acceptedSourceTypes`は`excel / word / pdf / powerpoint`です。
 
@@ -317,7 +320,8 @@ categoryは必須です。
 ```json
 {
   "category": "ecm",
-  "workbookIds": ["..."]
+  "workbookIds": ["..."],
+  "excelSheetSelectionMode": "numeric-only"
 }
 ```
 
@@ -326,7 +330,8 @@ PDF必要分：
 ```json
 {
   "category": "ecm",
-  "onlyUpdated": true
+  "onlyUpdated": true,
+  "excelSheetSelectionMode": "all-visible"
 }
 ```
 
@@ -383,6 +388,8 @@ categoryは必須です。
 ```
 
 実際に順序・割当が変わったvolumeだけを更新対象にします。
+
+ページ構成画面の「半角数字シートをまとめる」は、選択した出力先へ`^[0-9]+$`のシート名を文字列として安全に数字順で配置します。Excel以外のページはアンカーとして保持し、非該当Excelと既存の非表示シートページは`none`へ移します。変更がない場合はリクエストも履歴スナップショットも作りません。
 
 ## POST /api/pages/sort-by-sheet
 

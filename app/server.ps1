@@ -2230,6 +2230,10 @@ function Sync-StructureV3FromLegacy($Structure, [string]$Language = '') {
         Set-NoteProperty $wb 'required' ([bool](Get-DataProperty $old 'required' (Get-DataProperty $wb 'required' $true)))
         Set-NoteProperty $wb 'defaultTargetId' ([string](Get-DataProperty $old 'defaultTargetId' (Get-DataProperty $wb 'defaultTargetId' 'unassigned')))
         Set-NoteProperty $wb 'requirementId' ([string](Get-DataProperty $old 'requirementId' (Get-DataProperty $wb 'requirementId' '')))
+        if ($sourceType -eq 'excel') {
+            Set-NoteProperty $wb 'excelSheetSelectionMode' (Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb 'excelSheetSelectionMode' (Get-DataProperty $old 'excelSheetSelectionMode' 'all-visible'))))
+            Set-NoteProperty $wb 'lastRenderedSheetSelectionMode' (Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb 'lastRenderedSheetSelectionMode' (Get-DataProperty $old 'lastRenderedSheetSelectionMode' 'all-visible'))))
+        }
         $source = [pscustomobject][ordered]@{
             sourceId = $sourceId; packId = $savedPackId
             relativePath = [string](Get-DataProperty $wb 'relativePath' (Get-DataProperty $wb 'fileName' ''))
@@ -2239,6 +2243,7 @@ function Sync-StructureV3FromLegacy($Structure, [string]$Language = '') {
             required = [bool](Get-DataProperty $wb 'required' $true)
             defaultTargetId = [string](Get-DataProperty $wb 'defaultTargetId' 'unassigned')
             requirementId = [string](Get-DataProperty $wb 'requirementId' '')
+            excelSheetSelectionMode = $(if ($sourceType -eq 'excel') { Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb 'excelSheetSelectionMode' 'all-visible')) } else { 'all-visible' })
             status = [string](Get-DataProperty $wb 'status' 'new')
             currentSourceHash = [string](Get-DataProperty $wb 'currentExcelHash' '')
             currentSnapshotId = [string](Get-DataProperty $wb 'currentSnapshotId' '')
@@ -2377,6 +2382,11 @@ function Test-WorkbookRenderIsCurrent($Workbook) {
     if ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and $currentHash -ne $lastRenderedHash) { return $false }
     $profileVersion = Get-IntDataProperty $Workbook 'renderProfileVersion' 0
     if ($profileVersion -lt (Get-RequiredSourceRenderProfileVersion $Workbook)) { return $false }
+    if ([string](Get-DataProperty $Workbook 'sourceType' 'excel') -eq 'excel') {
+        $wantedSheetSelection = Normalize-ExcelSheetSelection ([string](Get-DataProperty $Workbook 'excelSheetSelectionMode' 'all-visible'))
+        $renderedSheetSelection = Normalize-ExcelSheetSelection ([string](Get-DataProperty $Workbook 'lastRenderedSheetSelectionMode' 'all-visible'))
+        if ($wantedSheetSelection -ne $renderedSheetSelection) { return $false }
+    }
     return $true
 }
 
@@ -2429,9 +2439,18 @@ function Repair-StructurePages($Structure) {
             @{Name='lastRenderedSheets'; Value=@()},
             @{Name='lastRenderedSheetFingerprint'; Value=''},
             @{Name='currentExcelLastWriteUtcTicks'; Value=''},
-            @{Name='warnings'; Value=@()}
+            @{Name='warnings'; Value=@()},
+            @{Name='excelSheetSelectionMode'; Value='all-visible'},
+            @{Name='lastRenderedSheetSelectionMode'; Value='all-visible'}
         )) {
             if ($null -eq $wb.PSObject.Properties[$pair.Name]) { Set-NoteProperty $wb $pair.Name $pair.Value; $changed = $true }
+        }
+        if ([string](Get-DataProperty $wb 'sourceType' 'excel') -eq 'excel') {
+            foreach ($selectionProperty in @('excelSheetSelectionMode','lastRenderedSheetSelectionMode')) {
+                try { $normalizedSelection = Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb $selectionProperty 'all-visible')) }
+                catch { $normalizedSelection = 'all-visible' }
+                if ([string](Get-DataProperty $wb $selectionProperty 'all-visible') -ne $normalizedSelection) { Set-NoteProperty $wb $selectionProperty $normalizedSelection; $changed = $true }
+            }
         }
         if (Mark-WorkbookContentStaleForProfile $Structure $wb) { $changed = $true }
     }
@@ -2454,6 +2473,7 @@ function Repair-StructurePages($Structure) {
         if ($null -eq $p.PSObject.Properties['numberingManual']) { Set-NoteProperty $p 'numberingManual' $false; $changed = $true }
         if ($null -eq $p.PSObject.Properties['numberingDefault']) { Set-NoteProperty $p 'numberingDefault' 'first-page-none'; $changed = $true }
         if ($null -eq $p.PSObject.Properties['enabled']) { Set-NoteProperty $p 'enabled' $true; $changed = $true }
+        if ($null -eq $p.PSObject.Properties['sheetSelectionExcluded']) { Set-NoteProperty $p 'sheetSelectionExcluded' $false; $changed = $true }
     }
     return $changed
 }
@@ -3021,6 +3041,9 @@ function New-WorkbookObject([string]$RelativePath, [string]$Language, [string]$C
         relativePath = $RelativePath
         displayName = $item.Name
         category = $categoryNormalized
+        sourceType = 'excel'
+        excelSheetSelectionMode = 'all-visible'
+        lastRenderedSheetSelectionMode = 'all-visible'
         currentExcelModifiedAt = $item.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:sszzz')
         currentExcelLastWriteUtcTicks = [string]$item.LastWriteTimeUtc.Ticks
         currentExcelSize = $item.Length
@@ -3455,18 +3478,59 @@ function New-WordSourceObject([string]$RelativePath, [string]$Language, [string]
     }
 }
 
+function Normalize-ExcelSheetSelection([string]$Selection) {
+    $value = ([string]$Selection).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($value)) { return 'all-visible' }
+    if ($value -in @('all-visible','numeric-only')) { return $value }
+    throw [ArgumentException]::new('Excelシートの対象指定が不正です。all-visible または numeric-only を指定してください。')
+}
+
+function Test-StrictNumericSheetName([string]$SheetName) {
+    # Trimは行わない。半角数字だけという運用ルールに空白や全角数字を混ぜない。
+    $raw = [string]$SheetName
+    return ($raw.Length -gt 0 -and $raw -match '^[0-9]+$' -and $raw -notmatch '[\r\n]')
+}
+
+function Set-ExcludedSheetPagesNotRendered($Structure, [string]$WorkbookId, [string[]]$ExcludedSheetNames, [string]$SelectionMode = 'numeric-only') {
+    if ((Normalize-ExcelSheetSelection $SelectionMode) -ne 'numeric-only') { return }
+    $excluded = @($ExcludedSheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($excluded.Count -eq 0) { return }
+    $excludedSet = @{}
+    foreach ($name in $excluded) { $excludedSet[$name] = $true }
+    foreach ($page in @(Get-Array $Structure.pages | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $WorkbookId })) {
+        $name = [string](Get-DataProperty $page 'sheetName' '')
+        if (-not $excludedSet.ContainsKey($name)) { continue }
+        # 配置・ページ名・ページ番号・使用範囲は保持する。今回の限定変換で古い
+        # contentPdfだけを再利用しないため、出力対象のアーティファクトを外す。
+        Set-NoteProperty $page 'volume' 'none'
+        Set-NoteProperty $page 'enabled' $false
+        Set-NoteProperty $page 'contentPdf' $null
+        Set-NoteProperty $page 'status' 'not-rendered'
+        Set-NoteProperty $page 'warnings' @('今回のPDF変換では半角数字シートだけを対象にしたため、PDF未作成です。')
+        Set-NoteProperty $page 'sheetSelectionExcluded' $true
+        Set-NoteProperty $page 'updatedAt' (New-NowIso)
+    }
+}
+
 function Render-Source([string]$Language, [string]$SourceId, $SharedHost = $null, [bool]$KeepHostOpen = $false, [scriptblock]$ProgressCallback = $null,
-                       [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '') {
+                       [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '', [string]$ExcelSheetSelection = '') {
     $context = Get-RegisteredSourceAdapterContext $Language $SourceId
     if ([string]$context.sourceType -eq 'excel') {
+        if ([string]::IsNullOrWhiteSpace($ExcelSheetSelection)) {
+            $ExcelSheetSelection = [string](Get-DataProperty $context.source 'excelSheetSelectionMode' 'all-visible')
+        }
+        $ExcelSheetSelection = Normalize-ExcelSheetSelection $ExcelSheetSelection
         if ($KeepHostOpen -and $null -eq $SharedHost) {
             throw 'Excelを起動できないため、この原稿をPDF化できませんでした。'
         }
-        $result = Render-Workbook $Language $SourceId $SharedHost $KeepHostOpen $ProgressCallback $SourceOverridePath $SourceSnapshotId $ExpectedSourceHash
+        $result = Render-Workbook $Language $SourceId $SharedHost $KeepHostOpen $ProgressCallback $SourceOverridePath $SourceSnapshotId $ExpectedSourceHash $ExcelSheetSelection
         Set-NoteProperty $result 'sourceId' $SourceId
         Set-NoteProperty $result 'sourceType' 'excel'
         Set-NoteProperty $result 'adapterId' ([string]$context.adapter.adapterId)
         return $result
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExcelSheetSelection) -and (Normalize-ExcelSheetSelection $ExcelSheetSelection) -eq 'numeric-only') {
+        throw '半角数字シート指定はExcel原稿でのみ利用できます。'
     }
     if ([string]$context.sourceType -eq 'pdf') {
         $result = Render-PdfSource $Language $SourceId $ProgressCallback $SourceOverridePath $SourceSnapshotId $ExpectedSourceHash
@@ -3476,7 +3540,7 @@ function Render-Source([string]$Language, [string]$SourceId, $SharedHost = $null
             $pending = $Script:PendingAnalysis
             $Script:PendingAnalysis = $null
             if ($null -ne $pending) {
-                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered ([string](Get-DataProperty $pending 'sheetSelectionMode' 'all-visible'))) }
                 catch { Write-Warning ('PDF原稿の画像解析に失敗しました: ' + $_.Exception.Message) }
             }
         }
@@ -3488,7 +3552,7 @@ function Render-Source([string]$Language, [string]$SourceId, $SharedHost = $null
             $pending = $Script:PendingAnalysis
             $Script:PendingAnalysis = $null
             if ($null -ne $pending) {
-                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered ([string](Get-DataProperty $pending 'sheetSelectionMode' 'all-visible'))) }
                 catch { Write-Warning ('Word原稿の画像解析に失敗しました: ' + $_.Exception.Message) }
             }
         }
@@ -3500,7 +3564,7 @@ function Render-Source([string]$Language, [string]$SourceId, $SharedHost = $null
             $pending = $Script:PendingAnalysis
             $Script:PendingAnalysis = $null
             if ($null -ne $pending) {
-                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+                try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered ([string](Get-DataProperty $pending 'sheetSelectionMode' 'all-visible'))) }
                 catch { Write-Warning ('PowerPoint原稿の画像解析に失敗しました: ' + $_.Exception.Message) }
             }
         }
@@ -3676,19 +3740,32 @@ function Update-SourceMetadata([string]$Language, [string]$SourceId, $Patch) {
     $hasRequired = Test-ConfigHasKey $Patch 'required'
     $hasDefaultTarget = Test-ConfigHasKey $Patch 'defaultTargetId'
     $hasRequirement = Test-ConfigHasKey $Patch 'requirementId'
-    if (-not ($hasOwner -or $hasRequired -or $hasDefaultTarget -or $hasRequirement)) { throw '更新する原稿設定が指定されていません。' }
+    $hasSheetSelection = Test-ConfigHasKey $Patch 'excelSheetSelectionMode'
+    if (-not ($hasOwner -or $hasRequired -or $hasDefaultTarget -or $hasRequirement -or $hasSheetSelection)) { throw '更新する原稿設定が指定されていません。' }
     $owner = if ($hasOwner) { ([string](Get-DataProperty $Patch 'ownerDepartment' '')).Trim() } else { '' }
     if ($owner.Length -gt 120) { throw '担当部署は120文字以内で入力してください。' }
     $defaultTarget = if ($hasDefaultTarget) { ([string](Get-DataProperty $Patch 'defaultTargetId' '')).Trim().ToLowerInvariant() } else { '' }
     $requirementId = if ($hasRequirement) { ([string](Get-DataProperty $Patch 'requirementId' '')).Trim() } else { '' }
+    $sheetSelection = if ($hasSheetSelection) { Normalize-ExcelSheetSelection ([string](Get-DataProperty $Patch 'excelSheetSelectionMode' '')) } else { '' }
     return Update-StructureLocked $Language {
         param($structure)
         $source = @(Get-Array (Get-DataProperty $structure 'sources' @()) | Where-Object { [string](Get-DataProperty $_ 'sourceId' '') -eq $id } | Select-Object -First 1)
         if ($source.Count -eq 0) { throw '指定された原稿が見つかりません。' }
         $current = $source[0]
+        $sourceType = ([string](Get-DataProperty $current 'sourceType' 'excel')).ToLowerInvariant()
+        if ($hasSheetSelection -and $sourceType -ne 'excel') { throw '半角数字シート指定はExcel原稿でのみ利用できます。' }
         $pack = Get-PackRecord $structure ([string](Get-DataProperty $current 'packId' ''))
         if ($hasDefaultTarget -and $defaultTarget -ne 'unassigned' -and @(Get-PackTargetIds $Language $pack) -notcontains $defaultTarget) { throw '既定の振り分け先が不正です。' }
         $workbook = @(Get-Array (Get-DataProperty $structure 'workbooks' @()) | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $id } | Select-Object -First 1)
+        $selectionChanged = $false
+        $selectionFallback = 'all-visible'
+        if ($workbook.Count -gt 0) { $selectionFallback = [string](Get-DataProperty $workbook[0] 'excelSheetSelectionMode' 'all-visible') }
+        if ($hasSheetSelection) {
+            $oldSelection = Normalize-ExcelSheetSelection ([string](Get-DataProperty $current 'excelSheetSelectionMode' $selectionFallback))
+            $selectionChanged = ($oldSelection -ne $sheetSelection)
+            Set-NoteProperty $current 'excelSheetSelectionMode' $sheetSelection
+            if ($workbook.Count -gt 0) { Set-NoteProperty $workbook[0] 'excelSheetSelectionMode' $sheetSelection }
+        }
         $requirement = $null
         if ($hasRequirement -and -not [string]::IsNullOrWhiteSpace($requirementId)) {
             [void](Assert-SafeStorageSegment $requirementId 'requirementId')
@@ -3745,12 +3822,24 @@ function Update-SourceMetadata([string]$Language, [string]$SourceId, $Patch) {
                 }
             }
         }
+        if ($selectionChanged) {
+            $affectedVolumes = @(Get-Array (Get-DataProperty $structure 'pages' @()) |
+                Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $id } |
+                ForEach-Object { [string](Get-DataProperty $_ 'volume' '') } |
+                Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+            foreach ($page in @(Get-Array (Get-DataProperty $structure 'pages' @()) | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $id })) {
+                if (-not [string]::IsNullOrWhiteSpace([string](Get-DataProperty $page 'contentPdf' ''))) { Set-NoteProperty $page 'status' 'stale' }
+            }
+            if ($workbook.Count -gt 0) { Set-NoteProperty $workbook[0] 'status' (Get-SourceUpdatedStatus $workbook[0]) }
+            Mark-VolumeNeedsRebuild $structure $Language ([string](Get-DataProperty $current 'packId' '')) $affectedVolumes 'sheet-selection-mode' 'ExcelシートのPDF化対象を変更しました'
+        }
         return [pscustomobject][ordered]@{
             sourceId = $id
             ownerDepartment = [string](Get-DataProperty $current 'ownerDepartment' '')
             required = [bool](Get-DataProperty $current 'required' $true)
             defaultTargetId = [string](Get-DataProperty $current 'defaultTargetId' 'unassigned')
             requirementId = [string](Get-DataProperty $current 'requirementId' '')
+            excelSheetSelectionMode = Normalize-ExcelSheetSelection ([string](Get-DataProperty $current 'excelSheetSelectionMode' $selectionFallback))
         }
     }
 }
@@ -4086,10 +4175,12 @@ function Remove-ContentPdfFileSafe([string]$Workspace, [string]$RelativePdf) {
 }
 
 
-# $Sheets には「今回描画できるシート」（Excelでは表示中のもの）が入る。
-# $PresentSheetNames には非表示を含む「原稿に存在するシート名」を渡す。省略時は
-# $Sheets と同じとみなす（Word/PowerPoint/PDFのように非表示の概念がない経路）。
-function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets, $PresentSheetNames = $null) {
+# $Sheets には今回のワークシート情報を渡す。通常は描画対象だけだが、Excelの
+# numeric-only経路では除外シートのメタデータも含める。
+# $PresentSheetNames には非表示を含む「原稿に存在するシート名」、$SelectedSheetNamesには
+# 実際に描画するシート名、$HiddenSheetNamesには非表示シート名を渡す。後ろ3引数を
+# 省略する経路（Word/PowerPoint/PDFなど）は従来どおり$Sheetsを描画対象として扱う。
+function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Workbook, $Sheets, $PresentSheetNames = $null, $SelectedSheetNames = $null, $HiddenSheetNames = $null, [bool]$SaveSnapshot = $true) {
     $workbookId = [string](Get-DataProperty $Workbook 'workbookId' '')
     $packId = Get-WorkbookPackId $Workbook
     [void](Resolve-DocumentPackScope $Structure $packId $true)
@@ -4109,6 +4200,23 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
             if (-not [string]::IsNullOrWhiteSpace($text)) { $present[$text.ToLowerInvariant()] = $true }
         }
     }
+    $selected = @{}
+    if ($null -eq $SelectedSheetNames) {
+        foreach ($sheetInfo in $sortedSheets) {
+            $name = [string](Get-DataProperty $sheetInfo 'sheetName' '')
+            if (-not [string]::IsNullOrWhiteSpace($name)) { $selected[$name.ToLowerInvariant()] = $true }
+        }
+    } else {
+        foreach ($name in @($SelectedSheetNames)) {
+            $text = [string]$name
+            if (-not [string]::IsNullOrWhiteSpace($text)) { $selected[$text.ToLowerInvariant()] = $true }
+        }
+    }
+    $hiddenNames = @{}
+    foreach ($name in @($HiddenSheetNames)) {
+        $text = [string]$name
+        if (-not [string]::IsNullOrWhiteSpace($text)) { $hiddenNames[$text.ToLowerInvariant()] = $true }
+    }
 
     $removed = @()
     $kept = @()
@@ -4116,7 +4224,10 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
     foreach ($page in $pages) {
         $belongs = ([string]$page.workbookId -eq $workbookId)
         $sheetKey = ([string]$page.sheetName).ToLowerInvariant()
-        if (-not $belongs -or $current.ContainsKey($sheetKey)) { $kept += $page; continue }
+        if (-not $belongs -or $current.ContainsKey($sheetKey)) {
+            if ($belongs -and $hiddenNames.ContainsKey($sheetKey)) { Set-NoteProperty $page 'sheetHidden' $true; $hidden += (Resolve-PageId $page) }
+            $kept += $page; continue
+        }
         # 非表示にしただけのシートは原稿から消えていない。ページを削除すると配置・
         # ページ名・使用範囲・番号設定が失われ、再表示しても未振り分けに戻るだけになる。
         if ($present.ContainsKey($sheetKey)) {
@@ -4127,7 +4238,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         }
         $removed += $page
     }
-    if ($removed.Count -gt 0) {
+    if ($removed.Count -gt 0 -and $SaveSnapshot) {
         # 削除は取り消せないため、確定前に必ず復元ポイントを残す。
         [void](Save-LayoutSnapshot $Language $packId 'source-sheets-changed' $Structure)
     }
@@ -4199,7 +4310,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
             Set-NoteProperty $page 'sheetName' $sheet
             Set-NoteProperty $page 'sheetIndex' $sheetIndex
             Set-NoteProperty $page 'detectedTitle' $title
-            Set-NoteProperty $page 'sheetHidden' $false
+            Set-NoteProperty $page 'sheetHidden' ($hiddenNames.ContainsKey($sheetKey))
             if ([string]::IsNullOrWhiteSpace([string]$page.title)) { Set-NoteProperty $page 'title' $title }
             $updated += $pageId
             continue
@@ -4214,7 +4325,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
             Set-NoteProperty $page 'sheetName' $sheet
             Set-NoteProperty $page 'sheetIndex' $sheetIndex
             Set-NoteProperty $page 'detectedTitle' $title
-            Set-NoteProperty $page 'sheetHidden' $false
+            Set-NoteProperty $page 'sheetHidden' ($hiddenNames.ContainsKey($sheetKey))
             Set-NoteProperty $page 'renamedFromSheetName' $previousSheet
             # 参照先のPDFは旧シート名で作られている。中身は作り直しになる。
             Set-NoteProperty $page 'contentPdf' $null
@@ -4228,13 +4339,18 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
             continue
         }
 
+        # Numeric-only rendering still supplies metadata for excluded visible
+        # sheets, but must not create a new page record for a sheet that has
+        # never been rendered. Existing records above retain their settings.
+        if (-not $selected.ContainsKey($sheetKey)) { continue }
+
         $pageId = New-WorksheetPageId $workbookId $sheet
         $page = [pscustomobject][ordered]@{
             pageId=$pageId; workbookId=$workbookId; sheetName=$sheet; sheetIndex=$sheetIndex
             titleSource='A1'; detectedTitle=$title; title=$title
             volume=$newVolume; order=0; orderManual=$false
             numberingMode='visible'; numberingManual=$false; numberingDefault='first-page-none'
-            enabled=($newVolume -ne 'none'); contentPdf=$null; status='not-rendered'; warnings=@(); updatedAt=New-NowIso
+            enabled=($newVolume -ne 'none'); contentPdf=$null; status='not-rendered'; warnings=@(); sheetSelectionExcluded=$false; updatedAt=New-NowIso
         }
         $insert = Insert-PageInSheetOrder $Structure $page $newVolume $packId
         $Structure.pages = @(Get-Array $Structure.pages) + @($page)
@@ -4252,7 +4368,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         }
     }
     Apply-DefaultNumberingPerVolume $Language $Structure $packId
-    $names = @($sortedSheets | ForEach-Object { [string]$_.sheetName })
+    $names = @($sortedSheets | Where-Object { $selected.ContainsKey(([string]$_.sheetName).ToLowerInvariant()) } | ForEach-Object { [string]$_.sheetName })
     return [ordered]@{
         addedPageIds=@($added); updatedPageIds=@($updated); removedPages=@($removed)
         renamedPages=@($renamed); hiddenSheetPageIds=@($hidden)
@@ -5039,7 +5155,7 @@ function Register-Workbook([string]$Language, [string]$RelativePath, [string]$Ca
         if ($existing.Count -gt 0) {
             $old=$existing[0]
             Set-NoteProperty $candidate 'workbookId' ([string]$old.workbookId)
-            foreach ($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','lastRenderedSheets','lastRenderedSheetFingerprint','lastRenderLog','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash')) {
+            foreach ($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','lastRenderedSheets','lastRenderedSheetFingerprint','lastRenderedSheetSelectionMode','excelSheetSelectionMode','lastRenderLog','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash')) {
                 Set-NoteProperty $candidate $name (Get-DataProperty $old $name $null)
             }
             if (-not [string]::IsNullOrWhiteSpace([string]$candidate.lastRenderedExcelHash)) { Set-NoteProperty $candidate 'status' $(if ($candidate.currentExcelHash -ne $candidate.lastRenderedExcelHash) {'excel-updated'} else {[string]$old.status}) }
@@ -5438,6 +5554,7 @@ function Set-WorkbookRenderError([string]$Language, [string]$WorkbookId, [string
                                  [string]$AttemptedSnapshotId = '', [string]$AttemptedHash = '') {
     try {
         $userMessage=ConvertTo-UserRenderError $Message
+        $noNumericTarget = ([string]$Message -match '半角数字だけの表示シートがありません')
         Update-StructureLocked $Language {
             param($structure)
             $wb=@(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
@@ -5449,7 +5566,9 @@ function Set-WorkbookRenderError([string]$Language, [string]$WorkbookId, [string
                 $sameVersion = ([string]::IsNullOrWhiteSpace($attempted)) -or ([string]::IsNullOrWhiteSpace($latest)) -or ($attempted -eq $latest)
                 if ($sameVersion) {
                     Set-NoteProperty $wb[0] 'status' 'render-error'
-                    foreach ($p in @(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.status -ne 'confirmed' })) { Set-NoteProperty $p 'status' 'render-error'; Set-NoteProperty $p 'warnings' @($userMessage); Set-NoteProperty $p 'updatedAt' (New-NowIso) }
+                    if (-not $noNumericTarget) {
+                        foreach ($p in @(Get-Array $structure.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.status -ne 'confirmed' })) { Set-NoteProperty $p 'status' 'render-error'; Set-NoteProperty $p 'warnings' @($userMessage); Set-NoteProperty $p 'updatedAt' (New-NowIso) }
+                    }
                 } else {
                     Set-NoteProperty $wb[0] 'status' (Get-SourceUpdatedStatus $wb[0])
                     # ページの status は上書きしない(新しい版の状態を壊さないため)
@@ -5553,7 +5672,8 @@ function Unregister-Workbook([string]$Language, [string]$WorkbookId) {
 }
 
 function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = $null, [bool]$KeepExcelOpen = $false, [scriptblock]$ProgressCallback = $null,
-                         [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '') {
+                         [string]$SourceOverridePath = '', [string]$SourceSnapshotId = '', [string]$ExpectedSourceHash = '', [string]$ExcelSheetSelection = 'all-visible') {
+    $ExcelSheetSelection = Normalize-ExcelSheetSelection $ExcelSheetSelection
     $paths = Get-Paths
     $workspace = Get-WorkspacePath $Language
     $structure = Get-Structure $Language
@@ -5747,6 +5867,9 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             # 一時的に非表示にしただけでページ設定が削除されてしまう。
             $allSheetNames = @()
             $sheetRenderInfos = @()
+            $excludedSheetNames = @()
+            $hiddenSheetNames = @()
+            $allSheetInfos = @()
             $sheetCount = 0
             try { $sheetCount = [int]$book.Worksheets.Count } catch { $sheetCount = 0 }
             $deferredPrintCommunication = $false
@@ -5761,15 +5884,22 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                         $sheetName = [string]$ws.Name
                         $visible = ([int]$ws.Visible -eq -1)
                         $allSheetNames += $sheetName
-                        if ($visible) {
+                        $a1 = ''
+                        try { $a1 = [string]$ws.Range('A1').Text } catch { }
+                        if ([string]::IsNullOrWhiteSpace($a1)) { $a1 = "$($wb.fileName) / $sheetName" }
+                        $sheetInfo = [ordered]@{ sheetName = $sheetName; sheetIndex = $i; titleSource = 'A1'; detectedTitle = $a1; printArea = '' }
+                        $allSheetInfos += $sheetInfo
+                        if (-not $visible) {
+                            $excludedSheetNames += $sheetName
+                            $hiddenSheetNames += $sheetName
+                        } elseif ($ExcelSheetSelection -eq 'numeric-only' -and -not (Test-StrictNumericSheetName $sheetName)) {
+                            $excludedSheetNames += $sheetName
+                        } else {
                             $targetSheetNames += $sheetName
-                            $a1 = ''
-                            try { $a1 = [string]$ws.Range('A1').Text } catch { }
-                            if ([string]::IsNullOrWhiteSpace($a1)) { $a1 = "$($wb.fileName) / $sheetName" }
                             # Reading PageSetup.PrintArea is another slow COM call and is only diagnostic.
                             # Keep it blank in render logs to avoid delaying PDF作成.
                             $printArea = ''
-                            $inspected += [ordered]@{ sheetName = $sheetName; sheetIndex = $i; titleSource = 'A1'; detectedTitle = $a1; printArea = $printArea }
+                            $inspected += $sheetInfo
 
                             if (-not $packagePrintSettingsPrepared) {
                                 $steps += "シート $sheetName の印刷設定を調整"
@@ -5788,11 +5918,10 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             }
             $timingsMs.sheetInspectionAndSetup = [int64]$sheetSetupTimer.ElapsedMilliseconds
             if ($targetSheetNames.Count -eq 0) {
-                $emptyPageSync = Update-WorkbookPagesFromInspection $Language $structure $wb @() $allSheetNames
-                # V5-§3.7: 旧世代の個別削除は廃止。世代単位の掃除(Remove-WorkbookContentPdfs)に一本化する。
-                # 個別に消すと、保持しているはずの世代フォルダの中身が欠損する。
-                Set-WorkbookRenderedSheetSnapshot $wb @()
-                Update-StructureLocked $Language { param($st) $x=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1);if($x.Count){[void](Update-WorkbookPagesFromInspection $Language $st $x[0] @() $allSheetNames);Set-WorkbookRenderedSheetSnapshot $x[0] @()} } | Out-Null
+                try { if (Test-Path -LiteralPath $contentDir) { Remove-Item -LiteralPath $contentDir -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
+                if ($ExcelSheetSelection -eq 'numeric-only') {
+                    throw '半角数字だけの表示シートがありません。シート名を半角数字（例: 1、2、10）にしてから、もう一度PDFを作成してください。PDFやページ構成は変更していません。'
+                }
                 throw 'PDF化対象の表示シートがありません。Excelで少なくとも1つのワークシートを表示してください。'
             }
 
@@ -5844,8 +5973,17 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             if ($rendered.Count -eq 0) {
                 throw 'PDFを作成できませんでした。Excelの印刷設定または対象シートを確認してください。'
             }
+            if ($ExcelSheetSelection -eq 'numeric-only' -and $excludedSheetNames.Count -gt 0) {
+                $warnings += "半角数字以外または非表示のExcelシート $($excludedSheetNames.Count) 件は今回のPDFに含めず、既存ページを未振り分けに戻しました。"
+            }
 
-            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $inspected $allSheetNames
+            # This copy is used only for the response/warning summary. The real
+            # snapshot and layout mutation happen once, against the latest
+            # structure, inside Update-StructureLocked below.
+            $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $allSheetInfos $allSheetNames $targetSheetNames $hiddenSheetNames $false
+            Set-ExcludedSheetPagesNotRendered $structure $WorkbookId $excludedSheetNames $ExcelSheetSelection
+            $selectionPack = (Resolve-DocumentPackScope $structure (Get-WorkbookPackId $wb) $true).pack
+            foreach ($selectionVolume in @(Get-PackVolumeList $Language $selectionPack $true)) { [void](Renumber-VolumeOrder $structure $selectionVolume (Get-WorkbookPackId $wb)) }
             $removedPages = @(Get-Array (Get-DataProperty $pageSync 'removedPages' @()))
             if ($removedPages.Count -gt 0) {
                 $removedNames = @($removedPages | ForEach-Object { [string](Get-DataProperty $_ 'sheetName' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -5878,6 +6016,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                     Set-NoteProperty ($p[0]) 'contentPdf' $rel
                     Set-NoteProperty ($p[0]) 'status' 'rendered'
                     Set-NoteProperty ($p[0]) 'warnings' @($r.warnings)
+                    Set-NoteProperty ($p[0]) 'sheetSelectionExcluded' $false
                     Set-NoteProperty ($p[0]) 'updatedAt' (New-NowIso)
                 }
             }
@@ -5891,6 +6030,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             Set-NoteProperty $wb 'lastRenderedAt' (New-NowIso)
             Set-WorkbookRenderedSheetSnapshot $wb (Get-DataProperty $pageSync 'sheetNames' @())
             Set-NoteProperty $wb 'renderProfileVersion' $Script:ExcelPrintProfileVersion
+            Set-NoteProperty $wb 'lastRenderedSheetSelectionMode' $ExcelSheetSelection
             Add-NotePropertyIfMissing $wb 'lastError' ''
             Add-NotePropertyIfMissing $wb 'lastErrorUser' ''
             Add-NotePropertyIfMissing $wb 'lastErrorAt' $null
@@ -5908,7 +6048,23 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 param($st)
                 $latest=@(Get-Array $st.workbooks|Where-Object{[string]$_.workbookId -eq $WorkbookId}|Select-Object -First 1)
                 if(-not $latest.Count){throw "Workbookが見つかりません: $WorkbookId"}
-                $lw=$latest[0];$sync=Update-WorkbookPagesFromInspection $Language $st $lw $inspected $allSheetNames
+                $lw=$latest[0]
+                $selectionAffectedVolumesLocked = @()
+                $selectionNeedsSnapshotLocked = $false
+                if ($ExcelSheetSelection -eq 'numeric-only' -and $excludedSheetNames.Count -gt 0) {
+                    $excludedSetLocked = @{}; foreach ($excludedName in $excludedSheetNames) { $excludedSetLocked[[string]$excludedName] = $true }
+                    $excludedPagesLocked = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and $excludedSetLocked.ContainsKey([string]$_.sheetName) })
+                    $selectionAffectedVolumesLocked = @($excludedPagesLocked | Where-Object { [string]$_.volume -and [string]$_.volume -ne 'none' } | ForEach-Object { [string]$_.volume } | Select-Object -Unique)
+                    $selectionNeedsSnapshotLocked = @($excludedPagesLocked | Where-Object { ([string]$_.volume -and [string]$_.volume -ne 'none') -or $_.enabled -ne $false }).Count -gt 0
+                    if ($selectionNeedsSnapshotLocked) { [void](Save-LayoutSnapshot $Language (Get-WorkbookPackId $lw) 'sheet-selection' $st) }
+                }
+                # If the numeric exclusion already made a restore point, let it
+                # cover simultaneous rename/removal changes too. Otherwise the
+                # normal source-sheet change path creates its one snapshot.
+                $sync=Update-WorkbookPagesFromInspection $Language $st $lw $allSheetInfos $allSheetNames $targetSheetNames $hiddenSheetNames (-not $selectionNeedsSnapshotLocked)
+                Set-ExcludedSheetPagesNotRendered $st $WorkbookId $excludedSheetNames $ExcelSheetSelection
+                $selectionPackLocked = (Resolve-DocumentPackScope $st (Get-WorkbookPackId $lw) $true).pack
+                foreach ($selectionVolume in @(Get-PackVolumeList $Language $selectionPackLocked $true)) { [void](Renumber-VolumeOrder $st $selectionVolume (Get-WorkbookPackId $lw)) }
                 foreach ($r in $rendered) {
                     $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
                     # Unrestricted worksheet names use stable hashed page IDs. The legacy
@@ -5922,11 +6078,12 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                         Set-NoteProperty $pg[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf))
                         Set-NoteProperty $pg[0] 'status' 'rendered'
                         Set-NoteProperty $pg[0] 'warnings' @($r.warnings)
+                        Set-NoteProperty $pg[0] 'sheetSelectionExcluded' $false
                         Set-NoteProperty $pg[0] 'updatedAt' (New-NowIso)
                     }
                 }
                 # V5-§2.4: currentExcel* はコピーしない(Scan-Updates の専有)。
-                foreach($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','renderProfileVersion','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash','warnings','lastRenderLog')){Set-NoteProperty $lw $name (Get-DataProperty $wb $name $null)}
+                foreach($name in @('lastRenderedVersionId','lastRenderedExcelHash','lastRenderedAt','renderProfileVersion','lastRenderedSheetSelectionMode','lastError','lastErrorUser','lastErrorAt','lastRenderAttemptHash','warnings','lastRenderLog')){Set-NoteProperty $lw $name (Get-DataProperty $wb $name $null)}
                 Set-NoteProperty $lw 'lastRenderedSnapshotId' ([string]$SourceSnapshotId)
                 Set-NoteProperty $lw 'renderEnvironmentFingerprint' ([string]$Script:CurrentRenderEnvFingerprint)
                 # V5-§6.3: ロック内で最新の currentExcelHash と突き合わせて status を決める。
@@ -5940,16 +6097,16 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                     foreach($pg2 in @(Get-Array $st.pages|Where-Object{[string]$_.workbookId -eq $WorkbookId -and [string]$_.status -eq 'rendered'})){ Set-NoteProperty $pg2 'status' 'stale' }
                 }
                 Set-WorkbookRenderedSheetSnapshot $lw (Get-DataProperty $sync 'sheetNames' @())
-                $cat=Get-WorkbookPackId $lw;$vols=@(Get-Array $st.pages|Where-Object{[string]$_.workbookId -eq $WorkbookId}|ForEach-Object{[string]$_.volume}|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique);Mark-VolumeNeedsRebuild $st $Language $cat $vols 'render' 'Excelを1件PDF作成しました'
+                $cat=Get-WorkbookPackId $lw;$vols=@(Get-Array $st.pages|Where-Object{[string]$_.workbookId -eq $WorkbookId}|ForEach-Object{[string]$_.volume}|Where-Object{$_ -and $_ -ne 'none'}|Select-Object -Unique);$vols=@($vols+$selectionAffectedVolumesLocked|Select-Object -Unique);Mark-VolumeNeedsRebuild $st $Language $cat $vols 'render' 'Excelを1件PDF作成しました'
                 return $sync
             }
             $timingsMs.total = [int64]$renderTimer.ElapsedMilliseconds
-            Write-JsonFile (Join-Path $workspace $logRel) ([ordered]@{ workbookId = $WorkbookId; rendered = $rendered; warnings = $warnings; steps = $steps; timingsMs = $timingsMs; sheetSync = $pageSync; at = New-NowIso })
+            Write-JsonFile (Join-Path $workspace $logRel) ([ordered]@{ workbookId = $WorkbookId; sheetSelectionMode = $ExcelSheetSelection; excludedSheetNames = @($excludedSheetNames); rendered = $rendered; warnings = $warnings; steps = $steps; timingsMs = $timingsMs; sheetSync = $pageSync; at = New-NowIso })
             # V5-P1: 解析はここでは実行しない。
             # レンダリング用Excelを開いたまま、レンダリングロックを保持したまま解析すると、
             # 比較用の再レンダリングが2つ目のExcel COMを起動してしまう(1ジョブ制限に反する)。
             # ロック解放後に実行するため、対象だけを記録しておく。
-            $Script:PendingAnalysis = [ordered]@{ language = $Language; workbookId = $WorkbookId; snapshotId = [string]$SourceSnapshotId; versionId = $versionId; rendered = $rendered }
+            $Script:PendingAnalysis = [ordered]@{ language = $Language; workbookId = $WorkbookId; snapshotId = [string]$SourceSnapshotId; versionId = $versionId; rendered = $rendered; sheetSelectionMode = $ExcelSheetSelection }
             Remove-WorkbookContentPdfs $workspace $WorkbookId $versionId
         } finally {
             if ($book) { try { $book.Close($false) } catch { } ; Invoke-ComRelease $book }
@@ -5958,7 +6115,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             if (-not [string]::IsNullOrWhiteSpace($ephemeralCaptureId)) { Remove-EphemeralCopy $Language $ephemeralCaptureId }
             if ($ownsExcel -or -not $KeepExcelOpen) { [GC]::Collect(); [GC]::WaitForPendingFinalizers() }
         }
-        return [ordered]@{ workbookId = $WorkbookId; versionId = $versionId; rendered = $rendered; warnings = $warnings; steps = $steps; timingsMs = $timingsMs; sheetSync = $pageSync }
+        return [ordered]@{ workbookId = $WorkbookId; versionId = $versionId; sheetSelectionMode = $ExcelSheetSelection; excludedSheetNames = @($excludedSheetNames); rendered = $rendered; warnings = $warnings; steps = $steps; timingsMs = $timingsMs; sheetSync = $pageSync }
     }
 
     # V5-P1: ここではレンダリングロックもExcelも解放済み。
@@ -5972,7 +6129,7 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
     $pending = $Script:PendingAnalysis
     $Script:PendingAnalysis = $null
     if ($null -ne $pending) {
-        try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+        try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered ([string](Get-DataProperty $pending 'sheetSelectionMode' 'all-visible'))) }
         catch { Write-Warning ('画像ハッシュの解析に失敗しました: ' + $_.Exception.Message) }
     }
     return $renderResult
@@ -6076,6 +6233,10 @@ function Get-AutoRenderWorkbookIds([string]$Language, [string[]]$PreferredIds, [
         $lastRenderedHash = [string]$wb.lastRenderedExcelHash
         $lastAttemptHash = [string]$wb.lastRenderAttemptHash
         $renderProfileOutdated = ((-not [string]::IsNullOrWhiteSpace($lastRenderedHash)) -and ((Get-IntDataProperty $wb 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $wb)))
+        $sheetSelectionOutdated = $false
+        if ([string](Get-DataProperty $wb 'sourceType' 'excel') -eq 'excel') {
+            $sheetSelectionOutdated = (Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb 'excelSheetSelectionMode' 'all-visible')) -ne Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb 'lastRenderedSheetSelectionMode' 'all-visible')))
+        }
         if ($status -eq 'render-error') {
             # The PDF button is an explicit retry. A previous render-error must not make
             # the button look idle just because the same file hash already failed once.
@@ -6084,6 +6245,7 @@ function Get-AutoRenderWorkbookIds([string]$Language, [string[]]$PreferredIds, [
             if ([string]::IsNullOrWhiteSpace($lastRenderedHash)) { $needs = $true }
             if ($status -in @('new','excel-updated','source-updated')) { $needs = $true }
             if ($renderProfileOutdated) { $needs = $true }
+            if ($sheetSelectionOutdated) { $needs = $true }
             if ((-not [string]::IsNullOrWhiteSpace($currentHash)) -and ($currentHash -ne $lastRenderedHash)) { $needs = $true }
             if ($usePreferred) { $needs = $true }
         }
@@ -6633,7 +6795,7 @@ function Invoke-FinalBuildJobFromFile([string]$JobPath) {
     try { Remove-Item -LiteralPath (Get-FinalJobCancellationPath $language $jobId) -Force -ErrorAction SilentlyContinue } catch { }
 }
 
-function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyUpdated, [string]$Category = '', $SnapshotPins = $null) {
+function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyUpdated, [string]$Category = '', $SnapshotPins = $null, [string]$ExcelSheetSelection = '') {
     # Return a job immediately. Expensive update scanning runs inside the background job,
     # so the PDF button does not appear to do nothing on large folders.
     $activeJob = Get-ActiveRenderJobStatus $Language
@@ -6664,6 +6826,27 @@ function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyU
     $registeredCount = @(Get-Array $structure.workbooks | Where-Object { ([string]$_.status -ne 'missing') -and ([string]::IsNullOrWhiteSpace($categoryNormalized) -or (Test-WorkbookCategory $_ $categoryNormalized)) }).Count
     if ($registeredCount -eq 0) { $OnlyUpdated = $false }
 
+    # Pin the per-source selection at queue time. A later settings change must not
+    # silently alter an already queued job; an empty argument means "use the
+    # persisted source setting" for backwards-compatible callers.
+    $sheetSelectionByWorkbook = [ordered]@{}
+    $selectionPinIds = @($ids)
+    if ($selectionPinIds.Count -eq 0 -and $OnlyUpdated) {
+        $selectionPinIds = @(Get-Array $structure.workbooks | Where-Object { [string]$_.status -ne 'missing' -and ([string]::IsNullOrWhiteSpace($categoryNormalized) -or (Test-WorkbookCategory $_ $categoryNormalized)) } | ForEach-Object { [string]$_.workbookId })
+    }
+    foreach ($id in @($selectionPinIds)) {
+        $source = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq [string]$id } | Select-Object -First 1)
+        if ($source.Count -eq 0) { continue }
+        $sourceType = ([string](Get-DataProperty $source[0] 'sourceType' 'excel')).ToLowerInvariant()
+        if ($sourceType -eq 'excel') {
+            $rawSelection = if (-not [string]::IsNullOrWhiteSpace($ExcelSheetSelection)) { $ExcelSheetSelection } else { [string](Get-DataProperty $source[0] 'excelSheetSelectionMode' 'all-visible') }
+            $sheetSelectionByWorkbook[[string]$id] = Normalize-ExcelSheetSelection $rawSelection
+        } else {
+            if (-not [string]::IsNullOrWhiteSpace($ExcelSheetSelection) -and (Normalize-ExcelSheetSelection $ExcelSheetSelection) -eq 'numeric-only') { throw '半角数字シート指定はExcel原稿でのみ利用できます。' }
+            $sheetSelectionByWorkbook[[string]$id] = 'all-visible'
+        }
+    }
+
     $jobId = 'job_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
     $jobDir = Get-RenderJobDir $Language
     $inputPath = Join-Path $jobDir "$jobId.input.json"
@@ -6683,7 +6866,8 @@ function Start-RenderJob([string]$Language, [string[]]$WorkbookIds, [bool]$OnlyU
     Write-JsonFile $statusPath $initial
     $pinsOut = [ordered]@{}
     if ($null -ne $SnapshotPins) { foreach ($k in @($SnapshotPins.Keys)) { $pinsOut[[string]$k] = $SnapshotPins[$k] } }
-    Write-JsonFile $inputPath ([ordered]@{ jobId = $jobId; mode = $Language; workbookIds = @($ids); onlyUpdated = $OnlyUpdated; category = $categoryNormalized; snapshotPins = $pinsOut; statusPath = $statusPath; stdoutPath = $stdoutPath; stderrPath = $stderrPath })
+    $requestedSheetSelection = if ([string]::IsNullOrWhiteSpace($ExcelSheetSelection)) { '' } else { Normalize-ExcelSheetSelection $ExcelSheetSelection }
+    Write-JsonFile $inputPath ([ordered]@{ jobId = $jobId; mode = $Language; workbookIds = @($ids); onlyUpdated = $OnlyUpdated; category = $categoryNormalized; snapshotPins = $pinsOut; sheetSelectionByWorkbook = $sheetSelectionByWorkbook; excelSheetSelectionMode = $requestedSheetSelection; statusPath = $statusPath; stdoutPath = $stdoutPath; stderrPath = $stderrPath })
     if ($registeredCount -eq 0 -or ($ids.Count -eq 0 -and -not $OnlyUpdated)) {
         $initial.status = 'completed'; $initial.percent = 100
         if ($registeredCount -eq 0) { $initial.message = '登録済み原稿がありません。' } else { $initial.message = '変換PDFの作成が必要な原稿はありません。' }
@@ -6736,6 +6920,8 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
     $explicitIds = ($ids.Count -gt 0)
     $onlyUpdated = [bool](Get-DataProperty $job 'onlyUpdated' $false)
     $category = Normalize-WorkbookCategory ([string](Get-DataProperty $job 'category' '')) ''
+    $sheetSelectionByWorkbook = Get-DataProperty $job 'sheetSelectionByWorkbook' $null
+    $requestedSheetSelection = [string](Get-DataProperty $job 'excelSheetSelectionMode' '')
     $statusPath = [string]$job.statusPath
     $stdoutPath = [string](Get-DataProperty $job 'stdoutPath' '')
     $stderrPath = [string](Get-DataProperty $job 'stderrPath' '')
@@ -6892,7 +7078,14 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
                 $pin = Get-DataProperty (Get-DataProperty $job 'snapshotPins' $null) $id $null
                 $pinSnapshot = [string](Get-DataProperty $pin 'snapshotId' '')
                 $pinHash = [string](Get-DataProperty $pin 'expectedHash' '')
-                $r = Render-Source $language $id $excel $true $callback '' $pinSnapshot $pinHash
+                $sheetSelection = [string](Get-DataProperty $sheetSelectionByWorkbook $id '')
+                if ([string]::IsNullOrWhiteSpace($sheetSelection) -and -not [string]::IsNullOrWhiteSpace($requestedSheetSelection)) {
+                    $sheetSelection = $requestedSheetSelection
+                }
+                if ([string]::IsNullOrWhiteSpace($sheetSelection) -and $jobSource.Count -gt 0 -and $jobSourceType -eq 'excel') {
+                    $sheetSelection = [string](Get-DataProperty $jobSource[0] 'excelSheetSelectionMode' 'all-visible')
+                }
+                $r = Render-Source $language $id $excel $true $callback '' $pinSnapshot $pinHash $sheetSelection
                 $deferredAnalyses += $Script:PendingAnalysis
                 $Script:PendingAnalysis = $null
                 $r['ok'] = $true
@@ -6946,7 +7139,7 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
                 $status.percent = [int][Math]::Min(99, 96 + [Math]::Floor(($analysisIndex / [Math]::Max(1, $analysisItems.Count)) * 3))
                 Write-RenderJobStatus $statusPath $status
             }
-            try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered) }
+            try { [void](Invoke-PostRenderAnalysis ([string]$pending.language) ([string]$pending.workbookId) ([string]$pending.snapshotId) ([string]$pending.versionId) $pending.rendered ([string](Get-DataProperty $pending 'sheetSelectionMode' 'all-visible'))) }
             catch { Write-Warning ('画像ハッシュの解析に失敗しました: ' + $_.Exception.Message) }
         }
     }
@@ -7137,6 +7330,7 @@ function Sort-PagesBySheet([string]$Language, $Body) {
         return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; packId=$cat; category=(Get-CategoryFromBuiltinPackId $cat); affectedVolumes=@($affected); layoutSnapshotId=$layoutSnapshotId }
     }
 }
+
 function Resolve-JavaExe {
     # 一度見つかったパスはキャッシュする(共有フォルダ上のTest-Pathの瞬断対策も兼ねる)。
     if (-not [string]::IsNullOrWhiteSpace($Script:CachedJavaExe)) { return $Script:CachedJavaExe }
@@ -7612,7 +7806,9 @@ function Get-PackProgressDashboard($Structure, [string]$Language) {
         }
         $needsRender = @($workbooks | Where-Object {
             [string](Get-DataProperty $_ 'status' '') -in @('new','excel-updated','source-updated','render-error','render-failed','missing') -or
-            [string]::IsNullOrWhiteSpace([string](Get-DataProperty $_ 'lastRenderedExcelHash' ''))
+            [string]::IsNullOrWhiteSpace([string](Get-DataProperty $_ 'lastRenderedExcelHash' '')) -or
+            (([string](Get-DataProperty $_ 'sourceType' 'excel') -eq 'excel') -and
+             (Normalize-ExcelSheetSelection ([string](Get-DataProperty $_ 'excelSheetSelectionMode' 'all-visible')) -ne Normalize-ExcelSheetSelection ([string](Get-DataProperty $_ 'lastRenderedSheetSelectionMode' 'all-visible'))))
         }).Count
         $unassigned = @($pages | Where-Object { [bool](Get-DataProperty $_ 'enabled' $true) -eq $false -or [string](Get-DataProperty $_ 'volume' 'none') -eq 'none' }).Count
         $targetRows = @(); $allBlockers = @(); $targetFingerprints = [ordered]@{}
@@ -7923,6 +8119,7 @@ function Get-V2StatePayload([string]$Language) {
             required = [bool](Get-DataProperty $source 'required' $true)
             defaultTargetId = [string](Get-DataProperty $source 'defaultTargetId' 'unassigned')
             requirementId = [string](Get-DataProperty $source 'requirementId' '')
+            excelSheetSelectionMode = Normalize-ExcelSheetSelection ([string](Get-DataProperty $source 'excelSheetSelectionMode' 'all-visible'))
             status = [string](Get-DataProperty $source 'status' '')
             currentSnapshotId = [string](Get-DataProperty $source 'currentSnapshotId' '')
             lastRenderedSnapshotId = [string](Get-DataProperty $source 'lastRenderedSnapshotId' '')
@@ -8550,7 +8747,7 @@ function Handle-Api($Context) {
                 $renderScope = Resolve-DocumentPackScope $renderStructure $renderPackId $false
                 $sourceIds = @(Get-Array $renderStructure.workbooks | Where-Object { Test-WorkbookPack $_ ([string]$renderScope.packId) } | ForEach-Object { [string]$_.workbookId })
             }
-            $result = Start-RenderJob $language $sourceIds ([bool](Get-DataProperty $body 'onlyUpdated' $false)) ([string](Get-DataProperty $body 'category' ''))
+            $result = Start-RenderJob $language $sourceIds ([bool](Get-DataProperty $body 'onlyUpdated' $false)) ([string](Get-DataProperty $body 'category' '')) $null ([string](Get-DataProperty $body 'excelSheetSelectionMode' ''))
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; jobId = [string]$result.jobId; job = $result }); return
         }
         if ($method -eq 'PATCH' -and $path -match '^/api/v2/sources/([^/]+)$') {
@@ -8804,7 +9001,7 @@ function Handle-Api($Context) {
             $body = Read-BodyJson $Context.Request
             $ids = @()
             if ($body.workbookIds) { $ids = @(Get-Array $body.workbookIds | ForEach-Object { [string]$_ }) }
-            $result = Start-RenderJob $language $ids ([bool]$body.onlyUpdated) ([string]$body.category)
+            $result = Start-RenderJob $language $ids ([bool]$body.onlyUpdated) ([string]$body.category) $null ([string](Get-DataProperty $body 'excelSheetSelectionMode' ''))
             $jobIdForResponse = Normalize-RenderJobId ([string](Get-DataProperty $result 'jobId' ''))
             if ([string]::IsNullOrWhiteSpace($jobIdForResponse)) { try { $jobIdForResponse = Normalize-RenderJobId ([string]$result.jobId) } catch { } }
             if ([string]::IsNullOrWhiteSpace($jobIdForResponse)) { $jobIdForResponse = Normalize-RenderJobId ([string]$result) }
@@ -8822,7 +9019,7 @@ function Handle-Api($Context) {
             $results = @()
             foreach ($id in $ids) {
                 try {
-                    $r = Render-Source $language $id
+                    $r = Render-Source $language $id $null $false $null '' '' '' ([string](Get-DataProperty $body 'excelSheetSelectionMode' ''))
                     $r['ok'] = $true
                     $results += $r
                 } catch {
@@ -10852,7 +11049,7 @@ function Invoke-PdfPageAnalyzer([hashtable[]]$Sheets) {
     }
 }
 
-function Write-RenderRecord([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$Purpose, [bool]$ContentPdfRetained, $Analysis) {
+function Write-RenderRecord([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$Purpose, [bool]$ContentPdfRetained, $Analysis, [string]$SheetSelectionMode = 'all-visible') {
     # V5-IV-3: レンダリング結果は renders\<versionId>\ に世代ごとに置き、書いたら変更しない。
     if ([string]::IsNullOrWhiteSpace($SnapshotId) -or [string]::IsNullOrWhiteSpace($VersionId)) { return }
     try {
@@ -10875,6 +11072,7 @@ function Write-RenderRecord([string]$Language, [string]$WorkbookId, [string]$Sna
                 renderEnvironmentFingerprint = [string]$Script:CurrentRenderEnvFingerprint
                 renderEnvironment = $Script:CurrentRenderEnvInfo
                 excelPrintProfileVersion = $Script:ExcelPrintProfileVersion
+                sheetSelectionMode = Normalize-ExcelSheetSelection $SheetSelectionMode
                 visualHashProfile = (Get-VisualHashProfile)
             })
         }
@@ -10897,6 +11095,34 @@ function Write-RenderRecord([string]$Language, [string]$WorkbookId, [string]$Sna
         # ここで破棄しないと「画像ハッシュなし」の作成前判定が残り続ける。
         Clear-SnapshotSummaryCache $Language $WorkbookId
     } catch { }
+}
+
+function Get-SnapshotRenderSheetSelection([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId = '') {
+    # A historical comparison must reproduce the sheet set used by that
+    # historical render, not today's source setting. Older records have no
+    # field and therefore retain the legacy all-visible behavior.
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($VersionId)) {
+            $exactManifest = Join-Path (Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId) 'render-manifest.json'
+            if (-not (Test-Path -LiteralPath $exactManifest -PathType Leaf)) { return 'all-visible' }
+            $exact = Read-JsonFile $exactManifest $null
+            if ($null -eq $exact) { return 'all-visible' }
+            $exactSelection = [string](Get-DataProperty $exact 'sheetSelectionMode' '')
+            if ([string]::IsNullOrWhiteSpace($exactSelection)) { return 'all-visible' }
+            return Normalize-ExcelSheetSelection $exactSelection
+        }
+        $rendersRoot = Join-Path (Get-SnapshotDir $Language $WorkbookId $SnapshotId) 'renders'
+        if (-not (Test-Path -LiteralPath $rendersRoot -PathType Container)) { return 'all-visible' }
+        $records = @(Get-ChildItem -LiteralPath $rendersRoot -File -Filter 'render-manifest.json' -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending)
+        foreach ($record in $records) {
+            $manifest = Read-JsonFile ([string]$record.FullName) $null
+            if ($null -eq $manifest) { continue }
+            $selection = [string](Get-DataProperty $manifest 'sheetSelectionMode' '')
+            if (-not [string]::IsNullOrWhiteSpace($selection)) { return Normalize-ExcelSheetSelection $selection }
+        }
+    } catch { }
+    return 'all-visible'
 }
 
 function Get-VisualHashes([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
@@ -11062,7 +11288,7 @@ function Set-LatestComparisonAssets([string]$Language, [string]$WorkbookId, $Com
 # ---- 比較専用レンダリング (V5-§6.7) --------------------------------
 
 
-function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [string]$SnapshotId) {
+function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$BaselineVersionId = '') {
     # structure.json等は変更しないが、画像ハッシュと同一世代のcontent PDFは保持する。
     # これにより再レンダリング比較でも、判定対象と画面表示対象が必ず一致する。
     try {
@@ -11077,6 +11303,7 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
     } catch { }
     $state = Get-SnapshotSourceState $Language $WorkbookId $SnapshotId
     if (-not [bool]$state.sourceRetained) { return [ordered]@{ ok = $false; reason = 'source-missing' } }
+    $comparisonSheetSelection = Get-SnapshotRenderSheetSelection $Language $WorkbookId $SnapshotId $BaselineVersionId
     return Invoke-WithRenderLock $Language $WorkbookId {
         $versionId = New-RbVersionId
         $tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('rb-cmp-' + (New-RbId))
@@ -11133,6 +11360,7 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
                     $ws = $book.Worksheets.Item($i)
                     $sheetName = [string]$ws.Name
                     if ([int]$ws.Visible -ne -1) { continue }
+                    if ($comparisonSheetSelection -eq 'numeric-only' -and -not (Test-StrictNumericSheetName $sheetName)) { continue }
                     $outPdf = Join-Path $contentDir ("{0}.pdf" -f (Get-WorksheetStorageStem $sheetName))
                     [void](Export-WorksheetToPdfSafe $excel $book $ws $outPdf $sheetName $comparisonPackagePrepared)
                     if (Test-Path -LiteralPath $outPdf) {
@@ -11148,7 +11376,7 @@ function Render-SnapshotForComparison([string]$Language, [string]$WorkbookId, [s
             if ($sheets.Count -eq 0) { return [ordered]@{ ok = $false; reason = 'no-sheets' } }
             $analysis = Invoke-PdfPageAnalyzer $sheets
             if ($null -eq $analysis -or -not [bool]$analysis.ok) { return [ordered]@{ ok = $false; reason = 'analyze-failed' } }
-            Write-RenderRecord $Language $WorkbookId $SnapshotId $versionId 'comparison' $true ([pscustomobject]$analysis.result)
+            Write-RenderRecord $Language $WorkbookId $SnapshotId $versionId 'comparison' $true ([pscustomobject]$analysis.result) $comparisonSheetSelection
             $availability = Get-HistoryRenderVersionAvailability $Language $WorkbookId $SnapshotId $versionId
             if (-not [bool]$availability.ready) { return [ordered]@{ ok = $false; reason = 'retention-verify-failed'; message = [string]$availability.reason } }
             $success = $true
@@ -11366,7 +11594,7 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
     $method = 'stored-hash'
     if ($null -eq $base -or $environmentChanged -or $assetsMissing) {
         # 環境差・ハッシュ欠落・同一世代PDF欠落のいずれでも、保存済みExcelから一組を再生成する。
-        $re = Render-SnapshotForComparison $Language $WorkbookId $baseSnap
+        $re = Render-SnapshotForComparison $Language $WorkbookId $baseSnap $baseVer
         if ([bool]$re.ok) {
             $baseVer = [string]$re.versionId
             $base = Get-VisualHashes $Language $WorkbookId $baseSnap $baseVer
@@ -11414,7 +11642,7 @@ function Compare-SnapshotVisual([string]$Language, [string]$WorkbookId, [string]
     return $saved
 }
 
-function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, $Rendered) {
+function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, $Rendered, [string]$SheetSelectionMode = 'all-visible') {
     # V5-§6.5: PDF作成のクリティカルパスの外。失敗しても PDF 作成は成功扱いのまま。
     if (-not (Test-InputHistoryEnabled)) { return $null }
     if ([string]::IsNullOrWhiteSpace($SnapshotId)) { return $null }
@@ -11437,7 +11665,7 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
         $analysis = Invoke-PdfPageAnalyzer $sheets
         $parsed = $null
         if ($null -ne $analysis -and [bool]$analysis.ok) { $parsed = [pscustomobject]$analysis.result }
-        Write-RenderRecord $Language $WorkbookId $SnapshotId $VersionId 'normal' $true $parsed
+        Write-RenderRecord $Language $WorkbookId $SnapshotId $VersionId 'normal' $true $parsed $SheetSelectionMode
         if ($null -eq $parsed) { return $null }
         $cmp = Compare-SnapshotVisual $Language $WorkbookId $SnapshotId $VersionId
         # complete/unavailableのどちらでも解析結果を版の記録へ残す。
