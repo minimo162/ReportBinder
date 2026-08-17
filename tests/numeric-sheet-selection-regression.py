@@ -178,6 +178,161 @@ def extract_ps_function(source: str, name: str) -> str:
     return source[start:] if match is None else source[start:start + len(marker) + match.start()]
 
 
+def test_page_mutation_state_sync():
+    """Exercise the production mutation freshness hand-off, not a mock copy."""
+    root = Path(__file__).resolve().parents[1]
+    app = (root / "app/web/app.js").read_text(encoding="utf-8")
+    server = (root / "app/server.ps1").read_text(encoding="utf-8-sig")
+
+    mutation = extract_js_function(app, "applyPageMutationResult")
+    for needed in (
+        "const mutationState=payload?.state",
+        "state.packProgress=mutationState.packProgress",
+        "state.finalReadiness=Object.assign",
+        "advanceFinalReadinessEpoch();",
+        "renderGlobalHeader()",
+        "renderVolumeLinks()",
+        "renderDashboardOverview()",
+        "markFinalReadinessStaleForPageMutation",
+        "reloadFinalReadinessAfterPageMutation",
+    ):
+        assert needed in mutation, f"page mutation state sync missing: {needed}"
+
+    # The old compatibility routes are still used by numeric sort and page
+    # settings. They must carry the same post-mutation state as the V2 route.
+    route_markers = (
+        "'/api/pages/reorder'",
+        "-in @('/api/pages/sort-by-numeric-sheet','/api/pages/sort-by-sheet')",
+        "'/api/pages/update'",
+    )
+    for route in route_markers:
+        route_block = server.split(f"$path -eq {route}", 1)[1].split("\n        if ", 1)[0] if route.startswith("'") else server.split(f"$path {route}", 1)[1].split("\n        if ", 1)[0]
+        assert "Get-V2StatePayload $language" in route_block, f"legacy mutation state missing: {route}"
+    v2_state = extract_ps_function(server, "Get-V2StatePayload")
+    assert "Get-FinalBuildReadiness" in v2_state and "$finalReadiness $packId" in v2_state, "custom pack readiness missing from mutation state"
+
+    # Refresh/conflict/restore must not carry an active custom key through an
+    # authoritative state replacement, and restore must consume the response
+    # state before the follow-up GET.
+    refresh = "async function refresh(options" + app.split("async function refresh(options", 1)[1].split("\nasync function refreshAndLoad", 1)[0]
+    layout_conflict = app.split("async function handlePageLayoutConflict", 1)[1].split("\nfunction saveBoardOrder", 1)[0]
+    settings_conflict = app.split("async function handlePageSettingsConflict", 1)[1].split("\nfunction pageSettingsBody", 1)[0]
+    restore = app.split("async function previewLayoutRestore", 1)[1].split("\nfunction volumeLabel", 1)[0]
+    pack_settings = app.split("async function savePackSettings", 1)[1].split("\nfunction requiredRenderProfileVersion", 1)[0]
+    assert "delete retained[carriedKey]" in refresh
+    assert "authoritativeReadiness" in refresh
+    assert "authoritativeReadiness:true" in layout_conflict
+    assert "authoritativeReadiness:true" in settings_conflict
+    assert "applyPageMutationResult(res)" in restore
+    assert "authoritativeReadiness:true" in restore
+    assert "await loadFinalReadiness({render:false})" in pack_settings
+
+    stale = extract_js_function(app, "advanceFinalReadinessEpoch") + "\n" + extract_js_function(app, "markFinalReadinessStaleForPageMutation")
+    stale_harness = r"""
+let finalReadinessEpoch = 0;
+let state = {finalReadiness:{pack_custom:{volumes:{
+  'ja-main': {pageCount:2,builtFingerprint:'old',outputPdf:'out.pdf',status:'built',displayState:'built',staleReasons:[]}
+}}}};
+function finalReadinessKey(){ return 'pack_custom'; }
+function asArray(value){ return value == null ? [] : (Array.isArray(value) ? value : [value]); }
+advanceFinalReadinessEpoch();
+markFinalReadinessStaleForPageMutation();
+const ready=state.finalReadiness.pack_custom.volumes['ja-main'];
+if(ready.displayState!=='needs-rebuild' || ready.status!=='needs-rebuild')throw new Error('reorder left final PDF marked latest');
+if(ready.pageCount!==2 || ready.outputPdf!=='out.pdf')throw new Error('stale transition discarded output metadata');
+if(finalReadinessEpoch!==1)throw new Error('readiness invalidation epoch did not advance');
+"""
+    completed = subprocess.run(["node", "-"], input=stale + "\n" + stale_harness, text=True, encoding="utf-8", capture_output=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    # Production-coupled race: a readiness GET started before a mutation must
+    # not overwrite the mutation's server-provided needs-rebuild state.
+    load_readiness = "async function loadFinalReadiness" + app.split("async function loadFinalReadiness", 1)[1].split("\nfunction advanceFinalReadinessEpoch", 1)[0]
+    race_functions = "\n".join([
+        extract_js_function(app, "finalReadinessKey"), load_readiness,
+        extract_js_function(app, "advanceFinalReadinessEpoch"),
+        extract_js_function(app, "markFinalReadinessStaleForPageMutation"),
+        extract_js_function(app, "applyPageMutationResult"),
+    ])
+    race_harness = r"""
+const finalReadinessInFlight = new Map();
+let finalReadinessEpoch = 0, finalPreflightCheckedAt = '';
+let lastPageBoardRenderSignature = '';
+let activePackId = 'pack_custom', activePreset = 'bod', activeView = 'final';
+let activePack = {packId:'pack_custom',category:''};
+let state = {structure:{pages:[{pageId:'old'}],volumes:{}},packProgress:{},finalReadiness:{
+  pack_custom:{volumes:{'ja-main':{pageCount:2,status:'built',displayState:'built',outputPdf:'out.pdf',builtFingerprint:'old'}}}
+}};
+let requests=[];
+function activePackRecord(){return activePack;}
+function configured(){return true;}
+function api(url){return new Promise(resolve=>requests.push({url,resolve}));}
+function asArray(value){return value==null?[]:(Array.isArray(value)?value:[value]);}
+function targetVolume(id){return String(id||'');}
+function log(){}
+function rememberLayoutFingerprint(){}
+function resolvedPageId(page){return String(page?.pageId||'');}
+function renderGlobalHeader(){} function renderNavBadges(){} function renderStepBar(){}
+function renderSummary(){} function renderDashboardOverview(){} function renderFinalOverview(){}
+function renderPages(){} function renderPageOverview(){} function renderVolumeLinks(){}
+function isModalOpen(){return false;} function syncPreviewOrganizerControls(){}
+const oldGet=loadFinalReadiness({render:false});
+if(requests.length!==1||!requests[0].url.includes('pack_custom'))throw new Error('initial readiness GET missing');
+applyPageMutationResult({result:{pages:[{pageId:'new'}],affectedVolumes:['ja-main']},state:{
+  packProgress:{unassigned:0},finalReadiness:{pack_custom:{volumes:{
+    'ja-main':{pageCount:2,status:'needs-rebuild',displayState:'needs-rebuild',outputPdf:'out.pdf',builtFingerprint:'new'}
+  }}}
+}});
+requests[0].resolve({volumes:{'ja-main':{pageCount:2,status:'built',displayState:'built',outputPdf:'out.pdf',builtFingerprint:'old'}}});
+await oldGet;
+const afterMutation=state.finalReadiness.pack_custom.volumes['ja-main'];
+if(afterMutation.displayState!=='needs-rebuild'||afterMutation.status!=='needs-rebuild')throw new Error('old GET restored built state after mutation');
+if(state.structure.pages[0].pageId!=='new')throw new Error('mutation result structure not applied');
+
+// Pack-key race: A pending request must not be reused for B, and A's late
+// response must not commit while B is active.
+requests=[]; state.finalReadiness={}; finalReadinessEpoch=0;
+activePackId='pack_a'; activePack={packId:'pack_a',category:''};
+const aGet=loadFinalReadiness({render:false});
+activePackId='pack_b'; activePack={packId:'pack_b',category:''};
+const bGet=loadFinalReadiness({render:false});
+if(requests.length!==2||!requests[0].url.includes('pack_a')||!requests[1].url.includes('pack_b'))throw new Error('pack switch reused an in-flight GET');
+requests[1].resolve({volumes:{'ja-main':{status:'built',displayState:'built',pageCount:2}}});
+await bGet;
+requests[0].resolve({volumes:{'ja-main':{status:'built',displayState:'built',pageCount:1}}});
+await aGet;
+if(!state.finalReadiness.pack_b||state.finalReadiness.pack_a)throw new Error('late A readiness clobbered active B');
+"""
+    completed = subprocess.run(["node", "--input-type=module", "-"], input=race_functions + "\n" + race_harness, text=True, encoding="utf-8", capture_output=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    # Conflict/restore custom-key regression: refresh drops the carried active
+    # key and waits for the real readiness endpoint before returning.
+    refresh_functions = "\n".join([
+        extract_js_function(app, "finalReadinessKey"), load_readiness,
+        extract_js_function(app, "advanceFinalReadinessEpoch"), refresh,
+    ])
+    refresh_harness = r"""
+const finalReadinessInFlight = new Map();
+let finalReadinessEpoch=0, finalPreflightCheckedAt='', activePackId='pack_custom', activePreset='bod', activeView='pages';
+let activePack={packId:'pack_custom',category:''};
+let state={finalReadiness:{pack_custom:{volumes:{'ja-main':{status:'built',displayState:'built',pageCount:2}}}}};
+function activePackRecord(){return activePack;} function configured(){return true;}
+function normalizeStatePayload(payload){return payload;}
+function targetVolume(id){return String(id||'');} function log(){} function renderAll(){}
+function showMessage(){} const snapshotHistoryResponseCache=new Map(); let historyPanelsInitialized=false;
+function api(url){
+  if(url==='/api/state')return Promise.resolve({structure:{pages:[]},packProgress:{},finalReadiness:{}});
+  return Promise.resolve({volumes:{'ja-main':{status:'needs-rebuild',displayState:'needs-rebuild',pageCount:2}}});
+}
+await refresh({authoritativeReadiness:true,render:false});
+const ready=state.finalReadiness.pack_custom.volumes['ja-main'];
+if(ready.displayState!=='needs-rebuild'||ready.status!=='needs-rebuild')throw new Error('refresh carried stale custom readiness');
+"""
+    completed = subprocess.run(["node", "--input-type=module", "-"], input=refresh_functions + "\n" + refresh_harness, text=True, encoding="utf-8", capture_output=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_production_javascript_helpers():
     root = Path(__file__).resolve().parents[1]
     app = (root / "app/web/app.js").read_text(encoding="utf-8")
@@ -405,5 +560,6 @@ if __name__ == "__main__":
     test_unassigned_non_excel_anchor_is_preserved()
     test_production_javascript_helpers()
     test_production_server_contracts()
+    test_page_mutation_state_sync()
     test_page_composition_ui_contracts()
     print("numeric-sheet-selection regression ok")

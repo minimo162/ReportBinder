@@ -8272,6 +8272,24 @@ function Get-V2StatePayload([string]$Language) {
     $configured = [bool](Get-DataProperty $legacy 'configured' $false)
     $structureLoadError = [string](Get-DataProperty $legacy 'structureLoadError' '')
     $structure = if ($configured -and [string]::IsNullOrWhiteSpace($structureLoadError)) { Get-Structure $Language } else { New-EmptyStructure $Language }
+    $publicPacks = @(Get-PublicPackList $structure $Language)
+    # The legacy state contains readiness only for the three migration-era
+    # categories.  V2 mutations must also carry the active custom pack's
+    # fingerprint; otherwise the browser has to guess that a reorder is stale.
+    $finalReadiness = Get-DataProperty $legacy 'finalReadiness' ([ordered]@{})
+    if ($configured -and [string]::IsNullOrWhiteSpace($structureLoadError)) {
+        foreach ($pack in $publicPacks) {
+            $packId = [string](Get-DataProperty $pack 'packId' '')
+            if ([string]::IsNullOrWhiteSpace($packId)) { continue }
+            $volumes = [ordered]@{}
+            foreach ($targetId in @(Get-PackTargetIds $Language $pack)) {
+                $volume = Get-LegacyVolumeFromTargetId $Language $targetId
+                try { $volumes[$volume] = Get-FinalBuildReadiness $structure $Language $volume $packId $true }
+                catch { }
+            }
+            Set-NoteProperty $finalReadiness $packId ([ordered]@{ volumes = $volumes })
+        }
+    }
     $sources = @()
     foreach ($source in @(Get-Array (Get-DataProperty $structure 'sources' @()))) {
         $sources += [pscustomobject][ordered]@{
@@ -8302,10 +8320,10 @@ function Get-V2StatePayload([string]$Language) {
         paths = Get-DataProperty $legacy 'paths' $null
         structureLoadError = $structureLoadError
         packTemplates = @(Get-PackTemplateCatalog $Language)
-        packs = @(Get-PublicPackList $structure $Language)
+        packs = $publicPacks
         structure = [ordered]@{
             schemaVersion = 3
-            packs = @(Get-PublicPackList $structure $Language)
+            packs = $publicPacks
             sources = @($sources)
             units = @(Get-Array (Get-DataProperty $structure 'units' @()))
             items = @(Get-Array (Get-DataProperty $structure 'items' @()))
@@ -8314,7 +8332,7 @@ function Get-V2StatePayload([string]$Language) {
             migrationIssues = @(Get-Array (Get-DataProperty $structure 'migrationIssues' @()))
             updatedAt = Get-DataProperty $structure 'updatedAt' $null
         }
-        finalReadiness = Get-DataProperty $legacy 'finalReadiness' ([ordered]@{})
+        finalReadiness = $finalReadiness
         packProgress = Get-DataProperty $legacy 'packProgress' ([ordered]@{})
         summary = Get-DataProperty $legacy 'summary' ([ordered]@{})
         recentErrors = @(Get-Array (Get-DataProperty $legacy 'recentErrors' @()))
@@ -9209,19 +9227,19 @@ function Handle-Api($Context) {
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/reorder') {
             $body = Read-BodyJson $Context.Request
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Reorder-Pages $language $body) }); return
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; result = (Reorder-Pages $language $body); state = (Get-V2StatePayload $language) }); return
         }
         if ($method -eq 'POST' -and $path -in @('/api/pages/sort-by-numeric-sheet','/api/pages/sort-by-sheet')) {
             $body=Read-BodyJson $Context.Request
             # Keep the old route as a compatibility alias. Its behavior is now
             # explicitly half-width numeric-sheet ordering rather than Excel
             # tab order.
-            Write-JsonResponse $Context 200 ([ordered]@{ok=$true;result=(Sort-PagesByNumericSheet $language $body)});return
+            Write-JsonResponse $Context 200 ([ordered]@{ok=$true;result=(Sort-PagesByNumericSheet $language $body);state=(Get-V2StatePayload $language)});return
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/update') {
             $body = Read-BodyJson $Context.Request
             $pageResult = Update-Page $language $body
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; page = $pageResult.page; result = $pageResult }); return
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; page = $pageResult.page; result = $pageResult; state = (Get-V2StatePayload $language) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/pages/confirm') {
             $body = Read-BodyJson $Context.Request
