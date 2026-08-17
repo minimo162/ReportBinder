@@ -128,7 +128,7 @@ input,select{height:34px;font-size:16px}.search-field{height:34px}.search-field 
 /* Page organizer: visual sorting, contextual actions, and compact sections. */
 .page-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap}.page-view-switch button{height:30px;display:inline-flex;align-items:center;gap:6px;padding:0 10px}.page-view-switch .icon{width:14px;height:14px}.page-thumbnail-size{height:30px;display:flex;align-items:center;gap:7px;padding:0 9px;border:1px solid var(--border);border-radius:var(--r-md);color:var(--text-secondary);font-size:14px;white-space:nowrap}.page-thumbnail-size input{width:140px;accent-color:var(--accent)}.page-thumbnail-size output{width:22px;color:var(--text);text-align:right}.page-command-bar{position:sticky;top:calc(var(--header-h) + var(--step-h) + 8px);z-index:18;align-items:center;margin:calc(var(--s-5)*-1) calc(var(--s-5)*-1) 0;padding:12px var(--s-5);border-bottom:1px solid var(--border);background:var(--surface);transition:background .15s,border-color .15s,box-shadow .15s}.page-command-bar.has-selection{border-color:var(--accent-border);background:var(--accent-subtle);box-shadow:0 4px 14px rgba(27,28,30,.08)}.page-selection-tools{min-width:0;flex:1}.page-search{min-width:210px;display:flex;align-items:center;gap:4px}.page-search input{width:250px;height:32px;padding:0 10px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);color:var(--text);font:inherit}.page-search input:focus{outline:2px solid var(--accent-active);outline-offset:1px;border-color:var(--accent)}.page-search .btn{height:30px}.page-selection-count{min-width:104px;color:var(--text-secondary);font-size:15px}.page-command-bar.has-selection .page-selection-count{color:var(--accent-active)}.page-command-bar.has-selection .page-destination-actions .btn{border-color:var(--accent-border);background:var(--surface);color:var(--accent-active)}.page-card{padding-top:var(--s-5)}.board{padding-top:14px}.page-filter-empty{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:0 var(--s-5) 14px;padding:16px 18px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface-subtle);color:var(--text-secondary)}.page-filter-empty strong{color:var(--text)}
 .volume-head{width:100%;border:0;text-align:left;color:inherit;cursor:pointer}.volume-head:hover{background:#f4f5f7}.volume-panel.inbox .volume-head:hover{background:#faeddc}.volume-head-meta{display:flex;align-items:center;gap:8px;white-space:nowrap}.volume-head-meta b{font-weight:500}.volume-head-meta .icon{transition:transform .16s}.volume-panel.collapsed .volume-head-meta .icon{transform:rotate(-90deg)}.volume-panel.collapsed .volume-content{display:none}.page-filter-hidden{display:none!important}
-.thumbnail-wrap{padding:18px var(--s-5) 24px;overflow:auto}.thumbnail-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--page-thumbnail-min,190px),1fr));gap:18px;align-items:start;min-height:72px}.page-thumb-card{min-width:0;padding:10px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);transition:border-color .15s,box-shadow .15s,transform .15s;cursor:default}.page-thumb-card:hover{border-color:var(--border-strong);box-shadow:0 3px 12px rgba(27,28,30,.08)}.page-thumb-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}/* 選択状態の手掛かりが1pxの枠線色だけだと、弱視・老眼の利用者が「どれを選んだか」を
+.thumbnail-wrap{padding:18px var(--s-5) 24px;overflow:visible}.thumbnail-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--page-thumbnail-min,190px),1fr));gap:18px;align-items:start;min-height:72px}.page-thumb-card{min-width:0;padding:10px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);transition:border-color .15s,box-shadow .15s,transform .15s;cursor:default}.page-thumb-card:hover{border-color:var(--border-strong);box-shadow:0 3px 12px rgba(27,28,30,.08)}.page-thumb-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}/* 選択状態の手掛かりが1pxの枠線色だけだと、弱視・老眼の利用者が「どれを選んだか」を
    確認できない(背景 #fff→#f1f2fb は 1.12:1)。太い枠と✓バッジで色以外の差も付ける。 */
 .page-thumb-card.selected-row{position:relative;border-color:var(--accent);border-width:2px;padding:7px;background:var(--accent-subtle);box-shadow:0 0 0 2px var(--accent)}
 .page-thumb-card.selected-row::after{content:"✓";position:absolute;top:-9px;left:-9px;z-index:2;display:grid;place-items:center;width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:14px;font-weight:700;line-height:1}.page-thumb-paper{position:relative;display:grid;place-items:center;width:100%;aspect-ratio:210/297;overflow:hidden;border:1px solid var(--border);border-radius:4px;background:#eef0f3}.page-thumb-paper canvas{display:block;width:100%;height:100%;object-fit:contain;background:#fff}.page-thumb-placeholder{position:absolute;inset:0;display:grid;place-items:center;padding:18px;text-align:center;color:var(--text-tertiary);font-size:14px}.page-thumb-seq,.page-thumb-check,.page-thumb-drag,.page-thumb-open{position:absolute;z-index:2;box-shadow:0 2px 8px rgba(27,28,30,.16)}.page-thumb-seq{left:8px;bottom:8px;min-width:28px;height:24px;display:grid;place-items:center;padding:0 7px;border-radius:12px;background:rgba(27,28,30,.78);color:#fff;font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}.page-thumb-check{left:8px;top:8px;width:30px;height:30px;display:grid;place-items:center;border-radius:7px;background:rgba(255,255,255,.94)}.page-thumb-check input{margin:0}.page-thumb-drag{right:8px;top:8px;background:rgba(255,255,255,.94);color:var(--text-secondary)}.page-thumb-open{right:8px;bottom:8px;height:28px;padding:0 10px;border:1px solid rgba(255,255,255,.75);border-radius:6px;background:rgba(27,28,30,.78);color:#fff;font-size:14px}.page-thumb-open:hover{background:rgba(27,28,30,.92)}.page-thumb-copy{min-width:0;padding:10px 2px 0}.page-thumb-copy strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:16px}.page-thumb-copy>span{display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary);font-size:14px}.page-thumb-meta{min-height:28px;display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:var(--text-secondary);font-size:14px}.page-thumb-meta .badge{height:20px;font-size:14px}.thumbnail-drop-placeholder{min-height:300px;display:grid;place-items:center;border:2px solid var(--accent);border-radius:var(--r-lg);background:var(--accent-subtle);color:var(--accent);text-align:center}.thumbnail-drop-placeholder .placeholder-card{padding:18px}.thumbnail-drop-placeholder strong{font-size:15px}.page-empty-drop{grid-column:1/-1;min-height:56px;display:grid;place-items:center;border:1px dashed var(--border-strong);border-radius:var(--r-lg);color:var(--text-tertiary)}.thumbnail-board .volume-panel.drop-active{outline:0;background:linear-gradient(var(--accent-subtle),var(--accent-subtle))}.detail-board .drop-placeholder td{height:46px!important;padding:4px var(--s-5)!important;background:var(--accent-subtle);color:var(--accent)}.detail-board .drop-placeholder .placeholder-card{padding:6px 10px;border-left:3px solid var(--accent)}
@@ -190,11 +190,11 @@ input,select{height:34px;font-size:16px}.search-field{height:34px}.search-field 
 /* Familiar kanban-style direct manipulation for page assignment. */
 .thumbnail-board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0;padding:14px var(--s-5) 18px;background:var(--surface-subtle)}
 .thumbnail-board>.page-status-banner,.thumbnail-board>.page-filter-empty{grid-column:1/-1;margin:0}
-.thumbnail-board .volume-panel{min-width:0;overflow:hidden;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface)}
+.thumbnail-board .volume-panel{min-width:0;overflow:visible;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface)}
 .thumbnail-board .volume-panel.inbox{border-color:var(--attention-border)}
 .thumbnail-board .volume-head{min-height:82px;padding:12px 14px;align-items:flex-start;border-bottom:1px solid var(--border)}
 .thumbnail-board .volume-head h3{font-size:16px}.thumbnail-board .volume-head p{line-height:1.35}
-.thumbnail-board .thumbnail-wrap{max-height:min(68vh,760px);padding:12px;overflow-x:hidden;overflow-y:auto}
+.thumbnail-board .thumbnail-wrap{padding:12px}
 .thumbnail-board .thumbnail-grid{grid-template-columns:minmax(0,1fr);gap:10px;align-content:start}
 .thumbnail-board .page-thumb-card{display:grid;grid-template-columns:clamp(82px,calc(var(--page-thumbnail-min,190px)*.5),130px) minmax(0,1fr);grid-template-areas:"paper copy" "paper meta" "editor editor";column-gap:10px;padding:8px;cursor:grab;touch-action:none}
 .thumbnail-board .page-thumb-card:active{cursor:grabbing}.thumbnail-board .page-thumb-card input,.thumbnail-board .page-thumb-card button,.thumbnail-board .page-thumb-card select{cursor:auto}
@@ -423,10 +423,10 @@ body:not(.is-configured) [data-view-panel="excel"] #auto-status{display:none}
    directly to its destination without first changing tabs. */
 .overview-board.thumbnail-board{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:14px;align-items:start;background:var(--surface-subtle)}
 .overview-board.thumbnail-board>.page-status-banner,.overview-board.thumbnail-board>.page-filter-empty{grid-column:1/-1}
-.overview-board.thumbnail-board .volume-panel{min-width:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface)}
+.overview-board.thumbnail-board .volume-panel{min-width:0;display:flex;flex-direction:column;overflow:visible;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface)}
 .overview-board.thumbnail-board .volume-panel.inbox{border-color:var(--attention-border)}
 .overview-board.thumbnail-board .volume-head{min-height:82px;flex:0 0 auto;padding:12px 14px;align-items:flex-start;border-bottom:1px solid var(--border)}
-.overview-board.thumbnail-board .thumbnail-wrap{max-height:min(68vh,760px);padding:12px;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.overview-board.thumbnail-board .thumbnail-wrap{padding:12px}
 .overview-board.thumbnail-board .thumbnail-grid{grid-template-columns:minmax(0,1fr);gap:10px;align-content:start}
 .overview-board.thumbnail-board .page-thumb-card{grid-template-columns:clamp(112px,35%,152px) minmax(0,1fr)}
 .overview-board.detail-board{display:block}
@@ -639,6 +639,66 @@ tr.page-row input,tr.page-row select,tr.page-row button{cursor:auto}
    of the {packName} placeholders. */
 .filename-pattern-field small{color:var(--text-tertiary);font-size:14px;line-height:1.6}
 
+/* ---- 2026-08-17 page-composition workspace pass -------------------------
+   The board is a document-sized workspace rather than a fixed-height widget.
+   The browser owns the vertical scroll; lanes grow with their cards. This
+   keeps the destination columns readable and avoids the screenshot's nested
+   scrollbars. */
+main.shell.pages-shell{
+  max-width:none;
+  width:100%;
+  padding-inline:clamp(20px,3vw,48px);
+}
+main.shell.pages-shell .page-head,
+main.shell.pages-shell #pages-next-action,
+main.shell.pages-shell .assignment-guide,
+main.shell.pages-shell .page-tools-details,
+main.shell.pages-shell .page-card{width:100%;max-width:none}
+main.shell.pages-shell .page-command-bar{flex-wrap:wrap;overflow:visible;row-gap:12px}
+main.shell.pages-shell .overview-board.thumbnail-board{
+  display:grid;
+  align-items:start;
+  grid-template-columns:minmax(0,1.2fr) repeat(2,minmax(0,1fr));
+  gap:18px;
+  padding-inline:clamp(12px,1.2vw,24px);
+  background:transparent;
+}
+main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-grid{
+  grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));
+  gap:14px;
+}
+main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap,
+main.shell.pages-shell .overview-board.thumbnail-board .volume-content{
+  overflow:visible;
+  overscroll-behavior:auto;
+  scrollbar-gutter:auto;
+}
+main.shell.pages-shell .overview-board.detail-board .volume-content{overflow:visible}
+main.shell.pages-shell .page-volume-tabs{padding-inline:clamp(12px,1.2vw,24px)}
+@media(max-width:1280px){
+  main.shell.pages-shell{padding-inline:28px}
+  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+  main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-grid{grid-template-columns:1fr}
+}
+@media(max-width:1024px){
+  main.shell.pages-shell{padding-inline:20px}
+  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:minmax(0,1.1fr) repeat(2,minmax(0,1fr));gap:10px}
+  main.shell.pages-shell .overview-board.thumbnail-board .volume-head{padding-inline:12px}
+  main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{padding:10px}
+}
+@media(max-width:760px){
+  main.shell.pages-shell{padding-inline:14px}
+  main.shell.pages-shell .overview-board.thumbnail-board{display:block;padding-inline:0}
+  main.shell.pages-shell .overview-board.thumbnail-board .volume-panel{margin-bottom:12px}
+  main.shell.pages-shell .overview-board.thumbnail-board .volume-content{overflow:visible}
+  main.shell.pages-shell .overview-board.detail-board .volume-content{overflow-x:auto;overflow-y:visible}
+}
+@media(max-width:480px){
+  main.shell.pages-shell{padding-inline:10px}
+  main.shell.pages-shell .page-command-bar{row-gap:8px}
+  main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{padding:8px}
+}
+
 /* The current step must stay marked even when it also warns. */
 .step-state.current{border-color:var(--accent);background:var(--accent);color:#fff}
 
@@ -695,3 +755,23 @@ input[type=range]::-webkit-slider-thumb{width:22px;height:22px}
 .relink-bulk-row .relink-from{font-weight:600;word-break:break-all}
 .relink-bulk-row select{width:100%}
 .relink-same{color:var(--success);font-weight:600}
+
+/* Final page-board guardrails: keep the command row single-line at desktop
+   zoom, let the browser own vertical scrolling, and never clip a lane's
+   cards. The head CTA remains visible even when the secondary tools are closed. */
+main.shell.pages-shell .page-command-bar{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;row-gap:0}
+main.shell.pages-shell .page-command-bar .toolbar{flex-wrap:nowrap}
+main.shell.pages-shell .overview-board.thumbnail-board{display:grid;align-items:start;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+main.shell.pages-shell .overview-board.thumbnail-board .volume-panel,
+main.shell.pages-shell .overview-board.thumbnail-board .volume-content,
+main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{height:auto;max-height:none;overflow:visible}
+@media(max-width:1100px) and (min-width:801px){
+  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:800px) and (min-width:761px){
+  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:1fr}
+}
+@media(max-width:760px){
+  main.shell.pages-shell .page-command-bar{flex-wrap:wrap;overflow:visible}
+  main.shell.pages-shell .page-command-bar .toolbar{flex-wrap:wrap}
+}

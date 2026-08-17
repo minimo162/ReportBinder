@@ -239,7 +239,7 @@ try_pos=write_json_block.find('try {')
 tmp_write_pos=write_json_block.find('Write-Utf8NoBomFile $tmp $json')
 if try_pos < 0 or tmp_write_pos < try_pos:
     raise SystemExit('atomic JSON temp write must be inside fallback try block')
-for route in ['/api/state','/api/v2/state','/api/diagnostics/run','/api/v2/pack-templates','/api/v2/packs','/api/v2/sources/','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/jobs/cancel','/api/pages/reorder','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
+for route in ['/api/state','/api/v2/state','/api/diagnostics/run','/api/v2/pack-templates','/api/v2/packs','/api/v2/sources/','/api/paths','/api/workbooks/register-batch','/api/workbooks/render/start','/api/jobs/status','/api/jobs/cancel','/api/pages/reorder','/api/pages/sort-by-numeric-sheet','/api/pages/sort-by-sheet','/api/final/readiness','/api/final/build','/api/final/publish','/api/final/file','/api/scan-updates','/api/history/diff-detail','/api/history/diff/prepare','/api/history/diff-page']:
     if route not in server: raise SystemExit(f'route not found: {route}')
 for needed in ['/api/history/diff-review','function Get-DiffReviewStatePath','function Get-DiffReviewStateForContext','function Set-DiffReviewState',
                'confirmedSheetKeys','id="diff-unreviewed-only"','id="diff-confirm-sheet"','function toggleDiffSheetReviewed']:
@@ -262,7 +262,7 @@ for needle in [
     'Get-VolumeStateKey','builtFingerprint','Get-FinalBuildInputSnapshot','contentPdfLastWriteUtcTicks','contentPdfSize',
     # 旧V4.1経路(Build-FinalPdfLegacy)を消したので、現行のトランザクション経路の形で固定する。
     'exports\\manifest_{0}_{1}.json','~building_{0}_{1}.pdf','Require-WorkbookCategory','System.ArgumentException',
-    'Mark-VolumeNeedsRebuild','staleReasons','Sort-PagesBySheet','Insert-PageInSheetOrder','Renumber-VolumeOrder',
+    'Mark-VolumeNeedsRebuild','staleReasons','Sort-PagesByNumericSheet','Sort-NumericPagesWithinAnchors','Insert-PageInSheetOrder','Renumber-VolumeOrder',
     'CenterHorizontally = $true','LeftMargin = Convert-CmToPt 1.2','RightMargin = Convert-CmToPt 1.2','punchShiftPt=(Convert-CmToPt 0.2)',
     'lib\\java\\bin\\java.exe','Apply-DefaultNumberingPerVolume','first-page-none','ExcelPrintProfileVersion',
     'ConvertTo-NormalizedPageRange','Resolve-OutputFileNamePattern','physicalPages=$snap.physicalPages','schemaVersion=3'
@@ -326,7 +326,7 @@ java_pos=build.find('ReportPdfComposer'); commit_pos=build.find('$commit = Updat
 if java_pos < 0 or commit_pos < java_pos: raise SystemExit('final composer/commit order is invalid')
 
 appjs=(root/'app/web/app.js').read_text(encoding='utf-8-sig')
-for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','/api/pages/sort-by-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor','data-thumb-page-range','savePackSettings','pack-output-pattern']:
+for needle in ['renderGlobalHeader','renderStepBar','renderNavBadges','aggregateFinalState','volumeReadiness','isEditing','lastPageBoardRenderSignature','sortPagesBySheet','sortPagesByNumericSheet','/api/pages/sort-by-numeric-sheet','category:activePreset','openFinalVolume(volume, category=activePreset)','notice-actions','insertedAtEndCount','modalReturnFocus','render-all-btn','openDiffDetail','moveDiffRegion','syncDiffScroll','fetchDiffPdfDocument','buildDiffBrowserPage','rememberPageLayoutUndo','preparePageThumbnails','page-filter-empty','pageMatchesSearch','applyPageThumbnailSize','savePageFromThumbnail','restorePageSettings','data-thumb-editor','data-thumb-page-range','savePackSettings','pack-output-pattern']:
     if needle not in appjs: raise SystemExit(f'ui feature not found: {needle}')
 for needle in ['function renderPackSwitcher', 'function openPackEditor', 'function submitPackEditor', 'function duplicatePack', 'function archivePack', 'function restorePack', 'includeArchived=true', 'ReportBinderPackId']:
     if needle not in appjs: raise SystemExit(f'pack management UI behavior missing: {needle}')
@@ -1550,7 +1550,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v183', 'style.css?v=20260817_v112']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v184', 'style.css?v=20260817_v113']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1605,7 +1605,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260817_v183' not in html:
+if 'app.js?v=20260817_v184' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1631,7 +1631,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260817_v183' not in html:
+if 'app.js?v=20260817_v184' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2021,7 +2021,7 @@ for needed in ['[string]$_.workbookId -eq $WorkbookId', '[string]$_.sheetName -e
     if needed not in _locked_render_commit:
         raise SystemExit(f'unrestricted worksheet render commit fallback missing: {needed}')
 for needed in ['未振り分け（出力しない）', '出力先へ移したページだけ',
-               '原稿内の順序に整える', '未振り分けへ戻す', 'assignment-guide']:
+               '半角数字順に並べ直す', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
 
@@ -2033,7 +2033,7 @@ for needed in ['左上のチェックで選ぶ', '移動先を押す', '右上�
         raise SystemExit(f'direct page movement UX missing: {needed}')
 if 'directCardDrag' in appjs:
     raise SystemExit('thumbnail cards must scroll/select normally; drag may start only from the handle')
-for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・並び・履歴</summary>',
+for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・履歴</summary>',
                '.page-command-bar:not(.has-selection) .page-destination-actions{display:none}',
                '.page-command-bar.has-selection .page-filter-tools{display:none}']:
     if needed not in html + css:
@@ -2051,7 +2051,11 @@ def assert_page_overview_css(candidate):
     # rule for the 1366px result.
     desktop_parts = []
     cursor = 0
-    for match in re.finditer(r'@media\s*\(\s*max-width\s*:[^)]+\)\s*\{', candidate):
+    # A responsive query may combine max-width with min-width. Treat the whole
+    # block as non-desktop too; stopping immediately after the first closing
+    # parenthesis leaves e.g. `and (min-width:801px)` in desktop_css and makes
+    # its grid-template-only override look like the final desktop rule.
+    for match in re.finditer(r'@media\s*[^\{]*\(\s*max-width\s*:[^)]+\)[^\{]*\{', candidate):
         if match.start() < cursor:
             continue
         desktop_parts.append(candidate[cursor:match.start()])

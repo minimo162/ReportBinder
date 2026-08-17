@@ -48,7 +48,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/sources/register-batch`: 複数形式の原稿を一括登録する
 - `POST /api/v2/sources/unregister`: `sourceId`で登録解除する
 - `POST /api/v2/sources/scan-updates`: 登録済み原稿の更新を検出する
-- `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する。Excelは保存済みの`excelSheetSelectionMode`（`all-visible`既定、または`numeric-only`）をジョブへ固定する。必要ならリクエストにも同名項目を指定できる
+- `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する。Excelは保存済みの`excelSheetSelectionMode`（新規登録は`numeric-only`、既存の明示設定や旧データの欠損フィールドは互換のため維持）をジョブへ固定する。必要ならリクエストにも同名項目を指定できる
 - `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する。Excelでは`excelSheetSelectionMode`も指定でき、`numeric-only`はシート名がstrictな`^[0-9]+$`の表示シートだけをPDF化する。対象が0件の場合はPDF・ページ構成を変更せずエラーにする
 - `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。ページ画面の「半角数字シートをまとめる」はこのAPIを使い、Excelのstrictな半角数字シートを数字順に指定先へ集め、非該当Excelを未振り分けへ戻す。`baseLayout`を指定した場合は競合を検出する
 - `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する（現行UIは未使用）。`baseLayout`を指定した場合は競合を検出する
@@ -73,7 +73,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 }
 ```
 
-`numeric-only`のPDF作成では、非該当または非表示の既存Excelページの`pageId`・ページ名・番号・使用範囲などの設定を保持したまま、`contentPdf`を消去し、`status=not-rendered`、`sheetSelectionExcluded=true`、`volume=none`、`enabled=false`にする。`all-visible`へ戻すと再び表示シートをPDF化する。PDF化時のシート順はExcelのタブ順で、数字順への変更はページ構成画面の一括操作だけが行う。
+`numeric-only`のPDF作成では、非該当または非表示の既存Excelページの`pageId`・ページ名・番号・使用範囲などの設定を保持したまま、`contentPdf`を消去し、`status=not-rendered`、`sheetSelectionExcluded=true`、`volume=none`、`enabled=false`にする。`all-visible`へ戻すと再び表示シートをPDF化する。Excelから変換PDFへ書き出す処理自体は、シートと分割PDFの対応を保つためタブ順で行う。ページ構成の初期配置と、画面上の「半角数字順に並べ直す」は、半角数字シートを数値順に配置する。
 
 既存のECM/BOD/DMM操作は引き続きV4 APIと互換です。組み込みテンプレートの`acceptedSourceTypes`は`excel / word / pdf / powerpoint`です。
 
@@ -391,7 +391,7 @@ categoryは必須です。
 
 ページ構成画面の「半角数字シートをまとめる」は、選択した出力先へ`^[0-9]+$`のシート名を文字列として安全に数字順で配置します。Excel以外のページはアンカーとして保持し、非該当Excelと既存の非表示シートページは`none`へ移します。変更がない場合はリクエストも履歴スナップショットも作りません。
 
-## POST /api/pages/sort-by-sheet
+## POST /api/pages/sort-by-numeric-sheet
 
 categoryは必須です。
 
@@ -402,7 +402,7 @@ categoryは必須です。
 }
 ```
 
-volumeを省略した場合は本体・補足だけを対象にします。割当は変えず、各表の中だけを半角数字、ファイル順、ファイル名、pageIdの安定順で並べ替えます。
+volumeを省略した場合は本体・補足だけを対象にします。割当は変えず、未振り分けを含む指定レーンの中だけを、半角数字シートの数値順（桁数→文字列順、同値はファイル順・ファイル名・シート位置・pageId）で並べ替えます。Excel以外や半角数字以外のページはアンカーとして同じレーン内に残します。既存クライアント向けに`POST /api/pages/sort-by-sheet`も同じ動作の別名として受け付けます。
 
 ## POST /api/pages/update
 

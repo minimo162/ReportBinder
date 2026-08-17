@@ -242,6 +242,27 @@ check(fillExcelPageSlots(slots,replacements).map(x=>x.pageId).join(',')==='memo,
 def test_production_server_contracts():
     root = Path(__file__).resolve().parents[1]
     server = (root / "app/server.ps1").read_text(encoding="utf-8-sig")
+    new_excel = extract_ps_function(server, "New-WorkbookObject")
+    assert "excelSheetSelectionMode = 'numeric-only'" in new_excel
+    assert "lastRenderedSheetSelectionMode = 'numeric-only'" in new_excel
+    normalize = extract_ps_function(server, "Normalize-ExcelSheetSelection")
+    # Blank/legacy records remain all-visible; only a newly created workbook
+    # opts into numeric-only explicitly.
+    assert "return 'all-visible'" in normalize
+    assert "function Get-NumericSheetSortRank" in server
+    assert "function Sort-PagesByNumericDefault" in server
+    assert "function Sort-NumericPagesWithinAnchors" in server
+    sort_endpoint = extract_ps_function(server, "Sort-PagesByNumericSheet")
+    assert "Sort-NumericPagesWithinAnchors" in sort_endpoint
+    assert "Get-RequestedBaseLayout" in sort_endpoint
+    assert "if (-not $inputChanged) { continue }" in sort_endpoint
+    assert sort_endpoint.index("if (-not $inputChanged) { continue }") < sort_endpoint.index("Save-LayoutSnapshot")
+    assert "/api/pages/sort-by-numeric-sheet" in server
+    insertion = extract_ps_function(server, "Insert-PageInSheetOrder")
+    assert "numericExisting" in insertion and "numericSorted" in insertion
+    assert "Sort-PagesByNumericDefault $withNew" in insertion
+    rank_helper = extract_ps_function(server, "Get-NumericSheetSortRank")
+    assert "length = $ordinal.Length" in rank_helper and "ordinal = $ordinal" in rank_helper
     excluded = extract_ps_function(server, "Set-ExcludedSheetPagesNotRendered")
     for statement in (
         "Set-NoteProperty $page 'volume' 'none'",
@@ -270,6 +291,45 @@ def test_production_server_contracts():
     assert "selectionAffectedVolumesLocked" in render[locked:]
 
 
+def test_page_composition_ui_contracts():
+    root = Path(__file__).resolve().parents[1]
+    app = (root / "app/web/app.js").read_text(encoding="utf-8")
+    html = (root / "app/web/index.html").read_text(encoding="utf-8")
+    css = (root / "app/web/style.css").read_text(encoding="utf-8")
+    sort_action = extract_js_function(app, "sortPagesByNumericSheet")
+    assert "if(numericBefore)" in sort_action
+    assert "hasManualFlags" not in sort_action
+    assert "pageVolumeSnapshotsEqual(beforeVolumes,collectBoardVolumes())" in sort_action
+    assert "if(pageMutationBusy||pageLayoutHistoryBusy)return" in sort_action
+    assert "priorSaveSucceeded=await boardSavePromise" in sort_action
+    assert "error.code==='structure-conflict'" in sort_action
+    assert "await handlePageLayoutConflict(beforeVolumes,requestRevision)" in sort_action
+    assert "finally{pageMutationBusy=false" in sort_action
+    drag_start = extract_js_function(app, "beginPointerPageDrag")
+    key_handler = extract_js_function(app, "handleBoardRowKeydown")
+    history_action = extract_js_function(app, "applyPageLayoutHistory")
+    assert "if (pageMutationBusy || !row" in drag_start
+    assert "if(pageMutationBusy&&e.altKey)" in key_handler
+    assert "if(pageLayoutHistoryBusy||pageMutationBusy)return" in history_action
+    assert "pageLayoutHistoryBusy=true;pageMutationBusy=true" in history_action
+    assert "pageLayoutHistoryBusy=false;pageMutationBusy=false" in history_action
+    assert "undo.disabled=pageMutationBusy||pageLayoutHistoryBusy" in app
+    assert "redo.disabled=pageMutationBusy||pageLayoutHistoryBusy" in app
+    assert "classList.toggle('pages-shell', activeView === 'pages')" in app
+    assert html.index('id="sort-by-sheet-btn"') < html.index('class="page-tools-details"')
+    assert "main.shell.pages-shell{" in css and "max-width:none" in css
+    assert (
+        "main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap"
+        "{height:auto;max-height:none;overflow:visible}" in css
+    )
+    assert "grid-template-columns:repeat(2,minmax(0,1fr))" in css
+    assert "grid-template-columns:1fr" in css
+    assert (
+        "main.shell.pages-shell .page-command-bar"
+        "{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden" in css
+    )
+
+
 if __name__ == "__main__":
     test_strict_names()
     test_large_numeric_sort()
@@ -279,4 +339,5 @@ if __name__ == "__main__":
     test_unassigned_non_excel_anchor_is_preserved()
     test_production_javascript_helpers()
     test_production_server_contracts()
+    test_page_composition_ui_contracts()
     print("numeric-sheet-selection regression ok")
