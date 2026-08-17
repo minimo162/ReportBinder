@@ -333,10 +333,10 @@ for needle in ['function renderPackSwitcher', 'function openPackEditor', 'functi
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
 if "body:{volumes:collectBoardVolumes()}" in appjs: raise SystemExit('page reorder must send category')
-if 'class="drag-handle page-thumb-drag"' in appjs:
-    raise SystemExit('thumbnail drag handle must not cover the page preview')
-if 'class="sr-only" type="checkbox" data-page-check' not in appjs:
-    raise SystemExit('thumbnail selection must remain keyboard-accessible without a visible overlay')
+if 'class="drag-handle page-thumb-drag"' not in appjs or 'if (!fromHandle) return' not in appjs:
+    raise SystemExit('thumbnail drag must start from its explicit handle only')
+if 'class="page-thumb-check"' not in appjs or 'type="checkbox" data-page-check' not in appjs:
+    raise SystemExit('thumbnail selection must use an explicit checkbox')
 
 html=(root/'app/web/index.html').read_text(encoding='utf-8')
 for needle in ['workspace-top','step-bar','id="pack-menu-button"','id="pack-menu-list"','id="create-pack-btn"','id="pack-editor-modal"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','id="final-target-grid"','id="bulk-target-buttons"','notice-actions','app-menu-popover','<symbol id="i-home"','<symbol id="i-edit"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"','id="page-view-thumbnail-btn"','id="page-layout-undo-btn"','id="page-command-bar"','id="page-search-input"','id="page-thumbnail-size"']:
@@ -989,16 +989,16 @@ for line_no, line in enumerate(server.splitlines(), 1):
     if '2>&1' in line and 'Invoke-NativeCapture' not in line and not line.strip().startswith('#'):
         raise SystemExit(f'raw native 2>&1 capture outside Invoke-NativeCapture at line {line_no}')
 # 画面が使っていない経路を「正式仕様」として区別なく並べると、次に触る人がそれを
-# 採用して競合検出の無い経路にはまる。実態と、baseLayout を受けないことを明記する。
+# 採用して誤る。実態と、baseLayout による競合検出を明記する。
 _apidoc = (root/'docs/API.md').read_text(encoding='utf-8')
-for needed in ['現行UIが使っていない経路について', 'baseLayout']:
+for needed in ['現行UIが使っていない経路について', 'baseLayout', '409 `structure-conflict`']:
     if needed not in _apidoc:
         raise SystemExit(f'the API document must say which v2 routes the UI never calls: {needed}')
-# 実装が変わったら注記も見直す。PATCH items が baseLayout を受けるようになったら、
-# ここで気付けるようにしておく。
+# V2 wrapper が request を組み直す際に baseLayout を落とすと、内側の楽観ロックが
+# 空文字扱いになり、古いタブが新しい構成を黙って上書きする。
 _patch_items = server.split("$path -match '^/api/v2/items/([^/]+)$'", 1)[1][:600]
-if 'baseLayout' in _patch_items:
-    raise SystemExit('PATCH /api/v2/items now takes baseLayout; update the warning in docs/API.md')
+if 'baseLayout' not in _patch_items:
+    raise SystemExit('PATCH /api/v2/items drops baseLayout before optimistic locking')
 
 # このリポジトリで繰り返し事故が起きた箇所の決まりごと。消えると同じ失敗を繰り返す。
 _rules_path = root/'docs/DEVELOPMENT_RULES.md'
@@ -1550,7 +1550,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260815_v181', 'style.css?v=20260815_v110']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v182', 'style.css?v=20260817_v111']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1605,7 +1605,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260815_v181' not in html:
+if 'app.js?v=20260817_v182' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1631,7 +1631,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260815_v181' not in html:
+if 'app.js?v=20260817_v182' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2026,29 +2026,70 @@ for needed in ['未振り分け（出力しない）', '出力先へ移したペ
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
 
 
-for needed in ['ページをクリックして選ぶ', '移動先を押す', '慣れたら直接ドラッグも使えます',
-               'createPageDragGhost', 'directCardDrag', 'page-drag-ghost']:
+for needed in ['左上のチェックで選ぶ', '移動先を押す', '右上のハンドルをドラッグ',
+               'createPageDragGhost', 'page-thumb-check', 'page-thumb-drag',
+               'page-thumb-preview-surface', 'if (!fromHandle) return', 'page-drag-ghost']:
     if needed not in html + appjs + css:
         raise SystemExit(f'direct page movement UX missing: {needed}')
-for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・絞り込み・並び</summary>',
-               '.page-command-bar:not(.has-selection) .page-destination-actions{opacity:1}']:
+if 'directCardDrag' in appjs:
+    raise SystemExit('thumbnail cards must scroll/select normally; drag may start only from the handle')
+for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・並び・履歴</summary>',
+               '.page-command-bar:not(.has-selection) .page-destination-actions{display:none}',
+               '.page-command-bar.has-selection .page-filter-tools{display:none}']:
     if needed not in html + css:
         raise SystemExit(f'page composition progressive disclosure missing: {needed}')
-# 選択前でも移動先の操作を見せる、という判断を守る検査。以前は opacity:.55 で
-# 「見せる」を実現していたが、無効ボタンが1.96:1、ラベルが2.17:1まで沈んでいた。
-# 隠さないことが本旨なので、非表示と、読めない濃さの両方を禁じる。
-for _bar in ['.page-command-bar:not(.has-selection) .page-destination-actions',
-             '#file-context-bar:not(.has-selection)']:
-    # 最後の規則が勝つ。前方一致で最初の宣言だけを見ると、上書き済みの死んだ規則を判定してしまう。
-    _decl = css.rsplit(_bar + '{', 1)[1].split('}', 1)[0]
-    if 'display:none' in _decl:
-        raise SystemExit(f'the bulk actions must stay visible before a selection: {_bar}')
-    if 'opacity:.' in _decl or 'opacity:0' in _decl:
-        raise SystemExit(f'dimming the bulk actions drops them below readable contrast: {_bar}')
+# The sticky workspace must not grow a disabled destination row before a
+# selection. Selection swaps in its actions within the same stable-height bar.
+_destination_default = css.rsplit('.page-command-bar:not(.has-selection) .page-destination-actions{', 1)[1].split('}', 1)[0]
+if 'display:none' not in _destination_default:
+    raise SystemExit('page destinations must replace normal tools only after a selection')
 if "pages: 'ページ構成'" not in appjs:
     raise SystemExit('page composition view name must match the navigation label')
-if 'grid-template-columns:repeat(3,minmax(0,1fr))' not in css:
-    raise SystemExit('thumbnail assignment lanes must remain simultaneously visible on desktop')
+def assert_page_overview_css(candidate):
+    # Ignore narrow-screen overrides when evaluating the desktop board. A raw
+    # "last occurrence" check would mistake the intentional 760px single-column
+    # rule for the 1366px result.
+    desktop_parts = []
+    cursor = 0
+    for match in re.finditer(r'@media\s*\(\s*max-width\s*:[^)]+\)\s*\{', candidate):
+        if match.start() < cursor:
+            continue
+        desktop_parts.append(candidate[cursor:match.start()])
+        depth = 1
+        index = match.end()
+        while index < len(candidate) and depth:
+            if candidate[index] == '{': depth += 1
+            elif candidate[index] == '}': depth -= 1
+            index += 1
+        cursor = index
+    desktop_parts.append(candidate[cursor:])
+    desktop_css = ''.join(desktop_parts)
+    declarations = re.findall(r'\.overview-board\.thumbnail-board\s*\{([^}]*)\}', desktop_css)
+    if not declarations:
+        raise AssertionError('overview board rule is missing')
+    display_values = re.findall(r'(?:^|;)\s*display\s*:\s*([^;}]*)', declarations[-1])
+    if not display_values or display_values[-1].strip() != 'grid':
+        raise AssertionError('the last desktop overview declaration must use display:grid')
+    if re.search(r'\.overview-board[^{}]*\.inactive-volume\s*\{[^}]*display\s*:\s*none', desktop_css):
+        raise AssertionError('overview lanes must not be hidden')
+try:
+    assert_page_overview_css(css)
+except AssertionError as error:
+    raise SystemExit(f'page overview layout regression: {error}')
+# Prove that this regression guard is not another dead substring test: a later
+# override must defeat the intended rule and make the guard fail.
+try:
+    assert_page_overview_css(css + '\n.overview-board.thumbnail-board{display:block}\n')
+except AssertionError:
+    pass
+else:
+    raise SystemExit('page overview regression guard does not catch a later display override')
+for needed in ["sessionStorage.getItem('ReportBinderActivePageVolume') || 'all'", "data-page-volume-tab=\"all\"",
+               "!row.closest('.volume-panel.inactive-volume')", "String(tab.dataset.pageVolumeTab||'')!=='all'",
+               "setPageSaveStatus('saving','保存中…')", "setPageSaveStatus('saved','保存済み')",
+               'class="page-board-empty"', '原稿を登録・PDF化へ']:
+    if needed not in appjs + html:
+        raise SystemExit(f'commercial-quality page organizer behavior missing: {needed}')
 for needed in ['boardSavePromise=boardSavePromise.then(persist,persist)',
                'newerBoardExists=requestRevision!==boardSaveRevision',
                'pendingBoardSaveVolumes=afterVolumes',
@@ -2060,6 +2101,18 @@ for needed in ['boardSavePromise=boardSavePromise.then(persist,persist)',
                'afterVolumes=JSON.parse(drag.previewSignature||afterSignature)']:
     if needed not in appjs:
         raise SystemExit(f'page movement save serialization missing: {needed}')
+_save_board = appjs.split('function saveBoardOrder()', 1)[1].split('\nasync function savePageFromRow', 1)[0]
+if _save_board.find('rememberPageMutationFingerprint(response)') > _save_board.find("if(!newerBoardExists){applyPageMutationResult(response)"):
+    raise SystemExit('queued page saves do not advance the layout fingerprint before the next request')
+_persist_start = _save_board.find('const persist=async()=>')
+if _persist_start < 0 or _save_board.find('activeLayoutFingerprint(requestPackId)', _persist_start) < 0:
+    raise SystemExit('serialized page saves freeze the pack id but not the latest per-pack fingerprint')
+_pack_switch = appjs.split('async function applyPresetSelection', 1)[1].split('\nasync function registerSelected', 1)[0]
+if 'const saved=await boardSavePromise' not in _pack_switch or "if(!saved){showMessage('warn','一式を切り替えられません'" not in _pack_switch:
+    raise SystemExit('pack switching can race with an in-flight page-layout save')
+_render_pages = appjs.split('function renderPages()', 1)[1].split('\nfunction dynamicVolumePanelHtml', 1)[0]
+if 'cs=changeSummaryFor(p.workbookId)' not in _render_pages or 'p.changeSummary' in _render_pages:
+    raise SystemExit('page organizer render signature does not track workbook change summaries')
 
 
 # 2026-08-06 page-preview organizer controls -------------------------------
@@ -2097,12 +2150,13 @@ for needed in ['.page-history-actions', '.page-history-actions .btn']:
 
 
 # 2026-08-06 keyboard-first page board ------------------------------------
-for needed in ['class="page-keyboard-hint"', '<kbd>Space</kbd>', '<kbd>Ctrl+A</kbd>',
+for needed in ['class="page-keyboard-hint"', '<kbd>Space</kbd>', '<kbd>F2</kbd>', '<kbd>Ctrl+A</kbd>',
                '<kbd>Alt+矢印</kbd>']:
     if needed not in html:
         raise SystemExit(f'page keyboard guide missing: {needed}')
 for needed in ['focusPageId', 'function visiblePageRowsForKeyboard',
                'function pageRowKeyboardTarget', 'function handlePageRowNavigation',
+               'function syncPageRovingTabIndex', "e.key==='F2'",
                "e.key==='Spacebar'", "shortcutKey==='a'", "row.setAttribute('aria-keyshortcuts'",
                "row.setAttribute('aria-label',`${n}ページ目 ${title}`)"]:
     if needed not in appjs:
@@ -2110,6 +2164,15 @@ for needed in ['focusPageId', 'function visiblePageRowsForKeyboard',
 for needed in ['.page-keyboard-hint', '.page-row:focus-visible']:
     if needed not in css:
         raise SystemExit(f'page keyboard styling missing: {needed}')
+if "const focusTarget=row.offsetParent!==null?row:visiblePageRowsForKeyboard().find" not in appjs:
+    raise SystemExit('keyboard volume movement can leave focus inside a hidden lane')
+if "else $('page-volume-tabs')?.querySelector('.page-volume-tab.active')?.focus()" not in appjs:
+    raise SystemExit('moving every focused-lane card leaves no keyboard focus fallback')
+for selector,needed in [('.sidebar,.workspace-top,.step-bar','position:static'),
+                        ('.progress-panel.global-progress','position:static')]:
+    declaration = css.rsplit(selector + '{', 1)[1].split('}', 1)[0]
+    if needed not in declaration:
+        raise SystemExit(f'zoomed page composition can obscure focus: {selector}')
 
 
 # Browser startup must not be interrupted before navigation handlers and the
@@ -2134,6 +2197,10 @@ for needed in [
 ]:
     if needed not in server:
         raise SystemExit(f'page V2 route compatibility is missing: {needed}')
+_v2_reorder_route = server.split("$path -eq '/api/v2/items/reorder'", 1)[1].split("$path -match '^/api/v2/items/([^/]+)$'", 1)[0]
+for needed in ["Test-ConfigHasKey $body 'baseLayout'", "Set-NoteProperty $request 'baseLayout'", "Get-DataProperty $body 'baseLayout'"]:
+    if needed not in _v2_reorder_route:
+        raise SystemExit(f'page V2 reorder drops the optimistic-lock fingerprint: {needed}')
 for needed in ["$excelStartupError = ''", 'Excel原稿をエラーとして記録し、他形式の処理を続けます。', 'if ($KeepHostOpen -and $null -eq $SharedHost)']:
     if needed not in server:
         raise SystemExit(f'mixed-source render isolation is missing: {needed}')

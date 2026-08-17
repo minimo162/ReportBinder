@@ -8574,12 +8574,18 @@ function Handle-Api($Context) {
                 $volumes = [pscustomobject]$volumeMap
             }
             $request = [pscustomobject][ordered]@{ packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); volumes=$volumes }
+            # Keep the optimistic-lock fingerprint supplied by the browser.
+            # Rebuilding the request without it silently disabled conflict
+            # detection on the V2 route and allowed a stale tab to overwrite a
+            # newer page composition.
+            if (Test-ConfigHasKey $body 'baseLayout') { Set-NoteProperty $request 'baseLayout' ([string](Get-DataProperty $body 'baseLayout' '')) }
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=(Reorder-Pages $language $request); state=(Get-V2StatePayload $language) }); return
         }
         if ($method -eq 'PATCH' -and $path -match '^/api/v2/items/([^/]+)$') {
             $body = Read-BodyJson $Context.Request
             $itemId = [Uri]::UnescapeDataString([string]$matches[1])
             $request = [pscustomobject][ordered]@{ packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); pageId=$itemId }
+            if (Test-ConfigHasKey $body 'baseLayout') { Set-NoteProperty $request 'baseLayout' ([string](Get-DataProperty $body 'baseLayout' '')) }
             foreach ($name in @('title','numberingMode','numberingManual','resetNumbering','pageRange','clearPageRange','enabled')) { if (Test-ConfigHasKey $body $name) { Set-NoteProperty $request $name (Get-DataProperty $body $name $null) } }
             if (Test-ConfigHasKey $body 'targetId') { Set-NoteProperty $request 'volume' (Get-LegacyVolumeFromTargetId $language ([string](Get-DataProperty $body 'targetId' ''))) }
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=(Update-Page $language $request); state=(Get-V2StatePayload $language) }); return
