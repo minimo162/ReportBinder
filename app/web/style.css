@@ -761,7 +761,11 @@ input[type=range]::-webkit-slider-thumb{width:22px;height:22px}
    cards. The head CTA remains visible even when the secondary tools are closed. */
 main.shell.pages-shell .page-command-bar{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;row-gap:0}
 main.shell.pages-shell .page-command-bar .toolbar{flex-wrap:nowrap}
-main.shell.pages-shell .overview-board.thumbnail-board{display:grid;align-items:start;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+/* The status banner spans every grid track. With auto-fit that spanning item
+   keeps otherwise-empty tracks alive, so three lanes occupied only the left
+   half of a wide board. Keep the three desktop lanes on one full-width row;
+   the responsive rules below fold them to two/one columns. */
+main.shell.pages-shell .overview-board.thumbnail-board{display:grid;align-items:start;grid-template-columns:repeat(3,minmax(0,1fr))}
 main.shell.pages-shell .overview-board.thumbnail-board .volume-panel,
 main.shell.pages-shell .overview-board.thumbnail-board .volume-content,
 main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{height:auto;max-height:none;overflow:visible}

@@ -387,7 +387,8 @@ for needed in ['grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1f
                '[contenteditable="true"]){-webkit-user-select:text;user-select:text}',
                '.thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}',
                '.volume-panel:not(.inbox) .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}',
-               '.volume-panel.inbox .thumbnail-grid{grid-template-columns:1fr}']:
+               '.volume-panel.inbox .thumbnail-grid{grid-template-columns:1fr}',
+               'main.shell.pages-shell .overview-board.thumbnail-board{display:grid;align-items:start;grid-template-columns:repeat(3,minmax(0,1fr))}']:
     if needed not in appjs + css:
         raise SystemExit(f'20-page lane density or pointer scrolling contract missing: {needed}')
 if "pages.length>=12?'high-volume':''" in appjs or '.volume-panel.high-volume' in css:
@@ -1595,7 +1596,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v189', 'style.css?v=20260817_v119']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v189', 'style.css?v=20260817_v120']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -2119,6 +2120,9 @@ def assert_page_overview_css(candidate):
     display_values = re.findall(r'(?:^|;)\s*display\s*:\s*([^;}]*)', declarations[-1])
     if not display_values or display_values[-1].strip() != 'grid':
         raise AssertionError('the last desktop overview declaration must use display:grid')
+    column_values = re.findall(r'(?:^|;)\s*grid-template-columns\s*:\s*([^;}]*)', declarations[-1])
+    if not column_values or re.sub(r'\s+', '', column_values[-1]) != 'repeat(3,minmax(0,1fr))':
+        raise AssertionError('three desktop lanes must consume the full board width')
     if re.search(r'\.overview-board[^{}]*\.inactive-volume\s*\{[^}]*display\s*:\s*none', desktop_css):
         raise AssertionError('overview lanes must not be hidden')
 try:
@@ -2133,6 +2137,14 @@ except AssertionError:
     pass
 else:
     raise SystemExit('page overview regression guard does not catch a later display override')
+# A full-width banner makes auto-fit retain empty tracks. Prove that the guard
+# rejects the exact rule that previously left the right half of the board blank.
+try:
+    assert_page_overview_css(css + '\n.overview-board.thumbnail-board{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}\n')
+except AssertionError:
+    pass
+else:
+    raise SystemExit('page overview regression guard does not catch empty auto-fit tracks')
 for needed in ["sessionStorage.getItem('ReportBinderActivePageVolume') || 'all'", "data-page-volume-tab=\"all\"",
                "!row.closest('.volume-panel.inactive-volume')", "String(tab.dataset.pageVolumeTab||'')!=='all'",
                "setPageSaveStatus('saving','保存中…')", "setPageSaveStatus('saved','保存済み')",

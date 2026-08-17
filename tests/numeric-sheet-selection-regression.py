@@ -347,7 +347,7 @@ def test_page_composition_ui_contracts():
     )
     assert "grid-template-columns:repeat(2,minmax(0,1fr))" in css
     assert "grid-template-columns:1fr" in css
-    assert "grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))" in css
+    assert "grid-template-columns:repeat(3,minmax(0,1fr))" in css
     assert (
         "main.shell.pages-shell .page-command-bar"
         "{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden" in css
