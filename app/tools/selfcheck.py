@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -1550,7 +1550,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v182', 'style.css?v=20260817_v111']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v183', 'style.css?v=20260817_v112']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1605,7 +1605,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260817_v182' not in html:
+if 'app.js?v=20260817_v183' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1631,7 +1631,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260817_v182' not in html:
+if 'app.js?v=20260817_v183' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2611,5 +2611,52 @@ if 'files = $selectedFiles }' not in _select_route:
 # 診断の容量は AvailableFreeSpace(空き容量)。「使用容量」と書くと逆の意味になる。
 if '使用容量' in appjs:
     raise SystemExit('free disk space must not be labelled as used capacity')
+
+# --- Excel strict numeric-sheet selection / page organizer (2026-08-17) ---
+# The feature intentionally has two independent, explicit paths: a persisted
+# per-source render mode and a one-shot page-layout organizer. Keep both paths
+# visible in the static gate so a future refactor cannot silently make numeric
+# mode global, trim names, or bypass the existing optimistic-lock reorder API.
+for needed in [
+    'function Normalize-ExcelSheetSelection',
+    "function Test-StrictNumericSheetName",
+    "^[0-9]+$",
+    "lastRenderedSheetSelectionMode",
+    "excelSheetSelectionMode",
+    "sheetSelectionByWorkbook",
+    'Set-ExcludedSheetPagesNotRendered',
+    "PDFやページ構成は変更していません",
+    "sheetSelectionExcluded",
+    "noNumericTarget",
+    "function collectNumericSheets",
+    "function compareNumericSheetPages",
+    "function compareAsciiNumericText",
+    "/api/v2/items/reorder",
+    "confirmAction({",
+    "pageVolumeSnapshotsEqual(normalizedBefore,normalizedAfter)",
+    "page?.sheetHidden!==true",
+    "sourceTypeValue(workbook)!=='excel'"
+]:
+    if needed not in server and needed not in appjs:
+        raise SystemExit(f'numeric-sheet selection regression coverage missing: {needed}')
+_numeric_render = server.split('function Render-Workbook(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["$ExcelSheetSelection -eq 'numeric-only'", 'targetSheetNames.Count -eq 0', 'Update-WorkbookPagesFromInspection', 'Set-ExcludedSheetPagesNotRendered']:
+    if needed not in _numeric_render:
+        raise SystemExit(f'numeric-only render safety missing: {needed}')
+_numeric_excluded = server.split('function Set-ExcludedSheetPagesNotRendered', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["volume' 'none", "enabled' $false", "sheetSelectionExcluded"]:
+    if needed not in _numeric_excluded:
+        raise SystemExit(f'excluded sheet page preservation missing: {needed}')
+_numeric_job = server.split('function Invoke-RenderJobFromFile', 1)[1].split('\nfunction ', 1)[0]
+if 'sheetSelectionByWorkbook' not in _numeric_job or 'Render-Source $language $id $excel $true $callback' not in _numeric_job:
+    raise SystemExit('render jobs must pin and pass sheet selection mode through Render-Source')
+_numeric_ui = appjs.split('async function collectNumericSheets', 1)[1].split('\n\n\nasync function sortPagesBySheet', 1)[0]
+if 'numeric.sort(compareNumericSheetPages)' not in _numeric_ui or 'desired.none=' not in _numeric_ui:
+    raise SystemExit('numeric page organizer must sort numeric pages and move excluded Excel pages to none')
+if 'collect-numeric-sheets-btn' not in html or 'data-source-sheet-selection' not in appjs:
+    raise SystemExit('numeric-sheet UI controls are missing')
+numeric_regression = subprocess.run([sys.executable, str(root / 'tests/numeric-sheet-selection-regression.py')], capture_output=True, text=True)
+if numeric_regression.returncode != 0:
+    raise SystemExit('numeric-sheet selection regression failed: ' + (numeric_regression.stdout + numeric_regression.stderr).strip())
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))
