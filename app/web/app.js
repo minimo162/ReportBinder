@@ -2837,6 +2837,20 @@ function openWorkbookComparisonHistory(workbookId){
   try{sessionStorage.setItem('ReportBinderSnapshotWorkbook',id);}catch{}
   setActiveView('history',{reloadPanels:true});
 }
+// Keep comparison state available in the compact detail table and for the
+// changed-only filter. Thumbnail cards intentionally omit these chips: the
+// card already carries title/source/actions, and the extra tag was visual
+// noise in the primary arranging view.
+function pageChangeBadge(p){
+  if (!state?.inputHistoryEnabled) return '';
+  const cs = changeSummaryFor(p?.workbookId);
+  if (!cs || String(cs.status||'') !== 'complete') return '';
+  const name = String(p?.sheetName||'');
+  if (changedSheetSet(p.workbookId).has(name)) return badge('変更あり','attention');
+  if (addedSheetSet(p.workbookId).has(name)) return badge('追加','attention');
+  if (unknownSheetSet(p.workbookId).has(name)) return badge('見比べできません','neutral');
+  return '';
+}
 function pageIsChanged(p){
   const cs = changeSummaryFor(p?.workbookId);
   if (!cs || String(cs.status||'') !== 'complete') return true;
@@ -4424,7 +4438,7 @@ function pageRowHtml(p, idx, filteredOut=false) {
   // Table headers do not name form controls, so without these every row read
   // out as an unlabelled checkbox / textbox / combobox in a list of hundreds.
   const rowLabel=`${idx+1}ページ目 ${p.title||p.sheetName||'ページ'}`;
-  return `<tr tabindex="0" aria-label="${escapeAttr(`${rowLabel}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー`)}" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="page-main-cell"><input class="title-input" data-page-title aria-label="${escapeAttr(`${rowLabel}のページ名`)}" value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering aria-label="${escapeAttr(`${rowLabel}のページ番号表示`)}"><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range aria-label="${escapeAttr(`${rowLabel}で使用するページ範囲`)}" value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
+  return `<tr tabindex="0" aria-label="${escapeAttr(`${rowLabel}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー`)}" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="page-main-cell"><input class="title-input" data-page-title aria-label="${escapeAttr(`${rowLabel}のページ名`)}" value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering aria-label="${escapeAttr(`${rowLabel}のページ番号表示`)}"><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range aria-label="${escapeAttr(`${rowLabel}で使用するページ範囲`)}" value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
 }
 function pageThumbnailHtml(p,idx,filteredOut=false){
   if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),false);

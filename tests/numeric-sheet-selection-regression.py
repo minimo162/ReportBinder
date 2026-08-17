@@ -372,7 +372,11 @@ def test_page_composition_ui_contracts():
     assert "if(requestBaseLayout)body.baseLayout=requestBaseLayout" in collect_action
     assert "waitForQueuedPageLayoutMutation" in app
     assert "pageMutationBusy=true;updateBulkSelectionLabel()" in app
-    assert "function pageChangeBadge" not in app
+    assert "function pageChangeBadge" in app
+    page_row = app.split("function pageRowHtml", 1)[1].split("\nfunction pageThumbnailHtml", 1)[0]
+    page_thumbnail = app.split("function pageThumbnailHtml", 1)[1].split("\nfunction pageThumbnailCacheKey", 1)[0]
+    assert "pageChangeBadge(p)" in page_row
+    assert "pageChangeBadge(" not in page_thumbnail
     assert "function reviewChip" not in app
     assert "変換PDFの更新が必要" in app
     assert "function deletePack" in app

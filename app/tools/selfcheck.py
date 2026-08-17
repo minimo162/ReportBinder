@@ -342,8 +342,14 @@ for needed in ['data-pack-action="delete"', "method:'DELETE'", '提出フォル�
         raise SystemExit(f'archived pack deletion UI missing: {needed}')
 if 'function reviewChip' in appjs or '${reviewChip(' in appjs:
     raise SystemExit('the unclear personal 未確認 chip must not appear on Home')
-if 'function pageChangeBadge' in appjs:
-    raise SystemExit('page cards must not show the redundant 変更あり tag')
+if 'function pageChangeBadge' not in appjs:
+    raise SystemExit('detail view must retain change state for the changed-only workflow')
+_page_row_html = appjs.split('function pageRowHtml', 1)[1].split('\nfunction pageThumbnailHtml', 1)[0]
+_page_thumbnail_html = appjs.split('function pageThumbnailHtml', 1)[1].split('\nfunction pageThumbnailCacheKey', 1)[0]
+if 'pageChangeBadge(p)' not in _page_row_html:
+    raise SystemExit('detail view must show the comparison state')
+if 'pageChangeBadge(' in _page_thumbnail_html:
+    raise SystemExit('thumbnail cards must not show the redundant 変更あり tag')
 if '変換PDFの更新が必要' not in appjs:
     raise SystemExit('Home must describe render freshness as an actionable PDF update')
 _pack_dashboard = server.split('function Get-PackProgressDashboard', 1)[1].split('\nfunction ', 1)[0]
