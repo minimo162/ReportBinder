@@ -397,20 +397,39 @@ body:not(.is-configured) [data-view-panel="excel"] #source-next-action,
 body:not(.is-configured) [data-view-panel="excel"] #auto-status{display:none}
 
 .auto-status{margin-top:16px}.auto-status .secondary-disclosure{margin:0}
-.page-volume-tabs{display:flex;gap:4px;padding:14px var(--s-5) 0;border-top:1px solid var(--border);overflow-x:auto}
+.page-volume-tabs{display:flex;gap:6px;padding:14px var(--s-5) 0;border-top:1px solid var(--border);overflow-x:auto;scrollbar-width:thin}
 .page-volume-tab{min-height:44px;display:flex;align-items:center;gap:8px;flex:0 0 auto;padding:0 14px;border:1px solid transparent;border-radius:var(--r-md);background:transparent;color:var(--text-secondary);font:inherit;font-weight:600}
 .page-volume-tab:hover{background:var(--surface-subtle);color:var(--text)}
 .page-volume-tab.active{border-color:var(--accent-border);background:var(--accent-subtle);color:var(--accent-active)}
+.page-volume-tab.overview{margin-right:4px;border-color:var(--border);background:var(--surface)}
+.page-volume-tab.overview.active{border-color:var(--accent);background:var(--accent);color:var(--text-on-accent)}
+.page-volume-tab.overview.active b{background:rgba(255,255,255,.2);color:inherit}
 .page-volume-tab.optional-empty{border-style:dashed;color:var(--text-tertiary);font-weight:500}
 .page-volume-tab b{min-width:24px;padding:1px 6px;border-radius:999px;background:var(--surface-sunken);color:inherit;font-size:14px;text-align:center}
-.thumbnail-board,.detail-board{display:block;padding:14px var(--s-5) 18px}
+.page-filter-tools{flex:1 1 280px}.page-selection-tools{flex:2 1 520px}.page-save-status{display:inline-flex;align-items:center;gap:6px;margin-left:auto;color:var(--text-tertiary);font-size:14px;white-space:nowrap}.page-save-status::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--success)}.page-save-status.saving::before{background:var(--attention)}.page-save-status.error{color:var(--danger)}.page-save-status.error::before{background:var(--danger)}
+.thumbnail-board,.detail-board{padding:14px var(--s-5) 18px}
 .thumbnail-board>.page-status-banner,.thumbnail-board>.page-filter-empty{margin:0 0 12px}
-.thumbnail-board .volume-panel.inactive-volume,.detail-board .volume-panel.inactive-volume{display:none}
-.thumbnail-board .volume-panel.active-volume{width:100%}
-.thumbnail-board .volume-head{min-height:70px}
-.thumbnail-board .thumbnail-wrap{max-height:none}
-.thumbnail-board .thumbnail-grid{grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
-.thumbnail-board .page-thumb-card{grid-template-columns:160px minmax(0,1fr)}
+.focused-board{display:block}
+.focused-board .volume-panel.inactive-volume{display:none}
+.focused-board.thumbnail-board .volume-panel.active-volume{width:100%}
+.focused-board.thumbnail-board .volume-head{min-height:70px}
+.focused-board.thumbnail-board .thumbnail-wrap{max-height:none}
+.focused-board.thumbnail-board .thumbnail-grid{grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.focused-board.thumbnail-board .page-thumb-card{grid-template-columns:160px minmax(0,1fr)}
+/* The default organizer view is a real multi-lane board. Every destination is
+   visible, so users can understand the composition at a glance and drag a page
+   directly to its destination without first changing tabs. */
+.overview-board.thumbnail-board{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:14px;align-items:start;background:var(--surface-subtle)}
+.overview-board.thumbnail-board>.page-status-banner,.overview-board.thumbnail-board>.page-filter-empty{grid-column:1/-1}
+.overview-board.thumbnail-board .volume-panel{min-width:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface)}
+.overview-board.thumbnail-board .volume-panel.inbox{border-color:var(--attention-border)}
+.overview-board.thumbnail-board .volume-head{min-height:82px;flex:0 0 auto;padding:12px 14px;align-items:flex-start;border-bottom:1px solid var(--border)}
+.overview-board.thumbnail-board .thumbnail-wrap{max-height:min(68vh,760px);padding:12px;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.overview-board.thumbnail-board .thumbnail-grid{grid-template-columns:minmax(0,1fr);gap:10px;align-content:start}
+.overview-board.thumbnail-board .page-thumb-card{grid-template-columns:clamp(112px,35%,152px) minmax(0,1fr)}
+.overview-board.detail-board{display:block}
+.overview-board.detail-board .volume-panel{display:block;margin-bottom:14px;border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden}
+.thumbnail-board .page-thumb-card{cursor:default;touch-action:pan-y}.page-thumb-paper{isolation:isolate}.page-thumb-preview-surface{position:absolute;inset:0;z-index:1;width:100%;height:100%;display:block;padding:0;border:0;border-radius:inherit;background:transparent;cursor:zoom-in}.page-thumb-preview-surface:disabled{cursor:default}.page-thumb-preview-surface:focus-visible{outline:3px solid var(--accent);outline-offset:-3px}.page-thumb-preview-surface canvas{width:100%;height:100%}.page-thumb-preview-surface .page-thumb-placeholder{z-index:1}.page-thumb-check,.page-thumb-drag{z-index:3}.page-thumb-drag{border:1px solid var(--border);background:rgba(255,255,255,.96)}
 .page-thumb-preview{min-height:32px!important;padding-inline:8px}
 .preflight-complete{margin-top:8px;border-top:1px solid var(--border)}
 .preflight-complete>summary{min-height:48px;display:flex;align-items:center;padding:8px 4px;color:var(--text-secondary);font-weight:600;cursor:pointer}
@@ -443,8 +462,16 @@ body:not(.is-configured) [data-view-panel="excel"] #auto-status{display:none}
   .source-folder-direct{grid-template-columns:1fr}.source-folder-direct .btn{width:100%}
   .thumbnail-board .thumbnail-grid{grid-template-columns:1fr}
   .thumbnail-board .page-thumb-card{grid-template-columns:110px minmax(0,1fr)}
+  .overview-board.thumbnail-board{display:block}
+  .overview-board.thumbnail-board .volume-panel{margin-bottom:12px}
+  .overview-board.thumbnail-board .thumbnail-wrap{max-height:none}
   .page-volume-tabs{padding-inline:12px}
+  .page-filter-tools,.page-selection-tools{width:100%;flex-basis:auto}.page-save-status{margin-left:0}
 }
+@media(pointer:coarse){.page-thumb-check,.page-thumb-drag{width:44px;height:44px}.page-thumb-check input{width:22px;height:22px}}
+.page-status-banner{align-items:center;justify-content:space-between;gap:14px}.page-status-banner>div{display:grid;gap:2px}.page-status-banner .btn{flex:0 0 auto}.page-filter-empty>div{display:grid;gap:3px}.page-filter-empty .btn{flex:0 0 auto}.page-empty-drop{display:grid;place-items:center;gap:5px;padding:20px;text-align:center}.page-empty-drop strong{color:var(--text-secondary)}.page-empty-drop span{max-width:280px;color:var(--text-tertiary);font-size:14px;line-height:1.45}
+.page-board-empty{grid-column:1/-1;min-height:260px;display:grid;place-items:center;align-content:center;gap:8px;padding:28px;border:1px dashed var(--border-strong);border-radius:var(--r-lg);background:var(--surface);text-align:center}.page-board-empty strong{font-size:18px}.page-board-empty span{max-width:460px;color:var(--text-secondary);line-height:1.55}
+@media(max-width:760px){.page-status-banner{align-items:stretch;flex-direction:column}.page-status-banner .btn,.page-filter-empty .btn{width:100%}}
 @media(max-width:420px){
   .nav-item{font-size:15px}.nav-item .icon{display:none}
   .workspace-top{top:57px}
@@ -582,6 +609,29 @@ tr.page-row input,tr.page-row select,tr.page-row button{cursor:auto}
 
 /* 4.22:1 on accent-subtle; --accent-active clears 4.5:1. */
 .snapshot-role-buttons .btn.active{border:1px solid var(--accent-border);background:var(--accent-subtle);color:var(--accent-active);font-weight:600}
+
+/* Page composition command workspace: one stable row, plus the destination
+   tabs. Selection replaces search/history controls instead of adding a row. */
+.page-command-bar{min-height:64px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}
+.page-command-bar:not(.has-selection) .page-destination-actions{display:none}
+.page-command-bar.has-selection .page-filter-tools{display:none}
+.page-command-bar.has-selection #select-all-visible-pages-btn,
+.page-command-bar.has-selection .page-history-actions{display:none}
+.page-command-bar.has-selection .page-selection-tools{flex:0 1 auto}
+.page-volume-tabs{position:sticky;top:calc(var(--header-h) + var(--step-h) + 72px);z-index:17;padding-bottom:10px;background:var(--surface);box-shadow:0 5px 12px rgba(27,28,30,.06)}
+@media(max-width:1320px) and (min-width:761px){
+  .page-command-bar{align-items:center;flex-direction:row}
+  .page-selection-tools,.page-destination-actions{width:auto}
+  .page-command-bar .toolbar{flex-wrap:nowrap}
+}
+@media(max-width:760px){.page-volume-tabs{position:static}.page-command-bar{overflow:visible}.page-command-bar:not(.has-selection) .page-selection-tools{display:flex}.page-command-bar.has-selection{display:flex}}
+@media(max-width:760px){
+  /* At 200–400% zoom, stacked sticky headers covered the focus target and the
+     fixed progress panel consumed the remaining viewport. Keep every region in
+     normal document flow so browser focus scrolling can reveal it fully. */
+  .sidebar,.workspace-top,.step-bar{position:static;top:auto}
+  .progress-panel.global-progress{position:static;inset:auto;margin:0 0 14px;border-radius:var(--r-lg);box-shadow:none}
+}
 
 /* Inherited 0.8333em of a 14px label = 11.67px, and this is the only explanation
    of the {packName} placeholders. */
