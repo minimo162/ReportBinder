@@ -235,7 +235,7 @@ workbooks.set('pdf',{sourceType:'pdf',fileName:'cover.pdf'});
 const replacements=[slots[0],slots[2]];
 check(fillExcelPageSlots(slots,replacements).map(x=>x.pageId).join(',')==='memo,cover,hidden','none anchor moved');
 """
-    completed = subprocess.run(["node", "-"], input=functions + "\n" + harness, text=True, capture_output=True)
+    completed = subprocess.run(["node", "-"], input=functions + "\n" + harness, text=True, encoding="utf-8", capture_output=True)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
