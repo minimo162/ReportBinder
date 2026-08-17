@@ -2176,7 +2176,7 @@ for needed in ['focusPageId', 'function visiblePageRowsForKeyboard',
                'function pageRowKeyboardTarget', 'function handlePageRowNavigation',
                'function syncPageRovingTabIndex', "e.key==='F2'",
                "e.key==='Spacebar'", "shortcutKey==='a'", "row.setAttribute('aria-keyshortcuts'",
-               "row.setAttribute('aria-label',`${n}ページ目 ${title}`)"]:
+               "row.setAttribute('aria-label',`${n}ページ目 ${title}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー、F2で設定`)"]:
     if needed not in appjs:
         raise SystemExit(f'page keyboard behavior missing: {needed}')
 for needed in ['.page-keyboard-hint', '.page-row:focus-visible']:
