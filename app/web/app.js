@@ -1029,7 +1029,16 @@ function startUpdateMonitor() {
   }
 }
 
-let finalReadinessInFlight = null;
+// Readiness requests are keyed by the active pack.  A single global promise
+// used to let an in-flight request for pack A be reused after switching to B,
+// leaving B without an authoritative request (and allowing A's late response
+// to repaint the B screen).  Keep the request epoch with each key as well so
+// page mutations can invalidate a request without cancelling the network call.
+const finalReadinessInFlight = new Map();
+// A page-layout mutation can finish while the boot-time readiness request is
+// still in flight.  Keep an epoch so that the old response cannot repaint a
+// "最新" card after the mutation has already made its input stale.
+let finalReadinessEpoch = 0;
 // Repaint guards. Entering the final screen re-rendered every block even when
 // the data was identical, so the page visibly redrew ~250ms after it appeared.
 // Keep signatures off the DOM (a dataset attribute would carry the whole HTML).
@@ -1075,31 +1084,112 @@ async function loadFinalPanels(options = {}){
   if(options.render===false) return;
   if(activeView==='final'){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
 }
-async function loadFinalReadiness(options = {}){
+async function loadFinalReadiness(options){
+  options=options||{};
   if(!state||!configured())return;
   const pack=activePackRecord(),preset=activePreset,key=pack?.category?preset:String(pack?.packId||activePackId);
   if(!pack?.packId)return;
-  if(finalReadinessInFlight)return finalReadinessInFlight;
+  const existing=finalReadinessInFlight.get(key);
+  if(existing&&existing.epoch===finalReadinessEpoch)return existing.promise;
+  const requestEpoch=finalReadinessEpoch;
+  const requestKey=key;
   const request=pack?.category?api(`/api/final/readiness?category=${encodeURIComponent(preset)}`):api(`/api/v2/outputs/readiness?packId=${encodeURIComponent(key)}`);
-  finalReadinessInFlight=request.then(r=>{
+  let promise;
+  promise=request.then(r=>{
+    // A response that began before a reorder/page-setting mutation is not an
+    // authoritative snapshot for the new layout.  The mutation path queues a
+    // second read after this request settles.
+    // Also check the pack key: switching packs while the request is in flight
+    // must never let the old response overwrite the newly active pack.
+    if(requestEpoch!==finalReadinessEpoch||finalReadinessKey()!==requestKey)return;
     state.finalReadiness=state.finalReadiness||{};
     const volumes=r.volumes||Object.fromEntries(Object.entries(r.targets||{}).map(([targetId,ready])=>[targetVolume(targetId),ready]));
-    state.finalReadiness[key]={volumes};
+    state.finalReadiness[requestKey]={volumes};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
     if(options.render!==false&&activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
-  }).catch(e=>log('提出用PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{finalReadinessInFlight=null;});
-  return finalReadinessInFlight;
+  }).catch(e=>log('提出用PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{
+    const current=finalReadinessInFlight.get(requestKey);
+    if(current?.promise===promise)finalReadinessInFlight.delete(requestKey);
+  });
+  finalReadinessInFlight.set(requestKey,{epoch:requestEpoch,promise});
+  return promise;
 }
 
-async function refresh(options = {}) {
+function advanceFinalReadinessEpoch(){
+  finalReadinessEpoch+=1;
+  return finalReadinessEpoch;
+}
+
+function markFinalReadinessStaleForPageMutation(affectedVolumes=[]){
+  const key=finalReadinessKey();
+  if(!key||!state)return;
+  state.finalReadiness=state.finalReadiness||{};
+  const cached=state.finalReadiness[key];
+  const affected=new Set(asArray(affectedVolumes).map(volume=>String(volume||'')).filter(Boolean));
+  if(cached?.volumes&&typeof cached.volumes==='object'){
+    // Preserve page counts and the previous output path while the authoritative
+    // server fingerprint is fetched.  Showing the fallback "0ページ / 未出力"
+    // would be a misleading intermediate state on the final screen.
+    for(const [volume,ready] of Object.entries(cached.volumes)){
+      if(affected.size>0&&!affected.has(String(volume)))continue;
+      if(!ready||typeof ready!=='object')continue;
+      if(Number(ready.pageCount||0)<=0&&!ready.builtFingerprint&&!ready.outputPdf)continue;
+      ready.status='needs-rebuild';
+      ready.displayState='needs-rebuild';
+      const reasons=asArray(ready.staleReasons);
+      if(!reasons.some(reason=>String(reason?.type||'')==='fingerprint')){
+        ready.staleReasons=[{type:'fingerprint',detail:'ページ構成が変更されました'}].concat(reasons).slice(0,10);
+      }
+    }
+  }
+}
+
+function reloadFinalReadinessAfterPageMutation(){
+  const packIdAtMutation=String(activePackId||'');
+  const epoch=finalReadinessEpoch;
+  const readinessKey=finalReadinessKey();
+  const priorEntry=readinessKey?finalReadinessInFlight.get(readinessKey):null;
+  const prior=priorEntry?.promise;
+  const waitForPrior=prior?prior.then(()=>{
+    // Keep the queued post-mutation read from accidentally reusing the old
+    // promise if its finally-handler has not run yet in this microtask turn.
+    const current=finalReadinessInFlight.get(readinessKey);
+    if(current?.promise===prior)finalReadinessInFlight.delete(readinessKey);
+  }):Promise.resolve();
+  return waitForPrior.then(()=>{
+    if(epoch!==finalReadinessEpoch||String(activePackId||'')!==packIdAtMutation)return;
+    return loadFinalReadiness({render:false});
+  }).then(()=>{
+    if(epoch!==finalReadinessEpoch||String(activePackId||'')!==packIdAtMutation)return;
+    renderGlobalHeader();renderNavBadges();renderStepBar();renderDashboardOverview();renderFinalOverview();renderVolumeLinks();
+  }).catch(error=>log('ページ構成後の提出用PDF状態の確認でエラー',error?.detail||error?.message||error));
+}
+
+async function refresh(options) {
+  options=options||{};
   try {
     // finalReadiness is filled in by loadFinalReadiness(), not by /api/state.
     // Replacing state wholesale dropped it, so the final screen painted
     // "0ページ / 出力できません" and corrected itself once the refetch landed -
     // a guaranteed wrong-then-right flash on every refresh.
     const carriedReadiness = state?.finalReadiness;
+    const carriedKey=finalReadinessKey();
+    const authoritativeReadiness=options.authoritativeReadiness===true;
+    // Only conflict/restore/settings callers request an authoritative
+    // readiness boundary.  Ordinary refresh keeps the previous card during
+    // the state GET to avoid reintroducing a 0-page flash.
+    if(authoritativeReadiness)advanceFinalReadinessEpoch();
     state = normalizeStatePayload(await api('/api/state'));
-    if (carriedReadiness) state.finalReadiness = Object.assign({}, carriedReadiness, state.finalReadiness || {});
+    if (carriedReadiness) {
+      const retained=Object.assign({},carriedReadiness);
+      // The active pack is the one whose page/fingerprint inputs just changed;
+      // carrying its old custom key through refresh kept a stale "latest" card
+      // alive and made a later load look optional.  Preserve other pack keys,
+      // while letting a server-provided active key win below.
+      if(authoritativeReadiness&&carriedKey)delete retained[carriedKey];
+      state.finalReadiness = Object.assign({}, retained, state.finalReadiness || {});
+    }
+    if(authoritativeReadiness) await loadFinalReadiness({render:false});
     const reloadHistory = activeView === 'history' && historyPanelsInitialized;
     snapshotHistoryResponseCache.clear();
     // render:false lets a caller fold several sequential loads into one paint.
@@ -1609,7 +1699,18 @@ async function savePackSettings(btn){
   const pack=packForPreset();if(!pack?.packId){showMessage('danger','一式設定を保存できません','対象の一式が見つかりません。');return;}
   const body={outputFileNamePattern:String($('pack-output-pattern')?.value||'').trim()};
   if(!body.outputFileNamePattern){showMessage('warn','出力ファイル名を入力してください','使用できる変数は {packName}・{targetName}・{yyyyMMdd} です。');$('pack-output-pattern')?.focus();return;}
-  await runBusy(btn,async()=>{try{const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}`,{method:'PATCH',body});state=normalizeStatePayload(response.state||await api('/api/state'));renderAll();showMessage('ok','資料の仕上げ設定を保存しました','次回の提出用PDF出力から反映されます。');}catch(error){showMessage('danger','資料の仕上げ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
+  await runBusy(btn,async()=>{try{
+    const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}`,{method:'PATCH',body});
+    // Pack output settings are part of the final-input fingerprint.  Do not
+    // leave a custom pack's cached readiness marked built after the settings
+    // response replaces state; invalidate the old request and await the
+    // authoritative readiness endpoint before repainting Home/final.
+    advanceFinalReadinessEpoch();
+    state=normalizeStatePayload(response.state||await api('/api/state'));
+    await loadFinalReadiness({render:false});
+    renderAll();
+    showMessage('ok','資料の仕上げ設定を保存しました','次回の提出用PDF出力から反映されます。');
+  }catch(error){showMessage('danger','資料の仕上げ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
 }
 function requiredRenderProfileVersion(source) {
   if (sourceTypeValue(source) === 'pdf') {
@@ -4943,8 +5044,27 @@ function collectBoardVolumes() {
 }
 function applyPageMutationResult(payload){
   const result=payload?.result||payload||{};
+  // Advance independently of the local structure guard.  A mutation response
+  // can still invalidate a boot-time readiness request even when a partial
+  // state (or a compatibility response without pages) is being applied.
+  advanceFinalReadinessEpoch();
   const structure=state?.structure;
   if(!structure)return;
+  // V2 page mutations return an atomic state snapshot alongside the mutation
+  // result.  The old client kept only result.pages/volumes, leaving Home's
+  // packProgress and the final screen's readiness from before the move.  That
+  // produced the contradictory "ページ構成 0" / "未振り分け 1" view and let a
+  // reordered lane continue to read "提出用PDFは最新です".
+  const mutationState=payload?.state;
+  if(mutationState&&typeof mutationState==='object'){
+    if(mutationState.packProgress&&typeof mutationState.packProgress==='object')state.packProgress=mutationState.packProgress;
+    if(mutationState.finalReadiness&&typeof mutationState.finalReadiness==='object'){
+      state.finalReadiness=Object.assign({},state.finalReadiness||{},mutationState.finalReadiness);
+    }
+  }
+  const readinessKey=finalReadinessKey();
+  const serverIncludedReadiness=!!(mutationState?.finalReadiness&&readinessKey&&Object.prototype.hasOwnProperty.call(mutationState.finalReadiness,readinessKey));
+  if(!serverIncludedReadiness)markFinalReadinessStaleForPageMutation(result.affectedVolumes);
   // 保存が通ったら、次の操作の基準を新しい指紋へ進める。ここを忘れると
   // 自分の直前の変更を「他のタブの変更」と誤認して2回目以降が必ず失敗する。
   if(result.layoutFingerprint)rememberLayoutFingerprint(activePackRecord()?.packId||activePackId,result.layoutFingerprint);
@@ -4955,6 +5075,15 @@ function applyPageMutationResult(payload){
     if(index>=0)structure.pages[index]=result.page;else structure.pages.push(result.page);
   }
   if(result.volumes)structure.volumes=result.volumes;
+  // Restore responses carry the authoritative structure in state rather than
+  // duplicating every page in result.  Adopt it when the result has no more
+  // specific page/volume payload; this keeps custom restore atomic before the
+  // follow-up refresh paints the rest of the dashboard.
+  const mutationStructure=mutationState?.structure;
+  if(mutationStructure&&typeof mutationStructure==='object'){
+    if(!Array.isArray(result.pages)&&!result.page&&Array.isArray(mutationStructure.pages))structure.pages=mutationStructure.pages;
+    if(!result.volumes&&mutationStructure.volumes&&typeof mutationStructure.volumes==='object')structure.volumes=mutationStructure.volumes;
+  }
   const pages=asArray(structure.pages);
   state.summary=state.summary||{};
   state.summary.totalPages=pages.length;
@@ -4965,7 +5094,8 @@ function applyPageMutationResult(payload){
   // 左ナビのバッジだけを更新し、上のステップ表示を置き去りにしていた。全ページを
   // 出力先へ移しても「!」のまま、全ページを未振り分けへ戻しても「✓」のままになり、
   // 画面を読み込み直すまで直らない。判断の材料がそこにあるので、同時に更新する。
-  renderNavBadges();renderStepBar();renderFinalOverview();renderPages();renderPageOverview();if(isModalOpen())syncPreviewOrganizerControls();
+  renderGlobalHeader();renderNavBadges();renderStepBar();renderSummary();renderDashboardOverview();renderFinalOverview();renderPages();renderPageOverview();renderVolumeLinks();if(isModalOpen())syncPreviewOrganizerControls();
+  if(!serverIncludedReadiness)void reloadFinalReadinessAfterPageMutation();
 }
 
 function rememberPageMutationFingerprint(payload,packId=null){
@@ -4994,10 +5124,14 @@ function scheduleBoardSave(undo=null) {
 async function handlePageLayoutConflict(rejectedVolumes,requestRevision){
   const failedUndo=pageLayoutUndoStack[pageLayoutUndoStack.length-1];
   if(failedUndo&&pageVolumeSnapshotsEqual(failedUndo.after,rejectedVolumes))pageLayoutUndoStack.pop();
-  try{await refresh();}catch{}
+  // A conflict means the server's layout/fingerprint is authoritative.  Drop
+  // the active custom-pack readiness key and await its fresh GET before
+  // repainting Home/final, otherwise the conflict screen can still say
+  // "latest" for the previous layout.
+  try{await refresh({authoritativeReadiness:true,render:false});}catch{}
   if(requestRevision!==boardSaveRevision)return;
   selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';
-  renderPages();
+  renderGlobalHeader();renderNavBadges();renderStepBar();renderSummary();renderDashboardOverview();renderFinalOverview();renderPages();renderPageOverview();renderVolumeLinks();
   updateBulkSelectionLabel();
   setPageSaveStatus('error','別画面の変更を反映');
   showMessage('warn','ページ構成が別の画面で変更されました',
@@ -5070,9 +5204,11 @@ async function savePageFromRow(row, numberingChanged=false) {
 }
 
 async function handlePageSettingsConflict(){
-  try{await refresh();}catch{}
+  // Settings conflicts also invalidate the final-input fingerprint (page
+  // range/numbering can change the emitted PDF), including custom packs.
+  try{await refresh({authoritativeReadiness:true,render:false});}catch{}
   lastPageBoardRenderSignature='';
-  renderPages();
+  renderGlobalHeader();renderNavBadges();renderStepBar();renderSummary();renderDashboardOverview();renderFinalOverview();renderPages();renderPageOverview();renderVolumeLinks();
   setPageSaveStatus('error','別画面の変更を反映');
   showMessage('warn','ページ構成が別の画面で変更されました',
     'この変更は保存していません。最新の状態を読み込み直したので、内容を確認してからもう一度操作してください。',
@@ -5938,7 +6074,12 @@ async function previewLayoutRestore(snapshotId, btn){
     restoreStarted=true;setPageSaveStatus('saving','保存中…');
     const res=await api(custom?'/api/v2/layout/restore':'/api/layout/restore',{method:'POST',body});
     clearPageLayoutHistory();
-    await refresh();
+    // V2 restore returns an atomic state snapshot.  Apply it before the
+    // authoritative refresh so the response cannot be discarded (especially
+    // custom-pack readiness/packProgress), while the refresh obtains the
+    // legacy restore route's structure and a fresh final readiness key too.
+    applyPageMutationResult(res);
+    await refresh({authoritativeReadiness:true});
     setPageSaveStatus('saved','保存済み');
     $('page-layout-revisions-btn')?.focus();
     showMessage('ok','ページ構成を復元しました',`${Number(res.result?.appliedPageCount||0)}ページに適用しました。取り消す場合は保存履歴の「復元の直前」から戻せます。`,null,

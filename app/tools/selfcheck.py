@@ -1596,7 +1596,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v189', 'style.css?v=20260817_v120']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v190', 'style.css?v=20260817_v120']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1651,7 +1651,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260817_v189' not in html:
+if 'app.js?v=20260817_v190' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1677,7 +1677,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260817_v189' not in html:
+if 'app.js?v=20260817_v190' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2524,6 +2524,39 @@ for needed in ['function activeLayoutFingerprint', 'function rememberLayoutFinge
 _apply = appjs.split('function applyPageMutationResult', 1)[1].split('\nfunction ', 1)[0]
 if 'rememberLayoutFingerprint' not in _apply:
     raise SystemExit('applyPageMutationResult must advance the stored layout fingerprint')
+for needed in ['advanceFinalReadinessEpoch()', 'state.packProgress=mutationState.packProgress',
+               'state.finalReadiness=Object.assign', 'renderDashboardOverview()',
+               'renderFinalOverview()', 'renderVolumeLinks()']:
+    if needed not in _apply:
+        raise SystemExit(f'page mutation must synchronize dashboard/final state: {needed}')
+_readiness_loader = appjs.split('async function loadFinalReadiness', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['finalReadinessInFlight.get(key)', 'finalReadinessInFlight.set(requestKey',
+               'requestEpoch!==finalReadinessEpoch', 'finalReadinessKey()!==requestKey']:
+    if needed not in _readiness_loader:
+        raise SystemExit(f'final readiness request isolation missing: {needed}')
+if 'const finalReadinessInFlight = new Map()' not in appjs:
+    raise SystemExit('final readiness requests must be keyed by pack')
+_refresh_state = appjs.split('async function refresh(', 1)[1].split('\nasync function ', 1)[0]
+for needed in ['authoritativeReadiness', 'delete retained[carriedKey]', 'await loadFinalReadiness({render:false})']:
+    if needed not in _refresh_state:
+        raise SystemExit(f'authoritative custom-pack refresh missing: {needed}')
+for conflict_name, end_marker in [('handlePageLayoutConflict','\nfunction saveBoardOrder'),('handlePageSettingsConflict','\nfunction pageSettingsBody')]:
+    conflict_block = appjs.split(f'async function {conflict_name}',1)[1].split(end_marker,1)[0]
+    if 'authoritativeReadiness:true' not in conflict_block:
+        raise SystemExit(f'{conflict_name} must refresh custom-pack readiness')
+_restore_layout = appjs.split('async function previewLayoutRestore',1)[1].split('\nfunction volumeLabel',1)[0]
+for needed in ['applyPageMutationResult(res)', 'authoritativeReadiness:true']:
+    if needed not in _restore_layout:
+        raise SystemExit(f'layout restore state synchronization missing: {needed}')
+
+_v2_state = server.split('function Get-V2StatePayload',1)[1].split('\nfunction ',1)[0]
+for needed in ['Get-FinalBuildReadiness', '$finalReadiness $packId']:
+    if needed not in _v2_state:
+        raise SystemExit(f'custom pack readiness missing from V2 mutation state: {needed}')
+for route_marker in ["$path -eq '/api/pages/reorder'", "$path -in @('/api/pages/sort-by-numeric-sheet','/api/pages/sort-by-sheet')", "$path -eq '/api/pages/update'"]:
+    route_block = server.split(route_marker,1)[1].split('\n        if ',1)[0]
+    if 'Get-V2StatePayload $language' not in route_block:
+        raise SystemExit(f'page mutation route must return synchronized state: {route_marker}')
 if appjs.count("e.code==='structure-conflict'") + appjs.count("error.code==='structure-conflict'") < 4:
     raise SystemExit('every page-mutating call site must handle the conflict response')
 
