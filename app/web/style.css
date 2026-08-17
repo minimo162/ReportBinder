@@ -196,7 +196,7 @@ input,select{height:34px;font-size:16px}.search-field{height:34px}.search-field 
 .thumbnail-board .volume-head h3{font-size:16px}.thumbnail-board .volume-head p{line-height:1.35}
 .thumbnail-board .thumbnail-wrap{padding:12px}
 .thumbnail-board .thumbnail-grid{grid-template-columns:minmax(0,1fr);gap:10px;align-content:start}
-.thumbnail-board .page-thumb-card{display:grid;grid-template-columns:clamp(82px,calc(var(--page-thumbnail-min,190px)*.5),130px) minmax(0,1fr);grid-template-areas:"paper copy" "paper meta" "editor editor";column-gap:10px;padding:8px;cursor:grab;touch-action:none}
+.thumbnail-board .page-thumb-card{display:grid;grid-template-columns:clamp(82px,calc(var(--page-thumbnail-min,190px)*.5),130px) minmax(0,1fr);grid-template-areas:"paper copy" "paper meta" "editor editor";column-gap:10px;padding:8px;cursor:grab;touch-action:pan-y}
 .thumbnail-board .page-thumb-card:active{cursor:grabbing}.thumbnail-board .page-thumb-card input,.thumbnail-board .page-thumb-card button,.thumbnail-board .page-thumb-card select{cursor:auto}
 .thumbnail-board .page-thumb-paper{grid-area:paper;align-self:start}.thumbnail-board .page-thumb-copy{grid-area:copy;padding:2px 0 0}.thumbnail-board .page-thumb-copy>span{white-space:normal;line-height:1.35}
 .thumbnail-board .page-thumb-meta{grid-area:meta;align-self:end;min-height:24px;margin-top:6px;padding-top:6px}.thumbnail-board .page-thumb-editor{grid-area:editor}
@@ -664,7 +664,7 @@ main.shell.pages-shell .overview-board.thumbnail-board{
   background:transparent;
 }
 main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-grid{
-  grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));
   gap:14px;
 }
 main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap,
@@ -774,4 +774,27 @@ main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{height:au
 @media(max-width:760px){
   main.shell.pages-shell .page-command-bar{flex-wrap:wrap;overflow:visible}
   main.shell.pages-shell .page-command-bar .toolbar{flex-wrap:wrap}
+}
+
+/* Pointer affordance matches the Explorer/Finder contract: mouse/pen can grab
+   any non-control card surface.  Touch keeps the browser's vertical scroll;
+   there is no hidden handle-only mode to discover. */
+.thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}
+.thumbnail-board .page-thumb-card:active{cursor:grabbing}
+.detail-board .page-row{cursor:grab;touch-action:pan-y}
+.detail-board .page-row:active{cursor:grabbing}
+.detail-board .page-row :is(input,select,button,a,label){cursor:auto}
+.thumbnail-board .page-thumb-check,.thumbnail-board .page-thumb-drag{display:none!important}
+.thumbnail-board .page-thumb-card.selected-row::after{content:"選択中";top:7px;left:7px;width:auto;height:24px;padding:0 8px;border-radius:12px;font-size:12px;box-shadow:0 1px 5px rgba(27,28,30,.18)}
+.page-thumb-preview-surface{pointer-events:none;cursor:default}
+@media(pointer:coarse){
+  .thumbnail-board .page-thumb-card{cursor:default;touch-action:pan-y}
+}
+/* A normal report often has about twenty pages in both main and appendix.
+   On a wide desktop, use the otherwise empty horizontal room to halve lane
+   height while preserving the single document scrollbar. Narrow screens keep
+   one card per lane row so text and controls never become cramped. */
+@media(min-width:1800px){
+  main.shell.pages-shell .overview-board.thumbnail-board .volume-panel.high-volume .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  main.shell.pages-shell .overview-board.thumbnail-board .volume-panel.high-volume .page-thumb-card{grid-template-columns:minmax(76px,96px) minmax(0,1fr)}
 }

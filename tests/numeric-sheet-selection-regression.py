@@ -305,10 +305,31 @@ def test_page_composition_ui_contracts():
     assert "error.code==='structure-conflict'" in sort_action
     assert "await handlePageLayoutConflict(beforeVolumes,requestRevision)" in sort_action
     assert "finally{pageMutationBusy=false" in sort_action
-    drag_start = extract_js_function(app, "beginPointerPageDrag")
+    drag_start = app.split("function beginPointerPageDrag", 1)[1].split("function setPageThumbnailEditor", 1)[0]
+    drag_finish = app.split("function finishPointerDrag", 1)[1].split("function beginPointerPageDrag", 1)[0]
     key_handler = extract_js_function(app, "handleBoardRowKeydown")
     history_action = extract_js_function(app, "applyPageLayoutHistory")
     assert "if (pageMutationBusy || !row" in drag_start
+    assert "pointerType" in drag_start and "interactive" in drag_start
+    assert "if(pointerType==='touch')return" in drag_start
+    assert "moved < 7" in drag_start
+    assert "lostpointercapture" in drag_start and "window.addEventListener('blur'" in drag_start
+    assert "if (!started)" in drag_start and "handlePageCardSelection(row,ev)" in drag_start
+    assert "selectedPages.clear();drag.rows.forEach" in drag_finish
+    assert "function handlePageCardSelection" in app
+    assert "if(event.ctrlKey||event.metaKey)" in app
+    assert "syncPageRovingTabIndex(card)" in app
+    assert "const visibleSelection=new Set" in app
+    assert "activePageVolume=target;pageVolumeAutoPicked=true" in app
+    assert "const focusRow=drag.rows.find" in app
+    assert "pageVolumesFromState" in app and "const domLanes" not in app
+    assert "renderPageOverview({volumes:afterVolumes})" in app
+    assert "textContent=manual?'手動順':'半角数字順'" in app
+    assert "sortButton.disabled=pageMutationBusy||!manual" in app
+    schedule_action = extract_js_function(app, "scheduleBoardSave")
+    save_action = app.split("function saveBoardOrder()", 1)[1].split("\nasync function savePageFromRow", 1)[0]
+    assert "renderPageOverview({volumes:afterVolumes})" in schedule_action
+    assert "pageMutationBusy=false" in save_action and "renderPageOverview()" in save_action
     assert "if(pageMutationBusy&&e.altKey)" in key_handler
     assert "if(pageLayoutHistoryBusy||pageMutationBusy)return" in history_action
     assert "pageLayoutHistoryBusy=true;pageMutationBusy=true" in history_action
@@ -324,10 +345,26 @@ def test_page_composition_ui_contracts():
     )
     assert "grid-template-columns:repeat(2,minmax(0,1fr))" in css
     assert "grid-template-columns:1fr" in css
+    assert "grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))" in css
     assert (
         "main.shell.pages-shell .page-command-bar"
         "{flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden" in css
     )
+    assert ".thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}" in css
+    assert ".thumbnail-board .page-thumb-card{cursor:default;touch-action:pan-y}" in css
+    assert ".thumbnail-board .page-thumb-check,.thumbnail-board .page-thumb-drag{display:none!important}" in css
+    assert ".page-thumb-preview-surface{pointer-events:none;cursor:default}" in css
+    assert "touch-action:pan-y" in css
+    assert "<th class=\"seq-col\">順</th><th>ページ名</th>" in app
+    assert 'type="checkbox" data-page-check' not in app
+    assert "pages.length>=12?'high-volume':''" in app
+    assert ".volume-panel.high-volume .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}" in css
+    assert "requestBaseLayout=activeLayoutFingerprint(requestPackId)" in app
+    collect_action = extract_js_function(app, "collectNumericSheets")
+    assert "latestBaseLayout" not in collect_action
+    assert "if(requestBaseLayout)body.baseLayout=requestBaseLayout" in collect_action
+    assert "waitForQueuedPageLayoutMutation" in app
+    assert "pageMutationBusy=true;updateBulkSelectionLabel()" in app
 
 
 if __name__ == "__main__":
