@@ -2051,7 +2051,11 @@ def assert_page_overview_css(candidate):
     # rule for the 1366px result.
     desktop_parts = []
     cursor = 0
-    for match in re.finditer(r'@media\s*\(\s*max-width\s*:[^)]+\)\s*\{', candidate):
+    # A responsive query may combine max-width with min-width. Treat the whole
+    # block as non-desktop too; stopping immediately after the first closing
+    # parenthesis leaves e.g. `and (min-width:801px)` in desktop_css and makes
+    # its grid-template-only override look like the final desktop rule.
+    for match in re.finditer(r'@media\s*[^\{]*\(\s*max-width\s*:[^)]+\)[^\{]*\{', candidate):
         if match.start() < cursor:
             continue
         desktop_parts.append(candidate[cursor:match.start()])
