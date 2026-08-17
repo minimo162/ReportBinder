@@ -318,6 +318,7 @@ def test_page_composition_ui_contracts():
     assert "selectedPages.clear();drag.rows.forEach" in drag_finish
     assert "function handlePageCardSelection" in app
     assert "if(event.ctrlKey||event.metaKey)" in app
+    assert "window.getSelection?.()?.removeAllRanges()" in app
     assert "syncPageRovingTabIndex(card)" in app
     assert "const visibleSelection=new Set" in app
     assert "activePageVolume=target;pageVolumeAutoPicked=true" in app
@@ -357,8 +358,11 @@ def test_page_composition_ui_contracts():
     assert "touch-action:pan-y" in css
     assert "<th class=\"seq-col\">順</th><th>ページ名</th>" in app
     assert 'type="checkbox" data-page-check' not in app
-    assert "pages.length>=12?'high-volume':''" in app
-    assert ".volume-panel.high-volume .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}" in css
+    assert "pages.length>=12?'high-volume':''" not in app
+    assert ".volume-panel.high-volume" not in css
+    assert "grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1fr))" in css
+    assert ".thumbnail-board .page-thumb-card,.detail-board .page-row{-webkit-user-select:none;user-select:none}" in css
+    assert '[contenteditable="true"]){-webkit-user-select:text;user-select:text}' in css
     assert "requestBaseLayout=activeLayoutFingerprint(requestPackId)" in app
     collect_action = extract_js_function(app, "collectNumericSheets")
     assert "latestBaseLayout" not in collect_action

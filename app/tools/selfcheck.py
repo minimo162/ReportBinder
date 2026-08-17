@@ -337,7 +337,8 @@ if 'function handlePageCardSelection' not in appjs or "if(pointerType==='touch')
     raise SystemExit('thumbnail cards must use Explorer selection and keep touch scrolling safe')
 for needed in ['const interactive=', 'selectedPages.clear();drag.rows.forEach', 'renderPageOverview({volumes:afterVolumes})',
                'moved < 7', 'lostpointercapture', "window.addEventListener('blur'", 'handlePageCardSelection(row,ev)',
-               'syncPageRovingTabIndex(card)', 'const visibleSelection=new Set']:
+               'syncPageRovingTabIndex(card)', 'const visibleSelection=new Set',
+               'window.getSelection?.()?.removeAllRanges()']:
     if needed not in appjs:
         raise SystemExit(f'pointer drag state isolation missing: {needed}')
 if 'class="page-thumb-check"' in appjs or 'class="drag-handle page-thumb-drag"' in appjs:
@@ -356,11 +357,14 @@ for symbol in '⌂□▦▤▣△⋮◉⌄↻⌕⊘›':
     if symbol in html: raise SystemExit(f'font symbol remains in html: {symbol}')
 
 css=(root/'app/web/style.css').read_text(encoding='utf-8')
-for needed in ["pages.length>=12?'high-volume':''",
-               '.volume-panel.high-volume .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}',
+for needed in ['grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1fr))',
+               '.thumbnail-board .page-thumb-card,.detail-board .page-row{-webkit-user-select:none;user-select:none}',
+               '[contenteditable="true"]){-webkit-user-select:text;user-select:text}',
                '.thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}']:
     if needed not in appjs + css:
         raise SystemExit(f'20-page lane density or pointer scrolling contract missing: {needed}')
+if "pages.length>=12?'high-volume':''" in appjs or '.volume-panel.high-volume' in css:
+    raise SystemExit('page card geometry must not change at a page-count threshold')
 for needle in ['--accent:#5e6ad2','--sidebar-w:248px','backdrop-filter','box-shadow:none','.badge.attention','background:var(--attention-subtle)','font-weight:600','.modal-card','.drop-placeholder','.notice{position:fixed','.diff-dialog{width:min(1800px,94vw)','.diff-viewers.overlay-mode','@media(max-width:1100px)','.thumbnail-grid','.page-command-bar.has-selection','.page-thumb-editor','.page-thumb-card.editing']:
     if needle not in css: raise SystemExit(f'css feature not found: {needle}')
 if 'font-weight:900' in css or 'radial-gradient' in css: raise SystemExit('old visual style remains')
@@ -1564,7 +1568,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v187', 'style.css?v=20260817_v117']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v188', 'style.css?v=20260817_v118']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1619,7 +1623,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260817_v187' not in html:
+if 'app.js?v=20260817_v188' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1645,7 +1649,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260817_v187' not in html:
+if 'app.js?v=20260817_v188' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
