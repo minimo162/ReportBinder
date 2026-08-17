@@ -52,6 +52,7 @@ let boardSaveTimer = null;
 let boardSavePromise = Promise.resolve(true);
 let boardSaveRevision = 0;
 let pendingBoardSaveVolumes = null;
+let boardSaveMutationBusy = false;
 let selectedFiles = new Set();
 let selectedWorkbooks = new Set();
 let expandedSourceSettings = new Set();
@@ -1181,6 +1182,9 @@ function renderAll(options={}) {
     renderFileList(availableFiles);
     renderWorkbooks();
     renderPages();
+    // renderPages rebuilds the lane DOM; refresh the numeric/manual badge
+    // after that rebuild so a prior DOM order cannot leak into the new state.
+    renderPageOverview();
   }
   if (state.structureLoadError) {
     showMessage('danger', '保存された作業内容を読み込めません', userFriendlyError(state.structureLoadError), state.structureLoadError);
@@ -1383,11 +1387,12 @@ async function runSystemDiagnostics(btn){
 
 
 
-function renderPageOverview() {
+function renderPageOverview(options={}) {
   const counts=pageCountsByVolume(); const strip=$('page-summary-strip');
   const summaryItems=[['未振り分け',counts.none,'attention'],...activeTargetDefinitions().map(target=>[`${target.displayName||target.targetId} PDF`,counts.volumes[targetVolume(target.targetId)]||0,''])];
   if(strip)strip.innerHTML=summaryItems.map(([label,n,cls])=>`<div class="page-summary-item ${cls&&n?'attention':''}"><div class="summary-label">${escapeHtml(label)}</div><div><span class="summary-value">${n}</span> ページ</div></div>`).join('');
-  const manual=!numericSheetSequenceIsDefault(); const label=$('sort-state-label'); if(label){label.textContent=manual?'手動':'半角数字順';label.classList.toggle('manual',manual);}
+  const manual=!numericSheetSequenceIsDefault(undefined,options.volumes||null); const label=$('sort-state-label'); if(label){label.textContent=manual?'手動順':'半角数字順';label.classList.toggle('manual',manual);}
+  const sortButton=$('sort-by-sheet-btn'); if(sortButton){sortButton.disabled=pageMutationBusy||!manual;sortButton.setAttribute('aria-disabled',String(sortButton.disabled));sortButton.title=manual?'各レーンの半角数字シートを並べ直します':'すでに半角数字順です';}
   // Step 1 hands off to step 2 with a primary button; step 2 had no equivalent
   // and left people wondering whether the sorting work was finished.
   const assigned=pagesForActivePreset().some(p=>p.enabled!==false&&String(p.volume||'none')!=='none');
@@ -1599,6 +1604,13 @@ function updateBulkSelectionLabel() {
 }
 function setPageSaveStatus(kind='saved',text='保存済み'){
   const el=$('page-save-status');if(!el)return;el.classList.toggle('saving',kind==='saving');el.classList.toggle('error',kind==='error');el.textContent=text;
+}
+async function waitForQueuedPageLayoutMutation(){
+  // Only a pointer/keyboard board save is safely awaitable here. Other layout
+  // mutations keep their existing busy guard and return without building a
+  // request body against a moving state.
+  if(boardSaveMutationBusy){const saved=await boardSavePromise;if(!saved)return false;}
+  return !pageMutationBusy;
 }
 
 async function savePackSettings(btn){
@@ -1983,7 +1995,7 @@ async function applyPageLayoutHistory(direction,btn=null){
     setPageSaveStatus('saving','保存中…');
     try{const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes:redo?entry.after:entry.before})});source.pop();target.push(entry);trimPageLayoutHistory(target);applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');selectedPages.clear();lastPageRangeAnchor='';syncPageSelectionUi();showMessage('ok',redo?'ページ構成をやり直しました':'ページ構成を元に戻しました',entry.label,null,[{label:redo?'元に戻す':'やり直す',handler:()=>redo?undoLastPageLayout():redoLastPageLayout()}],8000);}
     catch(error){setPageSaveStatus('error','保存できません');showMessage('danger',redo?'ページ構成をやり直せません':'ページ構成を元に戻せません',userFriendlyError(error.message),error.detail||error.stack||error.message);}
-  }finally{pageLayoutHistoryBusy=false;pageMutationBusy=false;if(button)button.classList.remove('busy');updateBulkSelectionLabel();}
+  }finally{pageLayoutHistoryBusy=false;pageMutationBusy=false;if(button)button.classList.remove('busy');updateBulkSelectionLabel();renderPageOverview();}
 }
 async function undoLastPageLayout(btn=null){return applyPageLayoutHistory('undo',btn);}
 async function redoLastPageLayout(btn=null){return applyPageLayoutHistory('redo',btn);}
@@ -2383,6 +2395,14 @@ function visiblePageSelectionValues() {
     .filter(row => !row.closest('.volume-panel.inactive-volume'))
     .map(row => String(row.getAttribute('data-page-id') || '')).filter(Boolean);
 }
+function pageSelectionValuesForCard(card) {
+  const volume=String(card?.closest?.('[data-volume]')?.getAttribute('data-volume')||'');
+  if(!volume)return visiblePageSelectionValues();
+  const lane=[...document.querySelectorAll('[data-volume]')].find(element=>String(element.getAttribute('data-volume')||'')===volume);
+  return [...(lane?.querySelectorAll('.page-row:not(.page-filter-hidden)')||[]) ]
+    .filter(row=>row.offsetParent!==null)
+    .map(row=>String(row.getAttribute('data-page-id')||'')).filter(Boolean);
+}
 function syncPageSelectionUi() {
   updateBulkSelectionLabel();
   document.querySelectorAll('.page-row').forEach(row => {
@@ -2409,6 +2429,39 @@ function syncPageSelectionUi() {
 function handlePageCheckboxToggle(ch, shiftKey=false) {
   lastPageRangeAnchor = updateSelectionRange(visiblePageSelectionValues(), selectedPages, ch.value, ch.checked, shiftKey, lastPageRangeAnchor);
   syncPageSelectionUi();
+}
+// Page cards follow the familiar Explorer/Finder selection model.  A plain
+// click replaces the selection, Ctrl/Cmd toggles one item, and Shift extends
+// from the last anchor.  Keep this separate from the detail-table checkbox
+// path so the thumbnail itself is a large, forgiving target rather than a
+// collection of tiny controls.
+function handlePageCardSelection(card, event={}) {
+  const id=String(card?.dataset?.pageId||'');
+  if(!id)return;
+  const values=pageSelectionValuesForCard(card);
+  if(event.shiftKey){
+    // Shift selects the range inclusively.  A missing anchor falls back to a
+    // single selection instead of selecting an arbitrary first page.
+    const anchor=lastPageRangeAnchor||id;
+    const list=values.map(String),from=list.indexOf(anchor),to=list.indexOf(id);
+    const anchorRow=[...document.querySelectorAll('.page-row')].find(row=>String(row.getAttribute('data-page-id')||'')===anchor&&row.offsetParent!==null);
+    const sameLane=anchorRow&&card.closest('[data-volume]')===anchorRow.closest('[data-volume]');
+    if(from>=0&&to>=0&&sameLane){
+      selectedPages.clear();
+      for(let i=Math.min(from,to);i<=Math.max(from,to);i++)selectedPages.add(list[i]);
+      lastPageRangeAnchor=id;
+    }else{selectedPages.clear();selectedPages.add(id);lastPageRangeAnchor=id;}
+  }else if(event.ctrlKey||event.metaKey){
+    if(selectedPages.has(id))selectedPages.delete(id);else selectedPages.add(id);
+    lastPageRangeAnchor=id;
+  }else{
+    selectedPages.clear();selectedPages.add(id);lastPageRangeAnchor=id;
+  }
+  syncPageSelectionUi();
+  // File-list clicks move both selection and keyboard focus. Otherwise Enter
+  // or F2 would still act on the previously focused card.
+  syncPageRovingTabIndex(card);
+  try{card.focus({preventScroll:true});}catch{card.focus?.();}
 }
 function currentFilteredFileSelectionValues() {
   const query = String(fileFilterText || '').trim().toLowerCase();
@@ -2463,7 +2516,7 @@ function selectAllActivePages() {
 function clearActivePageSelection() {
   pagesForActivePreset().map(p => resolvedPageId(p)).filter(Boolean).forEach(id => selectedPages.delete(id));
   lastPageRangeAnchor = '';
-  syncPageSelectionUi();
+  syncPageSelectionUi();renderPageOverview();
 }
 
 async function moveSelectedPagesToVolume(volume, btn) {
@@ -2473,8 +2526,8 @@ async function moveSelectedPagesToVolume(volume, btn) {
 // routes produce the same reorder request, undo entry and toast.
 async function movePageIdsToVolume(pageIds, volume, btn) {
   const target=String(volume||'');const ids=asArray(pageIds).map(String).filter(id=>!!getPage(id));
-  if(!ids.length){showMessage('warn','ページを選択してください','移動するページにチェックを入れてください。');return;}
-  if(pageMutationBusy)return;
+  if(!ids.length){showMessage('warn','ページを選択してください','移動するカードをクリックして選んでください。');return;}
+  if(!(await waitForQueuedPageLayoutMutation()))return;
   pageMutationBusy=true;
   updateBulkSelectionLabel();
   try{
@@ -2486,12 +2539,20 @@ async function movePageIdsToVolume(pageIds, volume, btn) {
     if(!volumes[target])volumes[target]=[];volumes[target].push(...ids);
     setPageSaveStatus('saving','保存中…');
     try{
-      const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');rememberPageLayoutUndo(`${ids.length}ページの移動`,beforeVolumes);selectedPages.clear();lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();
+      const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});
+      applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');rememberPageLayoutUndo(`${ids.length}ページの移動`,beforeVolumes);
+      // Moving files to another folder shows that destination. Do the same for
+      // a focused lane so the moved cards remain visible (and are the only
+      // selected cards) without reviving any hidden selection.
+      if(activePageVolume!=='all'&&target!==activePageVolume){activePageVolume=target;pageVolumeAutoPicked=true;try{sessionStorage.setItem('ReportBinderActivePageVolume',activePageVolume);}catch{}}
+      selectedPages=new Set(ids);lastPageRangeAnchor=ids[ids.length-1]||'';lastPageBoardRenderSignature='';renderPages();syncPageSelectionUi();
+      const movedRow=[...document.querySelectorAll('.page-row:not(.page-filter-hidden)')].find(row=>ids.includes(String(row.dataset.pageId||''))&&row.offsetParent!==null);
+      if(movedRow){syncPageRovingTabIndex(movedRow);try{movedRow.focus({preventScroll:true});}catch{movedRow.focus?.();}}
     }catch(error){setPageSaveStatus('error','保存できません');throw error;}
     showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
   });
   }finally{pageMutationBusy=false;updateBulkSelectionLabel();}
-  syncPageSelectionUi();
+  syncPageSelectionUi();renderPageOverview();
 }
 
 async function loadFiles(btn) {
@@ -4210,7 +4271,7 @@ async function renderAllWorkbooks(btn) {
 }
 async function renderSelectedPages(btn) {
   const pageIds = [...selectedPages];
-  if (!pageIds.length) { showMessage('warn', 'ページを選択してください', 'PDF作成するページにチェックを入れてください。'); return; }
+  if (!pageIds.length) { showMessage('warn', 'ページを選択してください', 'PDF作成するカードをクリックして選んでください。'); return; }
   const ids = [...new Set(pageIds.map(pid => getPage(pid)?.workbookId).filter(Boolean))];
   await renderWorkbookIds(ids, btn);
 }
@@ -4245,10 +4306,24 @@ function compositionPageComparator(pages=pagesForActivePreset()) {
   // transitive and can produce different orders across browsers.
   return pageSort;
 }
-function numericSheetSequenceIsDefault(pages=pagesForActivePreset()) {
-  const volumes=[...activeTargetVolumes(),'none'];
-  for(const volume of volumes){
-    const lane=asArray(pages).filter(page=>assignedPageVolume(page)===volume).sort(pageSort);
+function pageVolumesFromState(pages=pagesForActivePreset()) {
+  const volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(volume=>[volume,[]]));
+  for(const page of [...asArray(pages)].sort(pageSort)){
+    const volume=assignedPageVolume(page);
+    if(!volumes[volume])volumes[volume]=[];
+    volumes[volume].push(resolvedPageId(page));
+  }
+  return volumes;
+}
+function numericSheetSequenceIsDefault(pages=pagesForActivePreset(), volumeSnapshot=null) {
+  // The persisted page state is authoritative for normal renders, API
+  // responses, and pack switches.  A caller may pass an explicit optimistic
+  // snapshot only while a local pointer/keyboard reorder is waiting to save;
+  // never infer state from stale DOM lanes during an unrelated refresh.
+  const source=volumeSnapshot?clonePageVolumes(volumeSnapshot):pageVolumesFromState(pages);
+  const pageMap=new Map(asArray(pages).map(page=>[resolvedPageId(page),page]));
+  for(const ids of Object.values(source)){
+    const lane=asArray(ids).map(id=>pageMap.get(String(id))).filter(Boolean);
     const numeric=lane.filter(page=>numericSheetPageInfo(page).numeric);
     const expected=[...numeric].sort(compareNumericSheetPages);
     if(numeric.map(resolvedPageId).join('\n')!==expected.map(resolvedPageId).join('\n'))return false;
@@ -4325,14 +4400,20 @@ function renderPages() {
   const tabs=$('page-volume-tabs');if(tabs){const total=allPages.length;const overview=`<button class="page-volume-tab overview ${activePageVolume==='all'?'active':''}" type="button" aria-pressed="${activePageVolume==='all'}" data-page-volume-tab="all"><span>全体</span><b>${total}</b></button>`;tabs.innerHTML=overview+panels.map(panel=>{const count=allPages.filter(page=>panel.volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||activeTargetVolumes()[0]||mainVolume())===panel.volume&&page.enabled!==false)).length;const selected=panel.volume===activePageVolume,target=panel.volume==='none'?null:activeTargetDefinitions().find(item=>targetVolume(item.targetId)===panel.volume),optionalEmpty=target?.required===false&&count===0&&!selected,label=panel.volume==='none'?'未振り分け':optionalEmpty?`＋ ${panel.title}を使う`:panel.title;return `<button class="page-volume-tab ${selected?'active':''} ${optionalEmpty?'optional-empty':''}" type="button" aria-pressed="${selected}" data-page-volume-tab="${escapeAttr(panel.volume)}"><span>${escapeHtml(label)}</span>${optionalEmpty?'':`<b>${count}</b>`}</button>`;}).join('');tabs.querySelectorAll('[data-page-volume-tab]').forEach(button=>button.addEventListener('click',()=>{activePageVolume=String(button.dataset.pageVolumeTab||'all');pageVolumeAutoPicked=true;try{sessionStorage.setItem('ReportBinderActivePageVolume',activePageVolume);}catch{}lastPageBoardRenderSignature='';renderPages();}));}
   if(sourcePages.length>0&&visiblePages.length===0){const searching=!!String(pageFilterText||'').trim();const title=searching?'一致するページがありません':'変更されたページはありません';const hint=searching?'検索語を短くするか、条件を解除してください。':'「変更分のみ」を解除すると、すべてのページを表示できます。';banners.push(`<div class="page-filter-empty"><div><strong>${title}</strong><span>${hint}</span></div><button class="btn secondary" type="button" data-clear-page-filters>絞り込みを解除</button></div>`);}
   const boardContent=allPages.length?panels.map(panel=>dynamicVolumePanelHtml(panel,allPages,visibleIds)).join(''):'<div class="page-board-empty"><strong>ページがまだありません</strong><span>原稿を登録し、変換PDFを作成すると、ここで提出順を整えられます。</span><button class="btn primary" type="button" data-page-go-source>原稿を登録・PDF化へ</button></div>';
-  box.className=`board ${pageBoardView==='thumbnail'?'thumbnail-board':'detail-board'} ${activePageVolume==='all'?'overview-board':'focused-board'}`;box.innerHTML=banners.join('')+boardContent;attachBoardEvents();preparePageThumbnails();restorePageBoardScroll(scrollSnap);syncPageBoardViewControls();syncPageSelectionUi();
+  box.className=`board ${pageBoardView==='thumbnail'?'thumbnail-board':'detail-board'} ${activePageVolume==='all'?'overview-board':'focused-board'}`;box.innerHTML=banners.join('')+boardContent;
+  // Tabs and filters behave like changing folders in Explorer/Finder: cards
+  // no longer visible must not remain a hidden bulk-move target.
+  const visibleSelection=new Set([...box.querySelectorAll('.active-volume .page-row:not(.page-filter-hidden)')].map(row=>String(row.dataset.pageId||'')).filter(Boolean));
+  selectedPages=new Set([...selectedPages].filter(id=>visibleSelection.has(String(id))));
+  if(lastPageRangeAnchor&&!visibleSelection.has(String(lastPageRangeAnchor)))lastPageRangeAnchor='';
+  attachBoardEvents();preparePageThumbnails();restorePageBoardScroll(scrollSnap);syncPageBoardViewControls();syncPageSelectionUi();
 }
 function dynamicVolumePanelHtml(panel,allPages,visibleIds){
   const volume=panel.volume,first=activeTargetVolumes()[0]||mainVolume(),pages=allPages.filter(page=>volume==='none'?(String(page.volume)==='none'||page.enabled===false):(String(page.volume||first)===volume&&page.enabled!==false)),visibleCount=pages.filter(page=>visibleIds.has(resolvedPageId(page))).length,collapsed=pageVolumeCollapseOverrides.has(volume)?!!pageVolumeCollapseOverrides.get(volume):(pageBoardView==='detail'&&pages.length===0),filtering=(showChangedOnly&&state?.inputHistoryEnabled)||!!String(pageFilterText||'').trim(),countText=filtering?`${visibleCount} / ${pages.length}ページ`:`${pages.length}ページ`;
   const emptyThumbnail=allPages.length?'<div class="empty-row page-empty-drop"><strong>ページはありません</strong><span>ここへドラッグするか、ページを選んで移動先を押します。</span></div>':'<div class="empty-row page-empty-drop"><strong>ページがまだありません</strong><span>原稿を登録し、変換PDFを作成してください。</span><button class="btn secondary compact" type="button" data-page-go-source>原稿画面へ</button></div>';
-  const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" role="listbox" aria-label="${escapeAttr(panel.title)}" aria-multiselectable="true" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||emptyThumbnail}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="check-col"><label class="check-tap"><input type="checkbox" data-select-all-pages="${escapeAttr(volume)}" aria-label="${escapeAttr(panel.title)}をすべて選択"></label></th><th class="seq-col">順</th><th class="drag-col">移動</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="6">ここへドロップ</td></tr>'}</tbody></table></div>`;
+  const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" role="listbox" aria-label="${escapeAttr(panel.title)}" aria-multiselectable="true" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||emptyThumbnail}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="seq-col">順</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="4">ここへドロップ</td></tr>'}</tbody></table></div>`;
   const active=activePageVolume==='all'||volume===activePageVolume;
-  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${active?'active-volume':'inactive-volume'} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
+  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${pages.length>=12?'high-volume':''} ${active?'active-volume':'inactive-volume'} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
 }
 // 絞り込みで隠れるページは、中身を作らず data-page-id だけの器にする。
 // 器を残すのは collectBoardVolumes() が並び順をDOMから絶対値で読み取るため。
@@ -4348,11 +4429,17 @@ function pageRowHtml(p, idx, filteredOut=false) {
   // Table headers do not name form controls, so without these every row read
   // out as an unlabelled checkbox / textbox / combobox in a list of hundreds.
   const rowLabel=`${idx+1}ページ目 ${p.title||p.sheetName||'ページ'}`;
-  return `<tr tabindex="0" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="check-col"><input type="checkbox" data-page-check value="${escapeAttr(pid)}" aria-label="${escapeAttr(`${rowLabel}を選択`)}" ${checked?'checked':''}></td><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="drag-col"><span class="drag-handle" title="ドラッグして移動">${iconUse('i-drag')}</span></td><td class="page-main-cell"><input class="title-input" data-page-title aria-label="${escapeAttr(`${rowLabel}のページ名`)}" value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering aria-label="${escapeAttr(`${rowLabel}のページ番号表示`)}"><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range aria-label="${escapeAttr(`${rowLabel}で使用するページ範囲`)}" value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
+  return `<tr tabindex="0" aria-label="${escapeAttr(`${rowLabel}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー`)}" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="page-main-cell"><input class="title-input" data-page-title aria-label="${escapeAttr(`${rowLabel}のページ名`)}" value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering aria-label="${escapeAttr(`${rowLabel}のページ番号表示`)}"><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range aria-label="${escapeAttr(`${rowLabel}で使用するページ範囲`)}" value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
 }
 function pageThumbnailHtml(p,idx,filteredOut=false){
   if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),false);
-  const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);const source=`${wb?.displayName||wb?.fileName||''} / ${sourceUnitReference(wb,p.sheetName)}`,numbering=numberingSelectValue(p),range=pageRangeText(p),displayTitle=p.title||p.sheetName||'ページ',editorId=`page-thumb-editor-${pid}`,change=pageChangeBadge(p);return `<article role="option" aria-selected="${checked}" tabindex="-1" class="page-row page-thumb-card ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}" aria-label="${escapeAttr(`${idx+1}ページ目 ${displayTitle}。Spaceで選択、Enterでプレビュー、F2で設定`)}" title="${escapeAttr(displayTitle)}"><div class="page-thumb-paper"><button tabindex="-1" class="page-thumb-preview-surface" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''} aria-label="${escapeAttr(`${displayTitle}をプレビュー`)}" ${hasPdf?'':'disabled'}><canvas data-page-thumbnail="${escapeAttr(pid)}" aria-hidden="true"></canvas><span class="page-thumb-placeholder">${hasPdf?'プレビューを読み込み中':'PDF未作成'}</span><span class="page-thumb-seq" data-seq-cell>${idx+1}</span></button><label class="page-thumb-check" title="選択"><input tabindex="-1" type="checkbox" data-page-check value="${escapeAttr(pid)}" aria-label="${escapeAttr(`${displayTitle}を選択`)}" ${checked?'checked':''}></label><button tabindex="-1" class="drag-handle page-thumb-drag" type="button" aria-label="${escapeAttr(`${displayTitle}をドラッグして移動`)}" title="ドラッグして移動">${iconUse('i-drag')}</button></div><div class="page-thumb-copy"><strong title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</strong><span title="${escapeAttr(source)}">${escapeHtml(source)}</span>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</div><div class="page-thumb-meta"><span>${change||(!hasPdf?pdfStatusForPage(p):'')}</span><span class="page-thumb-settings-summary">${hasPdf?`<button tabindex="-1" class="btn ghost compact page-thumb-preview" type="button" data-preview-page="${escapeAttr(pid)}">プレビュー</button>`:''}<button tabindex="-1" class="btn ghost compact page-thumb-edit" type="button" data-thumb-edit aria-label="${escapeAttr(`${displayTitle}の設定を編集`)}" aria-controls="${escapeAttr(editorId)}" aria-expanded="false">${iconUse('i-edit')}設定</button></span></div><div id="${escapeAttr(editorId)}" class="page-thumb-editor" data-thumb-editor hidden><label>ページ名<input data-thumb-page-title value="${escapeAttr(p.title||'')}" data-original-value="${escapeAttr(p.title||'')}"></label><label>元PDFから使う範囲（複数ページの場合）<input data-thumb-page-range value="${escapeAttr(range)}" data-original-value="${escapeAttr(range)}" placeholder="すべて（例: 2-5）" inputmode="numeric"></label><label>ページ番号<select data-thumb-page-numbering data-original-value="${escapeAttr(numbering)}"><option value="auto" ${numbering==='auto'?'selected':''}>自動</option><option value="none" ${numbering==='none'?'selected':''}>表示なし</option><option value="visible" ${numbering==='visible'?'selected':''}>表示</option></select></label><div class="page-thumb-editor-actions"><button class="btn ghost compact" type="button" data-thumb-cancel>取消</button><button class="btn primary compact" type="button" data-thumb-save>保存</button></div></div></article>`;
+  const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);
+  const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);
+  const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
+  const source=`${wb?.displayName||wb?.fileName||''} / ${sourceUnitReference(wb,p.sheetName)}`;
+  const numbering=numberingSelectValue(p),range=pageRangeText(p),displayTitle=p.title||p.sheetName||'ページ';
+  const editorId=`page-thumb-editor-${pid}`,change=pageChangeBadge(p);
+  return `<article role="option" aria-selected="${checked}" tabindex="-1" class="page-row page-thumb-card ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}" aria-label="${escapeAttr(`${idx+1}ページ目 ${displayTitle}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー、F2で設定`)}" title="${escapeAttr(displayTitle)}"><div class="page-thumb-paper" data-page-surface aria-hidden="true"><canvas data-page-thumbnail="${escapeAttr(pid)}"></canvas><span class="page-thumb-placeholder">${hasPdf?'プレビューを読み込み中':'PDF未作成'}</span><span class="page-thumb-seq" data-seq-cell>${idx+1}</span></div><div class="page-thumb-copy"><strong title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</strong><span title="${escapeAttr(source)}">${escapeHtml(source)}</span>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</div><div class="page-thumb-meta"><span>${change||(!hasPdf?pdfStatusForPage(p):'')}</span><span class="page-thumb-settings-summary">${hasPdf?`<button tabindex="-1" class="btn ghost compact page-thumb-preview" type="button" data-preview-page="${escapeAttr(pid)}">プレビュー</button>`:''}<button tabindex="-1" class="btn ghost compact page-thumb-edit" type="button" data-thumb-edit aria-label="${escapeAttr(`${displayTitle}の設定を編集`)}" aria-controls="${escapeAttr(editorId)}" aria-expanded="false">${iconUse('i-edit')}設定</button></span></div><div id="${escapeAttr(editorId)}" class="page-thumb-editor" data-thumb-editor hidden><label>ページ名<input data-thumb-page-title value="${escapeAttr(p.title||'')}" data-original-value="${escapeAttr(p.title||'')}"></label><label>元PDFから使う範囲（複数ページの場合）<input data-thumb-page-range value="${escapeAttr(range)}" data-original-value="${escapeAttr(range)}" placeholder="すべて（例: 2-5）" inputmode="numeric"></label><label>ページ番号<select data-thumb-page-numbering data-original-value="${escapeAttr(numbering)}"><option value="auto" ${numbering==='auto'?'selected':''}>自動</option><option value="none" ${numbering==='none'?'selected':''}>表示なし</option><option value="visible" ${numbering==='visible'?'selected':''}>表示</option></select></label><div class="page-thumb-editor-actions"><button class="btn ghost compact" type="button" data-thumb-cancel>取消</button><button class="btn primary compact" type="button" data-thumb-save>保存</button></div></div></article>`;
 }
 
 function pageThumbnailCacheKey(page){const workbook=getWorkbook(page?.workbookId);return `${resolvedPageId(page)}|${String(page?.contentPdf||'')}|${String(workbook?.lastRenderedSnapshotId||'')}|${String(workbook?.lastRenderedVersionId||workbook?.lastRenderedAt||'')}`;}
@@ -4420,7 +4507,7 @@ function renumberBoardRows() {
       if (row.classList.contains('empty-row')) return;
       const seq = row.querySelector('[data-seq-cell], [data-placeholder-seq]');
       if (seq) seq.textContent = String(n);
-      if(row.classList.contains('page-thumb-card')){const title=row.querySelector('.page-thumb-copy strong')?.textContent?.trim()||'ページ';row.setAttribute('aria-label',`${n}ページ目 ${title}`);}
+      if(row.classList.contains('page-thumb-card')){const title=row.querySelector('.page-thumb-copy strong')?.textContent?.trim()||'ページ';row.setAttribute('aria-label',`${n}ページ目 ${title}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー、F2で設定`);}
       n++;
     });
   });
@@ -4430,7 +4517,7 @@ function getRowsForDrag(sourceRow) {
   if (sourceId && selectedPages.has(sourceId) && selectedPages.size > 1) {
     // A command-bar move intentionally includes the clearly counted hidden
     // selection. A pointer drag is spatial, so it only moves selected cards
-    // visible beside the handle being dragged.
+    // visible beside the card being dragged.
     const selectedRows = [...document.querySelectorAll('.page-row:not(.page-filter-hidden)')].filter(r => r.offsetParent!==null&&selectedPages.has(r.getAttribute('data-page-id')));
     if (selectedRows.some(r => r === sourceRow)) return selectedRows;
   }
@@ -4466,7 +4553,7 @@ function createDropPlaceholder(sourceRows) {
   const thumbnail = rows[0]?.classList?.contains('page-thumb-card');
   const ph = document.createElement(thumbnail?'div':'tr');
   ph.className = `drop-placeholder ${thumbnail?'thumbnail-drop-placeholder':''}`;
-  ph.innerHTML = thumbnail?`<div class="placeholder-card">ここへ移動<br><strong>${escapeHtml(title)}</strong></div>`:`<td colspan="6"><div class="placeholder-card">ここへ移動：${escapeHtml(title)}</div></td>`;
+  ph.innerHTML = thumbnail?`<div class="placeholder-card">ここへ移動<br><strong>${escapeHtml(title)}</strong></div>`:`<td colspan="4"><div class="placeholder-card">ここへ移動：${escapeHtml(title)}</div></td>`;
   return ph;
 }
 function createPageDragGhost(sourceRows) {
@@ -4580,15 +4667,36 @@ function finishPointerDrag(commit) {
   const afterSignature = currentBoardSignature();
   let beforeVolumes=drag.originalVolumes,afterVolumes=null;try{beforeVolumes=JSON.parse(beforeSignature);}catch{}try{afterVolumes=JSON.parse(drag.previewSignature||afterSignature);}catch{}
   setTimeout(()=>{if(drag.sourceRow?.dataset)delete drag.sourceRow.dataset.suppressClick;},0);
-  if (commit && moved && afterSignature !== beforeSignature) scheduleBoardSave({label:`${drag.rows.length}ページの並べ替え`,volumes:beforeVolumes,afterVolumes});
+  if (commit && moved && afterSignature !== beforeSignature) {
+    // Match Explorer/Finder: after a move, keep only the cards that actually
+    // moved selected.  A later drag on an unselected card replaces this set,
+    // while a selected card can intentionally move the whole explicit group.
+    selectedPages.clear();drag.rows.forEach(row=>{const id=String(row?.dataset?.pageId||'');if(id)selectedPages.add(id);});
+    lastPageRangeAnchor=drag.rows.length?String(drag.rows[drag.rows.length-1]?.dataset?.pageId||''):'';
+    syncPageSelectionUi();renderPageOverview({volumes:afterVolumes});
+    const focusRow=drag.rows.find(row=>row.offsetParent!==null)||null;
+    if(focusRow){syncPageRovingTabIndex(focusRow);try{focusRow.focus({preventScroll:true});}catch{focusRow.focus?.();}}
+    scheduleBoardSave({label:`${drag.rows.length}ページの並べ替え`,volumes:beforeVolumes,afterVolumes});
+  }
 }
 function beginPointerPageDrag(e, row) {
   if (pageMutationBusy || !row || e.button !== 0) return;
-  const fromHandle=!!e.target.closest('.drag-handle');
-  // Card swipes must keep scrolling the board. Reordering starts only from the
-  // visible drag handle, which also makes selection and preview unambiguous.
-  if (!fromHandle) return;
-  if (fromHandle) e.preventDefault();
+  const pointerType=String(e.pointerType||'mouse');
+  const interactive=!!e.target.closest('button,input,select,textarea,a,label,[contenteditable="true"],.page-thumb-editor,[data-preview-page]');
+  // Mouse/pen users can grab the card's non-editing body.  Touch deliberately
+  // never starts a drag so a vertical page scroll cannot be hijacked; tapping
+  // still selects through the delegated click handler below.
+  if(interactive)return;
+  if(pointerType==='touch')return;
+  // A modifier click belongs to selection, not drag initiation.  This keeps
+  // Ctrl/Cmd toggle and Shift range selection reliable even when the pointer
+  // moves a few pixels before the browser emits click.
+  if(e.ctrlKey||e.metaKey||e.shiftKey)return;
+  const sourceId=String(row.dataset.pageId||'');
+  if(sourceId&&!selectedPages.has(sourceId)){
+    selectedPages.clear();selectedPages.add(sourceId);lastPageRangeAnchor=sourceId;syncPageSelectionUi();
+  }
+  e.preventDefault();
   const captureTarget = e.currentTarget || row;
   const startX = e.clientX;
   const startY = e.clientY;
@@ -4606,7 +4714,10 @@ function beginPointerPageDrag(e, row) {
     if (tbody) moveDropPlaceholder(tbody, ev.clientX, ev.clientY);
   };
   try { captureTarget.setPointerCapture?.(e.pointerId); } catch {}
+  let onLost=null,cleaned=false;
   const cleanup = (ev) => {
+    if(cleaned)return;
+    cleaned=true;
     try { captureTarget.releasePointerCapture?.(ev.pointerId); } catch {}
     // 保留中のフレームを残すと、ドロップ後の確定済みDOMをもう一度動かしてしまう。
     if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
@@ -4614,6 +4725,8 @@ function beginPointerPageDrag(e, row) {
     document.removeEventListener('pointermove', onMove, true);
     document.removeEventListener('pointerup', onUp, true);
     document.removeEventListener('pointercancel', onCancel, true);
+    window.removeEventListener('blur',onBlur,true);
+    if(onLost)captureTarget.removeEventListener('lostpointercapture',onLost);
   };
   // pointermove は毎秒60回来る。1回ごとに盤面を全走査して getBoundingClientRect と
   // DOM書き込みを交互に行うと、毎イベントで全文書レイアウトが強制され、155ページの
@@ -4636,7 +4749,7 @@ function beginPointerPageDrag(e, row) {
   };
   const onMove = (ev) => {
     const moved = Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY);
-    if (!started && moved < 5) return;
+    if (!started && moved < 7) return;
     if (!started) startDrag(ev);
     if (!draggingRow) return;
     ev.preventDefault();
@@ -4645,7 +4758,13 @@ function beginPointerPageDrag(e, row) {
   };
   const onUp = (ev) => {
     cleanup(ev);
-    if (!started) { return; }
+    if (!started) {
+      // A selected multi-group that never crossed the drag threshold is still
+      // a normal plain click: collapse it to the clicked card.  Modifier
+      // clicks never enter this pointer lifecycle and are handled by click.
+      if(!ev.ctrlKey&&!ev.metaKey&&!ev.shiftKey)handlePageCardSelection(row,ev);
+      return;
+    }
     const tab = draggingRow ? findVolumeTabAt(ev.clientX, ev.clientY) : null;
     if (tab) {
       const target = String(tab.dataset.pageVolumeTab || '');
@@ -4665,9 +4784,19 @@ function beginPointerPageDrag(e, row) {
     cleanup(ev);
     if (started) finishPointerDrag(false);
   };
+  const onBlur = () => {
+    cleanup({pointerId:e.pointerId});
+    if(started)finishPointerDrag(false);
+  };
+  onLost = () => {
+    cleanup({pointerId:e.pointerId});
+    if(started)finishPointerDrag(false);
+  };
   document.addEventListener('pointermove', onMove, true);
   document.addEventListener('pointerup', onUp, true);
   document.addEventListener('pointercancel', onCancel, true);
+  window.addEventListener('blur',onBlur,true);
+  captureTarget.addEventListener('lostpointercapture',onLost);
 }
 
 function setPageThumbnailEditor(row,open,reset=false){
@@ -4707,8 +4836,12 @@ function handleBoardRowKeydown(row,e){
   if(pageMutationBusy&&e.altKey){e.preventDefault();return;}
   if(!e.altKey){
     if(e.key==='F2'&&row.classList.contains('page-thumb-card')){e.preventDefault();setPageThumbnailEditor(row,true);return;}
-    if(e.key===' '||e.key==='Spacebar'){e.preventDefault();const ch=row.querySelector('[data-page-check]');if(ch){ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);}return;}
-    if(e.key==='Enter'){const preview=row.querySelector('[data-preview-page]');if(preview){e.preventDefault();previewPage(preview.dataset.previewPage||row.dataset.pageId,pageFallbackFromRow(row));}return;}
+    if(e.key===' '||e.key==='Spacebar'){e.preventDefault();handlePageCardSelection(row,e);return;}
+    if(e.key==='Enter'){
+      const page=getPage(row.dataset.pageId)||pageFallbackFromRow(row);
+      if(pagePreviewAvailable(page)){e.preventDefault();previewPage(row.dataset.pageId,page);}
+      return;
+    }
     handlePageRowNavigation(row,e);return;
   }
   if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key))return;
@@ -4717,7 +4850,7 @@ function handleBoardRowKeydown(row,e){
     const volumeOrder=['none',...activeTargetVolumes()],current=String(tbody.dataset.volume||''),currentIndex=volumeOrder.indexOf(current);if(currentIndex<0)return;const targetIndex=e.shiftKey?(e.key==='ArrowLeft'?0:volumeOrder.length-1):currentIndex+(e.key==='ArrowLeft'?-1:1);if(targetIndex<0||targetIndex>=volumeOrder.length||targetIndex===currentIndex)return;const targetVolume=volumeOrder[targetIndex],target=[...document.querySelectorAll('[data-volume]')].find(container=>String(container.dataset.volume||'')===targetVolume);if(!target)return;const targetPanel=target.closest('.volume-panel');targetPanel?.classList.remove('collapsed');targetPanel?.querySelector('[data-toggle-volume]')?.setAttribute('aria-expanded','true');pageVolumeCollapseOverrides.set(targetVolume,false);for(const movingRow of getRowsForDrag(row)){target.appendChild(movingRow);moved=true;}
   }else if(e.shiftKey){if(e.key==='ArrowUp'&&idx>0){tbody.insertBefore(row,rows[0]);moved=true;}else if(e.key==='ArrowDown'&&idx<rows.length-1){tbody.appendChild(row);moved=true;}}
   else if(e.key==='ArrowUp'&&idx>0){tbody.insertBefore(row,rows[idx-1]);moved=true;}else if(e.key==='ArrowDown'&&idx<rows.length-1){tbody.insertBefore(rows[idx+1],row);moved=true;}
-  if(!moved)return;renumberBoardRows();scheduleBoardSave({label:e.key==='ArrowLeft'||e.key==='ArrowRight'?'キーボードでの出力先移動':'キーボードでの並べ替え',volumes:beforeVolumes});const focusTarget=row.offsetParent!==null?row:visiblePageRowsForKeyboard().find(candidate=>candidate!==row);syncPageRovingTabIndex(focusTarget||null);if(focusTarget)focusTarget.focus();else $('page-volume-tabs')?.querySelector('.page-volume-tab.active')?.focus();
+  if(!moved)return;renumberBoardRows();const afterVolumes=collectBoardVolumes();renderPageOverview({volumes:afterVolumes});scheduleBoardSave({label:e.key==='ArrowLeft'||e.key==='ArrowRight'?'キーボードでの出力先移動':'キーボードでの並べ替え',volumes:beforeVolumes,afterVolumes});const focusTarget=row.offsetParent!==null?row:visiblePageRowsForKeyboard().find(candidate=>candidate!==row);syncPageRovingTabIndex(focusTarget||null);if(focusTarget)focusTarget.focus();else $('page-volume-tabs')?.querySelector('.page-volume-tab.active')?.focus();
 }
 function volumeIdsForSelectAll(volume){
   const container=[...document.querySelectorAll('[data-volume]')].find(t=>String(t.dataset.volume||'')===String(volume||''));
@@ -4749,12 +4882,17 @@ function delegateBoardEvents(box){
     const card=e.target.closest('.page-row');
     if(card){
       if(card.dataset.suppressClick==='true'){delete card.dataset.suppressClick;e.preventDefault();e.stopPropagation();return;}
-      if(e.target.closest('input,button,a,select,.drag-handle,.badge,.page-thumb-check,.page-thumb-editor,.page-thumb-preview,[data-preview-page]'))return;
-      const ch=card.querySelector('[data-page-check]');if(!ch)return;
-      ch.checked=!selectedPages.has(ch.value);handlePageCheckboxToggle(ch,e.shiftKey);
+      if(e.target.closest('input,button,a,select,.drag-handle,.badge,.page-thumb-editor,[data-preview-page]'))return;
+      handlePageCardSelection(card,e);
     }
   });
-  box.addEventListener('dblclick',e=>{const row=e.target.closest('.page-row:not(.page-thumb-card)');if(!row)return;if(draggingRow||e.target.closest('input,select'))return;if(!row.querySelector('[data-preview-page]'))return;previewPage(row.dataset.pageId,pageFallbackFromRow(row));});
+  box.addEventListener('dblclick',e=>{
+    const row=e.target.closest('.page-row');
+    if(!row||draggingRow||e.target.closest('input,select,button,a,[contenteditable="true"],.page-thumb-editor'))return;
+    const page=getPage(row.dataset.pageId)||pageFallbackFromRow(row);
+    if(!pagePreviewAvailable(page))return;
+    e.preventDefault();previewPage(row.dataset.pageId,page);
+  });
   box.addEventListener('keydown',e=>{
     const editor=e.target.closest('[data-thumb-editor]');
     if(editor){
@@ -4818,7 +4956,7 @@ function applyPageMutationResult(payload){
   // 左ナビのバッジだけを更新し、上のステップ表示を置き去りにしていた。全ページを
   // 出力先へ移しても「!」のまま、全ページを未振り分けへ戻しても「✓」のままになり、
   // 画面を読み込み直すまで直らない。判断の材料がそこにあるので、同時に更新する。
-  renderNavBadges();renderStepBar();renderPageOverview();renderFinalOverview();renderPages();if(isModalOpen())syncPreviewOrganizerControls();
+  renderNavBadges();renderStepBar();renderFinalOverview();renderPages();renderPageOverview();if(isModalOpen())syncPreviewOrganizerControls();
 }
 
 function rememberPageMutationFingerprint(payload,packId=null){
@@ -4827,9 +4965,14 @@ function rememberPageMutationFingerprint(payload,packId=null){
 }
 
 function scheduleBoardSave(undo=null) {
+  // A pointer/keyboard reorder is an optimistic mutation until its save (and
+  // possible 409 refresh) finishes.  Disable every other layout mutation so a
+  // bulk move, collect, or Undo cannot race with the same baseLayout token.
+  boardSaveMutationBusy=true;pageMutationBusy=true;updateBulkSelectionLabel();
   setPageSaveStatus('saving','保存中…');
   boardSaveRevision+=1;
   const afterVolumes=clonePageVolumes(undo?.afterVolumes||collectBoardVolumes());pendingBoardSaveVolumes=afterVolumes;
+  renderPageOverview({volumes:afterVolumes});
   if(undo){
     rememberPageLayoutUndo(undo.label,undo.volumes,afterVolumes);
     if(!pendingPageLayoutUndo)pendingPageLayoutUndo=undo;
@@ -4872,7 +5015,7 @@ function saveBoardOrder() {
       if(!newerBoardExists)showMessage('ok','ページ構成を保存しました','未振り分け・本体・補足の割り当てと並びを反映しました。',null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
       return true;
     }catch(e){
-      if(e.code==='structure-conflict'){void handlePageLayoutConflict(volumes,requestRevision);return false;}
+      if(e.code==='structure-conflict'){await handlePageLayoutConflict(volumes,requestRevision);return false;}
       setPageSaveStatus('error','保存できません');showMessage('danger','並び替えを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);
       lastPageBoardRenderSignature='';
       // 保存できなかった並びを画面に残すと、collectBoardVolumes() が次の操作でそれを一緒に
@@ -4886,6 +5029,13 @@ function saveBoardOrder() {
         updateBulkSelectionLabel();
       }
       return false;
+    }finally{
+      if(boardSaveMutationBusy&&requestRevision===boardSaveRevision){
+        boardSaveMutationBusy=false;
+        if(!pageLayoutHistoryBusy)pageMutationBusy=false;
+        updateBulkSelectionLabel();
+        renderPageOverview();
+      }
     }
   };
   boardSavePromise=boardSavePromise.then(persist,persist);
@@ -4893,17 +5043,21 @@ function saveBoardOrder() {
 }
 async function savePageFromRow(row, numberingChanged=false) {
   if(!row)return;
+  if(!(await waitForQueuedPageLayoutMutation()))return;
   const pageId=row.getAttribute('data-page-id'),page=getPage(pageId);
   const body=pageApiBody({pageId,title:row.querySelector('[data-page-title]')?.value||page?.title||''});
   const pageRangeInput=row.querySelector('[data-page-range]');if(pageRangeInput){const range=String(pageRangeInput.value||'').trim();if(range)body.pageRange=range;else body.clearPageRange=true;}
   const numbering=row.querySelector('[data-page-numbering]')?.value||'auto';
   if(numberingChanged){if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering;body.numberingManual=true;}}
+  if(pageMutationBusy)return;
+  pageMutationBusy=true;updateBulkSelectionLabel();
   setPageSaveStatus('saving','保存中…');
   try{
     const response=await api('/api/pages/update',{method:'POST',body});
     applyPageMutationResult(response);
     setPageSaveStatus('saved','保存済み');
   }catch(e){setPageSaveStatus('error','保存できません');if(e.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページを保存できません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+  finally{pageMutationBusy=false;updateBulkSelectionLabel();renderPageOverview();}
 }
 
 async function handlePageSettingsConflict(){
@@ -4919,20 +5073,24 @@ function pageSettingsBody(pageId,title,numbering,pageRange=''){
   const body=pageApiBody({pageId:String(pageId||''),title:String(title||'').trim()});const range=String(pageRange||'').trim();if(range)body.pageRange=range;else body.clearPageRange=true;if(numbering==='auto')body.resetNumbering=true;else{body.numberingMode=numbering==='none'?'none':'visible';body.numberingManual=true;}return body;
 }
 async function restorePageSettings(previous){
+  if(!(await waitForQueuedPageLayoutMutation()))return;
+  if(pageMutationBusy)return;
+  pageMutationBusy=true;updateBulkSelectionLabel();
   setPageSaveStatus('saving','保存中…');
-  try{const response=await api('/api/pages/update',{method:'POST',body:pageSettingsBody(previous.pageId,previous.title,previous.numbering,previous.pageRange)});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');showMessage('ok','ページ設定を元に戻しました',previous.title);}
+  try{const body=pageSettingsBody(previous.pageId,previous.title,previous.numbering,previous.pageRange);const response=await api('/api/pages/update',{method:'POST',body});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');showMessage('ok','ページ設定を元に戻しました',previous.title);}
   catch(error){setPageSaveStatus('error','保存できません');if(error.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページ設定を元に戻せません',userFriendlyError(error.message),error.detail||error.stack||error.message);}
+  finally{pageMutationBusy=false;updateBulkSelectionLabel();renderPageOverview();}
 }
 async function savePageFromThumbnail(row,btn){
-  if(!row)return;const pageId=String(row.dataset.pageId||''),page=getPage(pageId),titleInput=row.querySelector('[data-thumb-page-title]'),rangeInput=row.querySelector('[data-thumb-page-range]'),numberingInput=row.querySelector('[data-thumb-page-numbering]'),title=String(titleInput?.value||'').trim(),pageRange=String(rangeInput?.value||'').trim(),numbering=String(numberingInput?.value||'auto');if(!title){showMessage('warn','ページ名を入力してください','ページ名は空にできません。');titleInput?.focus();return;}if(pageRange&&!/^\d+(\s*-\s*\d+)?$/.test(pageRange)){showMessage('warn','ページ範囲を確認してください','「2」または「2-5」の形式で入力してください。');rangeInput?.focus();return;}const previous={pageId,title:String(page?.title||page?.sheetName||''),pageRange:pageRangeText(page),numbering:numberingSelectValue(page)};
+  if(!row)return;if(!(await waitForQueuedPageLayoutMutation()))return;const pageId=String(row.dataset.pageId||''),page=getPage(pageId),titleInput=row.querySelector('[data-thumb-page-title]'),rangeInput=row.querySelector('[data-thumb-page-range]'),numberingInput=row.querySelector('[data-thumb-page-numbering]'),title=String(titleInput?.value||'').trim(),pageRange=String(rangeInput?.value||'').trim(),numbering=String(numberingInput?.value||'auto');if(!title){showMessage('warn','ページ名を入力してください','ページ名は空にできません。');titleInput?.focus();return;}if(pageRange&&!/^\d+(\s*-\s*\d+)?$/.test(pageRange)){showMessage('warn','ページ範囲を確認してください','「2」または「2-5」の形式で入力してください。');rangeInput?.focus();return;}const previous={pageId,title:String(page?.title||page?.sheetName||''),pageRange:pageRangeText(page),numbering:numberingSelectValue(page)};
   setPageSaveStatus('saving','保存中…');
-  await runBusy(btn,async()=>{try{const response=await api('/api/pages/update',{method:'POST',body:pageSettingsBody(pageId,title,numbering,pageRange)});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');showMessage('ok','ページ設定を保存しました',title,null,[{label:'元に戻す',handler:()=>restorePageSettings(previous)}],8000);}catch(error){setPageSaveStatus('error','保存できません');if(error.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
+  await runBusy(btn,async()=>{if(pageMutationBusy)return;pageMutationBusy=true;updateBulkSelectionLabel();try{const body=pageSettingsBody(pageId,title,numbering,pageRange);const response=await api('/api/pages/update',{method:'POST',body});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');showMessage('ok','ページ設定を保存しました',title,null,[{label:'元に戻す',handler:()=>restorePageSettings(previous)}],8000);}catch(error){setPageSaveStatus('error','保存できません');if(error.code==='structure-conflict'){await handlePageSettingsConflict();return;}showMessage('danger','ページ設定を保存できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}finally{pageMutationBusy=false;updateBulkSelectionLabel();renderPageOverview();}});
 }
 
 async function collectNumericSheets(btn=null){
   const targets=activeTargetVolumes(),target=String($('numeric-sheet-target')?.value||targets[0]||'');
   if(!target||!targets.includes(target)){showMessage('warn','まとめ先を選べません','先に出力先を1つ設定してください。');return;}
-  if(pageMutationBusy)return;
+  if(!(await waitForQueuedPageLayoutMutation()))return;
   // The proposed layout and its optimistic-lock fingerprint must come from the
   // same state. A background refresh can finish while the confirmation dialog
   // is open, so never rebuild the request body from the newer global state.
@@ -4972,12 +5130,16 @@ async function collectNumericSheets(btn=null){
   pageMutationBusy=true;updateBulkSelectionLabel();setPageSaveStatus('saving','保存中…');
   await runBusy(btn||$('collect-numeric-sheets-btn'),async()=>{
     try{
+      // Keep the proposal and its optimistic-lock token from the same state.
+      // If an auto refresh or another tab changes the layout while the dialog
+      // is open, the server must reject this old proposal instead of accepting
+      // it with a newer fingerprint and overwriting that change.
       const body={packId:requestPackId,volumes:normalizedAfter};if(requestBaseLayout)body.baseLayout=requestBaseLayout;
       const response=await api('/api/v2/items/reorder',{method:'POST',body});
       applyPageMutationResult(response);rememberPageLayoutUndo('半角数字シートをまとめる',normalizedBefore,normalizedAfter);setPageSaveStatus('saved','保存済み');selectedPages.clear();lastPageRangeAnchor='';showMessage('ok','半角数字シートをまとめました',`${numeric.length}ページを${targetLabel}へ数字順で配置しました。${excluded.length?` ${excluded.length}ページは未振り分けです。`:''}`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
     }catch(error){setPageSaveStatus('error','保存できません');if(error.code==='structure-conflict'){await handlePageLayoutConflict(normalizedAfter,boardSaveRevision);return;}showMessage('danger','半角数字シートをまとめられません',userFriendlyError(error.message),error.detail||error.stack||error.message);}
   });
-  pageMutationBusy=false;updateBulkSelectionLabel();syncPageSelectionUi();
+  pageMutationBusy=false;updateBulkSelectionLabel();syncPageSelectionUi();renderPageOverview();
 }
 
 
@@ -5015,7 +5177,7 @@ async function sortPagesByNumericSheet(btn=null) {
         throw error;
       }
     });
-  }finally{pageMutationBusy=false;updateBulkSelectionLabel();syncPageSelectionUi();}
+  }finally{pageMutationBusy=false;updateBulkSelectionLabel();syncPageSelectionUi();renderPageOverview();}
 }
 // Backward-compatible internal name for keyboard/extensions that used the
 // former tab-order action. The action now means numeric-sheet ordering.
@@ -5053,7 +5215,21 @@ async function navigatePreviewPage(delta){
   if(!previewOrganizerMode)return;syncPreviewOrganizerControls();const index=previewPageIds.indexOf(currentPreviewPageId),nextIndex=index+Number(delta||0);if(index<0||nextIndex<0||nextIndex>=previewPageIds.length)return;const page=getPage(previewPageIds[nextIndex]);if(page)await previewPage(resolvedPageId(page),page,{preserveFocus:true});
 }
 async function moveCurrentPreviewPageToVolume(volume,btn){
-  const page=getPage(currentPreviewPageId),target=String(volume||'');if(!page||assignedPageVolume(page)===target)return;setPageSaveStatus('saving','保存中…');await runBusy(btn,async()=>{const beforeVolumes=collectBoardVolumes(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),pageId=resolvedPageId(page),activePages=pagesForActivePreset();for(const candidate of[...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(candidate);if(!id||id===pageId)continue;const assigned=assignedPageVolume(candidate);if(!volumes[assigned])volumes[assigned]=[];volumes[assigned].push(id);}if(!volumes[target])volumes[target]=[];volumes[target].push(pageId);try{const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');rememberPageLayoutUndo('プレビューからのページ移動',beforeVolumes);syncPreviewOrganizerControls();showMessage('ok','ページを移動しました',`${page.title||page.sheetName||'ページ'}を${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()}],8000);}catch(error){setPageSaveStatus('error','保存できません');showMessage('danger','ページを移動できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}});
+  const target=String(volume||'');
+  if(!(await waitForQueuedPageLayoutMutation()))return;
+  const page=getPage(currentPreviewPageId);
+  if(!page||assignedPageVolume(page)===target)return;
+  setPageSaveStatus('saving','保存中…');
+  await runBusy(btn,async()=>{
+    if(!(await waitForQueuedPageLayoutMutation()))return;
+    const current=getPage(currentPreviewPageId);if(!current||assignedPageVolume(current)===target)return;
+    if(pageMutationBusy)return;
+    pageMutationBusy=true;updateBulkSelectionLabel();
+    const beforeVolumes=collectBoardVolumes(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),pageId=resolvedPageId(current),activePages=pagesForActivePreset();
+    for(const candidate of[...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(candidate);if(!id||id===pageId)continue;const assigned=assignedPageVolume(candidate);if(!volumes[assigned])volumes[assigned]=[];volumes[assigned].push(id);}
+    if(!volumes[target])volumes[target]=[];volumes[target].push(pageId);
+    try{const body=pageApiBody({volumes});const response=await api('/api/v2/items/reorder',{method:'POST',body});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');rememberPageLayoutUndo('プレビューからのページ移動',beforeVolumes);syncPreviewOrganizerControls();showMessage('ok','ページを移動しました',`${current.title||current.sheetName||'ページ'}を${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()}],8000);}catch(error){setPageSaveStatus('error','保存できません');showMessage('danger','ページを移動できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}finally{pageMutationBusy=false;updateBulkSelectionLabel();renderPageOverview();}
+  });
 }
 async function previewPage(pageId, fallback={}, options={}) {
   const page=getPage(pageId)||getPageByWorkbookSheet(fallback.workbookId,fallback.sheetName);

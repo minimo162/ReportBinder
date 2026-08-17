@@ -333,10 +333,19 @@ for needle in ['function renderPackSwitcher', 'function openPackEditor', 'functi
 for dead in ["bind('refresh-btn'","bind('load-files-btn'","bind('save-paths-btn'","bind('render-updated-btn'","bind('render-selected-pages-btn'","$('category-heading')","$('category-caption')"]:
     if dead in appjs: raise SystemExit(f'dead ui code remains: {dead}')
 if "body:{volumes:collectBoardVolumes()}" in appjs: raise SystemExit('page reorder must send category')
-if 'class="drag-handle page-thumb-drag"' not in appjs or 'if (!fromHandle) return' not in appjs:
-    raise SystemExit('thumbnail drag must start from its explicit handle only')
-if 'class="page-thumb-check"' not in appjs or 'type="checkbox" data-page-check' not in appjs:
-    raise SystemExit('thumbnail selection must use an explicit checkbox')
+if 'function handlePageCardSelection' not in appjs or "if(pointerType==='touch')return" not in appjs:
+    raise SystemExit('thumbnail cards must use Explorer selection and keep touch scrolling safe')
+for needed in ['const interactive=', 'selectedPages.clear();drag.rows.forEach', 'renderPageOverview({volumes:afterVolumes})',
+               'moved < 7', 'lostpointercapture', "window.addEventListener('blur'", 'handlePageCardSelection(row,ev)',
+               'syncPageRovingTabIndex(card)', 'const visibleSelection=new Set']:
+    if needed not in appjs:
+        raise SystemExit(f'pointer drag state isolation missing: {needed}')
+if 'class="page-thumb-check"' in appjs or 'class="drag-handle page-thumb-drag"' in appjs:
+    raise SystemExit('thumbnail selection controls must not remain in the primary card UI')
+_schedule_board = appjs.split('function scheduleBoardSave(', 1)[1].split('\n}', 1)[0]
+_save_board_state = appjs.split('function saveBoardOrder()', 1)[1].split('\nasync function savePageFromRow', 1)[0]
+if 'renderPageOverview({volumes:afterVolumes})' not in _schedule_board or 'pageMutationBusy=false' not in _save_board_state or 'renderPageOverview()' not in _save_board_state:
+    raise SystemExit('numeric sort state must be recomputed when queued save busy state changes')
 
 html=(root/'app/web/index.html').read_text(encoding='utf-8')
 for needle in ['workspace-top','step-bar','id="pack-menu-button"','id="pack-menu-list"','id="create-pack-btn"','id="pack-editor-modal"','global-final-status','nav-excel-count','sort-by-sheet-btn','build-all-btn','render-all-btn','unregister-selected-btn','id="final-target-grid"','id="bulk-target-buttons"','notice-actions','app-menu-popover','<symbol id="i-home"','<symbol id="i-edit"','id="diff-modal"','id="diff-before-viewport"','id="diff-after-viewport"','id="diff-mode-overlay"','id="page-view-thumbnail-btn"','id="page-layout-undo-btn"','id="page-command-bar"','id="page-search-input"','id="page-thumbnail-size"']:
@@ -347,6 +356,11 @@ for symbol in '⌂□▦▤▣△⋮◉⌄↻⌕⊘›':
     if symbol in html: raise SystemExit(f'font symbol remains in html: {symbol}')
 
 css=(root/'app/web/style.css').read_text(encoding='utf-8')
+for needed in ["pages.length>=12?'high-volume':''",
+               '.volume-panel.high-volume .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}',
+               '.thumbnail-board .page-thumb-card{cursor:grab;touch-action:pan-y}']:
+    if needed not in appjs + css:
+        raise SystemExit(f'20-page lane density or pointer scrolling contract missing: {needed}')
 for needle in ['--accent:#5e6ad2','--sidebar-w:248px','backdrop-filter','box-shadow:none','.badge.attention','background:var(--attention-subtle)','font-weight:600','.modal-card','.drop-placeholder','.notice{position:fixed','.diff-dialog{width:min(1800px,94vw)','.diff-viewers.overlay-mode','@media(max-width:1100px)','.thumbnail-grid','.page-command-bar.has-selection','.page-thumb-editor','.page-thumb-card.editing']:
     if needle not in css: raise SystemExit(f'css feature not found: {needle}')
 if 'font-weight:900' in css or 'radial-gradient' in css: raise SystemExit('old visual style remains')
@@ -1550,7 +1564,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v184', 'style.css?v=20260817_v113']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260817_v187', 'style.css?v=20260817_v117']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1605,7 +1619,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260817_v184' not in html:
+if 'app.js?v=20260817_v187' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1631,7 +1645,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260817_v184' not in html:
+if 'app.js?v=20260817_v187' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2026,13 +2040,13 @@ for needed in ['未振り分け（出力しない）', '出力先へ移したペ
         raise SystemExit(f'page assignment inbox UI missing: {needed}')
 
 
-for needed in ['左上のチェックで選ぶ', '移動先を押す', '右上のハンドルをドラッグ',
-               'createPageDragGhost', 'page-thumb-check', 'page-thumb-drag',
-               'page-thumb-preview-surface', 'if (!fromHandle) return', 'page-drag-ghost']:
+for needed in ['カードをクリックで選ぶ', '移動先を押す／カードをドラッグ', 'Ctrl/Cmdクリックで追加・解除',
+               'createPageDragGhost', 'function handlePageCardSelection',
+               'page-thumb-preview-surface', "if(pointerType==='touch')return", 'page-drag-ghost']:
     if needed not in html + appjs + css:
         raise SystemExit(f'direct page movement UX missing: {needed}')
-if 'directCardDrag' in appjs:
-    raise SystemExit('thumbnail cards must scroll/select normally; drag may start only from the handle')
+if 'class="page-thumb-check"' in appjs or 'class="drag-handle page-thumb-drag"' in appjs:
+    raise SystemExit('thumbnail cards must not expose checkbox/handle as the primary interaction')
 for needed in ['data-view-nav="pages"', '<span>ページ構成</span>', 'class="page-tools-details"', '<summary>表示・履歴</summary>',
                '.page-command-bar:not(.has-selection) .page-destination-actions{display:none}',
                '.page-command-bar.has-selection .page-filter-tools{display:none}']:
@@ -2162,7 +2176,7 @@ for needed in ['focusPageId', 'function visiblePageRowsForKeyboard',
                'function pageRowKeyboardTarget', 'function handlePageRowNavigation',
                'function syncPageRovingTabIndex', "e.key==='F2'",
                "e.key==='Spacebar'", "shortcutKey==='a'", "row.setAttribute('aria-keyshortcuts'",
-               "row.setAttribute('aria-label',`${n}ページ目 ${title}`)"]:
+               "row.setAttribute('aria-label',`${n}ページ目 ${title}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー、F2で設定`)"]:
     if needed not in appjs:
         raise SystemExit(f'page keyboard behavior missing: {needed}')
 for needed in ['.page-keyboard-hint', '.page-row:focus-visible']:
@@ -2657,6 +2671,12 @@ if 'sheetSelectionByWorkbook' not in _numeric_job or 'Render-Source $language $i
 _numeric_ui = appjs.split('async function collectNumericSheets', 1)[1].split('\n\n\nasync function sortPagesBySheet', 1)[0]
 if 'numeric.sort(compareNumericSheetPages)' not in _numeric_ui or 'desired.none=' not in _numeric_ui:
     raise SystemExit('numeric page organizer must sort numeric pages and move excluded Excel pages to none')
+for needed in ['requestBaseLayout=activeLayoutFingerprint(requestPackId)',
+               'if(requestBaseLayout)body.baseLayout=requestBaseLayout']:
+    if needed not in _numeric_ui:
+        raise SystemExit(f'numeric organizer proposal/baseLayout capture is unsafe: {needed}')
+if 'latestBaseLayout' in _numeric_ui:
+    raise SystemExit('numeric organizer must not pair an old confirmed proposal with a newer fingerprint')
 if 'collect-numeric-sheets-btn' not in html or 'data-source-sheet-selection' not in appjs:
     raise SystemExit('numeric-sheet UI controls are missing')
 numeric_regression = subprocess.run([sys.executable, str(root / 'tests/numeric-sheet-selection-regression.py')], capture_output=True, text=True)
