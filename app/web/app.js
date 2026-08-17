@@ -2440,6 +2440,11 @@ function handlePageCardSelection(card, event={}) {
   if(!id)return;
   const values=pageSelectionValuesForCard(card);
   if(event.shiftKey){
+    // File managers reserve Shift+click for range selection. Prevent the
+    // browser from extending a native text range across card labels at the
+    // same time, including a range that was started before this click.
+    event.preventDefault?.();
+    try{window.getSelection?.()?.removeAllRanges();}catch{}
     // Shift selects the range inclusively.  A missing anchor falls back to a
     // single selection instead of selecting an arbitrary first page.
     const anchor=lastPageRangeAnchor||id;
@@ -4413,7 +4418,7 @@ function dynamicVolumePanelHtml(panel,allPages,visibleIds){
   const emptyThumbnail=allPages.length?'<div class="empty-row page-empty-drop"><strong>ページはありません</strong><span>ここへドラッグするか、ページを選んで移動先を押します。</span></div>':'<div class="empty-row page-empty-drop"><strong>ページがまだありません</strong><span>原稿を登録し、変換PDFを作成してください。</span><button class="btn secondary compact" type="button" data-page-go-source>原稿画面へ</button></div>';
   const content=pageBoardView==='thumbnail'?`<div class="thumbnail-wrap volume-content"><div class="thumbnail-grid" role="listbox" aria-label="${escapeAttr(panel.title)}" aria-multiselectable="true" data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageThumbnailHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||emptyThumbnail}</div></div>`:`<div class="table-wrap volume-content"><table class="page-table"><thead><tr><th class="seq-col">順</th><th>ページ名</th><th>PDF</th><th>番号</th></tr></thead><tbody data-volume="${escapeAttr(volume)}">${pages.map((page,index)=>pageRowHtml(page,index,!visibleIds.has(resolvedPageId(page)))).join('')||'<tr class="empty-row"><td colspan="4">ここへドロップ</td></tr>'}</tbody></table></div>`;
   const active=activePageVolume==='all'||volume===activePageVolume;
-  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${pages.length>=12?'high-volume':''} ${active?'active-volume':'inactive-volume'} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
+  return `<section class="volume-panel ${volume==='none'?'inbox':''} ${active?'active-volume':'inactive-volume'} ${collapsed?'collapsed':''}" data-volume-panel="${escapeAttr(volume)}"><button class="volume-head" type="button" data-toggle-volume="${escapeAttr(volume)}" aria-expanded="${collapsed?'false':'true'}"><div><h3>${escapeHtml(panel.title)}</h3><p>${escapeHtml(panel.description)}</p></div><span class="volume-head-meta"><b>${escapeHtml(countText)}</b><svg class="icon"><use href="#i-chevron-down"/></svg></span></button>${content}</section>`;
 }
 // 絞り込みで隠れるページは、中身を作らず data-page-id だけの器にする。
 // 器を残すのは collectBoardVolumes() が並び順をDOMから絶対値で読み取るため。

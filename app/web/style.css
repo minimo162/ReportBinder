@@ -784,17 +784,19 @@ main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{height:au
 .detail-board .page-row{cursor:grab;touch-action:pan-y}
 .detail-board .page-row:active{cursor:grabbing}
 .detail-board .page-row :is(input,select,button,a,label){cursor:auto}
+.thumbnail-board .page-thumb-card,.detail-board .page-row{-webkit-user-select:none;user-select:none}
+.thumbnail-board .page-thumb-card :is(input,textarea,[contenteditable="true"]),.detail-board .page-row :is(input,textarea,[contenteditable="true"]){-webkit-user-select:text;user-select:text}
 .thumbnail-board .page-thumb-check,.thumbnail-board .page-thumb-drag{display:none!important}
 .thumbnail-board .page-thumb-card.selected-row::after{content:"選択中";top:7px;left:7px;width:auto;height:24px;padding:0 8px;border-radius:12px;font-size:14px;box-shadow:0 1px 5px rgba(27,28,30,.18)}
 .page-thumb-preview-surface{pointer-events:none;cursor:default}
 @media(pointer:coarse){
   .thumbnail-board .page-thumb-card{cursor:default;touch-action:pan-y}
 }
-/* A normal report often has about twenty pages in both main and appendix.
-   On a wide desktop, use the otherwise empty horizontal room to halve lane
-   height while preserving the single document scrollbar. Narrow screens keep
-   one card per lane row so text and controls never become cramped. */
-@media(min-width:1800px){
-  main.shell.pages-shell .overview-board.thumbnail-board .volume-panel.high-volume .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-  main.shell.pages-shell .overview-board.thumbnail-board .volume-panel.high-volume .page-thumb-card{grid-template-columns:minmax(76px,96px) minmax(0,1fr)}
-}
+/* Card density depends only on available width, never on the current page
+   count. The old 12-page threshold changed every card's size while pages were
+   being assigned. Auto-fill now gives overview and focused lanes the same
+   compact geometry from the first page through normal 20-page reports. */
+main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-grid,
+main.shell.pages-shell .focused-board.thumbnail-board .thumbnail-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1fr));gap:12px}
+main.shell.pages-shell .overview-board.thumbnail-board .page-thumb-card,
+main.shell.pages-shell .focused-board.thumbnail-board .page-thumb-card{grid-template-columns:minmax(76px,96px) minmax(0,1fr)}
