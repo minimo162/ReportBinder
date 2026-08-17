@@ -1950,6 +1950,57 @@ function Set-DocumentPackArchived([string]$Language, [string]$PackId, [bool]$Arc
     }
 }
 
+function Remove-DocumentPack([string]$Language, [string]$PackId) {
+    $id = ([string]$PackId).Trim()
+    if ([string]::IsNullOrWhiteSpace($id)) { throw [ArgumentException]::new('packId が必要です。') }
+    return Update-StructureLocked $Language {
+        param($structure)
+        $pack = Get-PackRecord $structure $id
+        if (-not [string]::IsNullOrWhiteSpace((Get-CategoryFromBuiltinPackId ([string](Get-DataProperty $pack 'packId' ''))))) {
+            throw [ArgumentException]::new('組み込み一式は削除できません。')
+        }
+        if (-not (Test-PackArchived $pack)) {
+            throw [InvalidOperationException]::new('一式を削除する前にアーカイブしてください。')
+        }
+
+        $workbooks = @(Get-Array (Get-DataProperty $structure 'workbooks' @()) | Where-Object { Test-WorkbookPack $_ $id })
+        $workbookIds = @{}; foreach ($workbook in $workbooks) { $workbookIds[[string](Get-DataProperty $workbook 'workbookId' '')] = $true }
+        $sources = @(Get-Array (Get-DataProperty $structure 'sources' @()) | Where-Object { [string](Get-DataProperty $_ 'packId' '') -eq $id })
+        $sourceIds = @{}; foreach ($source in $sources) { $sourceIds[[string](Get-DataProperty $source 'sourceId' '')] = $true }
+        foreach ($workbookId in @($workbookIds.Keys)) { $sourceIds[[string]$workbookId] = $true }
+        $units = @(Get-Array (Get-DataProperty $structure 'units' @()) | Where-Object { $sourceIds.ContainsKey([string](Get-DataProperty $_ 'sourceId' '')) })
+        $unitIds = @{}; foreach ($unit in $units) { $unitIds[[string](Get-DataProperty $unit 'unitId' '')] = $true }
+        $pages = @(Get-Array (Get-DataProperty $structure 'pages' @()) | Where-Object { $workbookIds.ContainsKey([string](Get-DataProperty $_ 'workbookId' '')) })
+
+        Set-NoteProperty $structure 'packs' @(Get-Array (Get-DataProperty $structure 'packs' @()) | Where-Object { [string](Get-DataProperty $_ 'packId' '') -ne $id })
+        Set-NoteProperty $structure 'workbooks' @(Get-Array (Get-DataProperty $structure 'workbooks' @()) | Where-Object { -not $workbookIds.ContainsKey([string](Get-DataProperty $_ 'workbookId' '')) })
+        Set-NoteProperty $structure 'pages' @(Get-Array (Get-DataProperty $structure 'pages' @()) | Where-Object { -not $workbookIds.ContainsKey([string](Get-DataProperty $_ 'workbookId' '')) })
+        Set-NoteProperty $structure 'sources' @(Get-Array (Get-DataProperty $structure 'sources' @()) | Where-Object { -not $sourceIds.ContainsKey([string](Get-DataProperty $_ 'sourceId' '')) })
+        Set-NoteProperty $structure 'units' @(Get-Array (Get-DataProperty $structure 'units' @()) | Where-Object { -not $sourceIds.ContainsKey([string](Get-DataProperty $_ 'sourceId' '')) })
+        Set-NoteProperty $structure 'items' @(Get-Array (Get-DataProperty $structure 'items' @()) | Where-Object {
+            [string](Get-DataProperty $_ 'packId' '') -ne $id -and -not $sourceIds.ContainsKey([string](Get-DataProperty $_ 'sourceId' ''))
+        })
+        Set-NoteProperty $structure 'artifacts' @(Get-Array (Get-DataProperty $structure 'artifacts' @()) | Where-Object {
+            [string](Get-DataProperty $_ 'packId' '') -ne $id -and
+            -not $sourceIds.ContainsKey([string](Get-DataProperty $_ 'sourceId' '')) -and
+            -not $unitIds.ContainsKey([string](Get-DataProperty $_ 'unitId' ''))
+        })
+        $outputs = Get-DataProperty $structure 'outputs' ([ordered]@{})
+        $keptOutputs = [ordered]@{}
+        foreach ($key in @(Get-ConfigKeyNames $outputs)) {
+            $output = Get-DataProperty $outputs $key $null
+            if ([string](Get-DataProperty $output 'packId' '') -eq $id -or $key.StartsWith("$id|", [StringComparison]::Ordinal)) { continue }
+            $keptOutputs[$key] = $output
+        }
+        Set-NoteProperty $structure 'outputs' $keptOutputs
+        return [ordered]@{
+            packId=$id; displayName=[string](Get-DataProperty $pack 'displayName' '')
+            removedWorkbookCount=$workbooks.Count; removedPageCount=$pages.Count
+            sourceFilesDeleted=$false
+        }
+    }
+}
+
 function New-WorksheetUnitId([string]$SourceId, [string]$SheetName) {
     if ([string]::IsNullOrWhiteSpace($SourceId) -or [string]::IsNullOrWhiteSpace($SheetName)) { return '' }
     return "unit-$SourceId-$(Get-WorksheetStorageStem $SheetName)"
@@ -7920,12 +7971,11 @@ function Get-PackProgressDashboard($Structure, [string]$Language) {
                 elseif ($dueDate -le $dueSoonLimit) { $dueSoonRequired++ }
             } catch { }
         }
-        $needsRender = @($workbooks | Where-Object {
-            [string](Get-DataProperty $_ 'status' '') -in @('new','excel-updated','source-updated','render-error','render-failed','missing') -or
-            [string]::IsNullOrWhiteSpace([string](Get-DataProperty $_ 'lastRenderedExcelHash' '')) -or
-            (([string](Get-DataProperty $_ 'sourceType' 'excel') -eq 'excel') -and
-             (Normalize-ExcelSheetSelection ([string](Get-DataProperty $_ 'excelSheetSelectionMode' 'all-visible')) -ne Normalize-ExcelSheetSelection ([string](Get-DataProperty $_ 'lastRenderedSheetSelectionMode' 'all-visible'))))
-        }).Count
+        # The dashboard and final-build checks must share one freshness rule.
+        # A duplicated approximation used to label a workbook "変換待ち" while
+        # the workbook card correctly said its conversion PDF was current.
+        $needsRender = @($workbooks | Where-Object { -not (Test-WorkbookRenderIsCurrent $_) }).Count
+
         $unassigned = @($pages | Where-Object { [bool](Get-DataProperty $_ 'enabled' $true) -eq $false -or [string](Get-DataProperty $_ 'volume' 'none') -eq 'none' }).Count
         $targetRows = @(); $allBlockers = @(); $targetFingerprints = [ordered]@{}
         foreach ($target in @(Get-Array (Get-DataProperty $pack 'targets' @()))) {
@@ -8815,6 +8865,12 @@ function Handle-Api($Context) {
             $packId = [Uri]::UnescapeDataString([string]$matches[1])
             $result = Set-DocumentPackArchived $language $packId $false
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; result = $result; packs = @(Get-PublicPackList (Get-Structure $language) $language) }); return
+        }
+        if ($method -eq 'DELETE' -and $path -match '^/api/v2/packs/([^/]+)$') {
+            $packId = [Uri]::UnescapeDataString([string]$matches[1])
+            $result = Remove-DocumentPack $language $packId
+            Write-HistoryEvent $language 'pack.deleted' ([ordered]@{ packId=$packId; displayName=[string]$result.displayName; removedWorkbookCount=[int]$result.removedWorkbookCount; removedPageCount=[int]$result.removedPageCount })
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result; state=(Get-StatePayload $language); packs=@(Get-PublicPackList (Get-Structure $language) $language $true) }); return
         }
         if ($method -eq 'GET' -and $path -match '^/api/v2/packs/([^/]+)/review$') {
             $packId = [Uri]::UnescapeDataString([string]$matches[1])
