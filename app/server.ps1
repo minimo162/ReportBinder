@@ -8,6 +8,7 @@
     [string]$FinalJobPath = '',
     [string]$DiffJobPath = '',
     [string]$AutoSchedulerPath = '',
+    [string]$SharedAppRoot = '',
     [int]$ParentProcessId = 0
 )
 
@@ -53,6 +54,26 @@ $Script:LastHeartbeatUtc = [DateTime]::UtcNow
 $Script:ClientCloseNotifiedUtc = [DateTime]::MinValue
 $Script:ShutdownRequested = $false
 $Script:CachedJavaExe = ''
+# 配布共有のappフォルダー(runtime-version.json と同じ場所)。launch.ps1 だけが渡す。
+# server.ps1 の直接起動では空になる。開発ツリーを launch.ps1 から起動した場合は
+# 自身のルートが渡る(自己比較になり更新なしで収まるため害はない)。
+# 版確認はこの値があるときだけ行う。
+# 注意: スクリプト直下では $Script: 付きの代入がパラメータ変数そのものを消す
+# ($SharedAppRoot と $Script:SharedAppRoot が同じ格納域のため)。候補変数を経由する。
+$sharedAppRootCandidate = [string]$SharedAppRoot
+if (-not [string]::IsNullOrWhiteSpace($sharedAppRootCandidate)) {
+    try { $sharedAppRootCandidate = [IO.Path]::GetFullPath($sharedAppRootCandidate) } catch { $sharedAppRootCandidate = '' }
+}
+$Script:SharedAppRoot = $sharedAppRootCandidate
+# GET /api/version-check の応答源。バックグラウンド確認がスナップショットを
+# 参照ごと差し替え、要求処理は読むだけ。個々の項目は書き換えないため、
+# リスナースレッドと確認スレッドが同時に触れても不整合は起きない。
+$Script:UpdateCheckState = [hashtable]::Synchronized(@{
+    snapshot = [pscustomobject]@{ checkedAtUtc = $null; latestVersion = ''; updateAvailable = $false }
+    inFlight = $false
+})
+$Script:UpdateCheckTimer = $null
+$Script:UpdateCheckSubscriptionId = $null
 # /api/state が読んだ共有フォルダー上のメタデータを、直後の比較画面でも再利用する。
 # ファイル更新時刻・サイズまたは版IDが変われば別キー/再読込になる。
 $Script:StructureReadCache = @{}
@@ -7688,7 +7709,52 @@ function Get-SystemDiagnostics([string]$Language) {
     $officeReady = ([bool]$excel.available -and [bool]$word.available -and [bool]$powerPoint.available)
     $overall = if (-not $coreReady) { 'blocked' } elseif ($officeReady) { 'ready' } else { 'limited' }
     $summary = if ($overall -eq 'ready') { 'Excel・Word・PowerPoint・PDF原稿を処理できます。' } elseif ($overall -eq 'limited') { 'PDF原稿は処理できます。Office原稿には対応が必要です。' } else { '実行依存ファイルが不足しているため、管理者による修復が必要です。' }
-    return [ordered]@{
+    # blocked のときだけ「次に何をすればいいか」を添える。配布形態の一次情報は
+    # package-release.ps1 が配布物の根(AppRootの親)に書く release-manifest.json で、
+    # portableJavaIncluded / flavor('オンライン導入版'|'オフライン完結版'|'shared-folder-offline')
+    # を見る。lib\java の有無は判別に使えない。install-thirdparty.ps1 が構築の途中で
+    # フォルダーを作るため、オンライン版でも残ることがある。マニフェストが無いのは
+    # 開発ツリーだけなので、そのときに限り lib\java フォルダーの有無で推定する。
+    # マニフェストがあるのに読めない場合は誤った案内より出さない方が安全なので、
+    # 外側の catch で案内ごと省略する。AppRoot の確認に失敗しても診断自体は止めない。
+    $advice = $null
+    try {
+        if ($overall -eq 'blocked') {
+            $manifestPath = Join-Path $Script:AppRoot '..\release-manifest.json'
+            $manifestText = $null
+            if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+                $manifestText = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8
+            }
+            if ($null -ne $manifestText) {
+                $manifest = $manifestText | ConvertFrom-Json
+                if ($manifest -and ($manifest.PSObject.Properties['portableJavaIncluded'] -or $manifest.PSObject.Properties['flavor'])) {
+                    if ($manifest.PSObject.Properties['portableJavaIncluded']) { $pji = $manifest.portableJavaIncluded; $offlineEdition = ($pji -eq $true -or $pji -eq 'true') }
+                    else { $offlineEdition = (@('shared-folder-offline', 'オフライン完結版') -contains [string]$manifest.flavor) }
+                } else {
+                    $offlineEdition = Test-Path -LiteralPath (Join-Path $Script:AppRoot 'lib\java') -PathType Container
+                }
+            } else {
+                $offlineEdition = Test-Path -LiteralPath (Join-Path $Script:AppRoot 'lib\java') -PathType Container
+            }
+            if ($offlineEdition) {
+                $advice = [ordered]@{
+                    kind='redistribute'
+                    title='PDFの作成と結合に必要なソフトが、このPCへの配布データに入っていないか壊れています。'
+                    steps=@('配布元の共有フォルダーから新しいReportBinder一式を取り直してください。','取り直した配布データで入れ直したあと、もう一度動作環境の診断を実行してください。')
+                }
+            } else {
+                $toolsDir = [IO.Path]::GetFullPath((Join-Path $Script:AppRoot 'tools'))
+                $advice = [ordered]@{
+                    kind='install-online'
+                    title='PDFの作成と結合に必要なソフトがこのPCに入っていません。'
+                    steps=@('インターネット接続が必要です。','ReportBinderフォルダーの中にある app\tools\install-thirdparty.cmd を実行してください。','終わったら、もう一度「動作環境を診断」を実行してください。')
+                    toolsDir=$toolsDir
+                    hasToolsDir=[bool](Test-Path -LiteralPath $toolsDir -PathType Container)
+                }
+            }
+        }
+    } catch { $advice = $null }
+    $payload = [ordered]@{
         capturedAt = New-NowIso; language=$Language; status=$overall; summary=$summary
         office = [ordered]@{ minimumSupportedMajor=16; excel=$excel; word=$word; powerPoint=$powerPoint }
         runtime = [ordered]@{
@@ -7700,6 +7766,161 @@ function Get-SystemDiagnostics([string]$Language) {
             configured=[bool](-not [string]::IsNullOrWhiteSpace([string]$paths.submissionDir)); submissionDir=[string]$paths.submissionDir; dataDir=[string]$paths.dataDir; outputDir=[string]$paths.outputDir
             dataFreeBytes=Get-PathFreeBytes ([string]$paths.dataDir); outputFreeBytes=Get-PathFreeBytes ([string]$paths.outputDir)
         }
+    }
+    if ($null -ne $advice) { $payload['advice'] = $advice }
+    return $payload
+}
+
+# ------------------------------------------------------------------
+# 共有フォルダーの新版確認(GET /api/version-check)。
+# 共有フォルダーの読み取りは必ず独立した新ランスペース上で非同期に行う。
+# SMBの応答停止に巻き込まれても、HTTPリスナーのスレッドは一切塞がらない。
+# ------------------------------------------------------------------
+
+# 探索の本体。独立ランスペースで動かすため、server.ps1 の関数・変数に依存しない
+# 自己完結スクリプトにしてある。結果は引数のSynchronizedハッシュテーブルへ
+# 丸ごと差し替える形で返し、失敗時は「未確認」(checkedAtUtc=null)に戻す。
+$Script:VersionCheckProbeScript = @'
+param([string]$SharedRoot, [string]$RunningVersion, [hashtable]$Sync)
+$result = New-Object psobject -Property @{
+    checkedAtUtc = $null
+    latestVersion = ''
+    updateAvailable = $false
+}
+try {
+    if ([string]::IsNullOrWhiteSpace($SharedRoot)) { return }
+    $probePath = Join-Path $SharedRoot 'runtime-version.json'
+    if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) { return }
+    $info = Get-Content -LiteralPath $probePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $candidate = ([string]$info.version).Trim()
+    if ($candidate -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { return }
+    $result.latestVersion = $candidate
+    $result.checkedAtUtc = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+    # 双方が4部構成の数字のときだけ大小を比べる。それ以外の形式は順序を
+    # 付けられないため、誤った案内を出さないよう更新なしとして扱う。
+    if ($candidate -match '^\d+\.\d+\.\d+\.\d+$' -and $RunningVersion -match '^\d+\.\d+\.\d+\.\d+$') {
+        try {
+            $result.updateAvailable = ([version]$candidate).CompareTo([version]$RunningVersion) -gt 0
+        } catch {
+            $result.updateAvailable = $false
+        }
+    }
+} catch {
+    $result.checkedAtUtc = $null
+    $result.latestVersion = ''
+    $result.updateAvailable = $false
+} finally {
+    $Sync['snapshot'] = $result
+    # 探索の完了を通知する。これが無いと以後の周期がすべて「実行中」扱いで止まる。
+    $Sync['inFlight'] = $false
+}
+'@
+
+function Get-VersionCheckPayload {
+    # 応答はメモリ内スナップショットだけから組み立てる。この関数では共有フォルダーに触れない。
+    $latestVersion = ''
+    $updateAvailable = $false
+    $checkedAt = $null
+    try {
+        $snapshot = $Script:UpdateCheckState['snapshot']
+        if ($null -ne $snapshot) {
+            if ($null -ne $snapshot.latestVersion) { $latestVersion = [string]$snapshot.latestVersion }
+            if ($null -ne $snapshot.checkedAtUtc) { $checkedAt = [string]$snapshot.checkedAtUtc }
+            $updateAvailable = [bool]$snapshot.updateAvailable
+        }
+    } catch { }
+    return [ordered]@{
+        ok = $true
+        checkedAt = $checkedAt
+        runningVersion = $Script:RuntimeVersion
+        latestVersion = $latestVersion
+        updateAvailable = $updateAvailable
+    }
+}
+
+function Stop-VersionCheckMonitor {
+    # Start-LocalTcpServer の finally から呼ぶ。タイマー自体はプロセス終了を妨げないが、
+    # 通常終了ではイベント購読ごと明示的に片付ける。
+    try {
+        if ($null -ne $Script:UpdateCheckSubscriptionId) {
+            Unregister-Event -SubscriptionId $Script:UpdateCheckSubscriptionId -ErrorAction SilentlyContinue
+        }
+    } catch { }
+    $Script:UpdateCheckSubscriptionId = $null
+    try {
+        if ($null -ne $Script:UpdateCheckTimer) {
+            $Script:UpdateCheckTimer.Stop()
+            $Script:UpdateCheckTimer.Dispose()
+        }
+    } catch { }
+    $Script:UpdateCheckTimer = $null
+}
+
+function Start-VersionCheckMonitor {
+    # 単一のSystem.Timers.Timer。初回は起動2分後、以後30分間隔。
+    # アクション本体は瞬時に返ること(SMB読み取りをここに書かない)。探索は
+    # 新しいランスペースへの非同期依頼(BeginInvoke)だけで完結させる。
+    # アクション内の値は -MessageData で渡す。イベントアクションは実行時に
+    # 新しいモジュールへ再束化されるためクロージャ(GetNewClosure)は効かない。
+    if ($null -ne $Script:UpdateCheckTimer) { return }
+    try {
+        $timerRef = New-Object System.Timers.Timer
+        $timerRef.Interval = 120000
+        $timerRef.AutoReset = $true
+        $messageData = @{
+            State = $Script:UpdateCheckState
+            Timer = $timerRef
+            Probe = [string]$Script:VersionCheckProbeScript
+            Root = [string]$Script:SharedAppRoot
+            Version = [string]$Script:RuntimeVersion
+        }
+        $subscription = Register-ObjectEvent -InputObject $timerRef -EventName Elapsed -MessageData $messageData -Action {
+            try {
+                $data = $Event.MessageData
+                # 前回の探索が戻っていない間は何もしない(SMBが止まっても積み上がらない)。
+                if ([bool]$data.State['inFlight']) { return }
+                if (-not [bool]$data.State['intervalRaised']) {
+                    $data.State['intervalRaised'] = $true
+                    try { $data.Timer.Stop(); $data.Timer.Interval = 1800000; $data.Timer.Start() } catch { }
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$data.Root)) { return }
+                # 前回の探索インスタンスを明示的に片付ける。inFlightが下りているので
+                # パイプラインは完了済みであり、EndInvokeで塞がることはない。
+                $previous = $data.State['lastProbe']
+                if ($null -ne $previous) {
+                    $data.State['lastProbe'] = $null
+                    try {
+                        # 完了していない場合(理論上のごく短い窓)は触れずGCへ委ねる。
+                        if ($previous.Handle.IsCompleted) {
+                            [void]$previous.Pipe.EndInvoke($previous.Handle)
+                            $previous.Pipe.Dispose()
+                        }
+                    } catch { }
+                }
+                $data.State['inFlight'] = $true
+                $probe = [powershell]::Create()
+                $handle = $null
+                try {
+                    [void]$probe.AddScript($data.Probe)
+                    [void]$probe.AddArgument([string]$data.Root)
+                    [void]$probe.AddArgument([string]$data.Version)
+                    [void]$probe.AddArgument($data.State)
+                    $handle = $probe.BeginInvoke()
+                } catch {
+                    try { $probe.Dispose() } catch { }
+                    throw
+                }
+                $data.State['lastProbe'] = @{ Pipe = $probe; Handle = $handle }
+            } catch {
+                try { $Event.MessageData.State['inFlight'] = $false } catch { }
+            }
+        }
+        $Script:UpdateCheckTimer = $timerRef
+        $Script:UpdateCheckSubscriptionId = $subscription.Id
+        $timerRef.Start()
+    } catch {
+        Write-Warning ("版確認の監視を開始できませんでした: " + $_.Exception.Message)
+        Stop-VersionCheckMonitor
     }
 }
 
@@ -8828,6 +9049,24 @@ function Handle-Api($Context) {
         if ($method -eq 'POST' -and $path -eq '/api/diagnostics/run') {
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; diagnostics=(Get-SystemDiagnostics $language) }); return
         }
+        if ($method -eq 'POST' -and $path -eq '/api/diagnostics/open-tools') {
+            # 診断の修復案内で使う専用口。開く先は AppRoot\tools に固定であり、
+            # 要求本文は一切参照しない。reveal と同じ ProcessStartInfo の形にする。
+            #   - パスは引用する。AppRoot が空白を含む場所に置かれることがあるため。
+            $diagnosticsToolsDir = Join-Path $Script:AppRoot 'tools'
+            if (-not (Test-Path -LiteralPath $diagnosticsToolsDir -PathType Container)) {
+                Write-JsonResponse $Context 404 ([ordered]@{ ok=$false; error='tools-folder-missing'; message='インストール用ファイルのフォルダーが見つかりません。' }); return
+            }
+            [void][Diagnostics.Process]::Start((New-Object Diagnostics.ProcessStartInfo -Property @{
+                FileName = 'explorer.exe'
+                Arguments = '"' + $diagnosticsToolsDir + '"'
+                UseShellExecute = $true
+            }))
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; path=$diagnosticsToolsDir }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/version-check') {
+            Write-JsonResponse $Context 200 (Get-VersionCheckPayload); return
+        }
         if ($method -eq 'GET' -and $path -eq '/api/v2/pack-templates') {
             Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; apiVersion = 2; packTemplates = @(Get-PackTemplateCatalog $language) }); return
         }
@@ -9699,6 +9938,7 @@ function Start-LocalTcpServer([int]$ListenPort, [string]$OpenUrl, [bool]$SkipOpe
         Write-Host "ReportBinder URL: $OpenUrl"
         Write-Host "ReportBinder will stop after 30 minutes without browser activity. PDF creation jobs continue even if the tab is closed."
         if (-not $SkipOpen) { Open-ReportBinderBrowser $OpenUrl }
+        Start-VersionCheckMonitor
         while ($true) {
             $now = [DateTime]::UtcNow
             if ($Script:ShutdownRequested) {
@@ -9746,6 +9986,7 @@ function Start-LocalTcpServer([int]$ListenPort, [string]$OpenUrl, [bool]$SkipOpe
         }
     } finally {
         # 親PID監視だけに頼らず、通常終了・listener起動失敗のどちらでも明示停止する。
+        try { Stop-VersionCheckMonitor } catch { }
         try { Stop-AutoSchedulerProcess } catch { }
         if ($tcp) { try { $tcp.Stop() } catch { } }
     }

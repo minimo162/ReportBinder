@@ -1460,7 +1460,16 @@ function renderDiagnosticsResult(){
   const statusLabel=value=>({ready:'利用可能',limited:'一部利用可能',blocked:'修復が必要','not-installed':'未導入',unsupported:'非対応版',unavailable:'起動不可'})[String(value||'')]||'要確認';
   const statusClass=value=>String(value)==='ready'?'neutral':String(value)==='blocked'?'danger':'attention';
   const appRow=app=>{const item=app||{},detail=item.available?`Version ${item.version||'16'}${item.build?` / Build ${item.build}`:''}`:(item.userAction||'利用できません。');return`<div class="diagnostic-row"><div><strong>${escapeHtml(item.displayName||'Office')}</strong><span>${escapeHtml(detail)}</span></div>${badge(statusLabel(item.status),statusClass(item.status))}</div>`;};
-  box.innerHTML=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDFを作る機能</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>このPCの空き容量</strong><span>管理データの保存先 ${formatCapacity(storage.dataFreeBytes)} / 出力先 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div><p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
+  let html=`<div class="diagnostics-summary"><div><strong>${escapeHtml(statusLabel(d.status))}</strong><p>${escapeHtml(d.summary||'')}</p></div>${badge(statusLabel(d.status),statusClass(d.status))}</div><div class="diagnostic-list">${appRow(office.excel)}${appRow(office.word)}${appRow(office.powerPoint)}<div class="diagnostic-row"><div><strong>PDFを作る機能</strong><span>Java・PDFBox・PDF.js</span></div>${badge(runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'利用可能':'修復が必要',runtime.java?.ready&&runtime.pdfbox?.ready&&runtime.pdfjs?.ready?'neutral':'danger')}</div><div class="diagnostic-row"><div><strong>このPCの空き容量</strong><span>管理データの保存先 ${formatCapacity(storage.dataFreeBytes)} / 出力先 ${formatCapacity(storage.outputFreeBytes)}</span></div>${badge(storage.configured?'確認済み':'未設定',storage.configured?'neutral':'attention')}</div></div>`;
+  const advice=d.advice&&d.advice.steps?d.advice:null;
+  const adviceSteps=advice?advice.steps.map(step=>String(step||'')).filter(step=>step.trim()):[];
+  const canOpenTools=!!(advice&&String(advice.kind)==='install-online'&&String(advice.toolsDir||'').trim()&&advice.hasToolsDir!==false);
+  if(advice&&(String(advice.title||'').trim()||adviceSteps.length)){
+    html+=`<div class="diagnostics-advice">${String(advice.title||'').trim()?`<strong>${escapeHtml(String(advice.title))}</strong>`:''}${adviceSteps.length?`<ul>${adviceSteps.map(step=>`<li>${escapeHtml(step)}</li>`).join('')}</ul>`:''}${canOpenTools?`<div class="disclosure-actions diagnostics-advice-open"><p>インストール用ファイルのあるフォルダーを開けます。</p><button class="btn secondary compact" type="button" data-diagnostics-open-tools>フォルダーを開く</button></div>`:''}</div>`;
+  }
+  html+=`<p class="caption diagnostics-time">診断日時 ${escapeHtml(formatDateTime(d.capturedAt))}</p>`;
+  box.innerHTML=html;
+  box.querySelector('[data-diagnostics-open-tools]')?.addEventListener('click',event=>runBusy(event.currentTarget,async()=>{try{await api('/api/diagnostics/open-tools',{method:'POST',body:{}});}catch(error){showMessage('danger','フォルダーを開けませんでした',userFriendlyError(error.message),error.detail||error.message);}}));
 }
 
 async function runSystemDiagnostics(btn){
@@ -5956,6 +5965,37 @@ async function loadInitialAppState(button=null) {
     if(button){button.classList.remove('hidden');button.disabled=false;}
   }
 }
+// ---- 共有フォルダーの新版案内(控えめな通知) ----
+async function pollVersionNotice(){
+  let info=null;
+  try{info=await api('/api/version-check');}catch(error){return;}
+  renderUpdateNotice(!!(info&&info.updateAvailable)&&!sessionStorage.getItem('rb-update-dismissed'));
+}
+function renderUpdateNotice(show){
+  const popover=$('app-menu-popover'),button=$('app-menu-button');
+  if(!popover||!button)return;
+  let line=document.getElementById('update-notice-line');
+  if(!line){
+    line=document.createElement('div');
+    line.id='update-notice-line';
+    line.className='update-notice-line hidden';
+    line.innerHTML='<span>共有フォルダーに新しい版があります。次回の起動で更新されます。</span><button class="btn ghost compact" type="button">閉じる</button>';
+    line.querySelector('button').addEventListener('click',()=>{sessionStorage.setItem('rb-update-dismissed','1');renderUpdateNotice(false);});
+    const actions=popover.querySelector('.popover-actions');
+    if(actions)actions.insertAdjacentElement('beforebegin',line);else popover.appendChild(line);
+  }
+  line.classList.toggle('hidden',!show);
+  button.querySelector(':scope > .menu-dot')?.remove();
+  if(show){
+    const dot=document.createElement('span');
+    dot.className='menu-dot';
+    dot.setAttribute('aria-hidden','true');
+    button.appendChild(dot);
+  }
+}
+setTimeout(pollVersionNotice,15000);
+setInterval(pollVersionNotice,1800000);
+
 (async function init() {
   startLifecycle();
   startUpdateMonitor();

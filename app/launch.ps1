@@ -747,7 +747,7 @@ try {
     Add-LaunchLog "ServerStdErr=$serverErr"
 
     $serverQuoted = Quote-ProcessArgument $server
-    $argLine = "-NoProfile -ExecutionPolicy Bypass -File $serverQuoted -Port $port -Token $token -NoOpen"
+    $argLine = "-NoProfile -ExecutionPolicy Bypass -File $serverQuoted -Port $port -Token $token -NoOpen -SharedAppRoot $(Quote-ProcessArgument $script:SharedAppRoot)"
     Add-LaunchLog "Starting server.ps1 as a background process. Browser startup wait page will be opened immediately."
     # UIサーバーはバックグラウンドで動作する。診断情報はローカルログへ保存し、通常起動ではコンソールを表示しない。
     $proc = Start-Process -FilePath $psExe -ArgumentList $argLine -WindowStyle Hidden -PassThru -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
