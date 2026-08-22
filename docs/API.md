@@ -239,6 +239,71 @@ Office、Java、PDFBox、PDF.js、保存先の動作環境を診断します。E
 }
 ```
 
+`status`が`blocked`のときは、次の一手を案内する`advice`フィールドが追加されます（旧クライアントは無視できる追加分）。配布形態は配布物の根にある`release-manifest.json`（package-release.ps1が出力）で判別します。`portableJavaIncluded: true`（flavor `shared-folder-offline` / `オフライン完結版`）の配布では壊れた配布として`kind: "redistribute"`を返し、`portableJavaIncluded: false`（flavor `オンライン導入版`）では導入コマンドで修復可能として`kind: "install-online"`を返します。マニフェストを持たない開発ツリーでは`app\lib\java`フォルダーの有無で推定します。マニフェストがあっても読み取れない場合は誤った案内を避けるため`advice`自体を省略し、従来どおりの応答に劣化します。
+
+```jsonc
+// kind: "install-online" の例
+{
+  "status": "blocked",
+  "advice": {
+    "kind": "install-online",
+    "title": "PDFの作成と結合に必要なソフトがこのPCに入っていません。",
+    "steps": [
+      "インターネット接続が必要です。",
+      "ReportBinderフォルダーの中にある app\\tools\\install-thirdparty.cmd を実行してください。",
+      "終わったら、もう一度「動作環境を診断」を実行してください。"
+    ],
+    "toolsDir": "C:\\ReportBinder\\app\\tools",
+    "hasToolsDir": true
+  }
+}
+
+// kind: "redistribute" の例（オフライン完結版。toolsDir / hasToolsDir は持たない）
+{ "kind": "redistribute", "title": "...", "steps": ["..."] }
+```
+
+## POST /api/diagnostics/open-tools
+
+診断の修復案内（`kind: "install-online"`）で案内する `AppRoot\tools` フォルダーをエクスプローラーで開きます。開く先はサーバー側で固定であり、要求本文は参照しません。
+
+```json
+{}
+```
+
+応答:
+
+```json
+{ "ok": true, "path": "C:\\ReportBinder\\app\\tools" }
+```
+
+フォルダーが無い場合は`404`と`error: "tools-folder-missing"`を返します。
+
+## GET /api/version-check
+
+共有フォルダー配布において、配布元により新しい版が公開されているかを返します。サーバーは起動2分後、以後30分ごとにバックグラウンドで配布元の`runtime-version.json`を確認し、結果をメモリに保持します。このAPIは要求時に共有フォルダーへアクセスせず、保持した結果だけを返すため、配布元が応答しなくても即座に応答します。
+
+```jsonc
+// 確認済みで、より新しい版がある例
+{
+  "ok": true,
+  "checkedAt": "2026-08-22T17:00:00+09:00",
+  "runningVersion": "2026.08.01.1",
+  "latestVersion": "2026.08.22.1",
+  "updateAvailable": true
+}
+
+// 未確認・確認失敗・開発ツリーからの直接起動の例（fail-silent）
+{
+  "ok": true,
+  "checkedAt": null,
+  "runningVersion": "2026.08.01.1",
+  "latestVersion": "",
+  "updateAvailable": false
+}
+```
+
+`updateAvailable`は、双方の版が`x.y.z.w`の4部構成の数字で、配布元の版が実行中より厳密に新しいときだけ`true`になります。それ以外の形式や、版ファイルの欠落・読み取り失敗では例外を表に出さず、`checkedAt: null`として扱います。
+
 ## POST /api/heartbeat
 
 ```json
