@@ -244,6 +244,39 @@ Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|'
 $afterJob = Publish-DocumentPackAllPdfsToShared 'ja' $publishId
 Assert-OutputTest (@($afterJob.files).Count -eq 2) 'Publishing did not resume after the output finished.'
 
+# ---- M-7: 発行の作業用フォルダーは隠し、残骸は次の発行の前に消す -----------------
+$me = Get-SafePublishUserName
+function New-StagingLeftover([string]$Name, [double]$HoursOld) {
+    $dir = New-Item -ItemType Directory -Path (Join-Path $submissionDir $Name) -Force
+    [IO.File]::WriteAllText((Join-Path $dir.FullName 'half.pdf'), '%PDF-half')
+    $dir.LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddHours(-$HoursOld)
+    return $Name
+}
+$guid = { [Guid]::NewGuid().ToString('N') }
+$ownOld = New-StagingLeftover (".publishing-$me-" + (& $guid)) 2
+$ownRecent = New-StagingLeftover (".publishing-$me-" + (& $guid)) 0
+$otherOld = New-StagingLeftover (".publishing-$me-x-" + (& $guid)) 48
+$legacyOld = New-StagingLeftover ('.publishing-' + (& $guid)) 48
+$legacyRecent = New-StagingLeftover ('.publishing-' + (& $guid)) 2
+# コピーの瞬間に作業用フォルダーの属性を記録する。
+$Script:StagingAttributes = @()
+function Copy-Item {
+    param([string]$LiteralPath, [string]$Destination, [switch]$Force)
+    $Script:StagingAttributes += (Get-Item -LiteralPath (Split-Path -Parent $Destination) -Force).Attributes
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force
+}
+[void](Publish-DocumentPackAllPdfsToShared 'ja' $publishId)
+Remove-Item Function:\Copy-Item
+$left = @(Get-SharedEntries)
+Assert-OutputTest (-not ($left -contains $ownOld)) 'An old staging folder left by this user was not removed.'
+Assert-OutputTest (-not ($left -contains $legacyOld)) 'An old staging folder in the previous naming was not removed.'
+Assert-OutputTest ($left -contains $ownRecent -and $left -contains $legacyRecent) 'A staging folder that may still be in use was removed.'
+Assert-OutputTest ($left -contains $otherOld) "Another user's staging folder was removed."
+Assert-OutputTest ($Script:StagingAttributes.Count -eq 2) 'The staging copy was not observed.'
+if ($env:OS -eq 'Windows_NT') {
+    Assert-OutputTest (@($Script:StagingAttributes | Where-Object { ($_ -band [IO.FileAttributes]::Hidden) -eq 0 }).Count -eq 0) 'The staging folder was visible in the shared folder while copying.'
+}
+
 Write-Output 'output-publish selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

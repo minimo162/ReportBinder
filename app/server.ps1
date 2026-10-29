@@ -9083,6 +9083,22 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
     return Invoke-WithPublishLocks $lockPaths { Publish-DocumentPackPdfToSharedLocked $Language $Volumes ([string]$scope.packId) }
 }
 
+# 共有用フォルダーに残った発行の作業用フォルダー（.publishing-*）を消す。消すのは、
+# この利用者が作って1時間以上たったものと、利用者名の入っていない以前の形式で1日以上
+# たったものだけ。他の人がコピーしている途中のフォルダーには触れない。
+function Remove-StalePublishingFolders([string]$SubmissionDir, [string]$UserName) {
+    $now = (Get-Date).ToUniversalTime()
+    $own = '.publishing-' + $UserName + '-'
+    foreach ($dir in @(Get-ChildItem -LiteralPath $SubmissionDir -Directory -Force -Filter '.publishing-*' -ErrorAction SilentlyContinue)) {
+        $age = $now - $dir.LastWriteTimeUtc
+        $legacy = $dir.Name -match '^\.publishing-[0-9a-f]{32}$'
+        $mine = $dir.Name.StartsWith($own, [StringComparison]::OrdinalIgnoreCase) -and $dir.Name.Length -eq ($own.Length + 32)
+        if (($mine -and $age.TotalHours -ge 1) -or ($legacy -and $age.TotalDays -ge 1)) {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # 渡したブロックは Invoke-WithLock の中で呼ばれる。PowerShell の変数は呼び出し元を
 # たどって解決されるので、Invoke-WithLock の引数と同じ名前（$Action）を使うと
 # 自分自身を呼び続ける。名前を分けておくこと。
@@ -9159,11 +9175,15 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
         $suffix++
     }
 
-    # PDFが半端な状態で共有側に見えないよう、同じ共有ルートの隠し一時フォルダーで
-    # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。
-    $stagingDir = Join-Path $submissionDir ('.publishing-' + [Guid]::NewGuid().ToString('N'))
+    # PDFが半端な状態で発行フォルダーとして見えないよう、同じ共有ルートの作業用フォルダーで
+    # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。Windows では
+    # 先頭の「.」では隠れないので、作った直後に隠し属性を付ける（M-7）。強制終了などで
+    # finally が走らずに残ったものは、次の発行の前に Remove-StalePublishingFolders が消す。
+    Remove-StalePublishingFolders $submissionDir $userName
+    $stagingDir = Join-Path $submissionDir ('.publishing-' + $userName + '-' + [Guid]::NewGuid().ToString('N'))
     try {
-        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        $staging = New-Item -ItemType Directory -Path $stagingDir -Force
+        try { $staging.Attributes = $staging.Attributes -bor [IO.FileAttributes]::Hidden } catch { }
         foreach ($entry in $entries) {
             $stagedPdf = Join-Path $stagingDir ([string]$entry.fileName)
             Copy-Item -LiteralPath ([string]$entry.sourceFull) -Destination $stagedPdf -Force
