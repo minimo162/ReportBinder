@@ -157,6 +157,75 @@ Assert-OutputTest (((Get-LayoutIds 'ja-main') -join ',') -eq (@($main[1],$main[0
 [void](Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@($main[1],$main[0],$appendix[0]) })))
 Assert-OutputTest (((Get-LayoutIds 'ja-main') -join ',') -eq (@($main[1],$main[0],$appendix[0]) -join ',') -and (Get-LayoutIds 'ja-appendix').Count -eq 0) 'Moving a page from an unsent lane into a sent lane was rejected or misapplied.'
 
+# ---- 共有用フォルダーへのまとめてコピー（publish-all）と出力PDFの照合（M-2） ----------
+# 原稿のPDFを置かずに済むよう、入力スナップショットだけを差し替える。指紋は出力先ごとに固定。
+function Get-FinalBuildInputSnapshot($Structure, [string]$Language, [string]$Volume, [string]$PackId) {
+    $ids = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $PackId })) { $ids[[string]$wb.workbookId] = $true }
+    $count = @(Get-Array $Structure.pages | Where-Object { $ids.ContainsKey([string]$_.workbookId) -and [string]$_.volume -eq $Volume -and $_.enabled -ne $false }).Count
+    return [pscustomobject]@{ fingerprint="fp|$PackId|$Volume"; blockers=@(); pageCount=$count }
+}
+# 出力ジョブが確定したときと同じ記録を置く。
+function Set-BuiltOutput([string]$PackId, [string]$Volume, [string]$Content, [bool]$RecordIntegrity = $true) {
+    $path = Get-PlannedOutputPath $PackId $Volume
+    [IO.File]::WriteAllText($path, $Content)
+    [void](Update-StructureLocked 'ja' {
+        param($st)
+        $state = Get-PackOutputState $st 'ja' $PackId $Volume $true
+        Set-NoteProperty $state 'outputPdf' $path
+        Set-NoteProperty $state 'builtFingerprint' ([string](Get-FinalBuildInputSnapshot $st 'ja' $Volume $PackId).fingerprint)
+        Set-NoteProperty $state 'outputIntegrity' $(if ($RecordIntegrity) { Get-OutputPdfIntegrity $path } else { $null })
+        return $null
+    })
+    return $path
+}
+function Get-SharedEntries { return @(Get-ChildItem -LiteralPath $submissionDir -Force | ForEach-Object { $_.Name }) }
+$publishPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='発行の一式' })
+$publishId = [string]$publishPack.packId
+Add-TestPages $publishId @('ja-main','ja-appendix')
+$mainPdf = Set-BuiltOutput $publishId 'ja-main' '%PDF-main'
+$appendixPdf = Set-BuiltOutput $publishId 'ja-appendix' '%PDF-appendix'
+$published = Publish-DocumentPackAllPdfsToShared 'ja' $publishId
+Assert-OutputTest (@($published.files).Count -eq 2) 'publish-all did not copy both targets with pages.'
+foreach ($file in @($published.files)) {
+    $local = if ([string]$file.targetId -eq 'main') { $mainPdf } else { $appendixPdf }
+    Assert-OutputTest ((New-Sha256 ([string]$file.sharedPath)) -eq (New-Sha256 $local)) "publish-all copied a different file for $($file.targetId)."
+    Assert-OutputTest ([IO.Path]::GetDirectoryName([string]$file.sharedPath) -eq [string]$published.sharedFolder) 'publish-all split the targets across folders.'
+}
+Assert-OutputTest (@(Get-SharedEntries | Where-Object { $_ -like '.publishing-*' }).Count -eq 0) 'A staging folder was left behind after publishing.'
+$sharedBefore = @(Get-SharedEntries)
+
+# 1冊でも最新でなければ何もコピーしない。
+[void](Update-StructureLocked 'ja' { param($st) Set-NoteProperty (Get-PackOutputState $st 'ja' $publishId 'ja-appendix' $true) 'builtFingerprint' 'old'; return $null })
+Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } '最新ではありません' 'publish-all copied while one target was stale.'
+Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|')) 'A rejected publish-all still created something in the shared folder.'
+$appendixPdf = Set-BuiltOutput $publishId 'ja-appendix' '%PDF-appendix'
+
+# 出力した後に書き換えられたPDFは「最新」と表示せず、発行もしない。
+[IO.File]::AppendAllText($mainPdf, 'edited')
+$changed = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $publishId
+Assert-OutputTest ([string]$changed.displayState -eq 'needs-rebuild' -and @($changed.staleReasons | Where-Object { [string]$_.type -eq 'output-changed' }).Count -eq 1) 'A PDF changed after output was still shown as latest.'
+Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } '変更または上書き' 'A PDF changed after output was published.'
+# サイズも更新日時も同じまま中身だけ違うものは、発行前のハッシュで止める。
+$mainPdf = Set-BuiltOutput $publishId 'ja-main' '%PDF-main'
+$stamp = (Get-Item -LiteralPath $mainPdf).LastWriteTimeUtc
+[IO.File]::WriteAllText($mainPdf, '%PDF-MAIN')
+(Get-Item -LiteralPath $mainPdf).LastWriteTimeUtc = $stamp
+Assert-OutputTest ([string](Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $publishId).displayState -eq 'built') 'The same-size case did not reach the hash check.'
+Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } '中身' 'A PDF whose content differs from the recorded hash was published.'
+# 照合の記録が無い（以前の版で出力した）PDFは発行しない。
+$mainPdf = Set-BuiltOutput $publishId 'ja-main' '%PDF-main' $false
+Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } '記録がありません' 'A PDF without an output record was published.'
+Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|')) 'A rejected publish still created something in the shared folder.'
+$mainPdf = Set-BuiltOutput $publishId 'ja-main' '%PDF-main'
+
+# ページの無い出力先は対象外（補足が空なら本体だけを発行する）。
+$mainOnlyPublish = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='本体だけの発行' })
+Add-TestPages ([string]$mainOnlyPublish.packId) @('ja-main')
+[void](Set-BuiltOutput ([string]$mainOnlyPublish.packId) 'ja-main' '%PDF-only')
+$onlyMain = Publish-DocumentPackAllPdfsToShared 'ja' ([string]$mainOnlyPublish.packId)
+Assert-OutputTest (@($onlyMain.files).Count -eq 1 -and [string]@($onlyMain.files)[0].targetId -eq 'main') 'publish-all did not skip the target without pages.'
+
 Write-Output 'output-publish selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

@@ -8049,10 +8049,37 @@ function Start-VersionCheckMonitor {
 
 function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty $Snapshot 'fingerprint' '') }
 
+# 出力を確定した時点の提出用PDFの記録（M-2）。readiness はサイズと更新日時だけを、
+# 共有用フォルダーへのコピーはハッシュまで照合する。同じパスへ別の出力先が書いた
+# ファイル（H-1）、手で差し替えたり編集したりしたファイルを「最新」として発行しない。
+# 確定は構成のロックの中で行うので、作業ファイルのうちに求めたハッシュを渡せる
+# （置き換えは移動なので中身は同じ）。大きなPDFをロックの中で読み直さない。
+function Get-OutputPdfIntegrity([string]$Path, [string]$KnownHash = '') {
+    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $hash = if ([string]::IsNullOrWhiteSpace($KnownHash)) { New-Sha256 $Path } else { $KnownHash }
+    return [ordered]@{ size=[int64]$item.Length; lastWriteUtcTicks=[string]$item.LastWriteTimeUtc.Ticks; sha256=(Normalize-FileHash $hash) }
+}
+# 記録と違えば理由を返す。記録が無い（この照合より前の版で出力した）ときは $null を返し、
+# 呼び出し側が扱いを決める。
+function Get-OutputPdfIntegrityProblem($State, [string]$Path, [bool]$CheckHash = $false) {
+    $record = Get-DataProperty $State 'outputIntegrity' $null
+    if ($null -eq $record) { return $null }
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return '出力したPDFが見つかりません。' }
+    if ([int64]$item.Length -ne [int64](Get-DataProperty $record 'size' -1) -or [string]$item.LastWriteTimeUtc.Ticks -ne [string](Get-DataProperty $record 'lastWriteUtcTicks' '')) {
+        return '出力したPDFが、出力した後に変更または上書きされています。'
+    }
+    if ($CheckHash -and (Normalize-FileHash (New-Sha256 $Path)) -ne (Normalize-FileHash ([string](Get-DataProperty $record 'sha256' '')))) {
+        return '出力したPDFの中身が、出力した時と違います。'
+    }
+    return ''
+}
+
 function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[string]$Category,[bool]$CheckOutputExists = $true) {
     $scope=Resolve-DocumentPackScope $Structure $Category $false;$packId=[string]$scope.packId;$snap=Get-FinalBuildInputSnapshot $Structure $Language $Volume $packId;$v=Get-PackOutputState $Structure $Language $packId $Volume $false;if($null -eq $v){$v=New-EmptyVolumeState};$built=[string](Get-DataProperty $v 'builtFingerprint' '');$current=[string]$snap.fingerprint;$out=[string](Get-DataProperty $v 'outputPdf' '');$exists=(-not [string]::IsNullOrWhiteSpace($out));if($exists -and $CheckOutputExists){$exists=Test-Path -LiteralPath $out};$status='not-built';if($built){if($built -ne $current -or $snap.blockers.Count -gt 0){$status='needs-rebuild'}else{$status='built'}};$display=if($snap.blockers.Count -gt 0){'blocked'}elseif(-not $built){'not-built'}elseif($built -ne $current){'needs-rebuild'}elseif(-not $exists){'output-missing'}else{'built'}
+    $integrityProblem=$null;if($display -eq 'built' -and $CheckOutputExists){$integrityProblem=Get-OutputPdfIntegrityProblem $v $out $false;if($integrityProblem){$display='needs-rebuild'}}
     Set-NoteProperty $v 'status' $status
-    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='提出用PDFの入力が変更されました'})}
+    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($integrityProblem){$reasons=@([ordered]@{type='output-changed';at=$null;detail=[string]$integrityProblem})};if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='提出用PDFの入力が変更されました'})}
     return [ordered]@{packId=$packId;targetId=(Get-TargetIdFromLegacyVolume $Volume);canBuild=($snap.blockers.Count -eq 0 -and $snap.pageCount -gt 0);pageCount=$snap.pageCount;status=$status;displayState=$display;builtFingerprint=$built;currentFingerprint=$current;outputPdf=$out;outputPdfExists=[bool]$exists;lastBuiltAt=(Get-DataProperty $v 'lastBuiltAt' $null);blockers=@($snap.blockers);staleReasons=@($reasons);snapshot=$snap}
 }
 
@@ -8475,6 +8502,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         if ([int]$run.exitCode -ne 0) { throw "PDFBox組版に失敗しました。exit=$([int]$run.exitCode)`n$([string]$run.text)" }
         if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
         Report-FinalBuildPhase '出力先へ保存しています'
+        $tempHash = New-Sha256 $tempPath
         $buildId = New-RbId
         $commit = Update-StructureLocked $Language {
             param($st)
@@ -8483,6 +8511,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
             Move-Item -LiteralPath $tempPath -Destination $outputPath -Force
             $state = Get-PackOutputState $st $Language ([string]$scope.packId) $volume $true
             Set-NoteProperty $state 'builtFingerprint' $fingerprint
+            Set-NoteProperty $state 'outputIntegrity' (Get-OutputPdfIntegrity $outputPath $tempHash)
             Set-NoteProperty $state 'lastBuiltAt' (New-NowIso)
             Set-NoteProperty $state 'outputPdf' $outputPath
             Set-NoteProperty $state 'staleReasons' @()
@@ -9053,6 +9082,8 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
         $prefix = if ($multiple) { "「$targetName」の" } else { '' }
         $ready = Get-FinalBuildReadiness $structure $Language $Volume $packId
         if ([string]$ready.displayState -ne 'built') {
+            $changedReason = @($ready.staleReasons | Where-Object { [string](Get-DataProperty $_ 'type' '') -eq 'output-changed' } | Select-Object -First 1)
+            if ($changedReason.Count -gt 0) { throw ("{0}{1} もう一度出力してから共有用フォルダーにコピーしてください。" -f $prefix, [string](Get-DataProperty $changedReason[0] 'detail' '')) }
             throw "${prefix}提出用PDFが最新ではありません。最新状態で再出力してから共有発行してください。"
         }
         $source = [string]$ready.outputPdf
@@ -9063,6 +9094,15 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
         if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
             throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
         }
+        # 出力した時のPDFそのものかをハッシュで確かめる（M-2）。記録の無いPDFは、この照合が
+        # 入る前の版で出力したもので、中身を確かめられないので発行しない。
+        $outputState = Get-PackOutputState $structure $Language $packId $Volume $false
+        $integrityProblem = Get-OutputPdfIntegrityProblem $outputState $sourceFull $true
+        if ($null -eq $integrityProblem) {
+            throw "${prefix}提出用PDFに、出力した時の記録がありません。もう一度出力してから共有用フォルダーにコピーしてください。"
+        }
+        if ($integrityProblem) { throw "${prefix}$integrityProblem もう一度出力してから共有用フォルダーにコピーしてください。" }
+        $expectedHash = Normalize-FileHash ([string](Get-DataProperty (Get-DataProperty $outputState 'outputIntegrity' $null) 'sha256' ''))
         $fileName = [IO.Path]::GetFileName($sourceFull)
         # 出力先はすべて同じ出力フォルダーの直下にあるため、名前が同じなら同じファイル。
         # 改名して2部発行すると、片方の中身はもう一方のPDFになっている（H-1）。
@@ -9070,7 +9110,7 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
             throw ("「{0}」と「{1}」の提出用PDFが同じファイル（{2}）です。一式の設定で出力ファイル名に {{targetName}} を含めて出力し直してから、共有用フォルダーにコピーしてください。" -f [string]$usedFileNames[$fileName.ToLowerInvariant()], $targetName, $fileName)
         }
         $usedFileNames[$fileName.ToLowerInvariant()] = $targetName
-        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName }
+        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName; sha256 = $expectedHash }
     }
 
     $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -9095,10 +9135,9 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
         foreach ($entry in $entries) {
             $stagedPdf = Join-Path $stagingDir ([string]$entry.fileName)
             Copy-Item -LiteralPath ([string]$entry.sourceFull) -Destination $stagedPdf -Force
-            $sourceLength = (Get-Item -LiteralPath ([string]$entry.sourceFull) -ErrorAction Stop).Length
-            $uploadedLength = (Get-Item -LiteralPath $stagedPdf -ErrorAction Stop).Length
-            if ($sourceLength -le 0 -or $uploadedLength -ne $sourceLength) {
-                throw '共有フォルダーへのコピーサイズが一致しません。'
+            # サイズだけでは、コピー中に出力側が置き換えた場合や途中で切れた場合を見分けられない（L-2）。
+            if ((Normalize-FileHash (New-Sha256 $stagedPdf)) -ne [string]$entry.sha256) {
+                throw '共有用フォルダーへコピーしたPDFが、出力したPDFと一致しません。もう一度コピーしてください。'
             }
         }
         while (Test-Path -LiteralPath $publishDir) {
@@ -12980,11 +13019,13 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                         outputPdf = [string](Get-DataProperty $old 'outputPdf' '')
                         lastBuiltAt = [string](Get-DataProperty $old 'lastBuiltAt' '')
                         staleReasons = @(Get-Array (Get-DataProperty $old 'staleReasons' @()))
+                        outputIntegrity = Get-DataProperty $old 'outputIntegrity' $null
                     } })
                     $t = Get-JournalTarget $journal $v
                     $journal.newVolumeStates[$v] = [ordered]@{
                         builtFingerprint = [string]$journal.beforeFingerprints[$v]
                         status = 'built'; outputPdf = [string]$t.finalPath; lastBuiltAt = New-NowIso; staleReasons = @()
+                        outputIntegrity = (Get-OutputPdfIntegrity ([string]$t.finalPath) ([string]$t.newPdfHash))
                     }
                 }
                 Write-FinalJournal $Language $journal
@@ -12996,6 +13037,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     Set-NoteProperty $vs 'builtFingerprint' ([string]$n.builtFingerprint)
                     Set-NoteProperty $vs 'lastBuiltAt' ([string]$n.lastBuiltAt)
                     Set-NoteProperty $vs 'outputPdf' ([string]$n.outputPdf)
+                    Set-NoteProperty $vs 'outputIntegrity' $n.outputIntegrity
                     Set-NoteProperty $vs 'staleReasons' @()
                     # 同じstructureロック内でfingerprintを確認済み。再度全ページを走査しない。
                     Set-NoteProperty $vs 'status' 'built'
@@ -13089,6 +13131,7 @@ function Restore-FinalTransaction([string]$Language, $Journal) {
                         Set-NoteProperty $vs 'outputPdf' ([string](Get-DataProperty $oldState 'outputPdf' ''))
                         Set-NoteProperty $vs 'lastBuiltAt' ([string](Get-DataProperty $oldState 'lastBuiltAt' ''))
                         Set-NoteProperty $vs 'staleReasons' @(Get-Array (Get-DataProperty $oldState 'staleReasons' @()))
+                        Set-NoteProperty $vs 'outputIntegrity' (Get-DataProperty $oldState 'outputIntegrity' $null)
                     }
                 } | Out-Null
             }
