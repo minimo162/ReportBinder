@@ -4164,7 +4164,7 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
             $v1Backup = Join-Path $workspace 'structure.json.v1.bak'
             if (-not (Test-Path -LiteralPath $v1Backup)) {
                 Copy-Item -LiteralPath $path -Destination $v1Backup -ErrorAction Stop
-                if ((Get-Item $v1Backup).Length -ne (Get-Item $path).Length -or (New-StableHash $v1Backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakの検証に失敗しました。' }
+                if ((Get-Item -LiteralPath $v1Backup).Length -ne (Get-Item -LiteralPath $path).Length -or (New-StableHash $v1Backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakの検証に失敗しました。' }
             }
             $backups += $v1Backup
             $structure = Normalize-StructureCollections $structure; [void](Repair-StructurePages $structure)
@@ -4187,7 +4187,7 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
         if (-not (Test-Path -LiteralPath $v2Backup)) {
             if ($version -eq 2) {
                 Copy-Item -LiteralPath $path -Destination $v2Backup -ErrorAction Stop
-                if ((Get-Item $v2Backup).Length -ne (Get-Item $path).Length -or (New-StableHash $v2Backup) -ne (New-StableHash $path)) { throw 'structure.json.v2.bakの検証に失敗しました。' }
+                if ((Get-Item -LiteralPath $v2Backup).Length -ne (Get-Item -LiteralPath $path).Length -or (New-StableHash $v2Backup) -ne (New-StableHash $path)) { throw 'structure.json.v2.bakの検証に失敗しました。' }
             } else {
                 Write-JsonFile $v2Backup $structure
                 $verifiedV2 = Read-JsonFile $v2Backup $null
@@ -7746,7 +7746,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     if($pages.Count -eq 0){$blockers+= [ordered]@{code='no-pages';pageTitle='';workbookName='';message='対象ページがありません。ページ構成を確認してください。'}}
     foreach($p in $pages){$pageId=Resolve-PageId $p;$wb=$wbMap[[string]$p.workbookId];$title=[string]$p.title;if([string]::IsNullOrWhiteSpace($title)){$title=[string]$p.sheetName};$wbName=[string]$wb.fileName;$rel=[string]$p.contentPdf;$full='';$size=0L;$ticks=0L;$sourcePageCount=1
         if(-not $rel){$blockers+=[ordered]@{code='content-missing';pageTitle=$title;workbookName=$wbName;message='PDF未作成のページがあります。先にPDF作成してください。'}}
-        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path $full)){throw 'missing'};$it=Get-Item $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;$sourcePageCount=Get-PdfPageCount $full}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
+        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path -LiteralPath $full)){throw 'missing'};$it=Get-Item -LiteralPath $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;$sourcePageCount=Get-PdfPageCount $full}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
         if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers+=[ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='元原稿が更新されています。先に変換PDFを作成してください。'}}
         elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers+=[ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='原稿のページ構成が変わっています。先に変換PDFを作成してください。'}}
         elseif(-not(Test-PageContentMatchesWorkbookVersion $p $wb)){$blockers+=[ordered]@{code='old-content';pageTitle=$title;workbookName=$wbName;message='古いPDF参照が残っています。先にPDF作成してください。'}}
@@ -8466,8 +8466,8 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
     return Invoke-WithLock $lockPath {
         $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
         $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-        if (-not (Test-Path $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
-        if (-not (Test-Path $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
         $snapshotBefore = Update-StructureLocked $Language {
             param($st)
             Apply-DefaultNumberingPerVolume $Language $st ([string]$scope.packId)
@@ -8500,7 +8500,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         $run = Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath) $Script:FinalComposeTimeoutSeconds
         if ($run.timedOut) { throw ('PDFの結合が{0}分以内に終わりませんでした。出力先がネットワーク上のフォルダーの場合は、いったんPC内のフォルダーに出力してみてください。' -f [int]($Script:FinalComposeTimeoutSeconds / 60)) }
         if ([int]$run.exitCode -ne 0) { throw "PDFBox組版に失敗しました。exit=$([int]$run.exitCode)`n$([string]$run.text)" }
-        if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
+        if (-not (Test-Path -LiteralPath $tempPath) -or (Get-Item -LiteralPath $tempPath).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
         Report-FinalBuildPhase '出力先へ保存しています'
         $tempHash = New-Sha256 $tempPath
         $buildId = New-RbId
@@ -8972,7 +8972,7 @@ function Serve-ContentPdfFromBody($Context, [string]$Language, $Body) {
 
 function Serve-FinalPdfByVolume($Context,[string]$Language,[string]$Volume,[string]$Category) {
     if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('不正な成果物です。')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw '提出用PDFはまだ作成されていません。'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw '出力フォルダ外のPDFは表示できません。'};if(-not(Test-Path $full)){throw '提出用PDFファイルが見つかりません。'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
+    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('不正な成果物です。')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw '提出用PDFはまだ作成されていません。'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw '出力フォルダ外のPDFは表示できません。'};if(-not(Test-Path -LiteralPath $full)){throw '提出用PDFファイルが見つかりません。'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
 }
 
 function Serve-FinalPdf($Context,[string]$Language) {
@@ -12961,8 +12961,8 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
 
         $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
         $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-        if (-not (Test-Path $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
-        if (-not (Test-Path $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
 
         $txId = New-RbId
         $journal = [ordered]@{
@@ -12998,7 +12998,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
                 $tmp = Join-Path ([string]$paths.outputDir) ("~building_{0}_{1}_{2}.pdf" -f $v, $cat, $txId)
-                if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
                 Set-NoteProperty $t 'tempPath' $tmp
                 $snap = $snapshots[$v]
                 $manifest = [ordered]@{ schemaVersion=3; language=$Language; category=$cat; volume=$v; projectId=[string]$snap.projectId; inputFingerprint=[string]$snap.fingerprint; outputPdf=$tmp; createdAt=New-NowIso; document=$snap.document; pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true}; physicalPages=$snap.physicalPages; pages=$snap.manifestPages }
@@ -13014,7 +13014,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 } finally {
                     if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }
                 }
-                if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
+                if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
                 Set-NoteProperty $t 'newPdfHash' (Normalize-FileHash (New-Sha256 $tmp))
                 Set-NoteProperty $t 'manifest' $manifest
             }

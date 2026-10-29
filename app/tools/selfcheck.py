@@ -97,6 +97,12 @@ if '-SkipPackageSmoke' in release_workflow:
     raise SystemExit('the release workflow must not skip the package smoke tests')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
+# -Path（位置引数）はワイルドカードとして解釈されるため、「[最終]」のような角括弧を含む
+# 一式名・出力ファイル名・アプリの置き場所で、ファイルがあるのに無いと判定する（M-8）。
+for _ps1 in sorted((root/'app').rglob('*.ps1')):
+    for _lineno, _line in enumerate(_ps1.read_text(encoding='utf-8-sig').splitlines(), 1):
+        if re.search(r'\b(Test-Path|Get-Item|Remove-Item)\s+[$(]', _line):
+            raise SystemExit(f'use -LiteralPath for file paths: {_ps1.relative_to(root).as_posix()}:{_lineno}')
 # Windows PowerShell 5.1 は BOM の無い .ps1 を ANSI として読む。日本語の文字列を
 # 照合する検査スクリプトでは、照合する側だけが化けて検査が必ず失敗する（または空振りする）。
 # 一覧に無いものも含め、ASCII 以外の文字を含む .ps1 はすべて BOM 付きにする。
