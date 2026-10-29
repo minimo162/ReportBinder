@@ -60,6 +60,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない
 - `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する
+- `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`を返す
 - `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す
 
 `PATCH`の例：
@@ -675,6 +676,7 @@ GET   /api/v2/outputs/readiness?packId=pack_...
 POST  /api/v2/outputs/build
 POST  /api/v2/outputs/file
 POST  /api/v2/outputs/publish
+POST  /api/v2/outputs/publish-all
 GET   /api/v2/outputs/archives?packId=pack_...
 ```
 

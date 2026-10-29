@@ -8904,27 +8904,56 @@ function Get-SafePublishPackName([string]$DisplayName) {
     return $name
 }
 
-function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [string]$PackIdOrCategory) {
+# 1冊だけのコピーも、本体・補足などをまとめたコピーも同じ経路で1つの発行フォルダーを作る。
+# まとめる場合は、どれか1冊でも最新でなければ何もコピーしない。古い補足が混ざった束を
+# 共有側へ置くと、受け取った側には見分けが付かないため。
+function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
     $paths = Get-Paths
     $structure = Get-Structure $Language
     $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
-    if (@(Get-PackVolumeList $Language $scope.pack $false) -notcontains $Volume) { throw [ArgumentException]::new('共有発行するPDFの種類が不正です。') }
+    $requestedVolumes = @($Volumes | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($requestedVolumes.Count -eq 0) { throw [ArgumentException]::new('共有発行するPDFを指定してください。') }
+    $allowedVolumes = @(Get-PackVolumeList $Language $scope.pack $false)
     $packId = [string]$scope.packId
     $cat = [string]$scope.category
-    $ready = Get-FinalBuildReadiness $structure $Language $Volume $packId
-    if ([string]$ready.displayState -ne 'built') {
-        throw '提出用PDFが最新ではありません。最新状態で再出力してから共有発行してください。'
-    }
-    $source = [string]$ready.outputPdf
-    if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        throw '共有発行できる提出用PDFがありません。先に提出用PDFを出力してください。'
-    }
-
     $localOutputRoot = [IO.Path]::GetFullPath([string]$paths.outputDir)
     if (-not $localOutputRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $localOutputRoot += [IO.Path]::DirectorySeparatorChar }
-    $sourceFull = [IO.Path]::GetFullPath($source)
-    if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
+    $multiple = $requestedVolumes.Count -gt 1
+    $usedFileNames = @{}
+    $entries = @()
+    foreach ($Volume in $requestedVolumes) {
+        if ($allowedVolumes -notcontains $Volume) { throw [ArgumentException]::new('共有発行するPDFの種類が不正です。') }
+        $targetId = Get-TargetIdFromLegacyVolume $Volume
+        $targetName = [string](Get-PackTargetDisplayName $Language $scope.pack $targetId)
+        if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $targetId }
+        $prefix = if ($multiple) { "「$targetName」の" } else { '' }
+        $ready = Get-FinalBuildReadiness $structure $Language $Volume $packId
+        if ([string]$ready.displayState -ne 'built') {
+            throw "${prefix}提出用PDFが最新ではありません。最新状態で再出力してから共有発行してください。"
+        }
+        $source = [string]$ready.outputPdf
+        if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "共有発行できる${prefix}提出用PDFがありません。先に提出用PDFを出力してください。"
+        }
+        $sourceFull = [IO.Path]::GetFullPath($source)
+        if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
+        }
+        $fileName = [IO.Path]::GetFileName($sourceFull)
+        # 出力ファイル名の型に {targetName} が無いと、本体と補足が同じ名前になる。
+        # 同じフォルダーで上書きし合わないよう、後の方に出力先名を添える。
+        if ($usedFileNames.ContainsKey($fileName.ToLowerInvariant())) {
+            $stem = [IO.Path]::GetFileNameWithoutExtension($fileName)
+            $extension = [IO.Path]::GetExtension($fileName)
+            $fileName = '{0}_{1}{2}' -f $stem, (Get-SafePublishPackName $targetName), $extension
+            $suffix = 2
+            while ($usedFileNames.ContainsKey($fileName.ToLowerInvariant())) {
+                $fileName = '{0}_{1}_{2}{3}' -f $stem, (Get-SafePublishPackName $targetName), $suffix, $extension
+                $suffix++
+            }
+        }
+        $usedFileNames[$fileName.ToLowerInvariant()] = $true
+        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName }
     }
 
     $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -8944,15 +8973,16 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [st
     # PDFが半端な状態で共有側に見えないよう、同じ共有ルートの隠し一時フォルダーで
     # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。
     $stagingDir = Join-Path $submissionDir ('.publishing-' + [Guid]::NewGuid().ToString('N'))
-    $fileName = [IO.Path]::GetFileName($sourceFull)
-    $stagedPdf = Join-Path $stagingDir $fileName
     try {
         New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
-        Copy-Item -LiteralPath $sourceFull -Destination $stagedPdf -Force
-        $sourceLength = (Get-Item -LiteralPath $sourceFull -ErrorAction Stop).Length
-        $uploadedLength = (Get-Item -LiteralPath $stagedPdf -ErrorAction Stop).Length
-        if ($sourceLength -le 0 -or $uploadedLength -ne $sourceLength) {
-            throw '共有フォルダーへのコピーサイズが一致しません。'
+        foreach ($entry in $entries) {
+            $stagedPdf = Join-Path $stagingDir ([string]$entry.fileName)
+            Copy-Item -LiteralPath ([string]$entry.sourceFull) -Destination $stagedPdf -Force
+            $sourceLength = (Get-Item -LiteralPath ([string]$entry.sourceFull) -ErrorAction Stop).Length
+            $uploadedLength = (Get-Item -LiteralPath $stagedPdf -ErrorAction Stop).Length
+            if ($sourceLength -le 0 -or $uploadedLength -ne $sourceLength) {
+                throw '共有フォルダーへのコピーサイズが一致しません。'
+            }
         }
         while (Test-Path -LiteralPath $publishDir) {
             $folderName = "{0}_{1}" -f $baseFolderName, $suffix
@@ -8966,37 +8996,58 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [st
             Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    $destination = Join-Path $publishDir $fileName
-
     $publishedAt = New-NowIso
-    Write-HistoryEvent $Language 'final.published' ([ordered]@{
-        packId = $packId
-        category = $cat
-        targetId = Get-TargetIdFromLegacyVolume $Volume
-        volume = $Volume
-        source = $sourceFull
-        destination = $destination
-        sharedFolder = $publishDir
-        folderName = $folderName
-        fileName = $fileName
-        userName = $userName
-        packName = $packName
-        publishedAt = $publishedAt
-    })
+    $files = @()
+    foreach ($entry in $entries) {
+        $destination = Join-Path $publishDir ([string]$entry.fileName)
+        Write-HistoryEvent $Language 'final.published' ([ordered]@{
+            packId = $packId
+            category = $cat
+            targetId = [string]$entry.targetId
+            volume = [string]$entry.volume
+            source = [string]$entry.sourceFull
+            destination = $destination
+            sharedFolder = $publishDir
+            folderName = $folderName
+            fileName = [string]$entry.fileName
+            userName = $userName
+            packName = $packName
+            publishedAt = $publishedAt
+        })
+        $files += [ordered]@{ volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourcePdf = [string]$entry.sourceFull; sharedPath = $destination; fileName = [string]$entry.fileName }
+    }
+    # 1冊だけの呼び出し元は volume/sharedPath/fileName を読む。先頭の1冊で従来の形を保つ。
+    $first = $files[0]
     return [ordered]@{
-        volume = $Volume
-        targetId = Get-TargetIdFromLegacyVolume $Volume
+        volume = $first.volume
+        targetId = $first.targetId
         packId = $packId
         category = $cat
-        sourcePdf = $sourceFull
-        sharedPath = $destination
+        sourcePdf = $first.sourcePdf
+        sharedPath = $first.sharedPath
         sharedFolder = $publishDir
         folderName = $folderName
-        fileName = $fileName
+        fileName = $first.fileName
+        files = @($files)
         publishedBy = $userName
         packName = $packName
         publishedAt = $publishedAt
     }
+}
+
+# 提出用PDFの画面の「まとめて共有用フォルダーにコピー」。ページが入っている出力先を
+# すべて1つの発行フォルダーへ入れる。ページの無い任意の出力先（空の補足など）は対象外。
+function Publish-DocumentPackAllPdfsToShared([string]$Language, [string]$PackIdOrCategory) {
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
+    $volumes = @()
+    foreach ($targetId in @(Get-PackTargetIds $Language $scope.pack)) {
+        $volume = Get-LegacyVolumeFromTargetId $Language $targetId
+        $ready = Get-FinalBuildReadiness $structure $Language $volume ([string]$scope.packId)
+        if ([int]$ready.pageCount -gt 0) { $volumes += $volume }
+    }
+    if ($volumes.Count -eq 0) { throw '共有発行できる提出用PDFがありません。先に提出用PDFを出力してください。' }
+    return Publish-DocumentPackPdfToShared $Language $volumes ([string]$scope.packId)
 }
 
 function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$Category) {
@@ -9295,6 +9346,11 @@ function Handle-Api($Context) {
             $targetId = Assert-PackTargetId $language $publishScope.pack $targetId
             $volume = Get-LegacyVolumeFromTargetId $language $targetId
             $result = Publish-DocumentPackPdfToShared $language $volume $packId
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/publish-all') {
+            $body = Read-BodyJson $Context.Request
+            $result = Publish-DocumentPackAllPdfsToShared $language ([string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')))
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/archives') {
