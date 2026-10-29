@@ -109,6 +109,15 @@ for (const name of ['runFinalBuildJob', 'publishFinalVolume', 'publishAllFinalVo
   assert.match(extractFunction(name), /await awaitPageMutationsIdle\(\)/, `${name} must wait for every pending page mutation`);
 }
 
+// 出力中は共有用フォルダーへコピーしない（M-3）。1冊ずつのボタンも、ジョブの開始・終了で描き直す。
+for (const name of ['publishFinalVolume', 'publishAllFinalVolumes']) {
+  assert.match(extractFunction(name), /if\(activeFinalJobId\)\{showMessage\(/, `${name} must refuse while an output job is running`);
+}
+assert.match(extractFunction('renderVolumeLinks'), /publish\.disabled=!publishable\|\|!!activeFinalJobId/, 'per-target copy buttons must be disabled while an output job is running');
+const buildJob = extractFunction('runFinalBuildJob');
+assert.ok(buildJob.indexOf('renderVolumeLinks()') > buildJob.indexOf('activeFinalJobId=jobId'), 'copy buttons must be redrawn when an output job starts');
+assert.ok(buildJob.lastIndexOf('renderVolumeLinks()') > buildJob.indexOf("activeFinalJobId='';"), 'copy buttons must be redrawn when an output job ends');
+
 // 待ち行列を直接 await する呼び出しを残さない。残すと同じ不具合が戻る。
 const direct = source.match(/await\s+boardSavePromise\b/g) || [];
 assert.equal(direct.length, 0, 'await awaitBoardSave() instead of the raw boardSavePromise queue');

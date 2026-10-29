@@ -226,6 +226,24 @@ Add-TestPages ([string]$mainOnlyPublish.packId) @('ja-main')
 $onlyMain = Publish-DocumentPackAllPdfsToShared 'ja' ([string]$mainOnlyPublish.packId)
 Assert-OutputTest (@($onlyMain.files).Count -eq 1 -and [string]@($onlyMain.files)[0].targetId -eq 'main') 'publish-all did not skip the target without pages.'
 
+# ---- M-3: 出力中は共有用フォルダーへコピーしない ------------------------------------
+$sharedBefore = @(Get-SharedEntries)
+# 出力が同じ出力先のPDFを置き換えている間（出力のロックを持っている間）はコピーしない。
+$outputLock = Join-Path (Get-WorkspacePath 'ja') ("locks\pack-output_{0}_main.lock" -f $publishId)
+New-Item -ItemType Directory -Path (Split-Path -Parent $outputLock) -Force | Out-Null
+$held = [IO.File]::Open($outputLock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try { Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } 'ロック中' 'Publishing ran while the output lock was held.' }
+finally { $held.Dispose() }
+# 出力ジョブが動いている間はコピーしない。
+$jobId = 'final_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + [Guid]::NewGuid().ToString('N').Substring(0,8)
+$jobStatus = Join-Path (Get-RenderJobDir 'ja') "$jobId.status.json"
+Write-JsonFile $jobStatus ([ordered]@{ ok=$true; jobId=$jobId; kind='final-build'; status='running'; processId=$PID; startedAt=(New-NowIso); updatedAt=(New-NowIso) })
+try { Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } '出力中' 'Publishing ran while an output job was active.' }
+finally { Remove-Item -LiteralPath $jobStatus -Force }
+Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|')) 'A publish refused during output still created something in the shared folder.'
+$afterJob = Publish-DocumentPackAllPdfsToShared 'ja' $publishId
+Assert-OutputTest (@($afterJob.files).Count -eq 2) 'Publishing did not resume after the output finished.'
+
 Write-Output 'output-publish selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

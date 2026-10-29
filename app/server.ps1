@@ -9060,7 +9060,39 @@ function Get-SafePublishPackName([string]$DisplayName) {
 # 1冊だけのコピーも、本体・補足などをまとめたコピーも同じ経路で1つの発行フォルダーを作る。
 # まとめる場合は、どれか1冊でも最新でなければ何もコピーしない。古い補足が混ざった束を
 # 共有側へ置くと、受け取った側には見分けが付かないため。
+# 共有用フォルダーへのコピーは、提出用PDFの出力と排他にする（M-3）。出力中にコピーすると、
+# 置き換えの途中のPDFや世代の違う本体と補足が1つの発行フォルダーに入り、コピー中の
+# 読み込みが出力側の置き換えを共有違反で失敗させる。実行中の出力ジョブがあれば断り、
+# 出力と同じロック（組み込み一式は final-build_*、カスタム一式は出力先ごとの pack-output_*）
+# を持ったまま、最新かどうかの確認からコピーまでを行う。
 function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
+    if ($null -ne (Get-ActiveFinalJobStatus $Language)) {
+        throw '提出用PDFを出力中のため、共有用フォルダーにコピーしていません。出力が終わってから、もう一度コピーしてください。'
+    }
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
+    $workspace = Get-WorkspacePath $Language
+    $lockPaths = @()
+    if ([bool]$scope.builtIn) {
+        $lockPaths += Join-Path $workspace ("locks\final-build_{0}.lock" -f [string]$scope.category)
+    } else {
+        foreach ($volume in @($Volumes | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)) {
+            $lockPaths += Join-Path $workspace ("locks\pack-output_{0}_{1}.lock" -f ([string]$scope.packId), (Get-TargetIdFromLegacyVolume $volume))
+        }
+    }
+    return Invoke-WithPublishLocks $lockPaths { Publish-DocumentPackPdfToSharedLocked $Language $Volumes ([string]$scope.packId) }
+}
+
+# 渡したブロックは Invoke-WithLock の中で呼ばれる。PowerShell の変数は呼び出し元を
+# たどって解決されるので、Invoke-WithLock の引数と同じ名前（$Action）を使うと
+# 自分自身を呼び続ける。名前を分けておくこと。
+function Invoke-WithPublishLocks([string[]]$PublishLockPaths, [scriptblock]$PublishAction) {
+    if (@($PublishLockPaths).Count -eq 0) { return & $PublishAction }
+    $publishRemainingLocks = @($PublishLockPaths | Select-Object -Skip 1)
+    return Invoke-WithLock ([string]@($PublishLockPaths)[0]) { Invoke-WithPublishLocks $publishRemainingLocks $PublishAction }
+}
+
+function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
     $paths = Get-Paths
     $structure = Get-Structure $Language
     $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false

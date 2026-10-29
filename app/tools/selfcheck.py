@@ -1760,7 +1760,7 @@ _default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfu
 for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
     if forbidden in _default_paths:
         raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
-_publish = server.split('function Publish-DocumentPackPdfToShared',1)[1].split('\nfunction ',1)[0]
+_publish = server.split('function Publish-DocumentPackPdfToSharedLocked',1)[1].split('\nfunction ',1)[0]
 for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
                'Get-SafePublishPackName',
                '"{0}_{1}_{2}" -f $stamp, $packName, $userName',

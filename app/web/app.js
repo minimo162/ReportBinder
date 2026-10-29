@@ -2151,7 +2151,7 @@ function renderVolumeLinks() {
     }
     const buildBtn=card.querySelector('[data-final-build]');
     setClassIfChanged(buildBtn,fresh?'btn ghost':'btn primary');
-    if(publish){publish.disabled=!publishable;setClassIfChanged(publish,`btn secondary${publishable?'':' hidden'}`);}
+    if(publish){publish.disabled=!publishable||!!activeFinalJobId;setClassIfChanged(publish,`btn secondary${publishable?'':' hidden'}`);}
     // 出力したPDFは別タブで見るだけでは掴めない。メールに添付する・共有フォルダーへ
     // 置くには実体が要るので、保存先そのものを画面に出し、フォルダーを開けるようにする。
     const pathBox=card.querySelector('[data-final-path]'),reveal=card.querySelector('[data-final-reveal]');
@@ -5652,6 +5652,9 @@ async function runFinalBuildJob(targetIds){
   const jobId=String(started.job?.jobId||'');
   if(!jobId)throw new Error('提出用PDFの出力を開始できませんでした。もう一度「提出用PDFをまとめて出力」を押してください。');
   activeFinalJobId=jobId;activeFinalCancelRequested=false;
+  // 出力中は共有用フォルダーへのコピーを押せなくする（M-3）。置き換え途中のPDFや
+  // 世代の違う本体と補足を発行しない。終わったら finally で戻す。
+  renderVolumeLinks();
   updateFinalProgressPanel(started.job);
   try{
     for(;;){
@@ -5674,6 +5677,7 @@ async function runFinalBuildJob(targetIds){
   } finally {
     activeFinalJobId='';activeFinalCancelRequested=false;
     hideProgressPanel();
+    renderVolumeLinks();
   }
 }
 function updateFinalProgressPanel(job){
@@ -5718,6 +5722,7 @@ async function cancelActiveFinalJob(){
 
 async function publishFinalVolume(volume,btn) {
   await runBusy(btn,async()=>{
+    if(activeFinalJobId){showMessage('warn','提出用PDFを出力中です','出力が終わってから、もう一度共有用フォルダーにコピーしてください。');return;}
     if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
     const custom=!activePackIsBuiltIn();
     const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
@@ -5737,6 +5742,7 @@ async function publishFinalVolume(volume,btn) {
 // 組み合わせを取り違える。ページの入っている出力先をすべて1つのフォルダーへ入れる。
 async function publishAllFinalVolumes(btn) {
   await runBusy(btn,async()=>{
+    if(activeFinalJobId){showMessage('warn','提出用PDFを出力中です','出力が終わってから、もう一度共有用フォルダーにコピーしてください。');return;}
     if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
     const response=await api('/api/v2/outputs/publish-all',{method:'POST',body:{packId:activePackId}});
     const result=response.result||{};
