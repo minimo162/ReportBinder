@@ -157,6 +157,18 @@ Assert-OutputTest (((Get-LayoutIds 'ja-main') -join ',') -eq (@($main[1],$main[0
 [void](Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@($main[1],$main[0],$appendix[0]) })))
 Assert-OutputTest (((Get-LayoutIds 'ja-main') -join ',') -eq (@($main[1],$main[0],$appendix[0]) -join ',') -and (Get-LayoutIds 'ja-appendix').Count -eq 0) 'Moving a page from an unsent lane into a sent lane was rejected or misapplied.'
 
+# ---- M-1: 日付が変わっただけでは「再出力が必要」にしない ----------------------------
+# ここではまだ実物の Get-FinalBuildInputSnapshot を使う（下で差し替える）。
+$dated = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='日付の一式' })
+Add-TestPages ([string]$dated.packId) @('ja-main')
+$today = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' ([string]$dated.packId)
+$realGetDate = Get-Command Get-Date -CommandType Cmdlet
+function Get-Date { param([string]$Format) $tomorrow = (& $realGetDate).AddDays(1); if ($Format) { return $tomorrow.ToString($Format) } return $tomorrow }
+try { $tomorrow = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' ([string]$dated.packId) }
+finally { Remove-Item Function:\Get-Date }
+Assert-OutputTest ([string]$today.outputFileName -ne [string]$tomorrow.outputFileName) 'The date override did not reach the output file name; the M-1 case is not exercised.'
+Assert-OutputTest ([string]$today.fingerprint -eq [string]$tomorrow.fingerprint) 'A date change alone changed the output input fingerprint.'
+
 # ---- 共有用フォルダーへのまとめてコピー（publish-all）と出力PDFの照合（M-2） ----------
 # 原稿のPDFを置かずに済むよう、入力スナップショットだけを差し替える。指紋は出力先ごとに固定。
 function Get-FinalBuildInputSnapshot($Structure, [string]$Language, [string]$Volume, [string]$PackId) {

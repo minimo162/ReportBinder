@@ -1406,14 +1406,14 @@ function Get-TargetDisplayName([string]$Language, [string]$Volume) {
     return $(if ($Language -eq 'en') { 'Main' } else { '本体' })
 }
 
-function Resolve-OutputFileNamePattern([string]$Pattern, [string]$ProjectId, [string]$PackName, [string]$TargetName) {
+function Resolve-OutputFileNamePattern([string]$Pattern, [string]$ProjectId, [string]$PackName, [string]$TargetName, [string]$DateText = '') {
     $value = ([string]$Pattern).Trim()
     if ([string]::IsNullOrWhiteSpace($value)) { $value = '{projectId}_{targetName}.pdf' }
     # 置換は大文字小文字を区別するため、照合もそろえる。{TargetName} を既知として通すと
     # 展開されずにそのまま名前へ残り、出力先どうしで同じ名前になる。
     $unknown = [regex]::Matches($value, '\{[^{}]+\}') | ForEach-Object { $_.Value } | Where-Object { $_ -cnotin @('{projectId}','{packName}','{targetName}','{yyyyMMdd}') } | Select-Object -Unique
     if (@($unknown).Count -gt 0) { throw [ArgumentException]::new("未対応のファイル名プレースホルダーです: $(@($unknown) -join ', ')") }
-    $resolved = $value.Replace('{projectId}', $ProjectId).Replace('{packName}', $PackName).Replace('{targetName}', $TargetName).Replace('{yyyyMMdd}', (Get-Date -Format 'yyyyMMdd'))
+    $resolved = $value.Replace('{projectId}', $ProjectId).Replace('{packName}', $PackName).Replace('{targetName}', $TargetName).Replace('{yyyyMMdd}', $(if ($DateText) { $DateText } else { Get-Date -Format 'yyyyMMdd' }))
     if ($resolved.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $resolved -match '[\\/]') { throw [ArgumentException]::new('出力ファイル名に使用できない文字が含まれています。') }
     if (-not $resolved.EndsWith('.pdf', [StringComparison]::OrdinalIgnoreCase)) { $resolved += '.pdf' }
     return $resolved
@@ -7614,8 +7614,13 @@ function Get-PackTargetOutputNaming($Structure, [string]$Language, $Scope, [stri
     $projectId = Get-ProjectIdFromWorkbooks $workbooks
     $namedProjectId = if ([bool]$Scope.builtIn) { Get-CategoryProjectId $projectId $cat } else { $projectId }
     $fallbackPackName = if ([bool]$Scope.builtIn) { $cat.ToUpperInvariant() } else { 'ReportBinder' }
-    $outputFileName = Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId ([string](Get-DataProperty $packObject 'displayName' $fallbackPackName)) $targetName
-    return [pscustomobject][ordered]@{ settings = $settings; targetName = $targetName; projectId = $projectId; outputFileName = $outputFileName }
+    $packName = [string](Get-DataProperty $packObject 'displayName' $fallbackPackName)
+    $outputFileName = Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId $packName $targetName
+    # 入力の指紋には日付を展開しない名前を使う（M-1）。展開後の名前を入れると、日付が
+    # 変わっただけで出力済みのPDFがすべて「再出力が必要」になり、日をまたいだ出力は
+    # 「ページ構成またはPDF入力が変更されました」で失敗していた。
+    $outputFileNameKey = Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId $packName $targetName '{yyyyMMdd}'
+    return [pscustomobject][ordered]@{ settings = $settings; targetName = $targetName; projectId = $projectId; outputFileName = $outputFileName; outputFileNameKey = $outputFileNameKey }
 }
 
 function Test-PackVolumeHasEnabledPages($Structure, [string]$PackId, [string]$Volume) {
@@ -7762,7 +7767,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     foreach($entry in $manifest){
         for($sourcePage=[int]$entry.sourcePageStart;$sourcePage -le [int]$entry.sourcePageEnd;$sourcePage++){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;kind='content';itemId=[string]$entry.itemId;pageId=[string]$entry.pageId;sourceId=[string]$entry.sourceId;unitId=[string]$entry.unitId;artifactId=[string]$entry.artifactId;sourceType=[string]$entry.sourceType;sourceKey=[string]$entry.sourceKey;sourcePdfPageNumber=$sourcePage;title=[string]$entry.title;sectionId=[string]$entry.sectionId;numberingMode=[string]$entry.numberingMode}}
     }
-    $input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;packId=$packId;category=$cat;volume=$Volume;document=$document;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
+    $fpDocument=[ordered]@{};foreach($fpKey in @($document.Keys)){$fpDocument[$fpKey]=$document[$fpKey]};$fpDocument.outputFileName=[string]$naming.outputFileNameKey;$input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;packId=$packId;category=$cat;volume=$Volume;document=$fpDocument;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
     return [ordered]@{language=$Language;packId=$packId;category=$cat;volume=$Volume;pages=$pages;manifestPages=$manifest;physicalPages=$physicalPages;document=$document;blockers=@($blockers);itemCount=$pages.Count;pageCount=$outputPageNumber;projectId=$projectId;outputFileName=$outputFileName;fingerprint=$fingerprint;fingerprintInput=$input}
 }
 
