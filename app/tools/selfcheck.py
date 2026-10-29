@@ -14,7 +14,7 @@ required = [
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
-    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
+    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/output-publish-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
@@ -1781,6 +1781,15 @@ if _publish.count('Move-Item -LiteralPath $stagingDir -Destination $publishDir')
 _publish_all = server.split('function Publish-DocumentPackAllPdfsToShared',1)[1].split('\nfunction ',1)[0] if 'function Publish-DocumentPackAllPdfsToShared' in server else ''
 if 'Get-PackTargetIds' not in _publish_all or 'Publish-DocumentPackPdfToShared $Language $volumes' not in _publish_all:
     raise SystemExit('publish-all must collect every target with pages and publish them together')
+# H-1: 出力先パスの重なりの検査そのものは output-publish-selfcheck.ps1 が振る舞いで見る。
+# ここでは、組版（Java）より前に両方の出力経路から呼ばれていることを見る。
+for _fn in ['function Build-DocumentPackPdf', 'function Invoke-FinalBuildTransaction']:
+    _body = server.split(_fn,1)[1].split('\nfunction ',1)[0]
+    _guard = _body.find('Assert-PackOutputPathsDistinct')
+    if _guard < 0 or _guard > _body.find('Resolve-JavaExe'):
+        raise SystemExit(f'{_fn} must reject overlapping output paths before composing the PDF')
+if 'Output and shared-copy regression' not in _fast:
+    raise SystemExit('the fast gate must run the output and shared-copy regression')
 for needed in ["'/api/v2/outputs/publish-all'", 'Publish-DocumentPackAllPdfsToShared $language']:
     if needed not in server:
         raise SystemExit(f'publish-all API route is missing: {needed}')

@@ -117,7 +117,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
   "templateId": "builtin-generic-department-pack",
   "settings": {
     "documentTitle": "月次部門報告書",
-    "outputFileNamePattern": "{packName}_{yyyyMMdd}.pdf"
+    "outputFileNamePattern": "{packName}_{targetName}_{yyyyMMdd}.pdf"
   }
 }
 ```
@@ -658,7 +658,7 @@ ecm / bod / dmm
 }
 ```
 
-ファイル名には`{projectId}`、`{packName}`、`{targetName}`、`{yyyyMMdd}`を使用できます。
+ファイル名には`{projectId}`、`{packName}`、`{targetName}`、`{yyyyMMdd}`を使用できます。`{targetName}`は必須です。含まない型は一式の設定・ひな形の保存時に400で拒否します。保存済みの古い型で出力先どうし（または他の一式の出力PDF）と同じパスになる場合は、出力を開始せずに失敗させます。
 
 ## 任意資料パックの原稿・ページ・出力
 

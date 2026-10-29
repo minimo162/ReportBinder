@@ -146,7 +146,7 @@
           <section class="card final-finish-card">
             <div class="card-head"><div><h3>出力ファイル名</h3><p>提出用PDFのファイル名の付け方を決めます。表紙・目次・区切りページは原稿として登録し、「ページ構成」で並べてください。</p></div><button id="save-pack-settings-btn" class="btn secondary" type="button">設定を保存</button></div>
             <div class="final-finish-fields">
-              <label class="filename-pattern-field"><span>出力ファイル名</span><input id="pack-output-pattern" type="text" maxlength="180" spellcheck="false"><span id="pack-output-pattern-unsaved" class="unsaved-note hidden">保存していない変更があります。「設定を保存」を押してください。</span><small>入力した記号は自動で置き換わります。{packName}＝一式名、{targetName}＝出力先名、{yyyyMMdd}＝出力した日（例：20260809）。例：{packName}_{targetName}_{yyyyMMdd}</small></label>
+              <label class="filename-pattern-field"><span>出力ファイル名</span><input id="pack-output-pattern" type="text" maxlength="180" spellcheck="false"><span id="pack-output-pattern-unsaved" class="unsaved-note hidden">保存していない変更があります。「設定を保存」を押してください。</span><small>入力した記号は自動で置き換わります。{packName}＝一式名、{targetName}＝出力先名、{yyyyMMdd}＝出力した日（例：20260809）。{targetName} は必ず含めてください（本体と補足が同じ名前になり、上書きし合うのを防ぎます）。例：{packName}_{targetName}_{yyyyMMdd}</small></label>
             </div>
           </section>
           </details>

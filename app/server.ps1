@@ -1370,7 +1370,19 @@ function Get-UpdatedPackSettings($Pack, [string]$Language, $Patch) {
     }
     if ([string]::IsNullOrWhiteSpace([string]$settings.documentTitle)) { throw [ArgumentException]::new('資料タイトルを入力してください。') }
     [void](Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) 'PROJECT' ([string](Get-DataProperty $Pack 'displayName' 'ReportBinder')) (Get-TargetDisplayName $Language ("$Language-main")))
+    # 型を変えるときだけ確かめる。保存済みの古い型で題名の変更まで拒むと直せなくなる。
+    # 古い型のまま出力した場合は、出力の開始時に出力先パスの重なりで止める。
+    if ($null -ne (Get-DataProperty $Patch 'outputFileNamePattern' $null)) { Assert-OutputFileNamePatternHasTarget ([string]$settings.outputFileNamePattern) }
     return $settings
+}
+
+# 出力ファイル名の型に {targetName} が無いと、本体と補足が同じファイルへ順に書かれ、
+# 本体の出力状態も「最新」のまま中身は補足になる。共有へのまとめてコピーでは同じPDFが
+# 2部発行される。出力先が1つの一式でも、ひな形の更新で出力先が増えうるため必須にする。
+function Assert-OutputFileNamePatternHasTarget([string]$Pattern) {
+    if (-not ([string]$Pattern).Contains('{targetName}')) {
+        throw [ArgumentException]::new('出力ファイル名には {targetName}（出力先名）を含めてください。含めないと本体と補足が同じファイル名になり、互いに上書きされます。')
+    }
 }
 
 function ConvertTo-NormalizedPageRange($Value) {
@@ -1397,7 +1409,9 @@ function Get-TargetDisplayName([string]$Language, [string]$Volume) {
 function Resolve-OutputFileNamePattern([string]$Pattern, [string]$ProjectId, [string]$PackName, [string]$TargetName) {
     $value = ([string]$Pattern).Trim()
     if ([string]::IsNullOrWhiteSpace($value)) { $value = '{projectId}_{targetName}.pdf' }
-    $unknown = [regex]::Matches($value, '\{[^{}]+\}') | ForEach-Object { $_.Value } | Where-Object { $_ -notin @('{projectId}','{packName}','{targetName}','{yyyyMMdd}') } | Select-Object -Unique
+    # 置換は大文字小文字を区別するため、照合もそろえる。{TargetName} を既知として通すと
+    # 展開されずにそのまま名前へ残り、出力先どうしで同じ名前になる。
+    $unknown = [regex]::Matches($value, '\{[^{}]+\}') | ForEach-Object { $_.Value } | Where-Object { $_ -cnotin @('{projectId}','{packName}','{targetName}','{yyyyMMdd}') } | Select-Object -Unique
     if (@($unknown).Count -gt 0) { throw [ArgumentException]::new("未対応のファイル名プレースホルダーです: $(@($unknown) -join ', ')") }
     $resolved = $value.Replace('{projectId}', $ProjectId).Replace('{packName}', $PackName).Replace('{targetName}', $TargetName).Replace('{yyyyMMdd}', (Get-Date -Format 'yyyyMMdd'))
     if ($resolved.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $resolved -match '[\\/]') { throw [ArgumentException]::new('出力ファイル名に使用できない文字が含まれています。') }
@@ -1587,6 +1601,8 @@ function Save-PackTemplate([string]$Language, $Request, [string]$TemplateId = ''
     $nextVersion = if ($null -eq $existing) { 1 } else { (Get-IntDataProperty $existing 'templateVersion' 1) + 1 }
     $merged.templateVersion = $nextVersion
     $template = ConvertTo-NormalizedPackTemplate $Language ([pscustomobject]$merged) $TemplateId
+    # 読み込み側（Get-UserPackTemplates）では確かめない。保存済みの古いひな形が一覧から消えるため。
+    Assert-OutputFileNamePatternHasTarget ([string](Get-DataProperty $template.output 'fileNamePattern' ''))
     $dir = Get-PackTemplateDir $Language
     if ([string]::IsNullOrWhiteSpace($dir)) { throw [ArgumentException]::new('先に提出フォルダと管理データフォルダを設定してください。') }
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -7567,6 +7583,95 @@ function Get-Sha256Text([string]$Text) {
     $sha=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($Text);return 'sha256:'+([BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant())}finally{$sha.Dispose()}
 }
 
+# 出力ファイル名の算出。出力時のスナップショットと、出力先パスの重なりの検査で同じ名前を使う。
+function Get-PackTargetOutputNaming($Structure, [string]$Language, $Scope, [string]$Volume) {
+    $packId = [string]$Scope.packId
+    $cat = [string]$Scope.category
+    $packObject = $Scope.pack
+    $workbooks = @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $packId })
+    $settings = Get-ResolvedPackSettings $packObject $Language
+    $targetName = Get-PackTargetDisplayName $Language $packObject (Get-TargetIdFromLegacyVolume $Volume)
+    $projectId = Get-ProjectIdFromWorkbooks $workbooks
+    $namedProjectId = if ([bool]$Scope.builtIn) { Get-CategoryProjectId $projectId $cat } else { $projectId }
+    $fallbackPackName = if ([bool]$Scope.builtIn) { $cat.ToUpperInvariant() } else { 'ReportBinder' }
+    $outputFileName = Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId ([string](Get-DataProperty $packObject 'displayName' $fallbackPackName)) $targetName
+    return [pscustomobject][ordered]@{ settings = $settings; targetName = $targetName; projectId = $projectId; outputFileName = $outputFileName }
+}
+
+function Test-PackVolumeHasEnabledPages($Structure, [string]$PackId, [string]$Volume) {
+    $workbookIds = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $PackId })) { $workbookIds[[string]$wb.workbookId] = $true }
+    foreach ($page in @(Get-Array $Structure.pages)) {
+        if ($page.enabled -eq $true -and [string]$page.volume -eq $Volume -and $workbookIds.ContainsKey([string]$page.workbookId)) { return $true }
+    }
+    return $false
+}
+
+# H-1: 出力の開始時に、書き出す先が他の出力先のPDFと重ならないことを確かめる。
+# 重なったまま書くと、後から書いた方の中身で前の出力先も「最新」と表示され、共有へも
+# そのまま発行される。照合は大文字小文字を区別しない（Windows のファイル名と同じ）。
+#   - 同じ一式の他の出力先（ページがあるもの）が、今の設定で同じ名前になる
+#   - 他の一式・他の出力先が記録している出力PDFと同じパスになる
+function Assert-PackOutputPathsDistinct($Structure, [string]$Language, [string]$PackId, [string[]]$Volumes) {
+    $scope = Resolve-DocumentPackScope $Structure $PackId $true
+    $outputDir = [string](Get-DataProperty (Get-Paths) 'outputDir' '')
+    $planned = [ordered]@{}
+    foreach ($volume in @(Get-PackVolumeList $Language $scope.pack $false)) {
+        $isRequested = $Volumes -contains $volume
+        if (-not $isRequested -and -not (Test-PackVolumeHasEnabledPages $Structure ([string]$scope.packId) $volume)) { continue }
+        $naming = Get-PackTargetOutputNaming $Structure $Language $scope $volume
+        $planned[$volume] = [pscustomobject]@{
+            path = [IO.Path]::GetFullPath((Join-Path $outputDir ([string]$naming.outputFileName)))
+            fileName = [string]$naming.outputFileName
+            targetName = [string]$naming.targetName
+            requested = $isRequested
+        }
+    }
+    $requested = @($planned.Keys | Where-Object { $planned[$_].requested })
+    foreach ($volume in $requested) {
+        $mine = $planned[$volume]
+        foreach ($other in @($planned.Keys)) {
+            if ($other -eq $volume) { continue }
+            if ([string]::Equals([string]$planned[$other].path, [string]$mine.path, [StringComparison]::OrdinalIgnoreCase)) {
+                throw [InvalidOperationException]::new(("「{0}」と「{1}」の提出用PDFが同じファイル名（{2}）になります。一式の設定で出力ファイル名に {{targetName}} を含めてから、もう一度出力してください。" -f [string]$mine.targetName, [string]$planned[$other].targetName, [string]$mine.fileName))
+            }
+        }
+    }
+    # 組み込み一式の状態は volumes（"ja-main|ecm"）と outputs（"pack_ecm|main"）の両方に
+    # あるため、どちらも「一式ID|出力先ID」へそろえて、自分の出力先だけを除く。
+    $ownKeys = @{}
+    foreach ($volume in $requested) { $ownKeys[("{0}|{1}" -f [string]$scope.packId, (Get-TargetIdFromLegacyVolume $volume))] = $true }
+    $packNames = @{}
+    foreach ($pack in @(Get-Array (Get-DataProperty $Structure 'packs' @()))) { $packNames[[string](Get-DataProperty $pack 'packId' '')] = [string](Get-DataProperty $pack 'displayName' '') }
+    $recorded = @()
+    $volumeStates = Get-DataProperty $Structure 'volumes' $null
+    foreach ($key in @(Get-ConfigKeyNames $volumeStates)) {
+        $parts = ([string]$key).Split('|')
+        if ($parts.Count -lt 2 -or $parts[1] -eq '_') { continue }
+        $ownerPackId = Get-BuiltinPackId $parts[1]
+        $recorded += [pscustomobject]@{ key = ("{0}|{1}" -f $ownerPackId, (Get-TargetIdFromLegacyVolume $parts[0])); packId = $ownerPackId; state = (Get-DataProperty $volumeStates $key $null) }
+    }
+    $outputStates = Get-DataProperty $Structure 'outputs' $null
+    foreach ($key in @(Get-ConfigKeyNames $outputStates)) {
+        $recorded += [pscustomobject]@{ key = [string]$key; packId = ([string]$key).Split('|')[0]; state = (Get-DataProperty $outputStates $key $null) }
+    }
+    foreach ($entry in $recorded) {
+        $state = $entry.state
+        if ($null -eq $state -or $ownKeys.ContainsKey([string]$entry.key)) { continue }
+        $recordedPdf = [string](Get-DataProperty $state 'outputPdf' '')
+        if ([string]::IsNullOrWhiteSpace($recordedPdf)) { continue }
+        try { $recordedFull = [IO.Path]::GetFullPath($recordedPdf) } catch { continue }
+        foreach ($volume in $requested) {
+            $mine = $planned[$volume]
+            if ([string]::Equals($recordedFull, [string]$mine.path, [StringComparison]::OrdinalIgnoreCase)) {
+                $ownerName = if ($packNames.ContainsKey([string]$entry.packId)) { $packNames[[string]$entry.packId] } else { '' }
+                $owner = if ([string]::IsNullOrWhiteSpace($ownerName)) { '' } else { "一式「$ownerName」の" }
+                throw [InvalidOperationException]::new(("「{0}」の出力ファイル名（{1}）が、{2}別の提出用PDFと同じです。上書きしないよう出力を止めました。一式の設定で出力ファイル名を変えてから、もう一度出力してください。" -f [string]$mine.targetName, [string]$mine.fileName, $owner))
+            }
+        }
+    }
+}
+
 function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volume,[string]$Category) {
     $scope=Resolve-DocumentPackScope $Structure $Category $false;$packId=[string]$scope.packId;$cat=[string]$scope.category
     if(@(Get-PackVolumeList $Language $scope.pack $false) -notcontains $Volume){throw [ArgumentException]::new("不正な成果物です: $Volume")}
@@ -7577,9 +7682,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     $artifactMap=@{};foreach($artifact in @(Get-Array (Get-DataProperty $Structure 'artifacts' @()))){$artifactMap[[string](Get-DataProperty $artifact 'artifactId' '')]=$artifact}
     $packObject=$scope.pack
     $effectiveTemplate=Get-PackEffectiveTemplate $Language $packObject
-    $settings=Get-ResolvedPackSettings $packObject $Language;$targetName=Get-PackTargetDisplayName $Language $packObject (Get-TargetIdFromLegacyVolume $Volume);$projectId=Get-ProjectIdFromWorkbooks $targets;$namedProjectId=if([bool]$scope.builtIn){Get-CategoryProjectId $projectId $cat}else{$projectId}
-    $fallbackPackName=if([bool]$scope.builtIn){$cat.ToUpperInvariant()}else{'ReportBinder'}
-    $outputFileName=Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId ([string](Get-DataProperty $packObject 'displayName' $fallbackPackName)) $targetName
+    $naming=Get-PackTargetOutputNaming $Structure $Language $scope $Volume;$settings=$naming.settings;$targetName=[string]$naming.targetName;$projectId=[string]$naming.projectId;$outputFileName=[string]$naming.outputFileName
     $document=[ordered]@{title=[string]$settings.documentTitle;subtitle=[string]$settings.documentSubtitle;targetName=$targetName;outputFileNamePattern=[string]$settings.outputFileNamePattern;outputFileName=$outputFileName}
     $pages=@(Get-Array $Structure.pages|Where-Object{$_.enabled -eq $true -and [string]$_.volume -eq $Volume -and $wbMap.ContainsKey([string]$_.workbookId)}|Sort-Object {[double]$_.order},{Resolve-PageId $_})
     $blockers=@();$manifest=@();$fpPages=@()
@@ -8321,6 +8424,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         $snapshotBefore = Update-StructureLocked $Language {
             param($st)
             Apply-DefaultNumberingPerVolume $Language $st ([string]$scope.packId)
+            Assert-PackOutputPathsDistinct $st $Language ([string]$scope.packId) @($volume)
             return Get-FinalBuildInputSnapshot $st $Language $volume ([string]$scope.packId)
         }
         [void](Add-FinalSnapshotSourceWorkbooks (Get-Structure $Language) $snapshotBefore)
@@ -8940,19 +9044,12 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
             throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
         }
         $fileName = [IO.Path]::GetFileName($sourceFull)
-        # 出力ファイル名の型に {targetName} が無いと、本体と補足が同じ名前になる。
-        # 同じフォルダーで上書きし合わないよう、後の方に出力先名を添える。
+        # 出力先はすべて同じ出力フォルダーの直下にあるため、名前が同じなら同じファイル。
+        # 改名して2部発行すると、片方の中身はもう一方のPDFになっている（H-1）。
         if ($usedFileNames.ContainsKey($fileName.ToLowerInvariant())) {
-            $stem = [IO.Path]::GetFileNameWithoutExtension($fileName)
-            $extension = [IO.Path]::GetExtension($fileName)
-            $fileName = '{0}_{1}{2}' -f $stem, (Get-SafePublishPackName $targetName), $extension
-            $suffix = 2
-            while ($usedFileNames.ContainsKey($fileName.ToLowerInvariant())) {
-                $fileName = '{0}_{1}_{2}{3}' -f $stem, (Get-SafePublishPackName $targetName), $suffix, $extension
-                $suffix++
-            }
+            throw ("「{0}」と「{1}」の提出用PDFが同じファイル（{2}）です。一式の設定で出力ファイル名に {{targetName}} を含めて出力し直してから、共有用フォルダーにコピーしてください。" -f [string]$usedFileNames[$fileName.ToLowerInvariant()], $targetName, $fileName)
         }
-        $usedFileNames[$fileName.ToLowerInvariant()] = $true
+        $usedFileNames[$fileName.ToLowerInvariant()] = $targetName
         $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName }
     }
 
@@ -12732,6 +12829,9 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 Set-NoteProperty $sn 'sourceWorkbooks' @($sw)
                 $all[$v] = $sn
             }
+            # ページの無い出力先は書き出さないので、重なりの検査からも外す。
+            $writing = @($requested | Where-Object { [int]$all[$_].pageCount -gt 0 })
+            if ($writing.Count -gt 0) { Assert-PackOutputPathsDistinct $st $Language (Get-BuiltinPackId $cat) $writing }
             return $all
         }
         foreach ($v in $requested) {

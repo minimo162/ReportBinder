@@ -1708,6 +1708,7 @@ async function savePackSettings(btn){
   const pack=packForPreset();if(!pack?.packId){showMessage('danger','一式設定を保存できません','対象の一式が見つかりません。');return;}
   const body={outputFileNamePattern:String($('pack-output-pattern')?.value||'').trim()};
   if(!body.outputFileNamePattern){showMessage('warn','出力ファイル名を入力してください','使用できる変数は {packName}・{targetName}・{yyyyMMdd} です。');$('pack-output-pattern')?.focus();return;}
+  if(!body.outputFileNamePattern.includes('{targetName}')){showMessage('warn','出力ファイル名に {targetName} を含めてください','含めないと本体と補足が同じファイル名になり、互いに上書きされます。');$('pack-output-pattern')?.focus();return;}
   await runBusy(btn,async()=>{try{
     const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}`,{method:'PATCH',body});
     // Pack output settings are part of the final-input fingerprint.  Do not
