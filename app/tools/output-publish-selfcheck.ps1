@@ -1,4 +1,4 @@
-param()
+﻿param()
 
 # 提出用PDFの出力先パスの重なり（H-1）と、共有用フォルダーへのコピー
 # （/api/v2/outputs/publish-all の本体 Publish-DocumentPackAllPdfsToShared）を、

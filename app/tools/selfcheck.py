@@ -97,6 +97,13 @@ if '-SkipPackageSmoke' in release_workflow:
     raise SystemExit('the release workflow must not skip the package smoke tests')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
+# Windows PowerShell 5.1 は BOM の無い .ps1 を ANSI として読む。日本語の文字列を
+# 照合する検査スクリプトでは、照合する側だけが化けて検査が必ず失敗する（または空振りする）。
+# 一覧に無いものも含め、ASCII 以外の文字を含む .ps1 はすべて BOM 付きにする。
+for _ps1 in sorted((root/'app').rglob('*.ps1')):
+    _raw = _ps1.read_bytes()
+    if not _raw.startswith(b'\xef\xbb\xbf') and any(byte > 0x7f for byte in _raw):
+        raise SystemExit(f'PowerShell with non-ASCII text must be UTF-8 BOM: {_ps1.relative_to(root).as_posix()}')
 
 launcher_cmd=(root/'資料をPDFにまとめる.cmd').read_text(encoding='utf-8-sig')
 for needed in ['app\\launch.ps1', 'start "" /b', 'powershell.exe']:
