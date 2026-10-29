@@ -1703,6 +1703,24 @@ function setPageSaveStatus(kind='saved',text='保存済み'){
 function awaitBoardSave(){
   return (boardSaveMutationBusy||pendingBoardSaveVolumes)?boardSavePromise:Promise.resolve(true);
 }
+// 出力・共有コピーの前に、保留中のページ変更をすべて待つ（M-14）。並べ替えの保存だけを
+// 待つと、「移動先」・元に戻す・やり直し・シート順の並べ替え・プレビューからの移動・
+// ページ名や範囲の保存の直後に出力したとき、変更前の構成でPDFができる。これらは
+// どれも pageMutationBusy（元に戻すは pageLayoutHistoryBusy も）を立てて送るので、
+// 旗がすべて下りるまで待つ。並べ替えの保存が失敗したら false を返す。それ以外の
+// 失敗は画面がサーバーの状態のまま残るので、出力はその状態で行ってよい。
+async function awaitPageMutationsIdle(timeoutMs=120000){
+  // ページ名の入力欄から出力ボタンへ移ると、focusout の保存が先に始まる。その旗が
+  // 立つまで1回待つ。
+  await sleep(0);
+  const deadline=Date.now()+timeoutMs;
+  for(;;){
+    if(boardSaveMutationBusy||pendingBoardSaveVolumes){if(!(await awaitBoardSave()))return false;continue;}
+    if(!pageMutationBusy&&!pageLayoutHistoryBusy)return true;
+    if(Date.now()>deadline)return false;
+    await sleep(50);
+  }
+}
 async function waitForQueuedPageLayoutMutation(){
   // Only a pointer/keyboard board save is safely awaitable here. Other layout
   // mutations keep their existing busy guard and return without building a
@@ -5627,9 +5645,9 @@ async function buildVolume(volume, btn) {
 async function runFinalBuildJob(targetIds){
   const ids=asArray(targetIds).map(id=>String(id||'')).filter(Boolean);
   if(!ids.length){showMessage('warn','出力先がありません','ページ構成で本体または補足にページを設定してください。');return null;}
-  // 並べ替えの保存は直列のキューで送る。直後に出力を押すと、保存より先に出力が
-  // 始まり変更前の構成でPDFができる。保存を待ち、保存できなかったら出力しない。
-  if(!(await awaitBoardSave())){showMessage('warn','ページ構成を保存できなかったため出力していません','ページ構成を確認してから、もう一度出力してください。');return null;}
+  // ページ構成の変更は非同期で送る。直後に出力を押すと、保存より先に出力が始まり
+  // 変更前の構成でPDFができる。保存を待ち、保存できなかったら出力しない。
+  if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったため出力していません','ページ構成を確認してから、もう一度出力してください。');return null;}
   const started=await api('/api/v2/outputs/build',{method:'POST',body:{packId:activePackId,targetIds:ids}});
   const jobId=String(started.job?.jobId||'');
   if(!jobId)throw new Error('提出用PDFの出力を開始できませんでした。もう一度「提出用PDFをまとめて出力」を押してください。');
@@ -5700,6 +5718,7 @@ async function cancelActiveFinalJob(){
 
 async function publishFinalVolume(volume,btn) {
   await runBusy(btn,async()=>{
+    if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
     const custom=!activePackIsBuiltIn();
     const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
     const result=response.result||{};
@@ -5718,6 +5737,7 @@ async function publishFinalVolume(volume,btn) {
 // 組み合わせを取り違える。ページの入っている出力先をすべて1つのフォルダーへ入れる。
 async function publishAllFinalVolumes(btn) {
   await runBusy(btn,async()=>{
+    if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
     const response=await api('/api/v2/outputs/publish-all',{method:'POST',body:{packId:activePackId}});
     const result=response.result||{};
     const names=asArray(result.files).map(file=>String(file?.fileName||'')).filter(Boolean);
