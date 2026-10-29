@@ -4,6 +4,7 @@ param()
 # （/api/v2/outputs/publish-all の本体 Publish-DocumentPackAllPdfsToShared）を、
 # server.ps1 の実物の関数で確かめる。Java・Office は使わない。組版の代わりに、
 # 出力済みのPDFと出力状態を直接置き、入力スナップショットだけを差し替える。
+# あわせて、ページ構成の保存（Reorder-Pages）が不完全な並びを拒むこと（H-2）も見る。
 $ErrorActionPreference = 'Stop'
 $toolsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $appRoot = Split-Path -Parent $toolsRoot
@@ -129,6 +130,32 @@ $ecmStructure = Get-Structure 'ja'
 $ecmMirror = Get-DataProperty (Get-DataProperty $ecmStructure 'outputs' $null) 'pack_ecm|main' $null
 Assert-OutputTest ($null -ne $ecmMirror -and [string](Get-DataProperty $ecmMirror 'outputPdf' '') -eq $ecmMainPath) 'The built-in output mirror was not populated; the self-exclusion case is not exercised.'
 Assert-PackOutputPathsDistinct $ecmStructure 'ja' 'pack_ecm' @('ja-main')
+
+# ---- H-2: ページ構成の保存は、送られたレーンのページを欠けなく1回ずつ含む --------
+$layoutPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='並べ替えの一式' })
+$layoutId = [string]$layoutPack.packId
+Add-TestPages $layoutId @('ja-main','ja-main','ja-appendix','none')
+function Get-LayoutIds([string]$Volume) {
+    $st = Get-Structure 'ja'
+    $ids = @{}
+    foreach ($wb in @(Get-Array $st.workbooks | Where-Object { Test-WorkbookPack $_ $layoutId })) { $ids[[string]$wb.workbookId] = $true }
+    return @(Get-Array $st.pages | Where-Object { $ids.ContainsKey([string]$_.workbookId) -and [string]$_.volume -eq $Volume } | Sort-Object {[double]$_.order} | ForEach-Object { Resolve-PageId $_ })
+}
+function Get-LayoutSignature { return (@('ja-main','ja-appendix','none') | ForEach-Object { $_ + '=' + ((Get-LayoutIds $_) -join ',') }) -join ';' }
+$main = @(Get-LayoutIds 'ja-main'); $appendix = @(Get-LayoutIds 'ja-appendix'); $none = @(Get-LayoutIds 'none')
+Assert-OutputTest ($main.Count -eq 2 -and $appendix.Count -eq 1 -and $none.Count -eq 1) 'Layout test pages were not placed as expected.'
+$before = Get-LayoutSignature
+function New-Layout($Volumes) { return [pscustomobject][ordered]@{ packId=$layoutId; volumes=[pscustomobject]$Volumes } }
+Assert-Throws { Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@(); 'ja-appendix'=$appendix; none=$none })) } '不完全' 'An empty lane that still has pages was accepted.'
+Assert-Throws { Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@($main[1]); 'ja-appendix'=$appendix; none=$none })) } '不完全' 'A lane missing one of its pages was accepted.'
+Assert-Throws { Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@($main + @('page_unknown')); 'ja-appendix'=$appendix; none=$none })) } 'この一式に無いページ' 'An unknown page id was silently ignored.'
+Assert-Throws { Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=$main; 'ja-appendix'=@($appendix + @($main[0])); none=$none })) } '2回' 'A page sent in two lanes was accepted.'
+Assert-OutputTest ((Get-LayoutSignature) -eq $before) 'A rejected layout save still changed the page composition.'
+# 正しい全体の並べ替えと、送ったレーンの間だけの移動（補足から本体へ）は通る。
+[void](Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@($main[1],$main[0]); 'ja-appendix'=$appendix; none=$none })))
+Assert-OutputTest (((Get-LayoutIds 'ja-main') -join ',') -eq (@($main[1],$main[0]) -join ',')) 'A complete reorder was not applied.'
+[void](Reorder-Pages 'ja' (New-Layout ([ordered]@{ 'ja-main'=@($main[1],$main[0],$appendix[0]) })))
+Assert-OutputTest (((Get-LayoutIds 'ja-main') -join ',') -eq (@($main[1],$main[0],$appendix[0]) -join ',') -and (Get-LayoutIds 'ja-appendix').Count -eq 0) 'Moving a page from an unsent lane into a sent lane was rejected or misapplied.'
 
 Write-Output 'output-publish selfcheck ok'
 '@

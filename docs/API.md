@@ -50,7 +50,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/sources/scan-updates`: 登録済み原稿の更新を検出する
 - `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する。Excelは保存済みの`excelSheetSelectionMode`（新規登録は`numeric-only`、既存の明示設定や旧データの欠損フィールドは互換のため維持）をジョブへ固定する。必要ならリクエストにも同名項目を指定できる
 - `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する。Excelでは`excelSheetSelectionMode`も指定でき、`numeric-only`はシート名がstrictな`^[0-9]+$`の表示シートだけをPDF化する。対象が0件の場合はPDF・ページ構成を変更せずエラーにする
-- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。ページ画面の「半角数字シートをまとめる」はこのAPIを使い、Excelのstrictな半角数字シートを数字順に指定先へ集め、非該当Excelを未振り分けへ戻す。`baseLayout`を指定した場合は競合を検出する
+- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。ページ画面の「半角数字シートをまとめる」はこのAPIを使い、Excelのstrictな半角数字シートを数字順に指定先へ集め、非該当Excelを未振り分けへ戻す。`baseLayout`を指定した場合は競合を検出する。送ったレーン（`volumes`または`targets`のキー）に今あるページは、送った内容のどこかにちょうど1回ずつ含めてください。空のレーン、ページの欠落、この一式に無いID、同じIDの重複、同じ出力先の二重指定はどれも400を返し、何も保存しない
 - `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する（現行UIは未使用）。`baseLayout`を指定した場合は競合を検出する
 - `GET /api/v2/layout/snapshots?packId={packId}`: 資料パックの保存済みページ構成を返す
 - `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
@@ -453,7 +453,7 @@ categoryは必須です。
 }
 ```
 
-実際に順序・割当が変わったvolumeだけを更新対象にします。
+実際に順序・割当が変わったvolumeだけを更新対象にします。送ったvolumeに今あるページが欠けている場合や、未知・重複のIDがある場合は400を返し、何も保存しません（`POST /api/v2/items/reorder`と同じ検証）。
 
 ページ構成画面の「半角数字シートをまとめる」は、選択した出力先へ`^[0-9]+$`のシート名を文字列として安全に数字順で配置します。Excel以外のページはアンカーとして保持し、非該当Excelと既存の非表示シートページは`none`へ移します。変更がない場合はリクエストも履歴スナップショットも作りません。
 
