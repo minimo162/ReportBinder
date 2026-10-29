@@ -1696,11 +1696,18 @@ function updateBulkSelectionLabel() {
 function setPageSaveStatus(kind='saved',text='保存済み'){
   const el=$('page-save-status');if(!el)return;el.classList.toggle('saving',kind==='saving');el.classList.toggle('error',kind==='error');el.textContent=text;
 }
+// 並べ替えの保存を待つ。boardSavePromise は直列の待ち行列で、保存に失敗すると false で
+// 解決したまま次の保存まで残る。保存が終わった後もそれを await すると、元に戻す・
+// シート順の並べ替え・一式の切り替えが前回の失敗を理由に無言で止まり続ける（H-4）。
+// 保存が進行中のときだけ待ち、その結果を返す。
+function awaitBoardSave(){
+  return (boardSaveMutationBusy||pendingBoardSaveVolumes)?boardSavePromise:Promise.resolve(true);
+}
 async function waitForQueuedPageLayoutMutation(){
   // Only a pointer/keyboard board save is safely awaitable here. Other layout
   // mutations keep their existing busy guard and return without building a
   // request body against a moving state.
-  if(boardSaveMutationBusy){const saved=await boardSavePromise;if(!saved)return false;}
+  if(!(await awaitBoardSave()))return false;
   return !pageMutationBusy;
 }
 
@@ -2100,7 +2107,7 @@ async function applyPageLayoutHistory(direction,btn=null){
   let button=btn;
   try{
     if(pendingPageLayoutUndo){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}const saved=await saveBoardOrder();if(!saved)return;}
-    const savedBeforeHistory=await boardSavePromise;if(!savedBeforeHistory)return;
+    const savedBeforeHistory=await awaitBoardSave();if(!savedBeforeHistory)return;
     const redo=direction==='redo',source=redo?pageLayoutRedoStack:pageLayoutUndoStack,target=redo?pageLayoutUndoStack:pageLayoutRedoStack,entry=source[source.length-1];if(!entry)return;
     button=btn||$(redo?'page-layout-redo-btn':'page-layout-undo-btn');if(button){button.disabled=true;button.classList.add('busy');}
     setPageSaveStatus('saving','保存中…');
@@ -2812,8 +2819,8 @@ async function applyPresetSelection(presetOrButton) {
   if(presetChanged){
     // A queued save belongs to the currently active pack. Do not switch the
     // state container while that response can still arrive and be applied.
-    if(pendingPageLayoutUndo||pendingBoardSaveVolumes){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}await saveBoardOrder();}
-    const saved=await boardSavePromise;
+    if(pendingPageLayoutUndo||pendingBoardSaveVolumes){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}if(!(await saveBoardOrder())){showMessage('warn','一式を切り替えられません','ページ構成を保存できなかったため、内容を確認してからもう一度切り替えてください。');return;}}
+    const saved=await awaitBoardSave();
     if(!saved){showMessage('warn','一式を切り替えられません','ページ構成を保存できなかったため、内容を確認してからもう一度切り替えてください。');return;}
   }
   activePreset=preset;activePackId=nextPackId;rememberActivePack(activePackId);try{sessionStorage.setItem('ReportBinderCategory',activePreset);}catch{}
@@ -5322,7 +5329,7 @@ async function sortPagesByNumericSheet(btn=null) {
     // A drag save may already be queued. Sort only after it advances the
     // optimistic-lock fingerprint, otherwise both requests share the same
     // baseLayout and one necessarily loses.
-    const priorSaveSucceeded=await boardSavePromise;
+    const priorSaveSucceeded=await awaitBoardSave();
     if(!priorSaveSucceeded)return;
     const beforeVolumes=collectBoardVolumes(),requestRevision=boardSaveRevision;
     const numericBefore=numericSheetSequenceIsDefault();
@@ -5622,10 +5629,7 @@ async function runFinalBuildJob(targetIds){
   if(!ids.length){showMessage('warn','出力先がありません','ページ構成で本体または補足にページを設定してください。');return null;}
   // 並べ替えの保存は直列のキューで送る。直後に出力を押すと、保存より先に出力が
   // 始まり変更前の構成でPDFができる。保存を待ち、保存できなかったら出力しない。
-  if(boardSaveMutationBusy||pendingBoardSaveVolumes){
-    const saved=await boardSavePromise;
-    if(!saved){showMessage('warn','ページ構成を保存できなかったため出力していません','ページ構成を確認してから、もう一度出力してください。');return null;}
-  }
+  if(!(await awaitBoardSave())){showMessage('warn','ページ構成を保存できなかったため出力していません','ページ構成を確認してから、もう一度出力してください。');return null;}
   const started=await api('/api/v2/outputs/build',{method:'POST',body:{packId:activePackId,targetIds:ids}});
   const jobId=String(started.job?.jobId||'');
   if(!jobId)throw new Error('提出用PDFの出力を開始できませんでした。もう一度「提出用PDFをまとめて出力」を押してください。');

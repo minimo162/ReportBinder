@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -1596,7 +1596,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261029_v192', 'style.css?v=20260822_v121']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261029_v193', 'style.css?v=20260822_v121']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1651,7 +1651,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261029_v192' not in html:
+if 'app.js?v=20261029_v193' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1677,7 +1677,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261029_v192' not in html:
+if 'app.js?v=20261029_v193' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2186,7 +2186,7 @@ for needed in ['boardSavePromise=boardSavePromise.then(persist,persist)',
                'undo?.afterVolumes||collectBoardVolumes()',
                'rememberPageLayoutUndo(undo.label,undo.volumes,afterVolumes)',
                'void saveBoardOrder()',
-               'savedBeforeHistory=await boardSavePromise',
+               'savedBeforeHistory=await awaitBoardSave()',
                'beforeVolumes=JSON.parse(beforeSignature)',
                'afterVolumes=JSON.parse(drag.previewSignature||afterSignature)']:
     if needed not in appjs:
@@ -2198,7 +2198,7 @@ _persist_start = _save_board.find('const persist=async()=>')
 if _persist_start < 0 or _save_board.find('activeLayoutFingerprint(requestPackId)', _persist_start) < 0:
     raise SystemExit('serialized page saves freeze the pack id but not the latest per-pack fingerprint')
 _pack_switch = appjs.split('async function applyPresetSelection', 1)[1].split('\nasync function registerSelected', 1)[0]
-if 'const saved=await boardSavePromise' not in _pack_switch or "if(!saved){showMessage('warn','一式を切り替えられません'" not in _pack_switch:
+if 'const saved=await awaitBoardSave()' not in _pack_switch or "if(!saved){showMessage('warn','一式を切り替えられません'" not in _pack_switch:
     raise SystemExit('pack switching can race with an in-flight page-layout save')
 _render_pages = appjs.split('function renderPages()', 1)[1].split('\nfunction dynamicVolumePanelHtml', 1)[0]
 if 'cs=changeSummaryFor(p.workbookId)' not in _render_pages or 'p.changeSummary' in _render_pages:
@@ -2796,5 +2796,10 @@ if _node is None:
 lanes_regression = subprocess.run([_node, str(root / 'tests/page-board-lanes-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
 if lanes_regression.returncode != 0:
     raise SystemExit('page-board lanes regression failed: ' + (lanes_regression.stdout + lanes_regression.stderr).strip())
+# 並べ替えの保存に1回失敗しただけで、元に戻す・並べ替え・一式の切り替えが止まり続けない
+# こと（H-4）。実物の saveBoardOrder() を、api() を差し替えて動かす。
+save_queue_regression = subprocess.run([_node, str(root / 'tests/page-board-save-queue-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
+if save_queue_regression.returncode != 0:
+    raise SystemExit('page-board save queue regression failed: ' + (save_queue_regression.stdout + save_queue_regression.stderr).strip())
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))
