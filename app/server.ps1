@@ -1370,7 +1370,19 @@ function Get-UpdatedPackSettings($Pack, [string]$Language, $Patch) {
     }
     if ([string]::IsNullOrWhiteSpace([string]$settings.documentTitle)) { throw [ArgumentException]::new('資料タイトルを入力してください。') }
     [void](Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) 'PROJECT' ([string](Get-DataProperty $Pack 'displayName' 'ReportBinder')) (Get-TargetDisplayName $Language ("$Language-main")))
+    # 型を変えるときだけ確かめる。保存済みの古い型で題名の変更まで拒むと直せなくなる。
+    # 古い型のまま出力した場合は、出力の開始時に出力先パスの重なりで止める。
+    if ($null -ne (Get-DataProperty $Patch 'outputFileNamePattern' $null)) { Assert-OutputFileNamePatternHasTarget ([string]$settings.outputFileNamePattern) }
     return $settings
+}
+
+# 出力ファイル名の型に {targetName} が無いと、本体と補足が同じファイルへ順に書かれ、
+# 本体の出力状態も「最新」のまま中身は補足になる。共有へのまとめてコピーでは同じPDFが
+# 2部発行される。出力先が1つの一式でも、ひな形の更新で出力先が増えうるため必須にする。
+function Assert-OutputFileNamePatternHasTarget([string]$Pattern) {
+    if (-not ([string]$Pattern).Contains('{targetName}')) {
+        throw [ArgumentException]::new('出力ファイル名には {targetName}（出力先名）を含めてください。含めないと本体と補足が同じファイル名になり、互いに上書きされます。')
+    }
 }
 
 function ConvertTo-NormalizedPageRange($Value) {
@@ -1394,12 +1406,14 @@ function Get-TargetDisplayName([string]$Language, [string]$Volume) {
     return $(if ($Language -eq 'en') { 'Main' } else { '本体' })
 }
 
-function Resolve-OutputFileNamePattern([string]$Pattern, [string]$ProjectId, [string]$PackName, [string]$TargetName) {
+function Resolve-OutputFileNamePattern([string]$Pattern, [string]$ProjectId, [string]$PackName, [string]$TargetName, [string]$DateText = '') {
     $value = ([string]$Pattern).Trim()
     if ([string]::IsNullOrWhiteSpace($value)) { $value = '{projectId}_{targetName}.pdf' }
-    $unknown = [regex]::Matches($value, '\{[^{}]+\}') | ForEach-Object { $_.Value } | Where-Object { $_ -notin @('{projectId}','{packName}','{targetName}','{yyyyMMdd}') } | Select-Object -Unique
+    # 置換は大文字小文字を区別するため、照合もそろえる。{TargetName} を既知として通すと
+    # 展開されずにそのまま名前へ残り、出力先どうしで同じ名前になる。
+    $unknown = [regex]::Matches($value, '\{[^{}]+\}') | ForEach-Object { $_.Value } | Where-Object { $_ -cnotin @('{projectId}','{packName}','{targetName}','{yyyyMMdd}') } | Select-Object -Unique
     if (@($unknown).Count -gt 0) { throw [ArgumentException]::new("未対応のファイル名プレースホルダーです: $(@($unknown) -join ', ')") }
-    $resolved = $value.Replace('{projectId}', $ProjectId).Replace('{packName}', $PackName).Replace('{targetName}', $TargetName).Replace('{yyyyMMdd}', (Get-Date -Format 'yyyyMMdd'))
+    $resolved = $value.Replace('{projectId}', $ProjectId).Replace('{packName}', $PackName).Replace('{targetName}', $TargetName).Replace('{yyyyMMdd}', $(if ($DateText) { $DateText } else { Get-Date -Format 'yyyyMMdd' }))
     if ($resolved.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $resolved -match '[\\/]') { throw [ArgumentException]::new('出力ファイル名に使用できない文字が含まれています。') }
     if (-not $resolved.EndsWith('.pdf', [StringComparison]::OrdinalIgnoreCase)) { $resolved += '.pdf' }
     return $resolved
@@ -1587,6 +1601,8 @@ function Save-PackTemplate([string]$Language, $Request, [string]$TemplateId = ''
     $nextVersion = if ($null -eq $existing) { 1 } else { (Get-IntDataProperty $existing 'templateVersion' 1) + 1 }
     $merged.templateVersion = $nextVersion
     $template = ConvertTo-NormalizedPackTemplate $Language ([pscustomobject]$merged) $TemplateId
+    # 読み込み側（Get-UserPackTemplates）では確かめない。保存済みの古いひな形が一覧から消えるため。
+    Assert-OutputFileNamePatternHasTarget ([string](Get-DataProperty $template.output 'fileNamePattern' ''))
     $dir = Get-PackTemplateDir $Language
     if ([string]::IsNullOrWhiteSpace($dir)) { throw [ArgumentException]::new('先に提出フォルダと管理データフォルダを設定してください。') }
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -4148,7 +4164,7 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
             $v1Backup = Join-Path $workspace 'structure.json.v1.bak'
             if (-not (Test-Path -LiteralPath $v1Backup)) {
                 Copy-Item -LiteralPath $path -Destination $v1Backup -ErrorAction Stop
-                if ((Get-Item $v1Backup).Length -ne (Get-Item $path).Length -or (New-StableHash $v1Backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakの検証に失敗しました。' }
+                if ((Get-Item -LiteralPath $v1Backup).Length -ne (Get-Item -LiteralPath $path).Length -or (New-StableHash $v1Backup) -ne (New-StableHash $path)) { throw 'structure.json.v1.bakの検証に失敗しました。' }
             }
             $backups += $v1Backup
             $structure = Normalize-StructureCollections $structure; [void](Repair-StructurePages $structure)
@@ -4171,7 +4187,7 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
         if (-not (Test-Path -LiteralPath $v2Backup)) {
             if ($version -eq 2) {
                 Copy-Item -LiteralPath $path -Destination $v2Backup -ErrorAction Stop
-                if ((Get-Item $v2Backup).Length -ne (Get-Item $path).Length -or (New-StableHash $v2Backup) -ne (New-StableHash $path)) { throw 'structure.json.v2.bakの検証に失敗しました。' }
+                if ((Get-Item -LiteralPath $v2Backup).Length -ne (Get-Item -LiteralPath $path).Length -or (New-StableHash $v2Backup) -ne (New-StableHash $path)) { throw 'structure.json.v2.bakの検証に失敗しました。' }
             } else {
                 Write-JsonFile $v2Backup $structure
                 $verifiedV2 = Read-JsonFile $v2Backup $null
@@ -7361,18 +7377,38 @@ function Reorder-Pages([string]$Language, $Body) {
         foreach ($wb in @(Get-Array $structure.workbooks | Where-Object { Test-WorkbookPack $_ $cat })) { $workbookIds[[string]$wb.workbookId] = $true }
         $pageMap = @{}
         foreach ($page in @(Get-Array $structure.pages | Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) })) { $pageMap[(Resolve-PageId $page)] = $page }
-        $affected = New-Object System.Collections.Generic.HashSet[string]
-        $layoutSnapshotId = ''
+        # 送られた並びを変更前の構成と突き合わせてから書き込む（H-2）。以前は空のレーンや
+        # 一部だけのレーンも受け入れ、送られなかったページを古い order のまま残して
+        # 並びを不定にしたうえで成功を返していた。未知のID・重複・送られたレーンに
+        # 今あるページの欠落はどれも、画面の読み取りか送信の不具合なので保存しない。
+        $currentByVolume = @{}
+        $sentIds = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($property in $volumeObject.PSObject.Properties) {
             $volume = [string]$property.Name
             if ($allowed -notcontains $volume) { throw [System.ArgumentException]::new("不正なvolumeです: $volume") }
-            $desiredIds = @(Get-Array $property.Value | ForEach-Object { [string]$_ })
-            $currentIds = @(Get-Array $structure.pages | Where-Object {
+            $currentByVolume[$volume] = @(Get-Array $structure.pages | Where-Object {
                 $workbookIds.ContainsKey([string]$_.workbookId) -and (
                     ($volume -eq 'none' -and ([string]$_.volume -eq 'none' -or $_.enabled -eq $false)) -or
                     ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
                 )
             } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_} | ForEach-Object { Resolve-PageId $_ })
+            foreach ($id in @(Get-Array $property.Value | ForEach-Object { [string]$_ })) {
+                if (-not $pageMap.ContainsKey($id)) { throw [System.ArgumentException]::new("この一式に無いページが含まれています: $id。画面を読み込み直してから、もう一度操作してください。") }
+                if (-not $sentIds.Add($id)) { throw [System.ArgumentException]::new("同じページが2回含まれています: $id。画面を読み込み直してから、もう一度操作してください。") }
+            }
+        }
+        foreach ($volume in @($currentByVolume.Keys)) {
+            $dropped = @($currentByVolume[$volume] | Where-Object { -not $sentIds.Contains([string]$_) })
+            if ($dropped.Count -gt 0) {
+                throw [System.ArgumentException]::new(("ページ構成の内容が不完全なため保存していません（{0} の {1} ページが含まれていません）。画面を読み込み直してから、もう一度操作してください。" -f $volume, $dropped.Count))
+            }
+        }
+        $affected = New-Object System.Collections.Generic.HashSet[string]
+        $layoutSnapshotId = ''
+        foreach ($property in $volumeObject.PSObject.Properties) {
+            $volume = [string]$property.Name
+            $desiredIds = @(Get-Array $property.Value | ForEach-Object { [string]$_ })
+            $currentIds = @($currentByVolume[$volume])
             $sameSequence = (($currentIds -join "`n") -eq ($desiredIds -join "`n"))
             if ($sameSequence) { continue }
             if ([string]::IsNullOrWhiteSpace($layoutSnapshotId)) { $layoutSnapshotId = Save-LayoutSnapshot $Language $cat 'reorder' $structure }
@@ -7567,6 +7603,100 @@ function Get-Sha256Text([string]$Text) {
     $sha=[Security.Cryptography.SHA256]::Create();try{$bytes=[Text.Encoding]::UTF8.GetBytes($Text);return 'sha256:'+([BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','').ToLowerInvariant())}finally{$sha.Dispose()}
 }
 
+# 出力ファイル名の算出。出力時のスナップショットと、出力先パスの重なりの検査で同じ名前を使う。
+function Get-PackTargetOutputNaming($Structure, [string]$Language, $Scope, [string]$Volume) {
+    $packId = [string]$Scope.packId
+    $cat = [string]$Scope.category
+    $packObject = $Scope.pack
+    $workbooks = @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $packId })
+    $settings = Get-ResolvedPackSettings $packObject $Language
+    $targetName = Get-PackTargetDisplayName $Language $packObject (Get-TargetIdFromLegacyVolume $Volume)
+    $projectId = Get-ProjectIdFromWorkbooks $workbooks
+    $namedProjectId = if ([bool]$Scope.builtIn) { Get-CategoryProjectId $projectId $cat } else { $projectId }
+    $fallbackPackName = if ([bool]$Scope.builtIn) { $cat.ToUpperInvariant() } else { 'ReportBinder' }
+    $packName = [string](Get-DataProperty $packObject 'displayName' $fallbackPackName)
+    $outputFileName = Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId $packName $targetName
+    # 入力の指紋には日付を展開しない名前を使う（M-1）。展開後の名前を入れると、日付が
+    # 変わっただけで出力済みのPDFがすべて「再出力が必要」になり、日をまたいだ出力は
+    # 「ページ構成またはPDF入力が変更されました」で失敗していた。
+    $outputFileNameKey = Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId $packName $targetName '{yyyyMMdd}'
+    return [pscustomobject][ordered]@{ settings = $settings; targetName = $targetName; projectId = $projectId; outputFileName = $outputFileName; outputFileNameKey = $outputFileNameKey }
+}
+
+function Test-PackVolumeHasEnabledPages($Structure, [string]$PackId, [string]$Volume) {
+    $workbookIds = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $PackId })) { $workbookIds[[string]$wb.workbookId] = $true }
+    foreach ($page in @(Get-Array $Structure.pages)) {
+        if ($page.enabled -eq $true -and [string]$page.volume -eq $Volume -and $workbookIds.ContainsKey([string]$page.workbookId)) { return $true }
+    }
+    return $false
+}
+
+# H-1: 出力の開始時に、書き出す先が他の出力先のPDFと重ならないことを確かめる。
+# 重なったまま書くと、後から書いた方の中身で前の出力先も「最新」と表示され、共有へも
+# そのまま発行される。照合は大文字小文字を区別しない（Windows のファイル名と同じ）。
+#   - 同じ一式の他の出力先（ページがあるもの）が、今の設定で同じ名前になる
+#   - 他の一式・他の出力先が記録している出力PDFと同じパスになる
+function Assert-PackOutputPathsDistinct($Structure, [string]$Language, [string]$PackId, [string[]]$Volumes) {
+    $scope = Resolve-DocumentPackScope $Structure $PackId $true
+    $outputDir = [string](Get-DataProperty (Get-Paths) 'outputDir' '')
+    $planned = [ordered]@{}
+    foreach ($volume in @(Get-PackVolumeList $Language $scope.pack $false)) {
+        $isRequested = $Volumes -contains $volume
+        if (-not $isRequested -and -not (Test-PackVolumeHasEnabledPages $Structure ([string]$scope.packId) $volume)) { continue }
+        $naming = Get-PackTargetOutputNaming $Structure $Language $scope $volume
+        $planned[$volume] = [pscustomobject]@{
+            path = [IO.Path]::GetFullPath((Join-Path $outputDir ([string]$naming.outputFileName)))
+            fileName = [string]$naming.outputFileName
+            targetName = [string]$naming.targetName
+            requested = $isRequested
+        }
+    }
+    $requested = @($planned.Keys | Where-Object { $planned[$_].requested })
+    foreach ($volume in $requested) {
+        $mine = $planned[$volume]
+        foreach ($other in @($planned.Keys)) {
+            if ($other -eq $volume) { continue }
+            if ([string]::Equals([string]$planned[$other].path, [string]$mine.path, [StringComparison]::OrdinalIgnoreCase)) {
+                throw [InvalidOperationException]::new(("「{0}」と「{1}」の提出用PDFが同じファイル名（{2}）になります。一式の設定で出力ファイル名に {{targetName}} を含めてから、もう一度出力してください。" -f [string]$mine.targetName, [string]$planned[$other].targetName, [string]$mine.fileName))
+            }
+        }
+    }
+    # 組み込み一式の状態は volumes（"ja-main|ecm"）と outputs（"pack_ecm|main"）の両方に
+    # あるため、どちらも「一式ID|出力先ID」へそろえて、自分の出力先だけを除く。
+    $ownKeys = @{}
+    foreach ($volume in $requested) { $ownKeys[("{0}|{1}" -f [string]$scope.packId, (Get-TargetIdFromLegacyVolume $volume))] = $true }
+    $packNames = @{}
+    foreach ($pack in @(Get-Array (Get-DataProperty $Structure 'packs' @()))) { $packNames[[string](Get-DataProperty $pack 'packId' '')] = [string](Get-DataProperty $pack 'displayName' '') }
+    $recorded = @()
+    $volumeStates = Get-DataProperty $Structure 'volumes' $null
+    foreach ($key in @(Get-ConfigKeyNames $volumeStates)) {
+        $parts = ([string]$key).Split('|')
+        if ($parts.Count -lt 2 -or $parts[1] -eq '_') { continue }
+        $ownerPackId = Get-BuiltinPackId $parts[1]
+        $recorded += [pscustomobject]@{ key = ("{0}|{1}" -f $ownerPackId, (Get-TargetIdFromLegacyVolume $parts[0])); packId = $ownerPackId; state = (Get-DataProperty $volumeStates $key $null) }
+    }
+    $outputStates = Get-DataProperty $Structure 'outputs' $null
+    foreach ($key in @(Get-ConfigKeyNames $outputStates)) {
+        $recorded += [pscustomobject]@{ key = [string]$key; packId = ([string]$key).Split('|')[0]; state = (Get-DataProperty $outputStates $key $null) }
+    }
+    foreach ($entry in $recorded) {
+        $state = $entry.state
+        if ($null -eq $state -or $ownKeys.ContainsKey([string]$entry.key)) { continue }
+        $recordedPdf = [string](Get-DataProperty $state 'outputPdf' '')
+        if ([string]::IsNullOrWhiteSpace($recordedPdf)) { continue }
+        try { $recordedFull = [IO.Path]::GetFullPath($recordedPdf) } catch { continue }
+        foreach ($volume in $requested) {
+            $mine = $planned[$volume]
+            if ([string]::Equals($recordedFull, [string]$mine.path, [StringComparison]::OrdinalIgnoreCase)) {
+                $ownerName = if ($packNames.ContainsKey([string]$entry.packId)) { $packNames[[string]$entry.packId] } else { '' }
+                $owner = if ([string]::IsNullOrWhiteSpace($ownerName)) { '' } else { "一式「$ownerName」の" }
+                throw [InvalidOperationException]::new(("「{0}」の出力ファイル名（{1}）が、{2}別の提出用PDFと同じです。上書きしないよう出力を止めました。一式の設定で出力ファイル名を変えてから、もう一度出力してください。" -f [string]$mine.targetName, [string]$mine.fileName, $owner))
+            }
+        }
+    }
+}
+
 function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volume,[string]$Category) {
     $scope=Resolve-DocumentPackScope $Structure $Category $false;$packId=[string]$scope.packId;$cat=[string]$scope.category
     if(@(Get-PackVolumeList $Language $scope.pack $false) -notcontains $Volume){throw [ArgumentException]::new("不正な成果物です: $Volume")}
@@ -7577,9 +7707,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     $artifactMap=@{};foreach($artifact in @(Get-Array (Get-DataProperty $Structure 'artifacts' @()))){$artifactMap[[string](Get-DataProperty $artifact 'artifactId' '')]=$artifact}
     $packObject=$scope.pack
     $effectiveTemplate=Get-PackEffectiveTemplate $Language $packObject
-    $settings=Get-ResolvedPackSettings $packObject $Language;$targetName=Get-PackTargetDisplayName $Language $packObject (Get-TargetIdFromLegacyVolume $Volume);$projectId=Get-ProjectIdFromWorkbooks $targets;$namedProjectId=if([bool]$scope.builtIn){Get-CategoryProjectId $projectId $cat}else{$projectId}
-    $fallbackPackName=if([bool]$scope.builtIn){$cat.ToUpperInvariant()}else{'ReportBinder'}
-    $outputFileName=Resolve-OutputFileNamePattern ([string]$settings.outputFileNamePattern) $namedProjectId ([string](Get-DataProperty $packObject 'displayName' $fallbackPackName)) $targetName
+    $naming=Get-PackTargetOutputNaming $Structure $Language $scope $Volume;$settings=$naming.settings;$targetName=[string]$naming.targetName;$projectId=[string]$naming.projectId;$outputFileName=[string]$naming.outputFileName
     $document=[ordered]@{title=[string]$settings.documentTitle;subtitle=[string]$settings.documentSubtitle;targetName=$targetName;outputFileNamePattern=[string]$settings.outputFileNamePattern;outputFileName=$outputFileName}
     $pages=@(Get-Array $Structure.pages|Where-Object{$_.enabled -eq $true -and [string]$_.volume -eq $Volume -and $wbMap.ContainsKey([string]$_.workbookId)}|Sort-Object {[double]$_.order},{Resolve-PageId $_})
     $blockers=@();$manifest=@();$fpPages=@()
@@ -7623,7 +7751,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     if($pages.Count -eq 0){$blockers+= [ordered]@{code='no-pages';pageTitle='';workbookName='';message='対象ページがありません。ページ構成を確認してください。'}}
     foreach($p in $pages){$pageId=Resolve-PageId $p;$wb=$wbMap[[string]$p.workbookId];$title=[string]$p.title;if([string]::IsNullOrWhiteSpace($title)){$title=[string]$p.sheetName};$wbName=[string]$wb.fileName;$rel=[string]$p.contentPdf;$full='';$size=0L;$ticks=0L;$sourcePageCount=1
         if(-not $rel){$blockers+=[ordered]@{code='content-missing';pageTitle=$title;workbookName=$wbName;message='PDF未作成のページがあります。先にPDF作成してください。'}}
-        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path $full)){throw 'missing'};$it=Get-Item $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;$sourcePageCount=Get-PdfPageCount $full}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
+        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path -LiteralPath $full)){throw 'missing'};$it=Get-Item -LiteralPath $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;$sourcePageCount=Get-PdfPageCount $full}catch{$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
         if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers+=[ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='元原稿が更新されています。先に変換PDFを作成してください。'}}
         elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers+=[ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='原稿のページ構成が変わっています。先に変換PDFを作成してください。'}}
         elseif(-not(Test-PageContentMatchesWorkbookVersion $p $wb)){$blockers+=[ordered]@{code='old-content';pageTitle=$title;workbookName=$wbName;message='古いPDF参照が残っています。先にPDF作成してください。'}}
@@ -7639,7 +7767,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     foreach($entry in $manifest){
         for($sourcePage=[int]$entry.sourcePageStart;$sourcePage -le [int]$entry.sourcePageEnd;$sourcePage++){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;kind='content';itemId=[string]$entry.itemId;pageId=[string]$entry.pageId;sourceId=[string]$entry.sourceId;unitId=[string]$entry.unitId;artifactId=[string]$entry.artifactId;sourceType=[string]$entry.sourceType;sourceKey=[string]$entry.sourceKey;sourcePdfPageNumber=$sourcePage;title=[string]$entry.title;sectionId=[string]$entry.sectionId;numberingMode=[string]$entry.numberingMode}}
     }
-    $input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;packId=$packId;category=$cat;volume=$Volume;document=$document;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
+    $fpDocument=[ordered]@{};foreach($fpKey in @($document.Keys)){$fpDocument[$fpKey]=$document[$fpKey]};$fpDocument.outputFileName=[string]$naming.outputFileNameKey;$input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;packId=$packId;category=$cat;volume=$Volume;document=$fpDocument;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
     return [ordered]@{language=$Language;packId=$packId;category=$cat;volume=$Volume;pages=$pages;manifestPages=$manifest;physicalPages=$physicalPages;document=$document;blockers=@($blockers);itemCount=$pages.Count;pageCount=$outputPageNumber;projectId=$projectId;outputFileName=$outputFileName;fingerprint=$fingerprint;fingerprintInput=$input}
 }
 
@@ -7926,10 +8054,37 @@ function Start-VersionCheckMonitor {
 
 function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty $Snapshot 'fingerprint' '') }
 
+# 出力を確定した時点の提出用PDFの記録（M-2）。readiness はサイズと更新日時だけを、
+# 共有用フォルダーへのコピーはハッシュまで照合する。同じパスへ別の出力先が書いた
+# ファイル（H-1）、手で差し替えたり編集したりしたファイルを「最新」として発行しない。
+# 確定は構成のロックの中で行うので、作業ファイルのうちに求めたハッシュを渡せる
+# （置き換えは移動なので中身は同じ）。大きなPDFをロックの中で読み直さない。
+function Get-OutputPdfIntegrity([string]$Path, [string]$KnownHash = '') {
+    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $hash = if ([string]::IsNullOrWhiteSpace($KnownHash)) { New-Sha256 $Path } else { $KnownHash }
+    return [ordered]@{ size=[int64]$item.Length; lastWriteUtcTicks=[string]$item.LastWriteTimeUtc.Ticks; sha256=(Normalize-FileHash $hash) }
+}
+# 記録と違えば理由を返す。記録が無い（この照合より前の版で出力した）ときは $null を返し、
+# 呼び出し側が扱いを決める。
+function Get-OutputPdfIntegrityProblem($State, [string]$Path, [bool]$CheckHash = $false) {
+    $record = Get-DataProperty $State 'outputIntegrity' $null
+    if ($null -eq $record) { return $null }
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return '出力したPDFが見つかりません。' }
+    if ([int64]$item.Length -ne [int64](Get-DataProperty $record 'size' -1) -or [string]$item.LastWriteTimeUtc.Ticks -ne [string](Get-DataProperty $record 'lastWriteUtcTicks' '')) {
+        return '出力したPDFが、出力した後に変更または上書きされています。'
+    }
+    if ($CheckHash -and (Normalize-FileHash (New-Sha256 $Path)) -ne (Normalize-FileHash ([string](Get-DataProperty $record 'sha256' '')))) {
+        return '出力したPDFの中身が、出力した時と違います。'
+    }
+    return ''
+}
+
 function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[string]$Category,[bool]$CheckOutputExists = $true) {
     $scope=Resolve-DocumentPackScope $Structure $Category $false;$packId=[string]$scope.packId;$snap=Get-FinalBuildInputSnapshot $Structure $Language $Volume $packId;$v=Get-PackOutputState $Structure $Language $packId $Volume $false;if($null -eq $v){$v=New-EmptyVolumeState};$built=[string](Get-DataProperty $v 'builtFingerprint' '');$current=[string]$snap.fingerprint;$out=[string](Get-DataProperty $v 'outputPdf' '');$exists=(-not [string]::IsNullOrWhiteSpace($out));if($exists -and $CheckOutputExists){$exists=Test-Path -LiteralPath $out};$status='not-built';if($built){if($built -ne $current -or $snap.blockers.Count -gt 0){$status='needs-rebuild'}else{$status='built'}};$display=if($snap.blockers.Count -gt 0){'blocked'}elseif(-not $built){'not-built'}elseif($built -ne $current){'needs-rebuild'}elseif(-not $exists){'output-missing'}else{'built'}
+    $integrityProblem=$null;if($display -eq 'built' -and $CheckOutputExists){$integrityProblem=Get-OutputPdfIntegrityProblem $v $out $false;if($integrityProblem){$display='needs-rebuild'}}
     Set-NoteProperty $v 'status' $status
-    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='提出用PDFの入力が変更されました'})}
+    $reasons=@(Get-Array (Get-DataProperty $v 'staleReasons' @()));if($integrityProblem){$reasons=@([ordered]@{type='output-changed';at=$null;detail=[string]$integrityProblem})};if($display -eq 'needs-rebuild' -and $reasons.Count -eq 0){$reasons=@([ordered]@{type='fingerprint';at=(Get-DataProperty $Structure 'updatedAt' $null);detail='提出用PDFの入力が変更されました'})}
     return [ordered]@{packId=$packId;targetId=(Get-TargetIdFromLegacyVolume $Volume);canBuild=($snap.blockers.Count -eq 0 -and $snap.pageCount -gt 0);pageCount=$snap.pageCount;status=$status;displayState=$display;builtFingerprint=$built;currentFingerprint=$current;outputPdf=$out;outputPdfExists=[bool]$exists;lastBuiltAt=(Get-DataProperty $v 'lastBuiltAt' $null);blockers=@($snap.blockers);staleReasons=@($reasons);snapshot=$snap}
 }
 
@@ -8316,11 +8471,12 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
     return Invoke-WithLock $lockPath {
         $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
         $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-        if (-not (Test-Path $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
-        if (-not (Test-Path $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
         $snapshotBefore = Update-StructureLocked $Language {
             param($st)
             Apply-DefaultNumberingPerVolume $Language $st ([string]$scope.packId)
+            Assert-PackOutputPathsDistinct $st $Language ([string]$scope.packId) @($volume)
             return Get-FinalBuildInputSnapshot $st $Language $volume ([string]$scope.packId)
         }
         [void](Add-FinalSnapshotSourceWorkbooks (Get-Structure $Language) $snapshotBefore)
@@ -8349,8 +8505,9 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
         $run = Invoke-NativeCapture $java @('-cp',"$composerJar;$pdfboxJar",'ReportPdfComposer','--manifest',$manifestPath) $Script:FinalComposeTimeoutSeconds
         if ($run.timedOut) { throw ('PDFの結合が{0}分以内に終わりませんでした。出力先がネットワーク上のフォルダーの場合は、いったんPC内のフォルダーに出力してみてください。' -f [int]($Script:FinalComposeTimeoutSeconds / 60)) }
         if ([int]$run.exitCode -ne 0) { throw "PDFBox組版に失敗しました。exit=$([int]$run.exitCode)`n$([string]$run.text)" }
-        if (-not (Test-Path $tempPath) -or (Get-Item $tempPath).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
+        if (-not (Test-Path -LiteralPath $tempPath) -or (Get-Item -LiteralPath $tempPath).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
         Report-FinalBuildPhase '出力先へ保存しています'
+        $tempHash = New-Sha256 $tempPath
         $buildId = New-RbId
         $commit = Update-StructureLocked $Language {
             param($st)
@@ -8359,6 +8516,7 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
             Move-Item -LiteralPath $tempPath -Destination $outputPath -Force
             $state = Get-PackOutputState $st $Language ([string]$scope.packId) $volume $true
             Set-NoteProperty $state 'builtFingerprint' $fingerprint
+            Set-NoteProperty $state 'outputIntegrity' (Get-OutputPdfIntegrity $outputPath $tempHash)
             Set-NoteProperty $state 'lastBuiltAt' (New-NowIso)
             Set-NoteProperty $state 'outputPdf' $outputPath
             Set-NoteProperty $state 'staleReasons' @()
@@ -8819,7 +8977,7 @@ function Serve-ContentPdfFromBody($Context, [string]$Language, $Body) {
 
 function Serve-FinalPdfByVolume($Context,[string]$Language,[string]$Volume,[string]$Category) {
     if ((Get-VolumeList $Language | Where-Object { $_ -ne 'none' }) -notcontains $Volume) { throw [System.ArgumentException]::new('volumeには本体または補足を指定してください。') }
-    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('不正な成果物です。')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw '提出用PDFはまだ作成されていません。'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw '出力フォルダ外のPDFは表示できません。'};if(-not(Test-Path $full)){throw '提出用PDFファイルが見つかりません。'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
+    $cat=Require-WorkbookCategory $Category;$volume=([string]$Volume).Trim();if(@(Get-VolumeList $Language|Where-Object{$_ -ne 'none'}) -notcontains $volume){throw [ArgumentException]::new('不正な成果物です。')};$structure=Get-Structure $Language;$v=Get-DataProperty $structure.volumes (Get-VolumeStateKey $volume $cat) $null;if($null -eq $v -or -not [string]$v.outputPdf){throw '提出用PDFはまだ作成されていません。'};$paths=Get-Paths;$full=[IO.Path]::GetFullPath([string]$v.outputPdf);$root=[IO.Path]::GetFullPath([string]$paths.outputDir);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw '出力フォルダ外のPDFは表示できません。'};if(-not(Test-Path -LiteralPath $full)){throw '提出用PDFファイルが見つかりません。'};Write-BytesResponse $Context 200 ([IO.File]::ReadAllBytes($full)) 'application/pdf'
 }
 
 function Serve-FinalPdf($Context,[string]$Language) {
@@ -8904,27 +9062,108 @@ function Get-SafePublishPackName([string]$DisplayName) {
     return $name
 }
 
-function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [string]$PackIdOrCategory) {
+# 1冊だけのコピーも、本体・補足などをまとめたコピーも同じ経路で1つの発行フォルダーを作る。
+# まとめる場合は、どれか1冊でも最新でなければ何もコピーしない。古い補足が混ざった束を
+# 共有側へ置くと、受け取った側には見分けが付かないため。
+# 共有用フォルダーへのコピーは、提出用PDFの出力と排他にする（M-3）。出力中にコピーすると、
+# 置き換えの途中のPDFや世代の違う本体と補足が1つの発行フォルダーに入り、コピー中の
+# 読み込みが出力側の置き換えを共有違反で失敗させる。実行中の出力ジョブがあれば断り、
+# 出力と同じロック（組み込み一式は final-build_*、カスタム一式は出力先ごとの pack-output_*）
+# を持ったまま、最新かどうかの確認からコピーまでを行う。
+function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
+    if ($null -ne (Get-ActiveFinalJobStatus $Language)) {
+        throw '提出用PDFを出力中のため、共有用フォルダーにコピーしていません。出力が終わってから、もう一度コピーしてください。'
+    }
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
+    $workspace = Get-WorkspacePath $Language
+    $lockPaths = @()
+    if ([bool]$scope.builtIn) {
+        $lockPaths += Join-Path $workspace ("locks\final-build_{0}.lock" -f [string]$scope.category)
+    } else {
+        foreach ($volume in @($Volumes | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)) {
+            $lockPaths += Join-Path $workspace ("locks\pack-output_{0}_{1}.lock" -f ([string]$scope.packId), (Get-TargetIdFromLegacyVolume $volume))
+        }
+    }
+    return Invoke-WithPublishLocks $lockPaths { Publish-DocumentPackPdfToSharedLocked $Language $Volumes ([string]$scope.packId) }
+}
+
+# 共有用フォルダーに残った発行の作業用フォルダー（.publishing-*）を消す。消すのは、
+# この利用者が作って1時間以上たったものと、利用者名の入っていない以前の形式で1日以上
+# たったものだけ。他の人がコピーしている途中のフォルダーには触れない。
+function Remove-StalePublishingFolders([string]$SubmissionDir, [string]$UserName) {
+    $now = (Get-Date).ToUniversalTime()
+    $own = '.publishing-' + $UserName + '-'
+    foreach ($dir in @(Get-ChildItem -LiteralPath $SubmissionDir -Directory -Force -Filter '.publishing-*' -ErrorAction SilentlyContinue)) {
+        $age = $now - $dir.LastWriteTimeUtc
+        $legacy = $dir.Name -match '^\.publishing-[0-9a-f]{32}$'
+        $mine = $dir.Name.StartsWith($own, [StringComparison]::OrdinalIgnoreCase) -and $dir.Name.Length -eq ($own.Length + 32)
+        if (($mine -and $age.TotalHours -ge 1) -or ($legacy -and $age.TotalDays -ge 1)) {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# 渡したブロックは Invoke-WithLock の中で呼ばれる。PowerShell の変数は呼び出し元を
+# たどって解決されるので、Invoke-WithLock の引数と同じ名前（$Action）を使うと
+# 自分自身を呼び続ける。名前を分けておくこと。
+function Invoke-WithPublishLocks([string[]]$PublishLockPaths, [scriptblock]$PublishAction) {
+    if (@($PublishLockPaths).Count -eq 0) { return & $PublishAction }
+    $publishRemainingLocks = @($PublishLockPaths | Select-Object -Skip 1)
+    return Invoke-WithLock ([string]@($PublishLockPaths)[0]) { Invoke-WithPublishLocks $publishRemainingLocks $PublishAction }
+}
+
+function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
     $paths = Get-Paths
     $structure = Get-Structure $Language
     $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
-    if (@(Get-PackVolumeList $Language $scope.pack $false) -notcontains $Volume) { throw [ArgumentException]::new('共有発行するPDFの種類が不正です。') }
+    $requestedVolumes = @($Volumes | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($requestedVolumes.Count -eq 0) { throw [ArgumentException]::new('共有発行するPDFを指定してください。') }
+    $allowedVolumes = @(Get-PackVolumeList $Language $scope.pack $false)
     $packId = [string]$scope.packId
     $cat = [string]$scope.category
-    $ready = Get-FinalBuildReadiness $structure $Language $Volume $packId
-    if ([string]$ready.displayState -ne 'built') {
-        throw '提出用PDFが最新ではありません。最新状態で再出力してから共有発行してください。'
-    }
-    $source = [string]$ready.outputPdf
-    if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        throw '共有発行できる提出用PDFがありません。先に提出用PDFを出力してください。'
-    }
-
     $localOutputRoot = [IO.Path]::GetFullPath([string]$paths.outputDir)
     if (-not $localOutputRoot.EndsWith([IO.Path]::DirectorySeparatorChar)) { $localOutputRoot += [IO.Path]::DirectorySeparatorChar }
-    $sourceFull = [IO.Path]::GetFullPath($source)
-    if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
+    $multiple = $requestedVolumes.Count -gt 1
+    $usedFileNames = @{}
+    $entries = @()
+    foreach ($Volume in $requestedVolumes) {
+        if ($allowedVolumes -notcontains $Volume) { throw [ArgumentException]::new('共有発行するPDFの種類が不正です。') }
+        $targetId = Get-TargetIdFromLegacyVolume $Volume
+        $targetName = [string](Get-PackTargetDisplayName $Language $scope.pack $targetId)
+        if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = $targetId }
+        $prefix = if ($multiple) { "「$targetName」の" } else { '' }
+        $ready = Get-FinalBuildReadiness $structure $Language $Volume $packId
+        if ([string]$ready.displayState -ne 'built') {
+            $changedReason = @($ready.staleReasons | Where-Object { [string](Get-DataProperty $_ 'type' '') -eq 'output-changed' } | Select-Object -First 1)
+            if ($changedReason.Count -gt 0) { throw ("{0}{1} もう一度出力してから共有用フォルダーにコピーしてください。" -f $prefix, [string](Get-DataProperty $changedReason[0] 'detail' '')) }
+            throw "${prefix}提出用PDFが最新ではありません。最新状態で再出力してから共有発行してください。"
+        }
+        $source = [string]$ready.outputPdf
+        if ([string]::IsNullOrWhiteSpace($source) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "共有発行できる${prefix}提出用PDFがありません。先に提出用PDFを出力してください。"
+        }
+        $sourceFull = [IO.Path]::GetFullPath($source)
+        if (-not $sourceFull.StartsWith($localOutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw '共有発行元が利用者ローカルの出力フォルダー外です。提出用PDFを再出力してください。'
+        }
+        # 出力した時のPDFそのものかをハッシュで確かめる（M-2）。記録の無いPDFは、この照合が
+        # 入る前の版で出力したもので、中身を確かめられないので発行しない。
+        $outputState = Get-PackOutputState $structure $Language $packId $Volume $false
+        $integrityProblem = Get-OutputPdfIntegrityProblem $outputState $sourceFull $true
+        if ($null -eq $integrityProblem) {
+            throw "${prefix}提出用PDFに、出力した時の記録がありません。もう一度出力してから共有用フォルダーにコピーしてください。"
+        }
+        if ($integrityProblem) { throw "${prefix}$integrityProblem もう一度出力してから共有用フォルダーにコピーしてください。" }
+        $expectedHash = Normalize-FileHash ([string](Get-DataProperty (Get-DataProperty $outputState 'outputIntegrity' $null) 'sha256' ''))
+        $fileName = [IO.Path]::GetFileName($sourceFull)
+        # 出力先はすべて同じ出力フォルダーの直下にあるため、名前が同じなら同じファイル。
+        # 改名して2部発行すると、片方の中身はもう一方のPDFになっている（H-1）。
+        if ($usedFileNames.ContainsKey($fileName.ToLowerInvariant())) {
+            throw ("「{0}」と「{1}」の提出用PDFが同じファイル（{2}）です。一式の設定で出力ファイル名に {{targetName}} を含めて出力し直してから、共有用フォルダーにコピーしてください。" -f [string]$usedFileNames[$fileName.ToLowerInvariant()], $targetName, $fileName)
+        }
+        $usedFileNames[$fileName.ToLowerInvariant()] = $targetName
+        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName; sha256 = $expectedHash }
     }
 
     $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -8941,18 +9180,22 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [st
         $suffix++
     }
 
-    # PDFが半端な状態で共有側に見えないよう、同じ共有ルートの隠し一時フォルダーで
-    # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。
-    $stagingDir = Join-Path $submissionDir ('.publishing-' + [Guid]::NewGuid().ToString('N'))
-    $fileName = [IO.Path]::GetFileName($sourceFull)
-    $stagedPdf = Join-Path $stagingDir $fileName
+    # PDFが半端な状態で発行フォルダーとして見えないよう、同じ共有ルートの作業用フォルダーで
+    # コピーと検証を完了してから、発行フォルダー名へ一度だけ切り替える。Windows では
+    # 先頭の「.」では隠れないので、作った直後に隠し属性を付ける（M-7）。強制終了などで
+    # finally が走らずに残ったものは、次の発行の前に Remove-StalePublishingFolders が消す。
+    Remove-StalePublishingFolders $submissionDir $userName
+    $stagingDir = Join-Path $submissionDir ('.publishing-' + $userName + '-' + [Guid]::NewGuid().ToString('N'))
     try {
-        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
-        Copy-Item -LiteralPath $sourceFull -Destination $stagedPdf -Force
-        $sourceLength = (Get-Item -LiteralPath $sourceFull -ErrorAction Stop).Length
-        $uploadedLength = (Get-Item -LiteralPath $stagedPdf -ErrorAction Stop).Length
-        if ($sourceLength -le 0 -or $uploadedLength -ne $sourceLength) {
-            throw '共有フォルダーへのコピーサイズが一致しません。'
+        $staging = New-Item -ItemType Directory -Path $stagingDir -Force
+        try { $staging.Attributes = $staging.Attributes -bor [IO.FileAttributes]::Hidden } catch { }
+        foreach ($entry in $entries) {
+            $stagedPdf = Join-Path $stagingDir ([string]$entry.fileName)
+            Copy-Item -LiteralPath ([string]$entry.sourceFull) -Destination $stagedPdf -Force
+            # サイズだけでは、コピー中に出力側が置き換えた場合や途中で切れた場合を見分けられない（L-2）。
+            if ((Normalize-FileHash (New-Sha256 $stagedPdf)) -ne [string]$entry.sha256) {
+                throw '共有用フォルダーへコピーしたPDFが、出力したPDFと一致しません。もう一度コピーしてください。'
+            }
         }
         while (Test-Path -LiteralPath $publishDir) {
             $folderName = "{0}_{1}" -f $baseFolderName, $suffix
@@ -8966,37 +9209,58 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string]$Volume, [st
             Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    $destination = Join-Path $publishDir $fileName
-
     $publishedAt = New-NowIso
-    Write-HistoryEvent $Language 'final.published' ([ordered]@{
-        packId = $packId
-        category = $cat
-        targetId = Get-TargetIdFromLegacyVolume $Volume
-        volume = $Volume
-        source = $sourceFull
-        destination = $destination
-        sharedFolder = $publishDir
-        folderName = $folderName
-        fileName = $fileName
-        userName = $userName
-        packName = $packName
-        publishedAt = $publishedAt
-    })
+    $files = @()
+    foreach ($entry in $entries) {
+        $destination = Join-Path $publishDir ([string]$entry.fileName)
+        Write-HistoryEvent $Language 'final.published' ([ordered]@{
+            packId = $packId
+            category = $cat
+            targetId = [string]$entry.targetId
+            volume = [string]$entry.volume
+            source = [string]$entry.sourceFull
+            destination = $destination
+            sharedFolder = $publishDir
+            folderName = $folderName
+            fileName = [string]$entry.fileName
+            userName = $userName
+            packName = $packName
+            publishedAt = $publishedAt
+        })
+        $files += [ordered]@{ volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourcePdf = [string]$entry.sourceFull; sharedPath = $destination; fileName = [string]$entry.fileName }
+    }
+    # 1冊だけの呼び出し元は volume/sharedPath/fileName を読む。先頭の1冊で従来の形を保つ。
+    $first = $files[0]
     return [ordered]@{
-        volume = $Volume
-        targetId = Get-TargetIdFromLegacyVolume $Volume
+        volume = $first.volume
+        targetId = $first.targetId
         packId = $packId
         category = $cat
-        sourcePdf = $sourceFull
-        sharedPath = $destination
+        sourcePdf = $first.sourcePdf
+        sharedPath = $first.sharedPath
         sharedFolder = $publishDir
         folderName = $folderName
-        fileName = $fileName
+        fileName = $first.fileName
+        files = @($files)
         publishedBy = $userName
         packName = $packName
         publishedAt = $publishedAt
     }
+}
+
+# 提出用PDFの画面の「まとめて共有用フォルダーにコピー」。ページが入っている出力先を
+# すべて1つの発行フォルダーへ入れる。ページの無い任意の出力先（空の補足など）は対象外。
+function Publish-DocumentPackAllPdfsToShared([string]$Language, [string]$PackIdOrCategory) {
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
+    $volumes = @()
+    foreach ($targetId in @(Get-PackTargetIds $Language $scope.pack)) {
+        $volume = Get-LegacyVolumeFromTargetId $Language $targetId
+        $ready = Get-FinalBuildReadiness $structure $Language $volume ([string]$scope.packId)
+        if ([int]$ready.pageCount -gt 0) { $volumes += $volume }
+    }
+    if ($volumes.Count -eq 0) { throw '共有発行できる提出用PDFがありません。先に提出用PDFを出力してください。' }
+    return Publish-DocumentPackPdfToShared $Language $volumes ([string]$scope.packId)
 }
 
 function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$Category) {
@@ -9195,6 +9459,9 @@ function Handle-Api($Context) {
                 foreach ($property in $targets.PSObject.Properties) {
                     $targetId = ([string]$property.Name).Trim().ToLowerInvariant()
                     $volume = if ($targetId -in @('none','unassigned')) { 'none' } else { Get-LegacyVolumeFromTargetId $language $targetId }
+                    # none と unassigned、または不正な targetId どうしが同じレーンになると、
+                    # 後のものが前のものを黙って上書きしていた。
+                    if ($volumeMap.Contains($volume)) { throw [System.ArgumentException]::new("同じ出力先が2回指定されています: $targetId") }
                     $volumeMap[$volume] = @(Get-Array $property.Value)
                 }
                 $volumes = [pscustomobject]$volumeMap
@@ -9295,6 +9562,11 @@ function Handle-Api($Context) {
             $targetId = Assert-PackTargetId $language $publishScope.pack $targetId
             $volume = Get-LegacyVolumeFromTargetId $language $targetId
             $result = Publish-DocumentPackPdfToShared $language $volume $packId
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/publish-all') {
+            $body = Read-BodyJson $Context.Request
+            $result = Publish-DocumentPackAllPdfsToShared $language ([string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')))
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/archives') {
@@ -12676,6 +12948,9 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 Set-NoteProperty $sn 'sourceWorkbooks' @($sw)
                 $all[$v] = $sn
             }
+            # ページの無い出力先は書き出さないので、重なりの検査からも外す。
+            $writing = @($requested | Where-Object { [int]$all[$_].pageCount -gt 0 })
+            if ($writing.Count -gt 0) { Assert-PackOutputPathsDistinct $st $Language (Get-BuiltinPackId $cat) $writing }
             return $all
         }
         foreach ($v in $requested) {
@@ -12691,8 +12966,8 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
 
         $composerJar = Join-Path $Script:AppRoot 'lib\pdfbox\ReportPdfComposer.jar'
         $pdfboxJar = Join-Path $Script:AppRoot 'lib\pdfbox\pdfbox-app.jar'
-        if (-not (Test-Path $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
-        if (-not (Test-Path $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $composerJar)) { throw 'ReportPdfComposer.jar がありません。' }
+        if (-not (Test-Path -LiteralPath $pdfboxJar)) { throw 'pdfbox-app.jar がありません。' }
 
         $txId = New-RbId
         $journal = [ordered]@{
@@ -12728,7 +13003,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
                 $tmp = Join-Path ([string]$paths.outputDir) ("~building_{0}_{1}_{2}.pdf" -f $v, $cat, $txId)
-                if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
                 Set-NoteProperty $t 'tempPath' $tmp
                 $snap = $snapshots[$v]
                 $manifest = [ordered]@{ schemaVersion=3; language=$Language; category=$cat; volume=$v; projectId=[string]$snap.projectId; inputFingerprint=[string]$snap.fingerprint; outputPdf=$tmp; createdAt=New-NowIso; document=$snap.document; pageNumber=[ordered]@{font='Arial';fontSize=8;bottomPt=18;format='hyphenated';countHidden=$true}; physicalPages=$snap.physicalPages; pages=$snap.manifestPages }
@@ -12744,7 +13019,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 } finally {
                     if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }
                 }
-                if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
+                if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
                 Set-NoteProperty $t 'newPdfHash' (Normalize-FileHash (New-Sha256 $tmp))
                 Set-NoteProperty $t 'manifest' $manifest
             }
@@ -12801,11 +13076,13 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                         outputPdf = [string](Get-DataProperty $old 'outputPdf' '')
                         lastBuiltAt = [string](Get-DataProperty $old 'lastBuiltAt' '')
                         staleReasons = @(Get-Array (Get-DataProperty $old 'staleReasons' @()))
+                        outputIntegrity = Get-DataProperty $old 'outputIntegrity' $null
                     } })
                     $t = Get-JournalTarget $journal $v
                     $journal.newVolumeStates[$v] = [ordered]@{
                         builtFingerprint = [string]$journal.beforeFingerprints[$v]
                         status = 'built'; outputPdf = [string]$t.finalPath; lastBuiltAt = New-NowIso; staleReasons = @()
+                        outputIntegrity = (Get-OutputPdfIntegrity ([string]$t.finalPath) ([string]$t.newPdfHash))
                     }
                 }
                 Write-FinalJournal $Language $journal
@@ -12817,6 +13094,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     Set-NoteProperty $vs 'builtFingerprint' ([string]$n.builtFingerprint)
                     Set-NoteProperty $vs 'lastBuiltAt' ([string]$n.lastBuiltAt)
                     Set-NoteProperty $vs 'outputPdf' ([string]$n.outputPdf)
+                    Set-NoteProperty $vs 'outputIntegrity' $n.outputIntegrity
                     Set-NoteProperty $vs 'staleReasons' @()
                     # 同じstructureロック内でfingerprintを確認済み。再度全ページを走査しない。
                     Set-NoteProperty $vs 'status' 'built'
@@ -12910,6 +13188,7 @@ function Restore-FinalTransaction([string]$Language, $Journal) {
                         Set-NoteProperty $vs 'outputPdf' ([string](Get-DataProperty $oldState 'outputPdf' ''))
                         Set-NoteProperty $vs 'lastBuiltAt' ([string](Get-DataProperty $oldState 'lastBuiltAt' ''))
                         Set-NoteProperty $vs 'staleReasons' @(Get-Array (Get-DataProperty $oldState 'staleReasons' @()))
+                        Set-NoteProperty $vs 'outputIntegrity' (Get-DataProperty $oldState 'outputIntegrity' $null)
                     }
                 } | Out-Null
             }

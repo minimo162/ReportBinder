@@ -1696,11 +1696,36 @@ function updateBulkSelectionLabel() {
 function setPageSaveStatus(kind='saved',text='保存済み'){
   const el=$('page-save-status');if(!el)return;el.classList.toggle('saving',kind==='saving');el.classList.toggle('error',kind==='error');el.textContent=text;
 }
+// 並べ替えの保存を待つ。boardSavePromise は直列の待ち行列で、保存に失敗すると false で
+// 解決したまま次の保存まで残る。保存が終わった後もそれを await すると、元に戻す・
+// シート順の並べ替え・一式の切り替えが前回の失敗を理由に無言で止まり続ける（H-4）。
+// 保存が進行中のときだけ待ち、その結果を返す。
+function awaitBoardSave(){
+  return (boardSaveMutationBusy||pendingBoardSaveVolumes)?boardSavePromise:Promise.resolve(true);
+}
+// 出力・共有コピーの前に、保留中のページ変更をすべて待つ（M-14）。並べ替えの保存だけを
+// 待つと、「移動先」・元に戻す・やり直し・シート順の並べ替え・プレビューからの移動・
+// ページ名や範囲の保存の直後に出力したとき、変更前の構成でPDFができる。これらは
+// どれも pageMutationBusy（元に戻すは pageLayoutHistoryBusy も）を立てて送るので、
+// 旗がすべて下りるまで待つ。並べ替えの保存が失敗したら false を返す。それ以外の
+// 失敗は画面がサーバーの状態のまま残るので、出力はその状態で行ってよい。
+async function awaitPageMutationsIdle(timeoutMs=120000){
+  // ページ名の入力欄から出力ボタンへ移ると、focusout の保存が先に始まる。その旗が
+  // 立つまで1回待つ。
+  await sleep(0);
+  const deadline=Date.now()+timeoutMs;
+  for(;;){
+    if(boardSaveMutationBusy||pendingBoardSaveVolumes){if(!(await awaitBoardSave()))return false;continue;}
+    if(!pageMutationBusy&&!pageLayoutHistoryBusy)return true;
+    if(Date.now()>deadline)return false;
+    await sleep(50);
+  }
+}
 async function waitForQueuedPageLayoutMutation(){
   // Only a pointer/keyboard board save is safely awaitable here. Other layout
   // mutations keep their existing busy guard and return without building a
   // request body against a moving state.
-  if(boardSaveMutationBusy){const saved=await boardSavePromise;if(!saved)return false;}
+  if(!(await awaitBoardSave()))return false;
   return !pageMutationBusy;
 }
 
@@ -1708,6 +1733,7 @@ async function savePackSettings(btn){
   const pack=packForPreset();if(!pack?.packId){showMessage('danger','一式設定を保存できません','対象の一式が見つかりません。');return;}
   const body={outputFileNamePattern:String($('pack-output-pattern')?.value||'').trim()};
   if(!body.outputFileNamePattern){showMessage('warn','出力ファイル名を入力してください','使用できる変数は {packName}・{targetName}・{yyyyMMdd} です。');$('pack-output-pattern')?.focus();return;}
+  if(!body.outputFileNamePattern.includes('{targetName}')){showMessage('warn','出力ファイル名に {targetName} を含めてください','含めないと本体と補足が同じファイル名になり、互いに上書きされます。');$('pack-output-pattern')?.focus();return;}
   await runBusy(btn,async()=>{try{
     const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}`,{method:'PATCH',body});
     // Pack output settings are part of the final-input fingerprint.  Do not
@@ -2099,7 +2125,7 @@ async function applyPageLayoutHistory(direction,btn=null){
   let button=btn;
   try{
     if(pendingPageLayoutUndo){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}const saved=await saveBoardOrder();if(!saved)return;}
-    const savedBeforeHistory=await boardSavePromise;if(!savedBeforeHistory)return;
+    const savedBeforeHistory=await awaitBoardSave();if(!savedBeforeHistory)return;
     const redo=direction==='redo',source=redo?pageLayoutRedoStack:pageLayoutUndoStack,target=redo?pageLayoutUndoStack:pageLayoutRedoStack,entry=source[source.length-1];if(!entry)return;
     button=btn||$(redo?'page-layout-redo-btn':'page-layout-undo-btn');if(button){button.disabled=true;button.classList.add('busy');}
     setPageSaveStatus('saving','保存中…');
@@ -2120,12 +2146,12 @@ function renderVolumeLinks() {
     // primary action and moves to the front; re-outputting drops to tertiary.
     const fresh=available&&String(r.displayState||'')==='built';
     if(a){
-      if(available){a.href='#';a.dataset.volume=volume;a.dataset.category=activePreset;setTextIfChanged(a,fresh?'出力したPDFを開く':'前回出力を開く');setClassIfChanged(a,fresh?'btn primary':'btn secondary');a.classList.remove('hidden');}
+      if(available){a.href='#';a.dataset.category=activePreset;setTextIfChanged(a,fresh?'出力したPDFを開く':'前回出力を開く');setClassIfChanged(a,fresh?'btn primary':'btn secondary');a.classList.remove('hidden');}
       else{a.removeAttribute('href');a.classList.add('hidden');}
     }
     const buildBtn=card.querySelector('[data-final-build]');
     setClassIfChanged(buildBtn,fresh?'btn ghost':'btn primary');
-    if(publish){publish.disabled=!publishable;setClassIfChanged(publish,`btn secondary${publishable?'':' hidden'}`);}
+    if(publish){publish.disabled=!publishable||!!activeFinalJobId;setClassIfChanged(publish,`btn secondary${publishable?'':' hidden'}`);}
     // 出力したPDFは別タブで見るだけでは掴めない。メールに添付する・共有フォルダーへ
     // 置くには実体が要るので、保存先そのものを画面に出し、フォルダーを開けるようにする。
     const pathBox=card.querySelector('[data-final-path]'),reveal=card.querySelector('[data-final-reveal]');
@@ -2133,9 +2159,18 @@ function renderVolumeLinks() {
       if(available){setHtmlIfChanged(pathBox,`<span class="final-path-label">保存先</span><span class="final-path-value" title="${escapeAttr(String(r.outputPdf||''))}">${escapeHtml(String(r.outputPdf||''))}</span>`);pathBox.classList.remove('hidden');}
       else{pathBox.classList.add('hidden');}
     }
-    if(reveal){reveal.dataset.volume=volume;setClassIfChanged(reveal,`btn secondary${available?'':' hidden'}`);}
+    if(reveal){setClassIfChanged(reveal,`btn secondary${available?'':' hidden'}`);}
     card.classList.toggle('has-output',fresh);
   });
+  // まとめてコピーは、ページの入っている出力先がすべて最新で出力済みのときだけ出す。
+  // 1冊でも古いまま混ぜると、共有側では新旧の組み合わせを見分けられない。
+  const publishAll=$('publish-all-btn');
+  if(publishAll){
+    const withPages=activeTargetDefinitions().map(target=>volumeReadiness(targetVolume(target.targetId))).filter(r=>Number(r?.pageCount||0)>0);
+    const ready=withPages.length>0&&withPages.every(r=>!!(r.outputPdf&&r.outputPdfExists)&&String(r.displayState||'')==='built');
+    publishAll.disabled=!ready||!!activeFinalJobId;
+    setClassIfChanged(publishAll,`btn secondary${ready?'':' hidden'}`);
+  }
 }
 
 
@@ -2411,7 +2446,7 @@ function visibleUnregisteredFiles(files) {
 function capturePageBoardScroll() {
   const focusedRow=document.activeElement?.closest?.('.page-row');
   const snap = {windowX: window.scrollX || 0, windowY: window.scrollY || 0, focusPageId:String(focusedRow?.dataset?.pageId||''), wraps: {}};
-  document.querySelectorAll('[data-volume]').forEach(tbody => {
+  pageBoardLanes().forEach(tbody => {
     const volume = tbody.getAttribute('data-volume') || '';
     const wrap = tbody.closest('.table-wrap,.thumbnail-wrap');
     if (volume && wrap) snap.wraps[volume] = {top: wrap.scrollTop || 0, left: wrap.scrollLeft || 0};
@@ -2422,7 +2457,7 @@ function restorePageBoardScroll(snap) {
   if (!snap) return;
   requestAnimationFrame(() => {
     for (const [volume, pos] of Object.entries(snap.wraps || {})) {
-      const tbody = [...document.querySelectorAll('[data-volume]')].find(t => t.getAttribute('data-volume') === volume);
+      const tbody = [...pageBoardLanes()].find(t => t.getAttribute('data-volume') === volume);
       const wrap = tbody?.closest?.('.table-wrap,.thumbnail-wrap');
       if (wrap) { wrap.scrollTop = pos.top || 0; wrap.scrollLeft = pos.left || 0; }
     }
@@ -2508,7 +2543,7 @@ function visiblePageSelectionValues() {
 function pageSelectionValuesForCard(card) {
   const volume=String(card?.closest?.('[data-volume]')?.getAttribute('data-volume')||'');
   if(!volume)return visiblePageSelectionValues();
-  const lane=[...document.querySelectorAll('[data-volume]')].find(element=>String(element.getAttribute('data-volume')||'')===volume);
+  const lane=[...pageBoardLanes()].find(element=>String(element.getAttribute('data-volume')||'')===volume);
   return [...(lane?.querySelectorAll('.page-row:not(.page-filter-hidden)')||[]) ]
     .filter(row=>row.offsetParent!==null)
     .map(row=>String(row.getAttribute('data-page-id')||'')).filter(Boolean);
@@ -2802,8 +2837,8 @@ async function applyPresetSelection(presetOrButton) {
   if(presetChanged){
     // A queued save belongs to the currently active pack. Do not switch the
     // state container while that response can still arrive and be applied.
-    if(pendingPageLayoutUndo||pendingBoardSaveVolumes){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}await saveBoardOrder();}
-    const saved=await boardSavePromise;
+    if(pendingPageLayoutUndo||pendingBoardSaveVolumes){if(boardSaveTimer){clearTimeout(boardSaveTimer);boardSaveTimer=null;}if(!(await saveBoardOrder())){showMessage('warn','一式を切り替えられません','ページ構成を保存できなかったため、内容を確認してからもう一度切り替えてください。');return;}}
+    const saved=await awaitBoardSave();
     if(!saved){showMessage('warn','一式を切り替えられません','ページ構成を保存できなかったため、内容を確認してからもう一度切り替えてください。');return;}
   }
   activePreset=preset;activePackId=nextPackId;rememberActivePack(activePackId);try{sessionStorage.setItem('ReportBinderCategory',activePreset);}catch{}
@@ -4620,7 +4655,7 @@ function highlightVolumeTabTarget(tab) {
   tab?.classList.add('drop-target-tab');
 }
 function renumberBoardRows() {
-  document.querySelectorAll('[data-volume]').forEach(tbody => {
+  pageBoardLanes().forEach(tbody => {
     let n = 1;
     [...tbody.querySelectorAll('.page-row,.drop-placeholder')].forEach(row => {
       if (row.classList.contains('empty-row')) return;
@@ -4651,7 +4686,7 @@ function previewBoardVolumesForDrop(tbody, afterRow) {
   const movingIds = dragRowIds(drag);
   const moving = new Set(movingIds);
   const volumes = {};
-  document.querySelectorAll('[data-volume]').forEach(tb => {
+  pageBoardLanes().forEach(tb => {
     volumes[tb.getAttribute('data-volume')] = [...tb.querySelectorAll('.page-row')]
       .map(row => String(row.getAttribute('data-page-id') || ''))
       .filter(id => id && !moving.has(id));
@@ -4706,7 +4741,7 @@ function findDropTbodyAt(x, y) {
   // Fallback for cases where the pointer is over a sticky header or a scrollbar.
   let best = null;
   let bestDistance = Infinity;
-  document.querySelectorAll('[data-volume]').forEach(tbody => {
+  pageBoardLanes().forEach(tbody => {
     const panel = tbody.closest('.volume-panel');
     const rect = panel?.getBoundingClientRect?.();
     if (!rect) return;
@@ -4966,13 +5001,13 @@ function handleBoardRowKeydown(row,e){
   if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key))return;
   e.preventDefault();const tbody=row.parentElement;const rows=[...tbody.querySelectorAll('.page-row:not(.page-filter-hidden)')];const idx=rows.indexOf(row);if(idx<0)return;const beforeVolumes=collectBoardVolumes();let moved=false;
   if(e.key==='ArrowLeft'||e.key==='ArrowRight'){
-    const volumeOrder=['none',...activeTargetVolumes()],current=String(tbody.dataset.volume||''),currentIndex=volumeOrder.indexOf(current);if(currentIndex<0)return;const targetIndex=e.shiftKey?(e.key==='ArrowLeft'?0:volumeOrder.length-1):currentIndex+(e.key==='ArrowLeft'?-1:1);if(targetIndex<0||targetIndex>=volumeOrder.length||targetIndex===currentIndex)return;const targetVolume=volumeOrder[targetIndex],target=[...document.querySelectorAll('[data-volume]')].find(container=>String(container.dataset.volume||'')===targetVolume);if(!target)return;const targetPanel=target.closest('.volume-panel');targetPanel?.classList.remove('collapsed');targetPanel?.querySelector('[data-toggle-volume]')?.setAttribute('aria-expanded','true');pageVolumeCollapseOverrides.set(targetVolume,false);for(const movingRow of getRowsForDrag(row)){target.appendChild(movingRow);moved=true;}
+    const volumeOrder=['none',...activeTargetVolumes()],current=String(tbody.dataset.volume||''),currentIndex=volumeOrder.indexOf(current);if(currentIndex<0)return;const targetIndex=e.shiftKey?(e.key==='ArrowLeft'?0:volumeOrder.length-1):currentIndex+(e.key==='ArrowLeft'?-1:1);if(targetIndex<0||targetIndex>=volumeOrder.length||targetIndex===currentIndex)return;const targetVolume=volumeOrder[targetIndex],target=[...pageBoardLanes()].find(container=>String(container.dataset.volume||'')===targetVolume);if(!target)return;const targetPanel=target.closest('.volume-panel');targetPanel?.classList.remove('collapsed');targetPanel?.querySelector('[data-toggle-volume]')?.setAttribute('aria-expanded','true');pageVolumeCollapseOverrides.set(targetVolume,false);for(const movingRow of getRowsForDrag(row)){target.appendChild(movingRow);moved=true;}
   }else if(e.shiftKey){if(e.key==='ArrowUp'&&idx>0){tbody.insertBefore(row,rows[0]);moved=true;}else if(e.key==='ArrowDown'&&idx<rows.length-1){tbody.appendChild(row);moved=true;}}
   else if(e.key==='ArrowUp'&&idx>0){tbody.insertBefore(row,rows[idx-1]);moved=true;}else if(e.key==='ArrowDown'&&idx<rows.length-1){tbody.insertBefore(rows[idx+1],row);moved=true;}
   if(!moved)return;renumberBoardRows();const afterVolumes=collectBoardVolumes();renderPageOverview({volumes:afterVolumes});scheduleBoardSave({label:e.key==='ArrowLeft'||e.key==='ArrowRight'?'キーボードでの出力先移動':'キーボードでの並べ替え',volumes:beforeVolumes,afterVolumes});const focusTarget=row.offsetParent!==null?row:visiblePageRowsForKeyboard().find(candidate=>candidate!==row);syncPageRovingTabIndex(focusTarget||null);if(focusTarget)focusTarget.focus();else $('page-volume-tabs')?.querySelector('.page-volume-tab.active')?.focus();
 }
 function volumeIdsForSelectAll(volume){
-  const container=[...document.querySelectorAll('[data-volume]')].find(t=>String(t.dataset.volume||'')===String(volume||''));
+  const container=[...pageBoardLanes()].find(t=>String(t.dataset.volume||'')===String(volume||''));
   return container?[...container.querySelectorAll('.page-row:not(.page-filter-hidden)')].map(r=>r.dataset.pageId).filter(Boolean):[];
 }
 function delegateBoardEvents(box){
@@ -5044,9 +5079,16 @@ function attachBoardEvents() {
   syncPageRovingTabIndex();
 }
 
+// ページ構成のレーンは #page-board の中にだけある。文書全体から [data-volume] を探すと、
+// 後ろにある提出用PDF画面などの要素まで拾い、同じ出力先の並びを空で上書きしてしまう。
+// そうなると並べ替え前後の並びが同じに見えて保存されず、PDFは変更前の構成で作られていた。
+function pageBoardLanes(){
+  const board=$('page-board');
+  return board?[...board.querySelectorAll('[data-volume]')]:[];
+}
 function collectBoardVolumes() {
   const volumes = {};
-  document.querySelectorAll('[data-volume]').forEach(tbody => {
+  pageBoardLanes().forEach(tbody => {
     volumes[tbody.getAttribute('data-volume')] = [...tbody.querySelectorAll('.page-row')].map(row => row.getAttribute('data-page-id'));
   });
   return volumes;
@@ -5305,7 +5347,7 @@ async function sortPagesByNumericSheet(btn=null) {
     // A drag save may already be queued. Sort only after it advances the
     // optimistic-lock fingerprint, otherwise both requests share the same
     // baseLayout and one necessarily loses.
-    const priorSaveSucceeded=await boardSavePromise;
+    const priorSaveSucceeded=await awaitBoardSave();
     if(!priorSaveSucceeded)return;
     const beforeVolumes=collectBoardVolumes(),requestRevision=boardSaveRevision;
     const numericBefore=numericSheetSequenceIsDefault();
@@ -5603,10 +5645,16 @@ async function buildVolume(volume, btn) {
 async function runFinalBuildJob(targetIds){
   const ids=asArray(targetIds).map(id=>String(id||'')).filter(Boolean);
   if(!ids.length){showMessage('warn','出力先がありません','ページ構成で本体または補足にページを設定してください。');return null;}
+  // ページ構成の変更は非同期で送る。直後に出力を押すと、保存より先に出力が始まり
+  // 変更前の構成でPDFができる。保存を待ち、保存できなかったら出力しない。
+  if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったため出力していません','ページ構成を確認してから、もう一度出力してください。');return null;}
   const started=await api('/api/v2/outputs/build',{method:'POST',body:{packId:activePackId,targetIds:ids}});
   const jobId=String(started.job?.jobId||'');
   if(!jobId)throw new Error('提出用PDFの出力を開始できませんでした。もう一度「提出用PDFをまとめて出力」を押してください。');
   activeFinalJobId=jobId;activeFinalCancelRequested=false;
+  // 出力中は共有用フォルダーへのコピーを押せなくする（M-3）。置き換え途中のPDFや
+  // 世代の違う本体と補足を発行しない。終わったら finally で戻す。
+  renderVolumeLinks();
   updateFinalProgressPanel(started.job);
   try{
     for(;;){
@@ -5629,6 +5677,7 @@ async function runFinalBuildJob(targetIds){
   } finally {
     activeFinalJobId='';activeFinalCancelRequested=false;
     hideProgressPanel();
+    renderVolumeLinks();
   }
 }
 function updateFinalProgressPanel(job){
@@ -5673,6 +5722,8 @@ async function cancelActiveFinalJob(){
 
 async function publishFinalVolume(volume,btn) {
   await runBusy(btn,async()=>{
+    if(activeFinalJobId){showMessage('warn','提出用PDFを出力中です','出力が終わってから、もう一度共有用フォルダーにコピーしてください。');return;}
+    if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
     const custom=!activePackIsBuiltIn();
     const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
     const result=response.result||{};
@@ -5683,6 +5734,23 @@ async function publishFinalVolume(volume,btn) {
       result.sharedPath
         ?`${String(result.sharedPath)} に保存しました。`
         :`${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
+      result,[],0);
+  });
+}
+
+// 本体・補足を別々にコピーすると、共有側に発行フォルダーが2つできて受け取る側が
+// 組み合わせを取り違える。ページの入っている出力先をすべて1つのフォルダーへ入れる。
+async function publishAllFinalVolumes(btn) {
+  await runBusy(btn,async()=>{
+    if(activeFinalJobId){showMessage('warn','提出用PDFを出力中です','出力が終わってから、もう一度共有用フォルダーにコピーしてください。');return;}
+    if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
+    const response=await api('/api/v2/outputs/publish-all',{method:'POST',body:{packId:activePackId}});
+    const result=response.result||{};
+    const names=asArray(result.files).map(file=>String(file?.fileName||'')).filter(Boolean);
+    showMessage('ok','提出用PDFをまとめて共有用フォルダーにコピーしました',
+      result.sharedFolder
+        ?`${String(result.sharedFolder)} に ${names.join('、')||'PDF'} を保存しました。`
+        :`${result.folderName||'発行フォルダー'} に ${names.join('、')||'PDF'} を保存しました。`,
       result,[],0);
   });
 }
@@ -5846,6 +5914,7 @@ const pageThumbnailSizeInput=$('page-thumbnail-size');if(pageThumbnailSizeInput)
 bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
 bind('register-selected-btn','click',()=>registerSelected($('register-selected-btn')));bind('unregister-selected-btn','click',()=>unregisterSelected($('unregister-selected-btn')));bind('render-selected-btn','click',()=>renderSelectedWorkbooks($('render-selected-btn')));bind('render-all-btn','click',()=>renderAllWorkbooks($('render-all-btn')));bind('sort-by-sheet-btn','click',()=>sortPagesByNumericSheet($('sort-by-sheet-btn')));bind('collect-numeric-sheets-btn','click',()=>collectNumericSheets($('collect-numeric-sheets-btn')));
 bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
+bind('publish-all-btn','click',()=>publishAllFinalVolumes($('publish-all-btn')));
 bind('source-next-pages','click',()=>setActiveView('pages'));
 bind('change-source-folder-btn','click',()=>chooseSubmissionFolder($('change-source-folder-btn')));
 bind('save-pack-settings-btn','click',()=>savePackSettings($('save-pack-settings-btn')));

@@ -104,8 +104,17 @@ Assert-PackTest (@(Get-PackTemplateCatalog 'en' | Where-Object { [string]$_.temp
 
 $created = New-DocumentPack 'en' ([pscustomobject]@{
     displayName = 'Monthly Department Report'
-    settings = [pscustomobject]@{ documentTitle='Monthly Department Report'; outputFileNamePattern='{packName}_{yyyyMMdd}.pdf' }
+    settings = [pscustomobject]@{ documentTitle='Monthly Department Report'; outputFileNamePattern='{packName}_{targetName}_{yyyyMMdd}.pdf' }
 })
+$patternWithoutTargetRejected = $false
+try { [void](New-DocumentPack 'en' ([pscustomobject]@{ displayName='No Target Name'; settings=[pscustomobject]@{ outputFileNamePattern='{packName}_{yyyyMMdd}.pdf' } })) } catch { $patternWithoutTargetRejected = $true }
+Assert-PackTest $patternWithoutTargetRejected 'An output file name pattern without {targetName} was accepted.'
+$templateWithoutTargetRejected = $false
+try { [void](Save-PackTemplate 'en' ([pscustomobject]@{ displayName='No Target Template'; acceptedSourceTypes=@('pdf'); output=[pscustomobject]@{ fileNamePattern='{packName}.pdf' } })) } catch { $templateWithoutTargetRejected = $true }
+Assert-PackTest $templateWithoutTargetRejected 'A template output pattern without {targetName} was accepted.'
+$wrongCaseRejected = $false
+try { [void](New-DocumentPack 'en' ([pscustomobject]@{ displayName='Wrong Case'; settings=[pscustomobject]@{ outputFileNamePattern='{packName}_{targetName}_{YYYYMMDD}.pdf' } })) } catch { $wrongCaseRejected = $true }
+Assert-PackTest $wrongCaseRejected 'A placeholder with different casing was accepted but would not be replaced.'
 Assert-PackTest ([string]$created.packId -match '^pack_[0-9a-f]{16}$') 'Custom packId is invalid.'
 Assert-PackTest ([string]$created.templateId -eq 'builtin-generic-department-pack') 'Default template was not assigned.'
 Assert-PackTest ([string]$created.settings.documentTitle -eq 'Monthly Department Report') 'Create settings were not applied.'

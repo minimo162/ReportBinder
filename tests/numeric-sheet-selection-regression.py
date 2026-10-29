@@ -457,7 +457,7 @@ def test_page_composition_ui_contracts():
     assert "hasManualFlags" not in sort_action
     assert "pageVolumeSnapshotsEqual(beforeVolumes,collectBoardVolumes())" in sort_action
     assert "if(pageMutationBusy||pageLayoutHistoryBusy)return" in sort_action
-    assert "priorSaveSucceeded=await boardSavePromise" in sort_action
+    assert "priorSaveSucceeded=await awaitBoardSave()" in sort_action
     assert "error.code==='structure-conflict'" in sort_action
     assert "await handlePageLayoutConflict(beforeVolumes,requestRevision)" in sort_action
     assert "finally{pageMutationBusy=false" in sort_action

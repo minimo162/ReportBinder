@@ -50,7 +50,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/sources/scan-updates`: 登録済み原稿の更新を検出する
 - `POST /api/v2/sources/render/start`: `sourceIds`で変換PDF作成を開始する。Excelは保存済みの`excelSheetSelectionMode`（新規登録は`numeric-only`、既存の明示設定や旧データの欠損フィールドは互換のため維持）をジョブへ固定する。必要ならリクエストにも同名項目を指定できる
 - `PATCH /api/v2/sources/{sourceId}`: `ownerDepartment / required / defaultTargetId`を更新する。Excelでは`excelSheetSelectionMode`も指定でき、`numeric-only`はシート名がstrictな`^[0-9]+$`の表示シートだけをPDF化する。対象が0件の場合はPDF・ページ構成を変更せずエラーにする
-- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。ページ画面の「半角数字シートをまとめる」はこのAPIを使い、Excelのstrictな半角数字シートを数字順に指定先へ集め、非該当Excelを未振り分けへ戻す。`baseLayout`を指定した場合は競合を検出する
+- `POST /api/v2/items/reorder`: 資料パック内のページを本体・補足・未振り分けへ移動、並べ替えする。ページ画面の「半角数字シートをまとめる」はこのAPIを使い、Excelのstrictな半角数字シートを数字順に指定先へ集め、非該当Excelを未振り分けへ戻す。`baseLayout`を指定した場合は競合を検出する。送ったレーン（`volumes`または`targets`のキー）に今あるページは、送った内容のどこかにちょうど1回ずつ含めてください。空のレーン、ページの欠落、この一式に無いID、同じIDの重複、同じ出力先の二重指定はどれも400を返し、何も保存しない
 - `PATCH /api/v2/items/{itemId}`: ページ名、番号表示、ページ範囲、出力先を変更する（現行UIは未使用）。`baseLayout`を指定した場合は競合を検出する
 - `GET /api/v2/layout/snapshots?packId={packId}`: 資料パックの保存済みページ構成を返す
 - `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
@@ -59,7 +59,8 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/outputs/build`: 資料パックの提出用PDFを出力するジョブを開始し、`job`（`jobId`・`status`・`total`）を返す。HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると進捗ポーリングも中止も受け付けられない。実処理は子プロセスで走る
 - `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない
-- `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する
+- `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する。出力を確定したときにPDFのサイズ・更新日時・SHA-256を`outputIntegrity`として記録し、発行の前にハッシュを、共有側へコピーした後にもハッシュを照合する。出力後に変更・上書きされたPDF、記録の無い（以前の版で出力した）PDFは発行せず、再出力を求める。readinessはサイズと更新日時が記録と違えば`needs-rebuild`（`staleReasons[].type`=`output-changed`）を返す。提出用PDFの出力ジョブの実行中は拒否し、出力と同じロックを持ってコピーする（`publish-all`も同じ）
+- `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`を返す
 - `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す
 
 `PATCH`の例：
@@ -116,7 +117,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
   "templateId": "builtin-generic-department-pack",
   "settings": {
     "documentTitle": "月次部門報告書",
-    "outputFileNamePattern": "{packName}_{yyyyMMdd}.pdf"
+    "outputFileNamePattern": "{packName}_{targetName}_{yyyyMMdd}.pdf"
   }
 }
 ```
@@ -452,7 +453,7 @@ categoryは必須です。
 }
 ```
 
-実際に順序・割当が変わったvolumeだけを更新対象にします。
+実際に順序・割当が変わったvolumeだけを更新対象にします。送ったvolumeに今あるページが欠けている場合や、未知・重複のIDがある場合は400を返し、何も保存しません（`POST /api/v2/items/reorder`と同じ検証）。
 
 ページ構成画面の「半角数字シートをまとめる」は、選択した出力先へ`^[0-9]+$`のシート名を文字列として安全に数字順で配置します。Excel以外のページはアンカーとして保持し、非該当Excelと既存の非表示シートページは`none`へ移します。変更がない場合はリクエストも履歴スナップショットも作りません。
 
@@ -657,7 +658,7 @@ ecm / bod / dmm
 }
 ```
 
-ファイル名には`{projectId}`、`{packName}`、`{targetName}`、`{yyyyMMdd}`を使用できます。
+ファイル名には`{projectId}`、`{packName}`、`{targetName}`、`{yyyyMMdd}`を使用できます。`{targetName}`は必須です。含まない型は一式の設定・ひな形の保存時に400で拒否します。保存済みの古い型で出力先どうし（または他の一式の出力PDF）と同じパスになる場合は、出力を開始せずに失敗させます。
 
 ## 任意資料パックの原稿・ページ・出力
 
@@ -675,6 +676,7 @@ GET   /api/v2/outputs/readiness?packId=pack_...
 POST  /api/v2/outputs/build
 POST  /api/v2/outputs/file
 POST  /api/v2/outputs/publish
+POST  /api/v2/outputs/publish-all
 GET   /api/v2/outputs/archives?packId=pack_...
 ```
 

@@ -14,11 +14,11 @@ required = [
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
-    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
+    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/output-publish-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -97,6 +97,19 @@ if '-SkipPackageSmoke' in release_workflow:
     raise SystemExit('the release workflow must not skip the package smoke tests')
 for ps1 in ['app/server.ps1','app/launch.ps1','app/lib/pdfbox/build.ps1','app/tools/install-thirdparty.ps1','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1','app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1']:
     if not (root/ps1).read_bytes().startswith(b'\xef\xbb\xbf'): raise SystemExit(f'PowerShell must be UTF-8 BOM: {ps1}')
+# -Path（位置引数）はワイルドカードとして解釈されるため、「[最終]」のような角括弧を含む
+# 一式名・出力ファイル名・アプリの置き場所で、ファイルがあるのに無いと判定する（M-8）。
+for _ps1 in sorted((root/'app').rglob('*.ps1')):
+    for _lineno, _line in enumerate(_ps1.read_text(encoding='utf-8-sig').splitlines(), 1):
+        if re.search(r'\b(Test-Path|Get-Item|Remove-Item)\s+[$(]', _line):
+            raise SystemExit(f'use -LiteralPath for file paths: {_ps1.relative_to(root).as_posix()}:{_lineno}')
+# Windows PowerShell 5.1 は BOM の無い .ps1 を ANSI として読む。日本語の文字列を
+# 照合する検査スクリプトでは、照合する側だけが化けて検査が必ず失敗する（または空振りする）。
+# 一覧に無いものも含め、ASCII 以外の文字を含む .ps1 はすべて BOM 付きにする。
+for _ps1 in sorted((root/'app').rglob('*.ps1')):
+    _raw = _ps1.read_bytes()
+    if not _raw.startswith(b'\xef\xbb\xbf') and any(byte > 0x7f for byte in _raw):
+        raise SystemExit(f'PowerShell with non-ASCII text must be UTF-8 BOM: {_ps1.relative_to(root).as_posix()}')
 
 launcher_cmd=(root/'資料をPDFにまとめる.cmd').read_text(encoding='utf-8-sig')
 for needed in ['app\\launch.ps1', 'start "" /b', 'powershell.exe']:
@@ -1596,7 +1609,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20260822_v191', 'style.css?v=20260822_v121']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261029_v193', 'style.css?v=20260822_v121']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1651,7 +1664,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20260822_v191' not in html:
+if 'app.js?v=20261029_v193' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1677,7 +1690,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20260822_v191' not in html:
+if 'app.js?v=20261029_v193' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1753,7 +1766,7 @@ _default_paths = server.split('function Get-DefaultChildPaths',1)[1].split('\nfu
 for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出力'"]:
     if forbidden in _default_paths:
         raise SystemExit(f'shared folder is still the default working storage: {forbidden}')
-_publish = server.split('function Publish-DocumentPackPdfToShared',1)[1].split('\nfunction ',1)[0]
+_publish = server.split('function Publish-DocumentPackPdfToSharedLocked',1)[1].split('\nfunction ',1)[0]
 for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
                'Get-SafePublishPackName',
                '"{0}_{1}_{2}" -f $stamp, $packName, $userName',
@@ -1771,6 +1784,35 @@ for needed in ["'/api/final/publish'", "'/api/v2/outputs/publish'", 'data-final-
                "publishable=available&&String(r.displayState||'')==='built'"]:
     if needed not in (server + html + appjs):
         raise SystemExit(f'shared publish UI/API is missing: {needed}')
+# 本体・補足を別々にしかコピーできないと、共有側に発行フォルダーが出力先の数だけでき、
+# 受け取る側が組み合わせを取り違える。まとめてコピーは1つの発行フォルダーへ全冊を入れ、
+# 1冊でも最新でなければ何もコピーしない。
+if '[string[]]$Volumes' not in _publish or not re.search(r'foreach \(\$entry in \$entries\) \{\s*\$stagedPdf = Join-Path \$stagingDir', _publish):
+    raise SystemExit('shared publishing must copy every requested PDF into one publish folder')
+if _publish.count('Move-Item -LiteralPath $stagingDir -Destination $publishDir') != 1:
+    raise SystemExit('shared publishing must switch the staged folder into place exactly once')
+_publish_all = server.split('function Publish-DocumentPackAllPdfsToShared',1)[1].split('\nfunction ',1)[0] if 'function Publish-DocumentPackAllPdfsToShared' in server else ''
+if 'Get-PackTargetIds' not in _publish_all or 'Publish-DocumentPackPdfToShared $Language $volumes' not in _publish_all:
+    raise SystemExit('publish-all must collect every target with pages and publish them together')
+# H-1: 出力先パスの重なりの検査そのものは output-publish-selfcheck.ps1 が振る舞いで見る。
+# ここでは、組版（Java）より前に両方の出力経路から呼ばれていることを見る。
+for _fn in ['function Build-DocumentPackPdf', 'function Invoke-FinalBuildTransaction']:
+    _body = server.split(_fn,1)[1].split('\nfunction ',1)[0]
+    _guard = _body.find('Assert-PackOutputPathsDistinct')
+    if _guard < 0 or _guard > _body.find('Resolve-JavaExe'):
+        raise SystemExit(f'{_fn} must reject overlapping output paths before composing the PDF')
+if 'Output and shared-copy regression' not in _fast:
+    raise SystemExit('the fast gate must run the output and shared-copy regression')
+for needed in ["'/api/v2/outputs/publish-all'", 'Publish-DocumentPackAllPdfsToShared $language']:
+    if needed not in server:
+        raise SystemExit(f'publish-all API route is missing: {needed}')
+for needed in ['id="publish-all-btn"', '提出用PDFをまとめて共有用フォルダーにコピー']:
+    if needed not in html:
+        raise SystemExit(f'publish-all button is missing: {needed}')
+for needed in ["api('/api/v2/outputs/publish-all'", "bind('publish-all-btn','click'",
+               "withPages.every(r=>!!(r.outputPdf&&r.outputPdfExists)&&String(r.displayState||'')==='built')"]:
+    if needed not in appjs:
+        raise SystemExit(f'publish-all UI wiring is missing: {needed}')
 # 出力したPDFは別タブで見られるだけでは持ち出せない。保存先そのものと、そこを開く
 # 手段を画面に出す。ここが無いと、添付も共有フォルダーへのコピーもできない。
 for needed in ["'/api/v2/outputs/reveal'", 'function Resolve-OutputPdfForReveal', 'function Open-OutputPdfLocation',
@@ -2157,7 +2199,7 @@ for needed in ['boardSavePromise=boardSavePromise.then(persist,persist)',
                'undo?.afterVolumes||collectBoardVolumes()',
                'rememberPageLayoutUndo(undo.label,undo.volumes,afterVolumes)',
                'void saveBoardOrder()',
-               'savedBeforeHistory=await boardSavePromise',
+               'savedBeforeHistory=await awaitBoardSave()',
                'beforeVolumes=JSON.parse(beforeSignature)',
                'afterVolumes=JSON.parse(drag.previewSignature||afterSignature)']:
     if needed not in appjs:
@@ -2169,7 +2211,7 @@ _persist_start = _save_board.find('const persist=async()=>')
 if _persist_start < 0 or _save_board.find('activeLayoutFingerprint(requestPackId)', _persist_start) < 0:
     raise SystemExit('serialized page saves freeze the pack id but not the latest per-pack fingerprint')
 _pack_switch = appjs.split('async function applyPresetSelection', 1)[1].split('\nasync function registerSelected', 1)[0]
-if 'const saved=await boardSavePromise' not in _pack_switch or "if(!saved){showMessage('warn','一式を切り替えられません'" not in _pack_switch:
+if 'const saved=await awaitBoardSave()' not in _pack_switch or "if(!saved){showMessage('warn','一式を切り替えられません'" not in _pack_switch:
     raise SystemExit('pack switching can race with an in-flight page-layout save')
 _render_pages = appjs.split('function renderPages()', 1)[1].split('\nfunction dynamicVolumePanelHtml', 1)[0]
 if 'cs=changeSummaryFor(p.workbookId)' not in _render_pages or 'p.changeSummary' in _render_pages:
@@ -2758,5 +2800,19 @@ if 'collect-numeric-sheets-btn' not in html or 'data-source-sheet-selection' not
 numeric_regression = subprocess.run([sys.executable, str(root / 'tests/numeric-sheet-selection-regression.py')], capture_output=True, text=True)
 if numeric_regression.returncode != 0:
     raise SystemExit('numeric-sheet selection regression failed: ' + (numeric_regression.stdout + numeric_regression.stderr).strip())
+
+# ページ構成のレーン以外が data-volume を持つと、並べ替えが保存されずPDFが変更前の構成で
+# 作られる。実物の関数を偽のDOMで動かして確かめる。
+_node = shutil.which('node')
+if _node is None:
+    raise SystemExit('node is required for the page-board lanes regression')
+lanes_regression = subprocess.run([_node, str(root / 'tests/page-board-lanes-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
+if lanes_regression.returncode != 0:
+    raise SystemExit('page-board lanes regression failed: ' + (lanes_regression.stdout + lanes_regression.stderr).strip())
+# 並べ替えの保存に1回失敗しただけで、元に戻す・並べ替え・一式の切り替えが止まり続けない
+# こと（H-4）。実物の saveBoardOrder() を、api() を差し替えて動かす。
+save_queue_regression = subprocess.run([_node, str(root / 'tests/page-board-save-queue-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
+if save_queue_regression.returncode != 0:
+    raise SystemExit('page-board save queue regression failed: ' + (save_queue_regression.stdout + save_queue_regression.stderr).strip())
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

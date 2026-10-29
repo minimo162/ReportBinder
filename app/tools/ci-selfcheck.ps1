@@ -254,6 +254,7 @@ function Assert-PackageContents([string]$OutputRoot) {
         'app/tools/scale-benchmark.ps1', 'app/tools/history-logic-selfcheck.ps1',
         'app/tools/create-pdf-diff-corpus.py', 'app/tools/pdf-diff-corpus-selfcheck.ps1',
         'app/tools/pack-lifecycle-selfcheck.ps1', 'app/tools/custom-pack-workflow-selfcheck.ps1',
+        'app/tools/output-publish-selfcheck.ps1',
         'tests/',
         'docs/PDF_DIFF_CORPUS.md', 'docs/benchmarks/', '.github/'
     )
@@ -307,6 +308,9 @@ try {
         # structure.json のスキーマ移行だけは変更ごとに見る。利用者データを不可逆に
         # 壊しうる唯一の種類で、しかも外部依存ゼロの1.7秒で確かめられるため。
         Invoke-Checked 'Schema migration regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'schema-v3-selfcheck.ps1'))
+        # 提出用PDFの出力先の重なりと共有用フォルダーへのコピーは、中身の違うPDFを
+        # 「最新」として共有へ出しうる経路。Java も Office も要らないので毎回見る。
+        Invoke-Checked 'Output and shared-copy regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'output-publish-selfcheck.ps1'))
         Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
         Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
         # 何を見ていないかを結果に残す。通った表示だけが後から参照されるため。
@@ -326,6 +330,7 @@ try {
     Invoke-Checked 'Final composition regression' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'final-composition-selfcheck.py')))
     Invoke-Checked 'Operational readiness regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'operational-readiness-selfcheck.ps1'))
     Invoke-Checked 'Pack lifecycle regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-lifecycle-selfcheck.ps1'))
+    Invoke-Checked 'Output and shared-copy regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'output-publish-selfcheck.ps1'))
     Invoke-Checked 'History logic regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'history-logic-selfcheck.ps1'))
     Invoke-Checked 'Custom pack workflow regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'custom-pack-workflow-selfcheck.ps1'))
     # この3本は書かれていたのに、どのCI経路からも呼ばれていなかった。原稿アダプタは
