@@ -11,6 +11,7 @@
 # - 表示中の全シートでは、改名・非表示でも配置を引き継ぐ（従来どおり）
 # - 改名後に旧名のシートが新しく現れても、ページIDが重ならず保存できる
 # - 以前の版が未振り分けに残したページを、起動時の読み込みで整理する
+# - 物理ページの頁・左右・見開きの番号が、出力先ごとに1頁＝右から数えた値になる（指紋は変わらない）
 $ErrorActionPreference = 'Stop'
 $testsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $testsRoot
@@ -206,6 +207,96 @@ Assert-SheetTest ($snapshotsAfter -eq $snapshotsBefore + 1) 'Cleanup did not lea
 $again = Initialize-Or-MigrateStructure 'ja' $dataDir
 Assert-SheetTest ([int](Get-DataProperty $again 'removedSheetSelectionResiduePageCount' 0) -eq 0) 'Cleanup ran again on clean data.'
 Assert-SheetTest (Test-StructureDocument (Read-StructureUnlocked 'ja') 'ja') 'The cleaned structure is not a valid document.'
+
+# ---- 物理ページの頁・左右（見開き） ---------------------------------------------------
+# 出力先ごとに1頁＝右から数え、奇数＝右（ReportPdfComposer.java のパンチ穴シフトと同じ）。
+# 頁数は変換PDFから数える。ページ数だけを持つ偽のPDFを置く。
+function Write-TestContentPdf([string]$WorkbookId, [string]$SheetName, [int]$PageCount) {
+    $rel = [string]@(Get-TestPage $WorkbookId $SheetName)[0].contentPdf
+    $full = [IO.Path]::GetFullPath((Join-Path (Get-WorkspacePath 'ja') $rel))
+    New-Item -ItemType Directory -Path (Split-Path -Parent $full) -Force | Out-Null
+    $body = '%PDF-1.4' + "`n" + ((1..$PageCount | ForEach-Object { "$_ 0 obj << /Type /Page >> endobj" }) -join "`n") + "`n%%EOF`n"
+    [IO.File]::WriteAllText($full, $body, [Text.Encoding]::ASCII)
+}
+function Set-TestPagePlacement([string]$WorkbookId, [string]$SheetName, [string]$Volume, [double]$Order, $PageRange) {
+    [void](Update-StructureLocked 'ja' {
+        param($st)
+        $page = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq $SheetName })[0]
+        Set-NoteProperty $page 'volume' $Volume
+        Set-NoteProperty $page 'enabled' ($Volume -ne 'none')
+        Set-NoteProperty $page 'order' $Order
+        Set-NoteProperty $page 'pageRange' $PageRange
+        return $null
+    })
+}
+function Get-TestPhysicalPages([string]$PackId, [string]$Volume) {
+    return @((Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' $Volume $PackId).physicalPages)
+}
+function Assert-PhysicalPage($Page, [int]$Number, [string]$Side, [int]$Spread, [string]$PageId, [int]$Part, [int]$PartCount, [int]$SourcePage, [string]$Label) {
+    Assert-SheetTest ([int]$Page.outputPageNumber -eq $Number) "$Label : outputPageNumber was $($Page.outputPageNumber), expected $Number."
+    Assert-SheetTest ([string]$Page.side -eq $Side) "$Label : side was '$($Page.side)', expected '$Side'."
+    Assert-SheetTest ([int]$Page.spreadIndex -eq $Spread) "$Label : spreadIndex was $($Page.spreadIndex), expected $Spread."
+    Assert-SheetTest ([string]$Page.pageId -eq $PageId) "$Label : pageId was '$($Page.pageId)', expected '$PageId'."
+    Assert-SheetTest ([int]$Page.pagePartIndex -eq $Part -and [int]$Page.pagePartCount -eq $PartCount) "$Label : part was $($Page.pagePartIndex)/$($Page.pagePartCount), expected $Part/$PartCount."
+    Assert-SheetTest ([int]$Page.sourcePdfPageNumber -eq $SourcePage) "$Label : sourcePdfPageNumber was $($Page.sourcePdfPageNumber), expected $SourcePage."
+}
+
+$spreadPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='見開きの一式' })
+$spreadPackId = [string]$spreadPack.packId
+$wbSpread = New-TestWorkbook $spreadPackId 'all-visible'
+[void](Invoke-TestRender $wbSpread 'all-visible' @(@{name='表紙'}, @{name='損益'}, @{name='営利'}, @{name='付録'}))
+Write-TestContentPdf $wbSpread '表紙' 1
+Write-TestContentPdf $wbSpread '損益' 2
+Write-TestContentPdf $wbSpread '営利' 3
+Write-TestContentPdf $wbSpread '付録' 1
+Set-TestPagePlacement $wbSpread '表紙' 'ja-main' 10 $null
+Set-TestPagePlacement $wbSpread '損益' 'ja-main' 20 $null
+Set-TestPagePlacement $wbSpread '営利' 'ja-main' 30 $null
+Set-TestPagePlacement $wbSpread '付録' 'ja-appendix' 10 $null
+$idCover = Resolve-PageId @(Get-TestPage $wbSpread '表紙')[0]
+$idPl = Resolve-PageId @(Get-TestPage $wbSpread '損益')[0]
+$idOp = Resolve-PageId @(Get-TestPage $wbSpread '営利')[0]
+$idAppendix = Resolve-PageId @(Get-TestPage $wbSpread '付録')[0]
+
+# 1・2・3頁のシートが混ざると、2頁目以降の左右はシートの境目と無関係に交互になる。
+$mainPhysical = @(Get-TestPhysicalPages $spreadPackId 'ja-main')
+Assert-SheetTest ($mainPhysical.Count -eq 6) "本体 should have 6 physical pages, got $($mainPhysical.Count)."
+Assert-PhysicalPage $mainPhysical[0] 1 'right' 0 $idCover 1 1 1 '本体1頁（表紙）'
+Assert-PhysicalPage $mainPhysical[1] 2 'left' 1 $idPl 1 2 1 '本体2頁（損益1/2）'
+Assert-PhysicalPage $mainPhysical[2] 3 'right' 1 $idPl 2 2 2 '本体3頁（損益2/2）'
+Assert-PhysicalPage $mainPhysical[3] 4 'left' 2 $idOp 1 3 1 '本体4頁（営利1/3）'
+Assert-PhysicalPage $mainPhysical[4] 5 'right' 2 $idOp 2 3 2 '本体5頁（営利2/3）'
+Assert-PhysicalPage $mainPhysical[5] 6 'left' 3 $idOp 3 3 3 '本体6頁（営利3/3）'
+
+# 出力先ごとに1頁＝右から数え直す。
+$appendixPhysical = @(Get-TestPhysicalPages $spreadPackId 'ja-appendix')
+Assert-SheetTest ($appendixPhysical.Count -eq 1) "補足 should have 1 physical page, got $($appendixPhysical.Count)."
+Assert-PhysicalPage $appendixPhysical[0] 1 'right' 0 $idAppendix 1 1 1 '補足1頁（付録）'
+
+# 指紋は頁・左右を含まない（項目を足しても「再出力が必要」にならない）。
+$snapBefore = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' $spreadPackId
+$fpJson = ConvertTo-Json $snapBefore.fingerprintInput -Depth 20 -Compress
+foreach ($field in @('side','spreadIndex','pagePartIndex','pagePartCount','outputPageNumber')) {
+    Assert-SheetTest (-not $fpJson.Contains('"' + $field + '"')) "The fingerprint input contains the physical-page field '$field'."
+}
+Assert-SheetTest ([string]$snapBefore.fingerprint -eq (Get-Sha256Text $fpJson)) 'The fingerprint is no longer computed from the fingerprint input alone.'
+$snapAgain = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' $spreadPackId
+Assert-SheetTest ([string]$snapAgain.fingerprint -eq [string]$snapBefore.fingerprint) 'The fingerprint changed without any input change.'
+
+# 使用ページ範囲は、枚数（pagePartCount）と後ろのページの左右に反映される。
+Set-TestPagePlacement $wbSpread '損益' 'ja-main' 20 '2'
+$rangePhysical = @(Get-TestPhysicalPages $spreadPackId 'ja-main')
+Assert-SheetTest ($rangePhysical.Count -eq 5) "本体 with 損益 limited to page 2 should have 5 physical pages, got $($rangePhysical.Count)."
+Assert-PhysicalPage $rangePhysical[1] 2 'left' 1 $idPl 1 1 2 '範囲指定後の本体2頁（損益の2ページ目だけ）'
+Assert-PhysicalPage $rangePhysical[2] 3 'right' 1 $idOp 1 3 1 '範囲指定後の本体3頁（営利1/3は右へ反転）'
+Assert-PhysicalPage $rangePhysical[4] 5 'right' 2 $idOp 3 3 3 '範囲指定後の本体5頁（営利3/3）'
+Set-TestPagePlacement $wbSpread '営利' 'ja-main' 30 '2-3'
+$rangePhysical = @(Get-TestPhysicalPages $spreadPackId 'ja-main')
+Assert-SheetTest ($rangePhysical.Count -eq 4) "本体 with two page ranges should have 4 physical pages, got $($rangePhysical.Count)."
+Assert-PhysicalPage $rangePhysical[2] 3 'right' 1 $idOp 1 2 2 '範囲指定後の本体3頁（営利の2ページ目）'
+Assert-PhysicalPage $rangePhysical[3] 4 'left' 2 $idOp 2 2 3 '範囲指定後の本体4頁（営利の3ページ目）'
+$snapRange = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' $spreadPackId
+Assert-SheetTest ([string]$snapRange.fingerprint -ne [string]$snapBefore.fingerprint) 'Changing the page range no longer changes the fingerprint.'
 
 Write-Output 'sheet-assignment regression ok'
 '@
