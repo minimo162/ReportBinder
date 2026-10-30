@@ -9683,8 +9683,14 @@ function Handle-Api($Context) {
             $scope = Resolve-DocumentPackScope $structure $packId $false
             $targets = [ordered]@{}
             foreach ($targetId in @(Get-PackTargetIds $language $scope.pack)) {
-                $volume = Get-LegacyVolumeFromTargetId $language $targetId
-                $targets[$targetId] = Get-FinalBuildReadiness $structure $language $volume ([string]$scope.packId)
+                # 1つの出力先の確認に失敗しても、他の出力先の状態は返す。失敗した出力先は
+                # readinessError を付けて「出力できません」として見せる。
+                try {
+                    $volume = Get-LegacyVolumeFromTargetId $language $targetId
+                    $targets[$targetId] = Get-FinalBuildReadiness $structure $language $volume ([string]$scope.packId)
+                } catch {
+                    $targets[$targetId] = [ordered]@{ packId=[string]$scope.packId; targetId=[string]$targetId; readinessError=$true; canBuild=$false; pageCount=0; status='not-built'; displayState='blocked'; outputPdf=''; outputPdfExists=$false; blockers=@([ordered]@{ code='readiness-failed'; message=('出力先の状態を確認できませんでした: ' + $_.Exception.Message) }); staleReasons=@() }
+                }
             }
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; packId=[string]$scope.packId; targets=$targets }); return
         }
