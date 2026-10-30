@@ -1,5 +1,14 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 原稿の更新スキャンで structure.json を原稿ごとに書き直さないようにした（2026-10-30）
+
+- `Scan-Updates`が原稿ごとに`Update-StructureLocked`を呼び、変更が無くても毎回`structure.json`を書き直していた（原稿数ぶんのロック取得・保存・保存後の検証）。ファイルの存在確認・更新時刻とサイズの取得・ハッシュ計算（`New-StableHash`）をロックの外で全原稿ぶん先に済ませ、結果の反映は`Update-StructureLocked`1回にまとめた。
+- ロックの中では最新の structure に結果を当てる。スキャン中に削除された原稿は飛ばす。値は`Set-NotePropertyIfChanged`で変わるときだけ書き、何も変わらなかったスキャンでは保存しない。更新検知の判定（どの原稿を「更新あり」とするか、ハッシュを取れなかった回に更新時刻・サイズを据え置くこと、出力先の再作成要求）と、戻り値の`changedWorkbookIds`・`scanned`・`hashed`・`metadataOnly`は変えていない。
+- `Update-StructureLocked`に、mutation が戻り値の辞書へ`__noStructureWrite=$true`を入れたら保存しない手段を加えた。キーは呼び出し元へ返す前に取り除く。キーを返さない既存の呼び出しは今までどおり毎回保存する。
+- 提出用PDF画面の出力前チェック「再確認」は、更新スキャンを`force:false`（保存日時・サイズが変わった原稿だけハッシュ）にした。全件を読み直す`force:true`は「原稿の更新を確認」（`scanAndRefresh`）だけに残した。
+- `app/tools/selfcheck.py`に、`Scan-Updates`の`Update-StructureLocked`が1回だけであること、ファイル確認とハッシュがロックの外にあること、ロック内で`Set-NoteProperty`を直接使わないこと、「再確認」が`force:false`で`scanAndRefresh`が`force:true`のままであることの静的検査を加えた。
+- RuntimeVersion `2026.10.30.10`、`app.js` `v20261030_v199` へ更新した。
+
 ## 出力先チェックが振り分け件数で判定するようにし、誤検知を直した（2026-10-30）
 
 - 提出用PDF画面の出力前チェック「出力先」が、ページを振り分けてある出力先を「○○にページがありません」と判定することがあった。readiness の`pageCount`は manifest に入った物理出力頁数で、変換PDFが未作成だと振り分け済みでも0になるのに、画面がそれで空かどうかを見ていた。振り分け件数（`itemCount`、readiness では`snapshot.itemCount`）で見るようにした。`itemCount`を返さない古い応答だけ`pageCount`で代用する（`targetItemCount`）。サーバーの`pageCount`・`itemCount`の意味は変えていない。

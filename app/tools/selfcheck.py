@@ -1646,7 +1646,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v198', 'style.css?v=20261030_v124']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v199', 'style.css?v=20261030_v124']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1701,7 +1701,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v198' not in html:
+if 'app.js?v=20261030_v199' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1727,7 +1727,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v198' not in html:
+if 'app.js?v=20261030_v199' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2477,11 +2477,38 @@ for needed in ['.error-actions{', '.error-panel-body{']:
 # 更新検知: ハッシュを取得できなかった回に更新時刻/サイズを保存すると、次回スキャンが
 # 再ハッシュを省略して更新済み原稿を最新と誤判定し、古い内容で提出用PDFが出る。
 _scan_updates = server.split('function Scan-Updates', 1)[1].split('\nfunction ', 1)[0]
-for needed in ["if (-not [string]::IsNullOrWhiteSpace($hash)) {", "Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks"]:
+for needed in ["if (-not [string]::IsNullOrWhiteSpace($hash)) {", "Set-NotePropertyIfChanged $w 'currentExcelLastWriteUtcTicks' $obs.ticks"]:
     if needed not in _scan_updates:
         raise SystemExit(f'scan-updates must not persist metadata without a hash: {needed}')
 if "Set-NoteProperty $w 'currentExcelModifiedAt' $modified\n            Set-NoteProperty $w 'currentExcelLastWriteUtcTicks'" in _scan_updates:
     raise SystemExit('scan-updates still writes ticks unconditionally after a failed hash')
+# 2026-10-30 更新スキャンの書き込み集約: 原稿ごとにロック・保存すると、変更が無くても
+# 原稿数だけ structure.json を書き直す。ファイル確認とハッシュはロック外で先に済ませ、
+# 保存は1回、値が変わったときだけにする。
+if _scan_updates.count('Update-StructureLocked') != 1:
+    raise SystemExit('scan-updates must apply all results in a single Update-StructureLocked call')
+_scan_collect = _scan_updates.split('$applied = Update-StructureLocked', 1)[0]
+if 'New-StableHash' not in _scan_collect or 'Test-Path -LiteralPath $full' not in _scan_collect:
+    raise SystemExit('scan-updates must stat/hash files before taking the structure lock')
+_scan_apply = _scan_updates.split('$applied = Update-StructureLocked', 1)[1]
+if 'New-StableHash' in _scan_apply or 'Get-Item' in _scan_apply:
+    raise SystemExit('scan-updates must not touch source files inside the structure lock')
+for needed in ['__noStructureWrite = (-not $dirty)', 'if (-not $workbooksById.ContainsKey($id)) { continue }']:
+    if needed not in _scan_apply:
+        raise SystemExit(f'scan-updates must skip unchanged writes / vanished workbooks: {needed}')
+if re.search(r"Set-NoteProperty \$(w|page) ", _scan_apply):
+    raise SystemExit('scan-updates must use Set-NotePropertyIfChanged so unchanged scans do not write')
+for needed in ["$result.Contains('__noStructureWrite')", "$result.Remove('__noStructureWrite')"]:
+    if needed not in _update_structure:
+        raise SystemExit(f'Update-StructureLocked no-write opt-out missing: {needed}')
+if _update_structure.find("__noStructureWrite") > _update_structure.find('Write-StructureUnlocked $Language $structure'):
+    raise SystemExit('Update-StructureLocked must decide the no-write opt-out before writing')
+_final_preflight_refresh = appjs.split('async function refreshFinalPreflight', 1)[1].split('\nasync function ', 1)[0].split('\nfunction ', 1)[0]
+if "body:{force:false}" not in _final_preflight_refresh or 'body:{force:true}' in _final_preflight_refresh:
+    raise SystemExit('final preflight refresh must scan with force:false (full rehash stays in scanAndRefresh)')
+_scan_and_refresh = appjs.split('async function scanAndRefresh', 1)[1].split('\nfunction ', 1)[0]
+if "body:{force:true}" not in _scan_and_refresh:
+    raise SystemExit('scanAndRefresh must keep the forced full rehash')
 # ローカルAPIのオリジン検証（別ポートのローカルページからのトークン悪用を防ぐ）
 for needed in ['function Test-RequestOrigin', "Test-RequestOrigin $Context.Request", "invalid origin"]:
     if needed not in server:

@@ -1679,7 +1679,8 @@ async function performPackReviewAction(action,button){
 
 async function refreshFinalPreflight(btn) {
   await runBusy(btn,async()=>{
-    if(configured())await api('/api/scan-updates',{method:'POST',body:{force:true}});
+    // 保存日時・サイズが変わった原稿だけハッシュする。全件の読み直しは「原稿の更新を確認」(scanAndRefresh)で行う。
+    if(configured())await api('/api/scan-updates',{method:'POST',body:{force:false}});
     state=normalizeStatePayload(await api('/api/state'));
     if(configured())await loadFiles(null);
     await loadFinalPanels({force:true, render:false});
