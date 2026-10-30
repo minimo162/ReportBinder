@@ -305,6 +305,19 @@ function Clear-PublishHiddenAttribute([string]$Path) {
     return (& $realClearHidden $Path)
 }
 $onWindows = $env:OS -eq 'Windows_NT'
+# Get-Item は -Force が無いと隠しファイルを返さない。照合が隠されたPDFを「見つかりません」に
+# しないこと。Windows では隠し属性で、それ以外では「.」で始まる名前で隠す。
+$hiddenProbe = Join-Path (Split-Path -Parent $mainPdf) '.hidden-integrity-probe.pdf'
+[IO.File]::WriteAllText($hiddenProbe, '%PDF-hidden')
+if ($onWindows) { (Get-Item -LiteralPath $hiddenProbe -Force).Attributes = [IO.FileAttributes]::Hidden }
+try {
+    $hiddenState = [pscustomobject]@{ outputIntegrity = (Get-OutputPdfIntegrity $hiddenProbe) }
+    $hiddenProblem = Get-OutputPdfIntegrityProblem $hiddenState $hiddenProbe $true
+    Assert-OutputTest ($hiddenProblem -eq '') "A hidden output PDF failed the integrity check: $hiddenProblem"
+} finally {
+    if ($onWindows) { (Get-Item -LiteralPath $hiddenProbe -Force).Attributes = [IO.FileAttributes]::Normal }
+    Remove-Item -LiteralPath $hiddenProbe -Force
+}
 # 出力したPDFが隠されていても、Copy-Item で写った属性を発行先に残さない。
 if ($onWindows) { (Get-Item -LiteralPath $mainPdf -Force).Attributes = (Get-Item -LiteralPath $mainPdf -Force).Attributes -bor [IO.FileAttributes]::Hidden }
 try { $visible = Publish-DocumentPackAllPdfsToShared 'ja' $publishId }

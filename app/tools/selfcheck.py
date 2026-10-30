@@ -106,7 +106,8 @@ for _ps1 in sorted((root/'app').rglob('*.ps1')):
 # Windows PowerShell 5.1 は BOM の無い .ps1 を ANSI として読む。日本語の文字列を
 # 照合する検査スクリプトでは、照合する側だけが化けて検査が必ず失敗する（または空振りする）。
 # 一覧に無いものも含め、ASCII 以外の文字を含む .ps1 はすべて BOM 付きにする。
-for _ps1 in sorted((root/'app').rglob('*.ps1')):
+# tests/ の .ps1 も CI の門で powershell.exe -File により実行されるため対象にする。
+for _ps1 in sorted([*(root/'app').rglob('*.ps1'), *(root/'tests').rglob('*.ps1')]):
     _raw = _ps1.read_bytes()
     if not _raw.startswith(b'\xef\xbb\xbf') and any(byte > 0x7f for byte in _raw):
         raise SystemExit(f'PowerShell with non-ASCII text must be UTF-8 BOM: {_ps1.relative_to(root).as_posix()}')
@@ -123,6 +124,12 @@ for needed in ['app\\tools\\package-release.ps1', '-SharedFolderOnly', 'pause']:
         raise SystemExit(f'shared-folder CMD regression: {needed}')
 
 server=(root/'app/server.ps1').read_text(encoding='utf-8-sig')
+# 出力したPDFの照合（M-2）は、隠し属性の付いたPDFも見つけなければならない。
+# Get-Item は -Force が無いと隠しファイルを返さず、Windows で「出力したPDFが見つかりません」になる。
+_integrity_at=server.find('function Get-OutputPdfIntegrity(')
+_integrity=server[_integrity_at:server.find('function Get-FinalBuildReadiness', _integrity_at)]
+if _integrity_at < 0 or _integrity.count('Get-Item -LiteralPath $Path -Force') != 2:
+    raise SystemExit('output PDF integrity checks must use Get-Item -Force so hidden PDFs are found')
 
 
 for needle in [

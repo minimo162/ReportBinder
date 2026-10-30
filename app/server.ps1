@@ -8136,8 +8136,10 @@ function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty
 # ファイル（H-1）、手で差し替えたり編集したりしたファイルを「最新」として発行しない。
 # 確定は構成のロックの中で行うので、作業ファイルのうちに求めたハッシュを渡せる
 # （置き換えは移動なので中身は同じ）。大きなPDFをロックの中で読み直さない。
+# Get-Item は -Force が無いと隠しファイルを返さない（Test-Path は見つける）。出力したPDFに
+# 隠し属性が付いていると、あるのに「見つかりません」になるため、照合では必ず -Force を付ける。
 function Get-OutputPdfIntegrity([string]$Path, [string]$KnownHash = '') {
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $hash = if ([string]::IsNullOrWhiteSpace($KnownHash)) { New-Sha256 $Path } else { $KnownHash }
     return [ordered]@{ size=[int64]$item.Length; lastWriteUtcTicks=[string]$item.LastWriteTimeUtc.Ticks; sha256=(Normalize-FileHash $hash) }
 }
@@ -8146,7 +8148,7 @@ function Get-OutputPdfIntegrity([string]$Path, [string]$KnownHash = '') {
 function Get-OutputPdfIntegrityProblem($State, [string]$Path, [bool]$CheckHash = $false) {
     $record = Get-DataProperty $State 'outputIntegrity' $null
     if ($null -eq $record) { return $null }
-    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if ($null -eq $item) { return '出力したPDFが見つかりません。' }
     if ([int64]$item.Length -ne [int64](Get-DataProperty $record 'size' -1) -or [string]$item.LastWriteTimeUtc.Ticks -ne [string](Get-DataProperty $record 'lastWriteUtcTicks' '')) {
         return '出力したPDFが、出力した後に変更または上書きされています。'
