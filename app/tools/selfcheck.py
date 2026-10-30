@@ -2615,6 +2615,10 @@ if 'Assert-PageReorderRequest' not in _ps_function(server, 'Reorder-Pages', 'ser
 # Mark-VolumeNeedsRebuild に連結された出力先名が渡る。
 if 'return ,@($affected)' in _ps_function(server, 'Set-PageReorderPlacement', 'server.ps1'):
     raise SystemExit('Set-PageReorderPlacement must stream the affected volumes, not wrap them with ,@()')
+# 変換PDFが見つからないページを manifest に入れると、頁数1の物理ページとして数えられ、
+# 試算の unknownPageIds から漏れる。catch で $full を空に戻す。
+if "catch{$full='';$blockers+=[ordered]@{code='content-file-missing'" not in _ps_function(server, 'Get-FinalBuildInputSnapshot', 'server.ps1'):
+    raise SystemExit('Get-FinalBuildInputSnapshot must not add pages whose content PDF is missing to the manifest')
 _spread_route = server.split("$path -eq '/api/v2/outputs/spread-preview'", 1)[1].split('\n        if ($method', 1)[0]
 for needed in ('ConvertTo-PageReorderVolumes', "Test-ConfigHasKey $body 'baseLayout'", 'Get-SpreadPreview $language $request'):
     if needed not in _spread_route:
