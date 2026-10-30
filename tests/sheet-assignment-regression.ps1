@@ -120,9 +120,9 @@ $packId = [string]$pack.packId
 # ---- 症状: 半角数字シートを外して改名すると、未振り分けに残り続ける -----------------
 $wbRename = New-TestWorkbook $packId 'numeric-only'
 [void](Invoke-TestRender $wbRename 'numeric-only' @(@{name='1'}, @{name='2'}, @{name='3'}))
-Assert-SheetTest ((Get-TestPages $wbRename).Count -eq 3) 'Numeric sheets did not become pages.'
+Assert-SheetTest (@(Get-TestPages $wbRename).Count -eq 3) 'Numeric sheets did not become pages.'
 foreach ($name in @('1','2','3')) { Move-TestPage $wbRename $name 'ja-main' }
-$oldId = Resolve-PageId (Get-TestPage $wbRename '3')[0]
+$oldId = Resolve-PageId @(Get-TestPage $wbRename '3')[0]
 # 一式から外す: 本体から未振り分けへ移し、シート名を半角数字以外へ変える。
 Move-TestPage $wbRename '3' 'none'
 $result = Invoke-TestRender $wbRename 'numeric-only' @(@{name='1'}, @{name='2'}, @{name='3_参考'})
@@ -139,34 +139,34 @@ $wbDirect = New-TestWorkbook $packId 'numeric-only'
 [void](Invoke-TestRender $wbDirect 'numeric-only' @(@{name='10'}, @{name='20'}))
 Move-TestPage $wbDirect '10' 'ja-main'; Move-TestPage $wbDirect '20' 'ja-main'
 [void](Invoke-TestRender $wbDirect 'numeric-only' @(@{name='10'}, @{name='メモ'}))
-Assert-SheetTest ((Get-TestPages $wbDirect).Count -eq 1 -and [string](Get-TestPages $wbDirect)[0].sheetName -eq '10') 'A renamed sheet that left 本体 remained as a page.'
+Assert-SheetTest (@(Get-TestPages $wbDirect).Count -eq 1 -and [string]@(Get-TestPages $wbDirect)[0].sheetName -eq '10') 'A renamed sheet that left 本体 remained as a page.'
 
 # 非表示にして外した半角数字シートも残らない。再表示すると新しいページとして戻る。
 $wbHidden = New-TestWorkbook $packId 'numeric-only'
 [void](Invoke-TestRender $wbHidden 'numeric-only' @(@{name='1'}, @{name='2'}))
-$hiddenId = Resolve-PageId (Get-TestPage $wbHidden '2')[0]
+$hiddenId = Resolve-PageId @(Get-TestPage $wbHidden '2')[0]
 $hiddenResult = Invoke-TestRender $wbHidden 'numeric-only' @(@{name='1'}, @{name='2'; hidden=$true})
-Assert-SheetTest ((Get-TestPage $wbHidden '2').Count -eq 0) 'A hidden numeric sheet stayed in the unassigned lane.'
+Assert-SheetTest (@(Get-TestPage $wbHidden '2').Count -eq 0) 'A hidden numeric sheet stayed in the unassigned lane.'
 Assert-SheetTest (@($hiddenResult.removedBySelection).Count -eq 1) 'The removed hidden-sheet page was not reported.'
 [void](Invoke-TestRender $wbHidden 'numeric-only' @(@{name='1'}, @{name='2'}))
-$back = Get-TestPage $wbHidden '2'
+$back = @(Get-TestPage $wbHidden '2')
 Assert-SheetTest ($back.Count -eq 1 -and (Resolve-PageId $back[0]) -eq $hiddenId) 'A re-shown sheet did not come back with the same page ID (layout history could not find it).'
 
 # 一度もPDF化していない半角数字以外のシートは、もともとページにならない。
 $wbNever = New-TestWorkbook $packId 'numeric-only'
 [void](Invoke-TestRender $wbNever 'numeric-only' @(@{name='表紙'}, @{name='1'}))
-Assert-SheetTest ((Get-TestPages $wbNever).Count -eq 1) 'A never-rendered non-numeric sheet became a page.'
+Assert-SheetTest (@(Get-TestPages $wbNever).Count -eq 1) 'A never-rendered non-numeric sheet became a page.'
 
 # ---- 表示中の全シート: 改名・非表示は配置を引き継ぐ（従来どおり） ----------------------
 $wbAll = New-TestWorkbook $packId 'all-visible'
 [void](Invoke-TestRender $wbAll 'all-visible' @(@{name='3'}, @{name='4'}))
 Move-TestPage $wbAll '3' 'ja-main'; Move-TestPage $wbAll '4' 'ja-appendix'
-$keptId = Resolve-PageId (Get-TestPage $wbAll '3')[0]
+$keptId = Resolve-PageId @(Get-TestPage $wbAll '3')[0]
 $allResult = Invoke-TestRender $wbAll 'all-visible' @(@{name='参考'}, @{name='4'; hidden=$true})
-$renamedPage = Get-TestPage $wbAll '参考'
+$renamedPage = @(Get-TestPage $wbAll '参考')
 Assert-SheetTest ($renamedPage.Count -eq 1 -and (Resolve-PageId $renamedPage[0]) -eq $keptId -and [string]$renamedPage[0].volume -eq 'ja-main') 'All-visible rename no longer carries over the assignment.'
 Assert-SheetTest (@(Get-Array $allResult.sync.renamedPages).Count -eq 1) 'All-visible rename was not reported.'
-$hiddenAll = Get-TestPage $wbAll '4'
+$hiddenAll = @(Get-TestPage $wbAll '4')
 Assert-SheetTest ($hiddenAll.Count -eq 1 -and [string]$hiddenAll[0].volume -eq 'ja-appendix') 'All-visible hidden sheet lost its assignment.'
 
 # ---- 改名後に旧名のシートが現れても、ページIDが重ならない ------------------------------
@@ -177,7 +177,7 @@ $pagesAll = @(Get-TestPages $wbAll)
 $ids = @($pagesAll | ForEach-Object { Resolve-PageId $_ })
 Assert-SheetTest ($pagesAll.Count -eq 3) 'The new sheet with the old name did not become a page.'
 Assert-SheetTest (@($ids | Select-Object -Unique).Count -eq $ids.Count) 'A new sheet reused the page ID of a renamed sheet.'
-Assert-SheetTest ([string](Get-TestPage $wbAll '3')[0].contentPdf -ne [string](Get-TestPage $wbAll '参考')[0].contentPdf) 'The new sheet and the renamed sheet share a converted PDF.'
+Assert-SheetTest ([string]@(Get-TestPage $wbAll '3')[0].contentPdf -ne [string]@(Get-TestPage $wbAll '参考')[0].contentPdf) 'The new sheet and the renamed sheet share a converted PDF.'
 
 # ---- 以前の版の残骸を起動時に整理する --------------------------------------------------
 $wbLegacy = New-TestWorkbook $packId 'numeric-only'
@@ -198,8 +198,8 @@ $snapshotsBefore = @(Get-ChildItem -LiteralPath $historyDir -File -Filter '*.jso
 $init = Initialize-Or-MigrateStructure 'ja' $dataDir
 Assert-SheetTest ([int](Get-DataProperty $init 'removedSheetSelectionResiduePageCount' 0) -eq 1) 'Leftover excluded pages were not cleaned when the workspace was opened.'
 $legacyPages = @(Get-TestPages $wbLegacy)
-Assert-SheetTest ((Get-TestPage $wbLegacy '3_旧').Count -eq 0) 'The leftover page of a renamed sheet was kept.'
-Assert-SheetTest ((Get-TestPage $wbLegacy '4_旧').Count -eq 1 -and (Get-TestPage $wbLegacy '1').Count -eq 1) 'Cleanup removed a page the user had assigned or a normal page.'
+Assert-SheetTest (@(Get-TestPage $wbLegacy '3_旧').Count -eq 0) 'The leftover page of a renamed sheet was kept.'
+Assert-SheetTest (@(Get-TestPage $wbLegacy '4_旧').Count -eq 1 -and @(Get-TestPage $wbLegacy '1').Count -eq 1) 'Cleanup removed a page the user had assigned or a normal page.'
 $snapshotsAfter = @(Get-ChildItem -LiteralPath $historyDir -File -Filter '*.json' -ErrorAction SilentlyContinue).Count
 Assert-SheetTest ($snapshotsAfter -eq $snapshotsBefore + 1) 'Cleanup did not leave a restore point.'
 # 2回目は何もしない。

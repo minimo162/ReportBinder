@@ -111,6 +111,27 @@ for _ps1 in sorted([*(root/'app').rglob('*.ps1'), *(root/'tests').rglob('*.ps1')
     _raw = _ps1.read_bytes()
     if not _raw.startswith(b'\xef\xbb\xbf') and any(byte > 0x7f for byte in _raw):
         raise SystemExit(f'PowerShell with non-ASCII text must be UTF-8 BOM: {_ps1.relative_to(root).as_posix()}')
+# 関数が return @(...) しても、出力はパイプラインで展開され、1件なら配列でなくなる。
+# Windows PowerShell 5.1 では単独の PSCustomObject に .Count が無く（$null になる。6.1 で追加）、
+# pwsh 7 では通る件数の比較が Windows だけで外れる。コマンドの結果に .Count・[n] を
+# 使うときは @() で包む。意図して単独のオブジェクトを数えるときは行末に # ps51-count-ok を付ける。
+# 1件のオブジェクト（コレクション自体・ファイル情報など）を返すものは対象外。
+# Get-DataProperty は保存値（主に辞書）をそのまま返す。配列の値は呼び出し側が Get-Array で包む。
+_ps_command = r'(?!(?:New-Object|Get-Item|Get-Date|Join-Path|Split-Path|ConvertFrom-Json|Get-DataProperty)\b)[A-Z][A-Za-z]*-[A-Z][A-Za-z0-9]*'
+for _ps1 in sorted([*(root/'app').rglob('*.ps1'), *(root/'tests').rglob('*.ps1')]):
+    _lines = _ps1.read_text(encoding='utf-8-sig').splitlines()
+    for _lineno, _line in enumerate(_lines, 1):
+        if '# ps51-count-ok' in _line: continue
+        _where = f'{_ps1.relative_to(root).as_posix()}:{_lineno}'
+        if re.search(r'(?<![@$\w])\(\s*' + _ps_command + r'\b[^()\r\n]*(?:\([^()\r\n]*\)[^()\r\n]*)*\)(?:\.Count\b|\[\d+\])', _line):
+            raise SystemExit(f'wrap command output in @() before .Count/[n] (Windows PowerShell 5.1): {_where}')
+        _assigned = re.match(r'\s*(\$\w+)\s*=\s*' + _ps_command + r'\b', _line)
+        if not _assigned: continue
+        _var = re.escape(_assigned.group(1))
+        for _next in _lines[_lineno:_lineno + 10]:
+            if re.match(r'\s*' + _var + r'\s*=', _next) or '# ps51-count-ok' in _next: break
+            if re.search(_var + r'(?:\.Count\b|\[\d+\])', _next):
+                raise SystemExit(f'wrap command output in @() before .Count/[n] (Windows PowerShell 5.1): {_where}')
 
 launcher_cmd=(root/'資料をPDFにまとめる.cmd').read_text(encoding='utf-8-sig')
 for needed in ['app\\launch.ps1', 'start "" /b', 'powershell.exe']:
