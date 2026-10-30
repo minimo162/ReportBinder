@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -2122,6 +2122,10 @@ _locked_render_commit = server.split('$pageSync = Update-StructureLocked $Langua
 for needed in ['[string]$_.workbookId -eq $WorkbookId', '[string]$_.sheetName -eq [string]$r.sheetName']:
     if needed not in _locked_render_commit:
         raise SystemExit(f'unrestricted worksheet render commit fallback missing: {needed}')
+# 旧形式のID（<原稿>-<数字>）でPDFの書き戻し先を探すと、改名したページが同じ名前の
+# 新しいシートのPDFを受け取る。シート名だけで探す。振る舞いは tests/sheet-assignment-regression.ps1。
+if "[regex]::Replace([string]$r.sheetName" in server.split('function Render-Workbook(',1)[1].split('\nfunction ',1)[0]:
+    raise SystemExit('rendered PDFs must be matched to pages by sheet name, not by the legacy page ID')
 for needed in ['未振り分け（出力しない）', '出力先へ移したページだけ',
                '半角数字順に並べ直す', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
@@ -2774,7 +2778,8 @@ for needed in [
     "lastRenderedSheetSelectionMode",
     "excelSheetSelectionMode",
     "sheetSelectionByWorkbook",
-    'Set-ExcludedSheetPagesNotRendered',
+    'Remove-SheetSelectionExcludedPages',
+    'Remove-SheetSelectionResiduePages',
     "PDFやページ構成は変更していません",
     "sheetSelectionExcluded",
     "noNumericTarget",
@@ -2790,13 +2795,16 @@ for needed in [
     if needed not in server and needed not in appjs:
         raise SystemExit(f'numeric-sheet selection regression coverage missing: {needed}')
 _numeric_render = server.split('function Render-Workbook(', 1)[1].split('\nfunction ', 1)[0]
-for needed in ["$ExcelSheetSelection -eq 'numeric-only'", 'targetSheetNames.Count -eq 0', 'Update-WorkbookPagesFromInspection', 'Set-ExcludedSheetPagesNotRendered']:
+for needed in ["$ExcelSheetSelection -eq 'numeric-only'", 'targetSheetNames.Count -eq 0', 'Update-WorkbookPagesFromInspection', 'Remove-SheetSelectionExcludedPages']:
     if needed not in _numeric_render:
         raise SystemExit(f'numeric-only render safety missing: {needed}')
-_numeric_excluded = server.split('function Set-ExcludedSheetPagesNotRendered', 1)[1].split('\nfunction ', 1)[0]
-for needed in ["volume' 'none", "enabled' $false", "sheetSelectionExcluded"]:
-    if needed not in _numeric_excluded:
-        raise SystemExit(f'excluded sheet page preservation missing: {needed}')
+# 対象外になったシートのページは未振り分けへ戻さずページ構成から外す。戻すと
+# PDF化済みだったシートだけが「出力しない」ページとして残り続けた。
+_numeric_excluded = server.split('function Remove-SheetSelectionExcludedPages', 1)[1].split('\nfunction ', 1)[0]
+if '$Structure.pages = @($kept)' not in _numeric_excluded or "volume' 'none" in _numeric_excluded:
+    raise SystemExit('excluded sheet pages must be removed, not parked in the unassigned lane')
+if "Remove-SheetSelectionResiduePages $Language $structure" not in server.split('function Initialize-Or-MigrateStructure', 1)[1].split('\nfunction ', 1)[0]:
+    raise SystemExit('leftover excluded pages from older builds must be cleaned when the workspace is opened')
 _numeric_job = server.split('function Invoke-RenderJobFromFile', 1)[1].split('\nfunction ', 1)[0]
 if 'sheetSelectionByWorkbook' not in _numeric_job or 'Render-Source $language $id $excel $true $callback' not in _numeric_job:
     raise SystemExit('render jobs must pin and pass sheet selection mode through Render-Source')
