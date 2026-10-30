@@ -78,6 +78,9 @@ $Script:UpdateCheckSubscriptionId = $null
 # ファイル更新時刻・サイズまたは版IDが変われば別キー/再読込になる。
 $Script:StructureReadCache = @{}
 $Script:StructureReadCacheLimit = 4
+# 直前の Read-StructureUnlocked が structure.json.last-good に切り替えて読んだか。
+# Get-Structure はこの結果をキャッシュしない（今のファイルの版として古い内容を返し続けるため）。
+$Script:StructureReadUsedLastGood = $false
 $Script:LatestComparisonCache = @{}
 $Script:LatestComparisonCacheLimit = 256
 $Script:SnapshotManifestCache = @{}
@@ -2715,6 +2718,7 @@ function Read-StructureUnlocked([string]$Language, [string]$DataDir = '') {
     if (-not (Test-Path -LiteralPath $path)) { return New-EmptyStructure $Language }
     $backupPath = Join-Path $workspace 'structure.json.last-good'
     $structure = $null
+    $Script:StructureReadUsedLastGood = $false
     try {
         $structure = Read-JsonFile $path $null
         if (-not (Test-StructureDocument $structure $Language)) { throw 'structure.json の内容が不完全です。' }
@@ -2728,7 +2732,7 @@ function Read-StructureUnlocked([string]$Language, [string]$DataDir = '') {
         try {
             if (Test-Path -LiteralPath $backupPath) {
                 $candidate = Read-JsonFile $backupPath $null
-                if (Test-StructureDocument $candidate $Language) { $structure = $candidate }
+                if (Test-StructureDocument $candidate $Language) { $structure = $candidate; $Script:StructureReadUsedLastGood = $true }
             }
         } catch { $structure = $null }
         if ($null -eq $structure) {
@@ -2776,6 +2780,9 @@ function Get-Structure([string]$Language) {
     $cached = $Script:StructureReadCache[$cacheKey]
     if ($null -ne $cached -and [string]$cached.stamp -eq $stamp) { return $cached.structure }
     $structure = Read-StructureUnlocked $Language
+    # last-good は1つ前の版（出力前の状態など）。今のファイルの版で覚えると、本体が読めるように
+    # なっても版が変わるまで古い内容を返し続ける。次の読取で本体を読み直す。
+    if ($Script:StructureReadUsedLastGood) { return $structure }
     if (-not $Script:StructureReadCache.ContainsKey($cacheKey) -and
         $Script:StructureReadCache.Count -ge $Script:StructureReadCacheLimit) {
         $oldestKey = @($Script:StructureReadCache.Keys)[0]
