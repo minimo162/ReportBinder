@@ -1665,7 +1665,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v200', 'style.css?v=20261030_v124']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v201', 'style.css?v=20261030_v124']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1719,7 +1719,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v200' not in html:
+if 'app.js?v=20261030_v201' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1745,7 +1745,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v200' not in html:
+if 'app.js?v=20261030_v201' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2944,6 +2944,19 @@ if "!=='ready'" not in _release:
     raise SystemExit('an in-flight thumbnail render must not be discarded by the release path')
 if 'pageThumbnailObserver.unobserve' in appjs:
     raise SystemExit('the thumbnail observer must keep watching so re-entry redraws released canvases')
+# サムネイルは変換PDFの文書をキャッシュから借りて描く。描くたびに getDocument/destroy しない。
+_build_thumbnail = appjs.split('async function buildPageThumbnail(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['acquirePageDocument(page)', 'release();']:
+    if needed not in _build_thumbnail:
+        raise SystemExit(f'page thumbnails must share the cached converted PDF document: {needed}')
+for banned in ['getDocument(', 'destroy']:
+    if banned in _build_thumbnail:
+        raise SystemExit(f'page thumbnails must not fetch or destroy the document per page: {banned}')
+if 'if(!canvas.dataset.thumbnailState){dequeuePageThumbnail(canvas);return;}' not in _release:
+    raise SystemExit('an off-screen thumbnail that has not started must leave the render queue')
+for needed in ['clearPageLayoutHistory();clearPageDocumentCache();', 'clearDiffBrowserResources(true); clearPageDocumentCache();']:
+    if needed not in appjs:
+        raise SystemExit(f'cached page documents must be released on pack switch and page hide: {needed}')
 
 # --- はじめて開いた人が最初に見る画面で見つかった欠陥 (2026-08-15) ---
 
@@ -3078,6 +3091,11 @@ if save_queue_regression.returncode != 0:
 spread_diff_regression = subprocess.run([_node, str(root / 'tests/spread-diff-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
 if spread_diff_regression.returncode != 0:
     raise SystemExit('spread diff regression failed: ' + (spread_diff_regression.stdout + spread_diff_regression.stderr).strip())
+# 変換PDFの文書キャッシュ: 同じ版の変換PDFは何ページ描いても1回だけ取得し、使用中の文書は
+# 追い出さず、失敗した文書は残さない。画面外へ出た未着手のサムネイルはキューから外す。
+page_document_cache_regression = subprocess.run([_node, str(root / 'tests/page-document-cache-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
+if page_document_cache_regression.returncode != 0:
+    raise SystemExit('page document cache regression failed: ' + (page_document_cache_regression.stdout + page_document_cache_regression.stderr).strip())
 # 出力前チェックの「出力先」は振り分け件数（itemCount）で空かどうかを見る。物理出力頁数
 # （pageCount）で見ると、変換PDF未作成の出力先を「ページがありません」と誤判定した。
 # readiness 未取得のあいだは確認中で、出力を止める問題に数えない。

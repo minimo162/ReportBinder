@@ -187,6 +187,7 @@ const slotIds = spread => [spread.left, spread.right].map(cell => (cell ? `${cel
 {
   const { pageThumbnailCacheKey } = new Function(`
     const getWorkbook=()=>({lastRenderedSnapshotId:'s',lastRenderedVersionId:'v'}),resolvedPageId=page=>String(page?.pageId||'');
+    ${extractFunction('pageDocumentCacheKey')}
     ${extractFunction('pageThumbnailCacheKey')}
     return { pageThumbnailCacheKey };`)();
   const page = { pageId: 'B', contentPdf: 'B.pdf' };

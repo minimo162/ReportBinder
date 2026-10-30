@@ -82,6 +82,13 @@ const pageVolumeCollapseOverrides = new Map();
 // 見開き表示は物理ページごとに描くため、複数ページのシートは1枚で複数の枠を使う。
 const PAGE_THUMBNAIL_CACHE_LIMIT = 64;
 const PAGE_THUMBNAIL_RENDER_LIMIT = 3;
+// 変換PDFの文書（PDFDocumentProxy）を、ページ項目と版ごとに1つだけ持つ。複数ページの
+// シートを見開きで描いても、同じ変換PDFを頁数分取得し直さない。key → {promise, refs, lastUsed}
+const pageDocumentCache = new Map();
+const PAGE_DOCUMENT_CACHE_LIMIT = 8;
+let pageDocumentCacheClock = 0;
+// 開いた変換PDFの頁数（pageId → numPages）。PDFイメージ表示の頁数表で使う。
+const pdfImageObservedPageCounts = new Map();
 const PAGE_LAYOUT_HISTORY_LIMIT = 20;
 let lastFileRangeAnchor = '';
 let lastWorkbookRangeAnchor = '';
@@ -2894,7 +2901,7 @@ async function applyPresetSelection(presetOrButton) {
   }
   activePreset=preset;activePackId=nextPackId;rememberActivePack(activePackId);try{sessionStorage.setItem('ReportBinderCategory',activePreset);}catch{}
   selectedFiles.clear();selectedWorkbooks.clear();selectedPages.clear();lastFileRangeAnchor='';lastWorkbookRangeAnchor='';lastPageRangeAnchor='';lastPageBoardRenderSignature='';
-  if(presetChanged)clearPageLayoutHistory();else updateBulkSelectionLabel();pageVolumeCollapseOverrides.clear();
+  if(presetChanged){clearPageLayoutHistory();clearPageDocumentCache();}else updateBulkSelectionLabel();pageVolumeCollapseOverrides.clear();
   if(configured()&&!availableFiles.length)await loadFilesSilently();
   if(activeView==='history'){
     historyPanelsInitialized=false;
@@ -5050,23 +5057,71 @@ function pageThumbnailHtml(p,idx,filteredOut=false){
 
 // pageNumber は変換PDF内のページ番号（physicalPages の sourcePdfPageNumber）。見開きでは
 // 複数ページのシートの2枚目以降も描く。サムネイル表示は従来どおり1枚目。
-function pageThumbnailCacheKey(page,pageNumber=1){const workbook=getWorkbook(page?.workbookId);return `${resolvedPageId(page)}|${String(page?.contentPdf||'')}|${String(workbook?.lastRenderedSnapshotId||'')}|${String(workbook?.lastRenderedVersionId||workbook?.lastRenderedAt||'')}|p${Math.max(1,Math.floor(Number(pageNumber)||1))}`;}
+function pageDocumentCacheKey(page){const workbook=getWorkbook(page?.workbookId);return `${resolvedPageId(page)}|${String(page?.contentPdf||'')}|${String(workbook?.lastRenderedSnapshotId||'')}|${String(workbook?.lastRenderedVersionId||workbook?.lastRenderedAt||'')}`;}
+function pageThumbnailCacheKey(page,pageNumber=1){return `${pageDocumentCacheKey(page)}|p${Math.max(1,Math.floor(Number(pageNumber)||1))}`;}
+// 変換PDFの文書を借りる。返す release() を必ず呼ぶ。使用中（refs>0）の文書は追い出さない。
+// 取得に失敗した文書はキャッシュに残さず、次に借りるときに取り直す。
+function acquirePageDocument(page){
+  const key=pageDocumentCacheKey(page);
+  let entry=pageDocumentCache.get(key);
+  if(!entry){
+    const created={promise:null,refs:0,lastUsed:0,detached:false};
+    created.promise=(async()=>{const lib=await ensureDiffPdfJs();return await lib.getDocument({url:apiUrl('/api/file',{pageId:resolvedPageId(page),workbookId:page?.workbookId||'',sheetName:page?.sheetName||''}),httpHeaders:{'X-ReportBinder-Token':token,'Accept':'application/pdf'},disableRange:false,disableStream:false}).promise;})();
+    created.promise.catch(()=>{created.detached=true;if(pageDocumentCache.get(key)===created)pageDocumentCache.delete(key);});
+    pageDocumentCache.set(key,created);entry=created;
+  }
+  const held=entry;
+  held.refs++;held.lastUsed=++pageDocumentCacheClock;
+  let released=false;
+  const release=()=>{
+    if(released)return;released=true;
+    held.refs=Math.max(0,held.refs-1);held.lastUsed=++pageDocumentCacheClock;
+    // 使用中にキャッシュから外れた文書は、最後の利用者が返したときに破棄する。
+    if(held.detached&&held.refs===0)Promise.resolve(held.promise).then(doc=>doc?.destroy?.()).catch(()=>{});
+    evictPageDocuments();
+  };
+  evictPageDocuments();
+  return held.promise.then(doc=>({doc,release}),error=>{release();throw error;});
+}
+// 上限を超えたら、使用中でない文書を古い順に破棄する。差分画面の fetchDiffPdfDocument と違い、
+// 使用中の文書は追い出さない（全部使用中なら上限を一時的に超えてよい）。
+function evictPageDocuments(){
+  while(pageDocumentCache.size>PAGE_DOCUMENT_CACHE_LIMIT){
+    let oldestKey=null,oldest=null;
+    for(const [key,entry] of pageDocumentCache){if(entry.refs===0&&(!oldest||entry.lastUsed<oldest.lastUsed)){oldestKey=key;oldest=entry;}}
+    if(!oldest)break;
+    pageDocumentCache.delete(oldestKey);oldest.detached=true;
+    Promise.resolve(oldest.promise).then(doc=>doc?.destroy?.()).catch(()=>{});
+  }
+}
+// 一式の切替や画面を閉じるときに全文書を手放す。使用中のものは返却時に破棄する。
+function clearPageDocumentCache(){
+  for(const entry of pageDocumentCache.values()){
+    entry.detached=true;
+    if(entry.refs===0)Promise.resolve(entry.promise).then(doc=>doc?.destroy?.()).catch(()=>{});
+  }
+  pageDocumentCache.clear();
+}
 async function buildPageThumbnail(page,pageNumber=1){
   const sourcePage=Math.max(1,Math.floor(Number(pageNumber)||1));
   const key=pageThumbnailCacheKey(page,sourcePage);if(pageThumbnailCache.has(key)){const cached=pageThumbnailCache.get(key);pageThumbnailCache.delete(key);pageThumbnailCache.set(key,cached);return cached;}
-  const promise=(async()=>{const lib=await ensureDiffPdfJs();const loadingTask=lib.getDocument({url:apiUrl('/api/file',{pageId:resolvedPageId(page),workbookId:page?.workbookId||'',sheetName:page?.sheetName||''}),httpHeaders:{'X-ReportBinder-Token':token,'Accept':'application/pdf'},disableRange:false,disableStream:false});let doc=null;try{doc=await loadingTask.promise;const pdfPage=await doc.getPage(Math.min(sourcePage,Math.max(1,Number(doc.numPages)||1)));const base=pdfPage.getViewport({scale:1});const pixelRatio=Math.min(2,Math.max(1,window.devicePixelRatio||1));const targetWidth=220*pixelRatio;const viewport=pdfPage.getViewport({scale:targetWidth/Math.max(1,base.width)});const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.ceil(viewport.width));canvas.height=Math.max(1,Math.ceil(viewport.height));const context=canvas.getContext('2d',{alpha:false});context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);await pdfPage.render({canvasContext:context,viewport,background:'rgb(255,255,255)'}).promise;return canvas;}finally{try{await doc?.destroy?.();}catch{}}})();
+  const promise=(async()=>{const {doc,release}=await acquirePageDocument(page);try{if(Number(doc.numPages)>0)pdfImageObservedPageCounts.set(resolvedPageId(page),Number(doc.numPages));const pdfPage=await doc.getPage(Math.min(sourcePage,Math.max(1,Number(doc.numPages)||1)));const base=pdfPage.getViewport({scale:1});const pixelRatio=Math.min(2,Math.max(1,window.devicePixelRatio||1));const targetWidth=220*pixelRatio;const viewport=pdfPage.getViewport({scale:targetWidth/Math.max(1,base.width)});const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.ceil(viewport.width));canvas.height=Math.max(1,Math.ceil(viewport.height));const context=canvas.getContext('2d',{alpha:false});context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);await pdfPage.render({canvasContext:context,viewport,background:'rgb(255,255,255)'}).promise;return canvas;}finally{release();}})();
   pageThumbnailCache.set(key,promise);while(pageThumbnailCache.size>PAGE_THUMBNAIL_CACHE_LIMIT)pageThumbnailCache.delete(pageThumbnailCache.keys().next().value);try{return await promise;}catch(error){pageThumbnailCache.delete(key);throw error;}
 }
 function pumpPageThumbnailQueue(){
   while(pageThumbnailRenderActive<PAGE_THUMBNAIL_RENDER_LIMIT&&pageThumbnailRenderQueue.length){const canvas=pageThumbnailRenderQueue.shift();if(!canvas?.isConnected||canvas.dataset.thumbnailState==='loading'||canvas.closest('.page-filter-hidden'))continue;const page=getPage(canvas.dataset.pageThumbnail);if(!page||!pagePreviewAvailable(page))continue;canvas.dataset.thumbnailState='loading';pageThumbnailRenderActive++;buildPageThumbnail(page,Number(canvas.dataset.thumbnailPage)||1).then(source=>{if(!canvas.isConnected)return;canvas.width=source.width;canvas.height=source.height;canvas.getContext('2d',{alpha:false}).drawImage(source,0,0);canvas.dataset.thumbnailState='ready';const placeholder=canvas.parentElement?.querySelector('.page-thumb-placeholder');if(placeholder)placeholder.classList.add('hidden');}).catch(()=>{if(!canvas.isConnected)return;canvas.dataset.thumbnailState='error';const placeholder=canvas.parentElement?.querySelector('.page-thumb-placeholder');if(placeholder)placeholder.textContent='プレビューできません';}).finally(()=>{pageThumbnailRenderActive--;pumpPageThumbnailQueue();});}
 }
 function queuePageThumbnail(canvas){if(!canvas||canvas.dataset.thumbnailState||pageThumbnailRenderQueue.includes(canvas))return;pageThumbnailRenderQueue.push(canvas);pumpPageThumbnailQueue();}
+function dequeuePageThumbnail(canvas){const index=pageThumbnailRenderQueue.indexOf(canvas);if(index>=0)pageThumbnailRenderQueue.splice(index,1);}
 // 画面外へ出たサムネイルの canvas を解放する。A4縦は 440x622x4B ≒ 1.09MB あり、
 // 174ページを一度スクロールし切ると描画済みcanvasだけで100MBを超える。
 // 解放しても data-page-id は DOM に残るので、並べ替えの絶対位置は変わらない。
 function releasePageThumbnailCanvas(canvas){
+  if(!canvas)return;
+  // 未着手のまま画面外へ出たものはキューから外す。速くスクロールしたとき、通り過ぎたページまで描かない。
+  if(!canvas.dataset.thumbnailState){dequeuePageThumbnail(canvas);return;}
   // 描画中(loading)を捨てると描き直しが二重に走る。完了済みだけ解放する。
-  if(!canvas||canvas.dataset.thumbnailState!=='ready')return;
+  if(canvas.dataset.thumbnailState!=='ready')return;
   canvas.width=0;canvas.height=0;
   delete canvas.dataset.thumbnailState;
   const placeholder=canvas.parentElement?.querySelector('.page-thumb-placeholder');
@@ -6607,7 +6662,7 @@ setInterval(pollVersionNotice,1800000);
   await loadInitialAppState($('app-load-retry'));
 })();
 
-window.addEventListener('pagehide', () => { clearDiffBrowserResources(true); for (const u of [...pdfObjectUrls]) revokePdfObjectUrl(u); });
+window.addEventListener('pagehide', () => { clearDiffBrowserResources(true); clearPageDocumentCache(); for (const u of [...pdfObjectUrls]) revokePdfObjectUrl(u); });
 
 
 // ---- V5: 自動処理の状態表示と履歴タイムライン ----
