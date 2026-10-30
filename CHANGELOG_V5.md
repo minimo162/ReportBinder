@@ -1,5 +1,14 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 共有用フォルダーの作成後に、作ったフォルダーを開くようにした（2026-10-30）
+
+- これまで: `共有フォルダー用フォルダー作成.cmd`（`package-release.ps1 -SharedFolderOnly`）の完了後、エクスプローラーが作成したフォルダーではない場所（ドキュメント等）を開いていた。
+- 原因: `Write-IntegrityManifest`が件数表示を`Write-Output`で出しており、それが`New-SharedFolderRelease`の戻り値へ混ざって「`integrity manifest: N files`」と作成先パスの配列になっていた。これを`explorer.exe`へ手組みのクォート（`'"{0}"' -f`）で渡したため、配列が空白でつながった存在しないパスになり、エクスプローラーが既定の場所を開いていた。
+- `Write-IntegrityManifest`の表示を`Write-Host`にした。`New-SharedFolderRelease`・`Publish-SharedFolderStage`・`New-ReleaseZip`の途中の呼び出しを`[void]`で受け、作成したフォルダー（ZIP）のパス1つだけを返すようにした。`Publish-SharedFolderStage`の戻り値が作成先と違えば失敗にする。
+- 開く処理は`Test-Path -LiteralPath -PathType Container`で作成したフォルダーがあることを確かめてから`Invoke-Item -LiteralPath`で開く。無い・開けないときは警告と作成先パスを出す。`-NoOpen`は今までどおり。
+- `app/tools/selfcheck.py`に、`Write-IntegrityManifest`が`Write-Output`を使わないこと、戻り値がパス1つであること、`explorer.exe`へ手組みで渡さず存在確認後に`Invoke-Item`で開くことの静的検査を加えた。
+- RuntimeVersion `2026.10.30.12` へ更新した（`app.js`は変更なし）。
+
 ## 提出用PDFの作成中に原稿が変わっても、作成開始時の内容で最後まで作るようにした（2026-10-30）
 
 - これまで失敗していた箇所: 出力中に原稿が変換し直されたりページ構成が変わったりすると、一括出力（`Invoke-FinalBuildTransaction`）は組版後の再確認（手順9）と structure 確定時の再確認（手順12）で、カスタム一式の出力（`Build-DocumentPackPdf`）は確定時の再確認で「PDF作成中にページ構成またはPDF入力が変更されました」と失敗させ、組み上がったPDFを捨てていた。さらに、変換し直しの後の世代整理（履歴を残さない設定では最新以外をすぐ消す）で組版中の変換PDFが消え、組版そのものが失敗することもあった。
