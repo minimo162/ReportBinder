@@ -1665,7 +1665,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v201', 'style.css?v=20261030_v124']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v202', 'style.css?v=20261030_v125']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1719,7 +1719,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v201' not in html:
+if 'app.js?v=20261030_v202' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1745,7 +1745,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v201' not in html:
+if 'app.js?v=20261030_v202' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2957,6 +2957,18 @@ if 'if(!canvas.dataset.thumbnailState){dequeuePageThumbnail(canvas);return;}' no
 for needed in ['clearPageLayoutHistory();clearPageDocumentCache();', 'clearDiffBrowserResources(true); clearPageDocumentCache();']:
     if needed not in appjs:
         raise SystemExit(f'cached page documents must be released on pack switch and page hide: {needed}')
+# サムネイルは使用ページ範囲の先頭ページを描く（1枚目固定にしない）。複数ページの項目は「全N枚」。
+_thumb_card = appjs.split('function pageThumbnailHtml(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['data-thumbnail-page="${escapeAttr(pageFirstSourcePage(p))}"', 'page-thumb-parts']:
+    if needed not in _thumb_card:
+        raise SystemExit(f'thumbnails must draw the first page of the used range and show the part count: {needed}')
+if '.page-thumb-parts{' not in css:
+    raise SystemExit('the thumbnail part count badge needs its style')
+# 見開きの頁・左右は今までどおりサーバー値（buildSpreadLayout）。枚数のバッジは頁・左右を使わない。
+_part_counts = appjs.split('function pagePartCountsFromPhysicalPages(', 1)[1].split('\nfunction ', 1)[0]
+for banned in ['outputPageNumber', 'side', 'spreadIndex']:
+    if banned in _part_counts:
+        raise SystemExit(f'the thumbnail part count must not depend on page numbers or sides: {banned}')
 
 # --- はじめて開いた人が最初に見る画面で見つかった欠陥 (2026-08-15) ---
 
