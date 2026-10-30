@@ -169,6 +169,215 @@ finally { Remove-Item Function:\Get-Date }
 Assert-OutputTest ([string]$today.outputFileName -ne [string]$tomorrow.outputFileName) 'The date override did not reach the output file name; the M-1 case is not exercised.'
 Assert-OutputTest ([string]$today.fingerprint -eq [string]$tomorrow.fingerprint) 'A date change alone changed the output input fingerprint.'
 
+# ---- 性能: 記録済みの頁数があれば変換PDFを開かない --------------------------------
+# ここもまだ実物の Get-FinalBuildInputSnapshot を使う。頁数の数え方だけ差し替えて呼ばれた回数を見る。
+$counted = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='頁数記録の一式' })
+$countedId = [string]$counted.packId
+Add-TestPages $countedId @('ja-main')
+$countedPdfRel = 'content-pdf\selfcheck\counted.pdf'
+$countedPdf = Join-Path (Get-WorkspacePath 'ja') $countedPdfRel
+New-Item -ItemType Directory -Path (Split-Path -Parent $countedPdf) -Force | Out-Null
+[IO.File]::WriteAllText($countedPdf, '%PDF-counted')
+[void](Update-StructureLocked 'ja' {
+    param($st)
+    $ids = @{}; foreach ($wb in @(Get-Array $st.workbooks | Where-Object { Test-WorkbookPack $_ $countedId })) { $ids[[string]$wb.workbookId] = $true }
+    foreach ($page in @(Get-Array $st.pages | Where-Object { $ids.ContainsKey([string]$_.workbookId) })) { Set-NoteProperty $page 'contentPdf' $countedPdfRel }
+    return $null
+})
+$realPageCount = ${function:Get-PdfPageCount}
+$Script:PageCountCalls = 0
+function Get-PdfPageCount([string]$PdfPath) { $Script:PageCountCalls++; return 2 }
+try {
+    $unrecorded = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' $countedId
+    Assert-OutputTest ($Script:PageCountCalls -eq 1 -and [int]$unrecorded.pageCount -eq 2) "Without a recorded page count the converted PDF was not counted (calls=$($Script:PageCountCalls), pages=$($unrecorded.pageCount))."
+    [void](Update-StructureLocked 'ja' {
+        param($st)
+        foreach ($artifact in @(Get-Array (Get-DataProperty $st 'artifacts' @()) | Where-Object { [string](Get-DataProperty $_ 'relativePdfPath' '') -eq $countedPdfRel })) { Set-NoteProperty $artifact 'pageCount' 3 }
+        return $null
+    })
+    $recordedArtifacts = @(Get-Array (Get-DataProperty (Get-Structure 'ja') 'artifacts' @()) | Where-Object { [string](Get-DataProperty $_ 'relativePdfPath' '') -eq $countedPdfRel -and (Get-IntDataProperty $_ 'pageCount' 0) -eq 3 })
+    Assert-OutputTest ($recordedArtifacts.Count -ge 1) 'The recorded artifact page count was not stored; the recorded-count case is not exercised.'
+    $Script:PageCountCalls = 0
+    $recorded = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' $countedId
+    Assert-OutputTest ($Script:PageCountCalls -eq 0) 'Get-PdfPageCount was called although the artifact page count was recorded.'
+    Assert-OutputTest ([int]$recorded.pageCount -eq 3) "The recorded page count was not used (pages=$($recorded.pageCount))."
+} finally {
+    Set-Item Function:\Get-PdfPageCount $realPageCount
+}
+
+# ---- 性能: 入力スナップショットは要求（ジョブ）の中で structure の版ごとに使い回す ----
+$realSnapshot = ${function:Get-FinalBuildInputSnapshot}
+$Script:SnapshotCalls = 0
+function Get-FinalBuildInputSnapshot { $Script:SnapshotCalls++; return (& $realSnapshot @args) }
+$Script:FinalSnapshotCache = @{}
+try {
+    $view = Get-StructureWithStamp 'ja'
+    Assert-OutputTest (-not [string]::IsNullOrWhiteSpace([string]$view.stamp)) 'Get-StructureWithStamp returned no stamp; the cache case is not exercised.'
+    $first = Get-FinalBuildReadiness $view.structure 'ja' 'ja-main' $countedId $true ([string]$view.stamp)
+    $second = Get-FinalBuildReadiness $view.structure 'ja' 'ja-main' $countedId $false ([string]$view.stamp)
+    Assert-OutputTest ($Script:SnapshotCalls -eq 1) "The readiness of the same structure version rebuilt the input snapshot (calls=$($Script:SnapshotCalls))."
+    Assert-OutputTest ([string]$first.currentFingerprint -eq [string]$second.currentFingerprint) 'A cached snapshot returned a different fingerprint.'
+    # 版を渡さない呼び出し（mutation の中など）は使い回さない。
+    [void](Get-FinalBuildReadiness $view.structure 'ja' 'ja-main' $countedId)
+    Assert-OutputTest ($Script:SnapshotCalls -eq 2) 'A readiness call without a structure version used the snapshot cache.'
+    # 返したスナップショットに書き足しても、キャッシュの実体は汚れない。
+    $copy = Get-CachedFinalBuildInputSnapshot $view.structure 'ja' 'ja-main' $countedId ([string]$view.stamp)
+    Set-NoteProperty $copy 'sourceWorkbooks' @('x')
+    $again = Get-CachedFinalBuildInputSnapshot $view.structure 'ja' 'ja-main' $countedId ([string]$view.stamp)
+    Assert-OutputTest (-not $again.Contains('sourceWorkbooks')) 'A caller-side addition leaked into the cached snapshot.'
+    # 変換PDFが差し替わったら（structure はそのまま）引き直す。
+    $calls = $Script:SnapshotCalls
+    [IO.File]::AppendAllText($countedPdf, '-changed')
+    $changedPdf = Get-FinalBuildReadiness $view.structure 'ja' 'ja-main' $countedId $true ([string]$view.stamp)
+    Assert-OutputTest ($Script:SnapshotCalls -eq $calls + 1) 'A replaced converted PDF did not invalidate the cached snapshot.'
+    Assert-OutputTest ([string]$changedPdf.currentFingerprint -ne [string]$first.currentFingerprint) 'The fingerprint did not follow the replaced converted PDF.'
+    # structure を保存したら古い結果は使わない。
+    $calls = $Script:SnapshotCalls
+    [void](Update-StructureLocked 'ja' { param($st) return $null })
+    $view2 = Get-StructureWithStamp 'ja'
+    [void](Get-FinalBuildReadiness $view2.structure 'ja' 'ja-main' $countedId $true ([string]$view2.stamp))
+    Assert-OutputTest ($Script:SnapshotCalls -eq $calls + 1) 'A saved structure still served the cached snapshot.'
+} finally {
+    $Script:FinalSnapshotCache = $null
+    Set-Item Function:\Get-FinalBuildInputSnapshot $realSnapshot
+}
+
+# ---- 性能: 出力前の既定番号で何も変わらなければ structure.json を書き直さない ---------
+$numberingFirst = Update-StructureLocked 'ja' { param($st) return [ordered]@{ changed = (Update-DefaultNumberingPerVolume 'ja' $st $countedId) } }
+$stampBefore = Get-StructureFileStamp 'ja'
+$numberingAgain = Update-StructureLocked 'ja' {
+    param($st)
+    $changed = Update-DefaultNumberingPerVolume 'ja' $st $countedId
+    return [ordered]@{ changed = $changed; __noStructureWrite = (-not $changed) }
+}
+Assert-OutputTest ([bool]$numberingFirst.changed) 'The first default numbering pass reported no change; the no-write case is not exercised.'
+Assert-OutputTest (-not [bool]$numberingAgain.changed) 'Re-applying the default numbering reported a change.'
+Assert-OutputTest ((Get-StructureFileStamp 'ja') -eq $stampBefore) 'An unchanged default numbering pass still rewrote structure.json.'
+Assert-OutputTest (-not $numberingAgain.Contains('__noStructureWrite')) 'The __noStructureWrite marker leaked to the caller.'
+
+# ---- 作成中に原稿・入力が変わっても、作成開始時のスナップショットで最後まで作る ----------
+# 組版（Java）と入力スナップショットだけを差し替え、実物の Build-DocumentPackPdf と
+# Invoke-FinalBuildTransaction を通す。組版の最中に「変換し直し」を起こす（元の変換PDFを
+# 世代整理で消し、入力の指紋を変える）。以前はここで「PDF作成中に…変更されました」と失敗した。
+$midWorkspace = Get-WorkspacePath 'ja'
+$midPdfRel = 'content-pdf\selfcheck-mid\v1\Sheet10.pdf'
+$midPdf = Join-Path $midWorkspace $midPdfRel
+New-Item -ItemType Directory -Path (Split-Path -Parent $midPdf) -Force | Out-Null
+$Script:MidInputVersion = 'v1'
+$Script:MidOutputName = 'mid-build.pdf'
+$Script:MidComposeHook = $null
+$Script:MidComposedSources = @()
+$realMidSnapshot = ${function:Get-FinalBuildInputSnapshot}
+$realMidScan = ${function:Scan-Updates}
+$realMidJava = ${function:Resolve-JavaExe}
+$realMidNative = ${function:Invoke-NativeCapture}
+$realMidAppRoot = $Script:AppRoot
+# 呼ばれた時点の変換PDFのサイズ・更新時刻を記録する。指紋は $Script:MidInputVersion で決める。
+function Get-FinalBuildInputSnapshot($Structure, [string]$Language, [string]$Volume, [string]$PackId) {
+    $info = New-Object IO.FileInfo $midPdf
+    $size = if ($info.Exists) { [int64]$info.Length } else { 0L }
+    $ticks = if ($info.Exists) { [int64]$info.LastWriteTimeUtc.Ticks } else { 0L }
+    $fpPage = [ordered]@{ pageId='mid-p1'; contentPdf=$midPdfRel; contentPdfSize=$size; contentPdfLastWriteUtcTicks=$ticks }
+    $entry = [ordered]@{ pageId='mid-p1'; itemId='mid-p1'; sourceId='selfcheck-mid'; title='Sheet10'; sourcePdf=$midPdf; sourcePageStart=1; sourcePageEnd=1; sourcePageCount=1; numberingMode='visible' }
+    return [ordered]@{ language=$Language; packId=$PackId; volume=$Volume; pages=@(); manifestPages=@($entry); physicalPages=@(); document=[ordered]@{}; blockers=@(); itemCount=1; pageCount=1; projectId=''; outputFileName=$Script:MidOutputName; fingerprint=('fp|mid|' + $Script:MidInputVersion); fingerprintInput=[ordered]@{ pages=@($fpPage) } }
+}
+function Scan-Updates { return $null }
+function Resolve-JavaExe { return 'java' }
+# 組版の代わり: manifest が指す変換PDFを読んでつなげる。読む前に $Script:MidComposeHook を走らせる。
+function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSeconds = 120) {
+    $manifestArg = [string]$ArgumentList[[Array]::IndexOf($ArgumentList, '--manifest') + 1]
+    $m = Get-Content -LiteralPath $manifestArg -Raw -Encoding UTF8 | ConvertFrom-Json
+    $Script:MidComposedSources = @($m.pages | ForEach-Object { [string]$_.sourcePdf })
+    if ($null -ne $Script:MidComposeHook) { & $Script:MidComposeHook }
+    $text = (@($Script:MidComposedSources | ForEach-Object { [IO.File]::ReadAllText($_) }) -join '|')
+    [IO.File]::WriteAllText([string]$m.outputPdf, $text)
+    return [pscustomobject]@{ exitCode = 0; text = 'composed'; timedOut = $false }
+}
+$fakeAppRoot = Join-Path $Script:LocalConfigRoot 'fake-app'
+New-Item -ItemType Directory -Path (Join-Path $fakeAppRoot 'lib\pdfbox') -Force | Out-Null
+foreach ($jar in @('ReportPdfComposer.jar','pdfbox-app.jar')) { [IO.File]::WriteAllText((Join-Path (Join-Path $fakeAppRoot 'lib\pdfbox') $jar), 'jar') }
+$Script:AppRoot = $fakeAppRoot
+$changedDuringBuildHook = { Remove-Item -LiteralPath $midPdf -Force; $Script:MidInputVersion = ('changed-' + [Guid]::NewGuid().ToString('N')) }
+function Get-InputCopyDirs { return @(Get-ChildItem -LiteralPath (Join-Path $midWorkspace 'state\tmp') -Directory -Filter 'final-inputs-*' -ErrorAction SilentlyContinue) }
+function Assert-BuiltFromStartSnapshot($Result, [string]$PackId, [string]$Expected, [string]$Label) {
+    Assert-OutputTest ([bool](Get-DataProperty $Result 'inputChangedDuringBuild' $false)) "$Label did not report that the inputs changed during the build."
+    $outPath = [string](Get-DataProperty $Result 'outputPdf' '')
+    Assert-OutputTest ((Test-Path -LiteralPath $outPath) -and [IO.File]::ReadAllText($outPath) -eq $Expected) "$Label did not keep the PDF composed from the start-of-build inputs."
+    Assert-OutputTest ($Script:MidComposedSources.Count -eq 1 -and $Script:MidComposedSources[0] -ne $midPdf -and $Script:MidComposedSources[0] -like '*final-inputs-*') "$Label composed from the live converted PDF instead of the start-of-build copy: $($Script:MidComposedSources -join ', ')"
+    Assert-OutputTest (-not (Test-Path -LiteralPath $Script:MidComposedSources[0])) "$Label left the start-of-build copy behind."
+    $state = Get-PackOutputState (Get-Structure 'ja') 'ja' $PackId 'ja-main' $false
+    Assert-OutputTest ([string](Get-DataProperty $state 'builtFingerprint' '') -eq 'fp|mid|v1') "$Label did not record the start-of-build fingerprint."
+    Assert-OutputTest ([string](Get-DataProperty $state 'status' '') -eq 'needs-rebuild') "$Label did not mark the output as needs-rebuild."
+    $ready = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $PackId
+    Assert-OutputTest ([string]$ready.displayState -eq 'needs-rebuild') "$Label is not shown as needs-rebuild (displayState=$($ready.displayState))."
+    $firstReason = @(Get-Array $ready.staleReasons) | Select-Object -First 1
+    Assert-OutputTest ([string](Get-DataProperty $firstReason 'type' '') -eq 'changed-during-build') "$Label did not explain that the inputs changed during the build."
+}
+try {
+    # 1. カスタム一式（Build-DocumentPackPdf）。作成中に変わっても失敗せず、開始時の内容で確定する。
+    $midPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='作成中に変わる一式' })
+    $midId = [string]$midPack.packId
+    Add-TestPages $midId @('ja-main')
+    # 作成前からあった理由（前回の出力に対するもの）は、今回の出力で解消済みなので残さない。
+    [void](Update-StructureLocked 'ja' {
+        param($st)
+        $state = Get-PackOutputState $st 'ja' $midId 'ja-main' $true
+        Set-NoteProperty $state 'builtFingerprint' 'fp|older'
+        Set-NoteProperty $state 'staleReasons' @([ordered]@{ type='unregister'; at='2000-01-01T00:00:00+09:00'; detail='前回の出力に対する理由'; count=1 })
+        return $null
+    })
+    [IO.File]::WriteAllText($midPdf, '%PDF-start-of-build')
+    $Script:MidInputVersion = 'v1'
+    $Script:MidComposeHook = $changedDuringBuildHook
+    $midResult = Build-DocumentPackPdf 'ja' $midId 'main'
+    Assert-BuiltFromStartSnapshot $midResult $midId '%PDF-start-of-build' 'A custom pack build'
+    $midState = Get-PackOutputState (Get-Structure 'ja') 'ja' $midId 'ja-main' $false
+    Assert-OutputTest (@(Get-Array (Get-DataProperty $midState 'staleReasons' @()) | Where-Object { [string](Get-DataProperty $_ 'type' '') -eq 'unregister' }).Count -eq 0) 'A stale reason from before the build survived the new output.'
+    $savedManifest = Read-JsonFile (Join-Path $midWorkspace ("exports\manifest_{0}_main.json" -f $midId)) $null
+    Assert-OutputTest ([string]@($savedManifest.pages)[0].sourcePdf -eq $midPdf) 'The saved manifest points at the temporary copy instead of the converted PDF.'
+    Assert-OutputTest (@(Get-InputCopyDirs).Count -eq 0) 'The start-of-build copy folder was left behind.'
+
+    # 変わらなければ今までどおり built。前回の changed-during-build は残さない。
+    [IO.File]::WriteAllText($midPdf, '%PDF-second')
+    $Script:MidInputVersion = 'v1'
+    $Script:MidComposeHook = $null
+    $steady = Build-DocumentPackPdf 'ja' $midId 'main'
+    Assert-OutputTest (-not [bool](Get-DataProperty $steady 'inputChangedDuringBuild' $true)) 'An unchanged build reported changed inputs.'
+    $steadyReady = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $midId
+    Assert-OutputTest ([string]$steadyReady.displayState -eq 'built' -and @($steadyReady.staleReasons).Count -eq 0) "An unchanged build is not shown as built (displayState=$($steadyReady.displayState))."
+
+    # 2. 組み込み一式の一括出力（Invoke-FinalBuildTransaction）でも同じ。
+    $Script:MidOutputName = 'mid-build-ecm.pdf'
+    [IO.File]::WriteAllText($midPdf, '%PDF-start-of-transaction')
+    $Script:MidInputVersion = 'v1'
+    $Script:MidComposeHook = $changedDuringBuildHook
+    $txResult = Invoke-FinalBuildTransaction 'ja' 'ecm' @('ja-main')
+    Assert-OutputTest (@($txResult.built).Count -eq 1) 'The final build transaction did not complete when the inputs changed during the build.'
+    Assert-BuiltFromStartSnapshot @($txResult.built)[0] (Get-BuiltinPackId 'ecm') '%PDF-start-of-transaction' 'A built-in pack build'
+    Assert-OutputTest (@(Get-InputCopyDirs).Count -eq 0) 'The start-of-build copy folder of the transaction was left behind.'
+
+    # 3. 合成する変換PDFそのものが開始時点で消えた・差し替わったときだけ失敗する。
+    $Script:MidOutputName = 'mid-build.pdf'
+    $Script:MidComposeHook = $null
+    [IO.File]::WriteAllText($midPdf, '%PDF-probe')
+    $probeSnapshot = Get-FinalBuildInputSnapshot $null 'ja' 'ja-main' $midId
+    [IO.File]::AppendAllText($midPdf, '-replaced')
+    Assert-Throws { Copy-FinalBuildInputPdfs 'ja' $probeSnapshot (Join-Path $Script:LocalConfigRoot 'copy-probe-replaced') } '変換PDF' 'A converted PDF replaced after the snapshot was copied as if it were the start-of-build version.'
+    $probeSnapshot = Get-FinalBuildInputSnapshot $null 'ja' 'ja-main' $midId
+    Remove-Item -LiteralPath $midPdf -Force
+    Assert-Throws { Copy-FinalBuildInputPdfs 'ja' $probeSnapshot (Join-Path $Script:LocalConfigRoot 'copy-probe-missing') } '変換PDF' 'A missing converted PDF did not stop the build.'
+    $beforeMissing = [string](Get-DataProperty (Get-PackOutputState (Get-Structure 'ja') 'ja' $midId 'ja-main' $false) 'builtFingerprint' '')
+    Assert-Throws { Build-DocumentPackPdf 'ja' $midId 'main' } '変換PDF' 'A build whose converted PDF is missing did not fail.'
+    Assert-OutputTest ([string](Get-DataProperty (Get-PackOutputState (Get-Structure 'ja') 'ja' $midId 'ja-main' $false) 'builtFingerprint' '') -eq $beforeMissing) 'A failed build changed the recorded output.'
+    Assert-OutputTest (@(Get-InputCopyDirs).Count -eq 0) 'A failed build left the start-of-build copy folder behind.'
+} finally {
+    $Script:AppRoot = $realMidAppRoot
+    Set-Item Function:\Get-FinalBuildInputSnapshot $realMidSnapshot
+    Set-Item Function:\Scan-Updates $realMidScan
+    Set-Item Function:\Resolve-JavaExe $realMidJava
+    Set-Item Function:\Invoke-NativeCapture $realMidNative
+}
+
 # ---- 共有用フォルダーへのまとめてコピー（publish-all）と出力PDFの照合（M-2） ----------
 # 原稿のPDFを置かずに済むよう、入力スナップショットだけを差し替える。指紋は出力先ごとに固定。
 function Get-FinalBuildInputSnapshot($Structure, [string]$Language, [string]$Volume, [string]$PackId) {

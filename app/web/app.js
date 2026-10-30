@@ -6131,6 +6131,15 @@ function showBuildArchiveWarning(job) {
   const detail=String(failed[0].archiveError||'');
   setTimeout(()=>showMessage('warn','提出用PDFは出力しましたが、控えを保存できませんでした',`${detail} 提出用PDF自体は保存されています。出力フォルダーの空き容量とアクセス権を確認してから、もう一度出力してください。`,failed,[],0),700);
 }
+// 作成中に原稿や入力が変わっても、出力は作成開始時点の内容で最後まで終わる。その出力先は
+// サーバーが needs-rebuild と理由（changed-during-build）を残しているので、完了直後に知らせる。
+function showChangedDuringBuildWarning(job) {
+  const changed=asArray(job?.built).filter(item=>item&&item.inputChangedDuringBuild);
+  if(!changed.length)return false;
+  const names=changed.map(item=>outputFileName(item?.outputPdf)).filter(Boolean);
+  setTimeout(()=>showMessage('warn','作成中に原稿が変わったので再出力が必要です',`${names.length?`${names.join('、')} は`:'出力したPDFは'}作成開始時点の内容で保存しました。最新の原稿で作り直すには、もう一度出力してください。`,changed,[{label:'提出用PDFを確認',handler:()=>{setActiveView('final');focusFinalOutputs();}}],0),900);
+  return true;
+}
 function showPostBuildWarning(volume) {
   const after=volumeReadiness(volume),blockers=asArray(after.blockers);
   if(blockers.length){setTimeout(()=>showMessage('warn','提出用PDFは出力しましたが、追加対応が必要です',blockers[0]?.message||'変換PDFを作成し直してから、提出用PDFを再出力してください。',blockers,[{label:'原稿・変換PDFへ',view:'excel'}],0),900);}
@@ -6154,7 +6163,7 @@ async function buildVolume(volume, btn) {
     // 控えの作成に失敗しても提出用PDF自体はできている。ただし黙って進むと、
     // 出力の元になった原稿の版がいつ消えたか誰にも分からなくなる。
     showBuildArchiveWarning(job);
-    showPostBuildWarning(volume);
+    if(!showChangedDuringBuildWarning(job))showPostBuildWarning(volume);
   },false);
 }
 
@@ -6305,6 +6314,7 @@ async function buildAllVolumes(btn) {
         : [{label:'出力したPDFを確認',primary:true,handler:()=>{setActiveView('final');focusFinalOutputs();}}];
       showMessage('ok','提出用PDFを出力しました', detailText, {built, skipped}, actions, 0);
       showBuildArchiveWarning(job);
+      showChangedDuringBuildWarning(job);
     } else {
       showMessage('warn','出力対象がありません','ページ構成で本体または補足にページを設定してください。');
     }

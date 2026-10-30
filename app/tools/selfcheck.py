@@ -1646,7 +1646,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v199', 'style.css?v=20261030_v124']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v200', 'style.css?v=20261030_v124']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1689,7 +1689,6 @@ for forbidden in ['Scan-Updates $Language', '$ready = Get-FinalBuildReadiness']:
         raise SystemExit(f'final build still contains redundant shared-folder work: {forbidden}')
 for needed in ['Assert-FinalBuildSourcesUnchanged $snapshots $targets',
                '$initialSnapshots = Update-StructureLocked',
-               '$afterStructure = Get-Structure $Language',
                '[IO.Path]::GetTempPath()']:
     if needed not in _final_build:
         raise SystemExit(f'optimized final build path is missing: {needed}')
@@ -1701,7 +1700,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v199' not in html:
+if 'app.js?v=20261030_v200' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1727,7 +1726,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v199' not in html:
+if 'app.js?v=20261030_v200' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2509,6 +2508,164 @@ if "body:{force:false}" not in _final_preflight_refresh or 'body:{force:true}' i
 _scan_and_refresh = appjs.split('async function scanAndRefresh', 1)[1].split('\nfunction ', 1)[0]
 if "body:{force:true}" not in _scan_and_refresh:
     raise SystemExit('scanAndRefresh must keep the forced full rehash')
+
+def _ps_function(text, name, where):
+    # 引数のない関数は `function Name {`、あるものは `function Name(` と書かれる。
+    start = -1
+    for marker in (f'function {name}(', f'function {name} {{', f'function {name}\n'):
+        start = text.find(marker)
+        if start >= 0:
+            break
+    if start < 0:
+        raise SystemExit(f'{name} is missing from {where}')
+    depth, brace = 0, text.index('{', start)
+    for index in range(brace, len(text)):
+        if text[index] == '{':
+            depth += 1
+        elif text[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:index+1]
+    raise SystemExit(f'{name} is unterminated in {where}')
+
+# 2026-10-30 提出用PDFの出力まわりの性能 -----------------------------------------
+# 出力ジョブの進捗は700msごとにポーリングされる。応答に全体の state を付けると、そのたびに
+# structure 全体と全出力先の readiness を組み立て直す。画面は job しか見ない。
+_build_status_route = server.split("$path -eq '/api/v2/outputs/build/status') {", 1)[1].split('if ($method', 1)[0]
+if 'Get-V2StatePayload' in _build_status_route or 'Get-StatePayload' in _build_status_route or 'state=' in _build_status_route:
+    raise SystemExit('/api/v2/outputs/build/status must not return the full state payload')
+if 'Read-FinalJobStatus' not in _build_status_route:
+    raise SystemExit('/api/v2/outputs/build/status must still return the job status')
+_run_final_job = appjs.split('async function runFinalBuildJob', 1)[1].split('\nfunction ', 1)[0]
+if re.search(r'polled\??\.state', _run_final_job):
+    raise SystemExit('runFinalBuildJob must not depend on a state payload in the build status response')
+# 記録済みの頁数（artifact.pageCount／unit.physicalPageCount）があれば変換PDFを開いて数えない。
+_final_snapshot = _ps_function(server, 'Get-FinalBuildInputSnapshot', 'server.ps1')
+if 'if($recordedPageCount -le 0){$sourcePageCount=Get-PdfPageCount $full}' not in _final_snapshot:
+    raise SystemExit('Get-FinalBuildInputSnapshot must skip Get-PdfPageCount when a page count is recorded')
+if _final_snapshot.count('Get-PdfPageCount') != 1:
+    raise SystemExit('Get-FinalBuildInputSnapshot must count PDF pages only when no page count is recorded')
+if _final_snapshot.find('$recordedPageCount=Get-IntDataProperty') > _final_snapshot.find('Get-PdfPageCount'):
+    raise SystemExit('Get-FinalBuildInputSnapshot must look up the recorded page count before counting PDF pages')
+# 入力スナップショットは要求（ジョブ）スコープで structure の版ごとに使い回す。
+for needed in ['function Get-CachedFinalBuildInputSnapshot', 'function Test-FinalSnapshotContentUnchanged',
+               'function Get-StructureWithStamp', 'function Get-StructureFileStamp', '$Script:FinalSnapshotCache = $null']:
+    if needed not in server:
+        raise SystemExit(f'final input snapshot cache missing: {needed}')
+_cached_snapshot = _ps_function(server, 'Get-CachedFinalBuildInputSnapshot', 'server.ps1')
+for needed in ['[string]::IsNullOrWhiteSpace($StructureStamp)', 'Test-FinalSnapshotContentUnchanged', '$copy = [ordered]@{}']:
+    if needed not in _cached_snapshot:
+        raise SystemExit(f'the snapshot cache must be keyed by the structure version, check content PDFs and return copies: {needed}')
+if '$Script:FinalSnapshotCache.Clear()' not in _update_structure:
+    raise SystemExit('Update-StructureLocked must drop cached snapshots after saving structure.json')
+_readiness_fn = _ps_function(server, 'Get-FinalBuildReadiness', 'server.ps1')
+if 'Get-CachedFinalBuildInputSnapshot' not in _readiness_fn or '$Snapshot = $null' not in _readiness_fn:
+    raise SystemExit('Get-FinalBuildReadiness must use the snapshot cache and accept a precomputed snapshot')
+_job_runner_perf = _ps_function(server, 'Invoke-FinalBuildJobFromFile', 'server.ps1')
+if '$Script:FinalSnapshotCache = @{}' not in _job_runner_perf:
+    raise SystemExit('the final build job must enable the snapshot cache for its run')
+if 'Get-StructureWithStamp' not in _job_runner_perf:
+    raise SystemExit('the final build job must pass the structure version to its readiness check')
+_server_loop = server.split("if ($path.StartsWith('/api/')) { Handle-Api $context }", 1)
+if len(_server_loop) != 2 or '$Script:FinalSnapshotCache = @{}' not in _server_loop[0][-400:] or '$Script:FinalSnapshotCache = $null' not in _server_loop[1][:2000]:
+    raise SystemExit('each HTTP request must get its own snapshot cache that is dropped afterwards')
+for fn in ('Get-StatePayload', 'Get-V2StatePayload'):
+    if 'Get-StructureWithStamp' not in _ps_function(server, fn, 'server.ps1'):
+        raise SystemExit(f'{fn} must pass the structure version so readiness is not rebuilt per view')
+_readiness_route = server.split("$path -eq '/api/v2/outputs/readiness') {", 1)[1].split('if ($method', 1)[0]
+if 'Get-StructureWithStamp' not in _readiness_route:
+    raise SystemExit('/api/v2/outputs/readiness must pass the structure version to readiness')
+# 出力後の「入力が変わっていないか」の確認はキャッシュを使わず読み直す。
+_pack_build = _ps_function(server, 'Build-DocumentPackPdf', 'server.ps1')
+_pack_commit = _pack_build.split('$commit = Update-StructureLocked', 1)[1]
+if '$after = Get-FinalBuildInputSnapshot $st' not in _pack_commit or 'Get-CachedFinalBuildInputSnapshot' in _pack_commit:
+    raise SystemExit('the post-compose fingerprint check of Build-DocumentPackPdf must recompute the snapshot')
+if "$true '' $after)" not in _pack_commit:
+    raise SystemExit('Build-DocumentPackPdf must reuse the just-verified snapshot for the returned readiness')
+_tx_build = _ps_function(server, 'Invoke-FinalBuildTransaction', 'server.ps1')
+_tx_after_compose = _tx_build.split('# 12. structure 更新', 1)[1]
+if 'Get-CachedFinalBuildInputSnapshot' in _tx_after_compose or '$after = Get-FinalBuildInputSnapshot $st' not in _tx_after_compose:
+    raise SystemExit('the post-compose fingerprint check of the final build transaction must recompute the snapshot')
+# 作成中に原稿・入力が変わっても途中で失敗させない。開始時に確定した変換PDFの写しで組み、
+# 完了時に入力が変わっていれば出力は確定したうえで needs-rebuild と理由を残す。
+# 振る舞いは output-publish-selfcheck.ps1 が実物の Build-DocumentPackPdf で確かめる。
+_changed_mid_build = 'PDF作成中にページ構成またはPDF入力が変更されました'
+if _changed_mid_build in server:
+    raise SystemExit('a final build must not fail because the inputs changed while it was being composed')
+for needed in ['function Copy-FinalBuildInputPdfs', 'function Set-FinalBuildChangedDuringBuild', 'function New-FinalBuildInputCopyDir',
+               "$Script:FinalBuildChangedDuringBuildReason = 'changed-during-build'"]:
+    if needed not in server:
+        raise SystemExit(f'build-from-start-snapshot helper is missing: {needed}')
+_copy_inputs = _ps_function(server, 'Copy-FinalBuildInputPdfs', 'server.ps1')
+for needed in ['Get-ContentPdfMaintenanceLockPath', "'contentPdfSize'", "'contentPdfLastWriteUtcTicks'", 'Copy-FileSharedRead', '$info.Refresh()']:
+    if needed not in _copy_inputs:
+        raise SystemExit(f'the start-of-build copy of converted PDFs must be pinned and verified: {needed}')
+_mark_changed = _ps_function(server, 'Set-FinalBuildChangedDuringBuild', 'server.ps1')
+if "'needs-rebuild'" not in _mark_changed or 'Add-StaleReason' not in _mark_changed or 'Test-StaleReasonSince' not in _mark_changed:
+    raise SystemExit('a build whose inputs changed must be recorded as needs-rebuild with a stale reason')
+for _name, _body in (('Build-DocumentPackPdf', _pack_build), ('Invoke-FinalBuildTransaction', _tx_build)):
+    _copy_at = _body.find('Copy-FinalBuildInputPdfs')
+    if _copy_at < 0 or _copy_at > _body.find('Resolve-JavaExe'):
+        raise SystemExit(f'{_name} must copy the converted PDFs before composing')
+    for needed in ['$composeManifest', 'Remove-FinalBuildInputCopyDir $inputCopyDir', '$buildStartedAt = New-NowIso',
+                   'Set-FinalBuildChangedDuringBuild', 'inputChangedDuringBuild']:
+        if needed not in _body:
+            raise SystemExit(f'{_name} must build from the start snapshot and flag inputs changed mid-build: {needed}')
+# 組版に渡すのは写しを指す manifest。保存する manifest は元の変換PDFを指したまま。
+if "'--manifest',$composeManifestPath" not in _pack_build:
+    raise SystemExit('Build-DocumentPackPdf must compose from the copied converted PDFs')
+if 'Write-JsonFile $manifestPath $composeManifest' not in _tx_build:
+    raise SystemExit('Invoke-FinalBuildTransaction must compose from the copied converted PDFs')
+_pack_commit_body = _pack_build.split('$commit = Update-StructureLocked', 1)[1]
+if 'return [ordered]@{ changed=$true }' in _pack_commit_body or 'Move-Item -LiteralPath $tempPath' not in _pack_commit_body:
+    raise SystemExit('Build-DocumentPackPdf must commit the composed PDF even if the inputs changed meanwhile')
+if 'changedDuringBuildCount' not in _ps_function(server, 'Invoke-FinalBuildJobFromFile', 'server.ps1'):
+    raise SystemExit('the output job status must report how many outputs need a rebuild because inputs changed')
+_changed_ui = appjs.split('function showChangedDuringBuildWarning', 1)
+if len(_changed_ui) != 2 or 'inputChangedDuringBuild' not in _changed_ui[1].split('\nfunction ', 1)[0]:
+    raise SystemExit('the UI must tell the user to rebuild when the inputs changed during the build')
+for _fn in ('async function buildVolume', 'async function buildAllVolumes'):
+    if 'showChangedDuringBuildWarning(job)' not in appjs.split(_fn, 1)[1].split('\nasync function ', 1)[0]:
+        raise SystemExit(f'{_fn} must show the changed-during-build guidance')
+# 出力前の既定番号で何も変わらなければ structure.json を書き直さない。
+_numbering = _ps_function(server, 'Update-DefaultNumberingPerVolume', 'server.ps1')
+if 'return $changed' not in _numbering or re.search(r'\bSet-NoteProperty \$p ', _numbering):
+    raise SystemExit('Update-DefaultNumberingPerVolume must report changes and write only changed values')
+_pack_prepare = _pack_build.split('$locked = Update-StructureLocked', 1)[1].split('$snapshotBefore = $locked.snapshot', 1)[0]
+for needed in ['Update-DefaultNumberingPerVolume', '__noStructureWrite = (-not $numberingChanged)', 'Get-CachedFinalBuildInputSnapshot']:
+    if needed not in _pack_prepare:
+        raise SystemExit(f'Build-DocumentPackPdf must skip unchanged structure writes before composing: {needed}')
+_tx_prepare = _tx_build.split('$initialSnapshots = Update-StructureLocked', 1)[1].split('\n        foreach ($v in $requested) {\n            $snap', 1)[0]
+for needed in ['Update-DefaultNumberingPerVolume', "$all['__noStructureWrite'] = (-not $numberingChanged)", 'Get-CachedFinalBuildInputSnapshot']:
+    if needed not in _tx_prepare:
+        raise SystemExit(f'Invoke-FinalBuildTransaction must skip unchanged structure writes before composing: {needed}')
+# 同じ原稿の全体ハッシュを繰り返さない。ロック内の比較とコピー直後の検証は読み直す。
+for needed in ['function Get-Sha256Reusing', 'function Get-RecentFileHash', 'function Register-RecentFileHash']:
+    if needed not in server:
+        raise SystemExit(f'recent file hash reuse missing: {needed}')
+_capture_detected = _ps_function(server, 'Capture-DetectedSnapshot', 'server.ps1')
+if '$capturedHash = Normalize-FileHash (Get-Sha256Reusing $sourcePath)' not in _capture_detected:
+    raise SystemExit('Capture-DetectedSnapshot must reuse the scan hash for the captured source')
+if '$liveHash = Normalize-FileHash (New-Sha256 $sourcePath)' not in _capture_detected.split('Update-StructureLocked', 1)[1]:
+    raise SystemExit('the compare-and-set inside the structure lock must still rehash the live source')
+_save_source = _ps_function(server, 'Save-SnapshotSourceFile', 'server.ps1')
+for needed in ['$copyHash = Normalize-FileHash (New-Sha256 $tmp)', '$finalHash = Normalize-FileHash (New-Sha256 $dest)', 'Register-RecentFileHash $dest $finalHash']:
+    if needed not in _save_source:
+        raise SystemExit(f'Save-SnapshotSourceFile must keep verifying copies and remember the verified hash: {needed}')
+if 'Get-Sha256Reusing ([string]$state.sourcePath)' not in _ps_function(server, 'Capture-RenderInput', 'server.ps1'):
+    raise SystemExit('Capture-RenderInput must not rehash a retained source verified moments ago')
+if server.count('$sourceHash = Normalize-FileHash (Get-Sha256Reusing $inputPath)') != 3:
+    raise SystemExit('Word/PDF/PowerPoint conversion must reuse the verified input hash')
+# 描画環境の指紋は原稿×版ごとに持つ。一括変換の解析は全原稿の変換後なので、今の値は最後の原稿のもの。
+for needed in ['function Register-RenderEnvironment', 'function Get-RenderEnvironmentFor', '$Script:RenderEnvironmentByVersion = @{}']:
+    if needed not in server:
+        raise SystemExit(f'per-source render environment missing: {needed}')
+if server.count('Register-RenderEnvironment $') != 4:
+    raise SystemExit('every converter must register its render environment before queuing the analysis')
+for fn in ('Write-RenderRecord', 'Invoke-PostRenderAnalysis'):
+    _body = _ps_function(server, fn, 'server.ps1')
+    if 'CurrentRenderEnvFingerprint' in _body or 'Get-RenderEnvironmentFor' not in _body:
+        raise SystemExit(f'{fn} must use the render environment of the analysed version')
 # ローカルAPIのオリジン検証（別ポートのローカルページからのトークン悪用を防ぐ）
 for needed in ['function Test-RequestOrigin', "Test-RequestOrigin $Context.Request", "invalid origin"]:
     if needed not in server:
@@ -2537,25 +2694,6 @@ if '.page-thumb-card.selected-row::after' not in css:
 # 2026-08-09 distribution integrity manifest --------------------------------
 launcher = (root/'app/launch.ps1').read_text(encoding='utf-8-sig')
 packager = (root/'app/tools/package-release.ps1').read_text(encoding='utf-8-sig')
-
-def _ps_function(text, name, where):
-    # 引数のない関数は `function Name {`、あるものは `function Name(` と書かれる。
-    start = -1
-    for marker in (f'function {name}(', f'function {name} {{', f'function {name}\n'):
-        start = text.find(marker)
-        if start >= 0:
-            break
-    if start < 0:
-        raise SystemExit(f'{name} is missing from {where}')
-    depth, brace = 0, text.index('{', start)
-    for index in range(brace, len(text)):
-        if text[index] == '{':
-            depth += 1
-        elif text[index] == '}':
-            depth -= 1
-            if depth == 0:
-                return text[start:index+1]
-    raise SystemExit(f'{name} is unterminated in {where}')
 
 # 除外規則が片方だけ変わると、検証対象から外れたファイルが素通りする。
 _excl_launcher = _ps_function(launcher, 'Test-IntegrityExcludedPath', 'launch.ps1')

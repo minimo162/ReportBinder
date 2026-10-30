@@ -1,5 +1,27 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 提出用PDFの作成中に原稿が変わっても、作成開始時の内容で最後まで作るようにした（2026-10-30）
+
+- これまで失敗していた箇所: 出力中に原稿が変換し直されたりページ構成が変わったりすると、一括出力（`Invoke-FinalBuildTransaction`）は組版後の再確認（手順9）と structure 確定時の再確認（手順12）で、カスタム一式の出力（`Build-DocumentPackPdf`）は確定時の再確認で「PDF作成中にページ構成またはPDF入力が変更されました」と失敗させ、組み上がったPDFを捨てていた。さらに、変換し直しの後の世代整理（履歴を残さない設定では最新以外をすぐ消す）で組版中の変換PDFが消え、組版そのものが失敗することもあった。
+- 作成開始時（出力ロック内で入力スナップショットを確定した直後）に、合成する変換PDFを作業用フォルダー（`state\tmp\final-inputs-*`）へ写し、組版にはその写しを指す manifest を渡すようにした（`Copy-FinalBuildInputPdfs`）。写すのはスナップショットに記録したサイズ・更新時刻と同じものだけで、原稿ごとに変換PDFの世代整理のロックを持って写す。保存する manifest（`exports\manifest_*.json`）は今までどおり元の変換PDFを指す。写しは成否にかかわらず消し、強制終了で残ったものは起動時の復旧で1日経ったものから消す。
+- 組版後の再確認で止めるのをやめた。確定時に入力が変わっていれば、出力は作成開始時の指紋（`builtFingerprint`）で確定したうえで、出力先を`needs-rebuild`にし、`staleReasons`の先頭に`changed-during-build`（「作成中に原稿や入力が変わりました。出力したPDFは作成開始時点の内容です。再出力してください。」）を足す（`Set-FinalBuildChangedDuringBuild`）。作成中に他の操作が足した理由は残し、前回の出力に対する古い理由は捨てる。readiness は今までどおり今の入力と比べるので、提出用PDFの画面には「再出力が必要」とこの理由が出る。共有用フォルダーへのコピーも最新でないので止まる。
+- 出力結果と履歴（`final.built`）に`inputChangedDuringBuild`を、出力ジョブの状態に`changedDuringBuildCount`と「うち N 冊は作成中に原稿が変わったため、再出力が必要です。」を加えた。画面は出力完了後に「作成中に原稿が変わったので再出力が必要です」と案内する（`showChangedDuringBuildWarning`。単体出力・まとめて出力の両方）。
+- 失敗にするのは、合成する変換PDFそのものが作成開始時点で消えた・壊れた・差し替わった（記録したサイズ・更新時刻と違う）ときだけ。開始時点で確定する元原稿の確認（`Assert-FinalBuildSourcesUnchanged`）や blocker は今までどおり。
+- `Build-DocumentPackPdf`で、控え・pin に使う原稿の版（`sourceWorkbooks`）を、ロックの外で structure を読み直して取っていたのを、スナップショットと同じロック内の structure から取るようにした。
+- `app/tools/output-publish-selfcheck.ps1`で、組版と入力スナップショットを差し替えて実物の`Build-DocumentPackPdf`と`Invoke-FinalBuildTransaction`を動かし、組版中に元の変換PDFを消して入力を変えても完走すること、出力が開始時点の内容であること、写しから組んで写しを残さないこと、`needs-rebuild`と`changed-during-build`が readiness に出ること、変わらなければ`built`のままであること、変換PDFが開始時点で消えた・差し替わったときだけ失敗し出力の記録を変えないことを確かめるようにした。`app/tools/selfcheck.py`に、途中失敗のメッセージが残っていないこと、組版前の写し・写しを指す manifest・確定時の needs-rebuild・画面の案内の静的検査を加え、削除した組版後の再確認に依存していた検査を直した。
+- RuntimeVersion `2026.10.30.11`、`app.js` `v20261030_v200` のまま（同じ未リリース版に含める）。
+
+## 提出用PDFの出力・変換まわりの重複計算を減らした（2026-10-30）
+
+- `GET /api/v2/outputs/build/status`の応答から`state`（`Get-V2StatePayload`の全体）を外した。出力中は700msごとにポーリングされ、そのたびに structure 全体と全出力先の readiness を組み立て直していた。画面（`runFinalBuildJob`）は`job`しか使っておらず、終了後は今までどおり`/api/state`と readiness を取り直す。
+- 提出用PDFの入力スナップショット（`Get-FinalBuildInputSnapshot`）を、HTTP 要求1件・出力ジョブ1件のあいだだけ使い回すようにした（`Get-CachedFinalBuildInputSnapshot`）。キーは structure.json の版（サイズと更新時刻、`Get-StructureWithStamp`）で、その版をそのまま読んだ structure にだけ使う。引くたびに変換PDFのサイズと更新時刻を照合し、structure を保存したらキャッシュを捨てる。これで`/api/v2/state`が同じ出力先の readiness を旧形式・一式進捗・V2 の3回組み立てていたのが1回になり、出力ジョブでも出力前の readiness とロック内の入力確定で同じ計算をしなくなった。出力後の「入力が変わっていないか」の再確認は今までどおり毎回計算し直す。`Build-DocumentPackPdf`が返す readiness は、直前に確認したスナップショットを使う。
+- 出力の前処理（既定の頁番号の適用）で何も変わらなければ structure.json を書き直さないようにした（`Update-DefaultNumberingPerVolume`が変更の有無を返し、`__noStructureWrite`で保存を省く）。`Build-DocumentPackPdf`と`Invoke-FinalBuildTransaction`の両方。
+- `Get-FinalBuildInputSnapshot`は、記録済みの頁数（`artifact.pageCount`、無ければ`unit.physicalPageCount`）があるときは変換PDFを開いて数えない（`Get-PdfPageCount`を呼ばない）。頁数の決め方は今までと同じ（記録があれば記録を優先）。
+- 変換の流れ（更新スキャン → 検知版の保存 → 変換）で同じ原稿・同じ保存済みコピーを何度も SHA-256 で読み直していたのを、パス・サイズ・更新時刻が同じで10分以内なら直前の結果を使うようにした（`Get-Sha256Reusing`／`Get-RecentFileHash`）。構成ロック内での再ハッシュ（`Capture-DetectedSnapshot`の compare-and-set）、コピー・移動直後の検証、「原稿の更新を確認」（`force:true`）の全件読み直しは今までどおり読み直す。
+- 描画環境の指紋を原稿×版ごとに持つようにした（`Register-RenderEnvironment`／`Get-RenderEnvironmentFor`）。一括変換では画像解析を全原稿の変換後にまとめて行うため、解析時の`$Script:CurrentRenderEnvFingerprint`は最後に変換した原稿のもので、別の原稿の render-manifest・visual-hashes・比較基準に違う環境の指紋が入っていた。比較用の再変換で今の値が書き換わった後の比較基準の記録も、解析した版の値を使う。
+- `app/tools/output-publish-selfcheck.ps1`で、記録済みの頁数があれば`Get-PdfPageCount`を呼ばないこと（無ければ数えること）、同じ版の structure では readiness を何度求めてもスナップショットを1回しか作らないこと、版を渡さない呼び出しは使い回さないこと、返したスナップショットへの書き足しがキャッシュを汚さないこと、変換PDFの差し替えと structure の保存で引き直すこと、既定番号で何も変わらなければ structure.json を書き直さないことを、実物の関数で確かめるようにした。`app/tools/selfcheck.py`に、status 応答に全体の state が無いこと、出力後の再確認がキャッシュを使わないこと、ハッシュの使い回しとロック内の再ハッシュ、原稿×版ごとの描画環境の静的検査を加えた。
+- RuntimeVersion `2026.10.30.11`、`app.js` `v20261030_v200` へ更新した。
+
 ## 原稿の更新スキャンで structure.json を原稿ごとに書き直さないようにした（2026-10-30）
 
 - `Scan-Updates`が原稿ごとに`Update-StructureLocked`を呼び、変更が無くても毎回`structure.json`を書き直していた（原稿数ぶんのロック取得・保存・保存後の検証）。ファイルの存在確認・更新時刻とサイズの取得・ハッシュ計算（`New-StableHash`）をロックの外で全原稿ぶん先に済ませ、結果の反映は`Update-StructureLocked`1回にまとめた。
