@@ -2192,6 +2192,19 @@ function Set-NoteProperty($Object, [string]$Name, $Value) {
     }
 }
 
+# 値が変わるときだけ書き、書いたかどうかを返す。保存の要否を判定したい mutation 用。
+function Set-NotePropertyIfChanged($Object, [string]$Name, $Value) {
+    if ($null -eq $Object) { return $false }
+    $exists = if ($Object -is [System.Collections.IDictionary]) { $Object.Contains($Name) } else { $null -ne $Object.PSObject.Properties[$Name] }
+    if ($exists) {
+        $old = Get-DataProperty $Object $Name $null
+        if ($null -eq $old -and $null -eq $Value) { return $false }
+        if ($null -ne $old -and $null -ne $Value -and ([string]$old) -ceq ([string]$Value)) { return $false }
+    }
+    Set-NoteProperty $Object $Name $Value
+    return $true
+}
+
 function Get-DataProperty($Object, [string]$Name, $DefaultValue = $null) {
     if ($null -eq $Object) { return $DefaultValue }
     if ($Object -is [System.Collections.IDictionary]) {
@@ -2793,6 +2806,13 @@ function Update-StructureLocked([string]$Language, [scriptblock]$Mutation, [stri
             if ($BaseLayout -ne $currentLayout) { throw (New-StructureConflictError $BaseLayout $currentLayout) }
         }
         $result = & $Mutation $structure
+        # 何も変えなかった mutation は、戻り値の辞書に __noStructureWrite=$true を入れて書き込みを省ける。
+        # キーは呼び出し元へ返す前に取り除く。キーが無い既存の呼び出しは今までどおり毎回書く。
+        if ($result -is [System.Collections.IDictionary] -and $result.Contains('__noStructureWrite')) {
+            $skipWrite = [bool]$result['__noStructureWrite']
+            $result.Remove('__noStructureWrite')
+            if ($skipWrite) { return $result }
+        }
         Write-StructureUnlocked $Language $structure
         # 同一ファイルシステム時刻内の連続更新でも古い読取結果を返さない。
         $Script:StructureReadCache.Clear()
@@ -6417,31 +6437,19 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
 function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null, [bool]$ForceHash = $false) {
     $paths = Get-Paths
     $snapshot = Get-Structure $Language
-    $changed = @()
     $scanned = 0; $hashed = 0; $metadataOnly = 0
     $list = @(Get-Array $snapshot.workbooks)
     $index = 0
+    # ファイル確認とハッシュ計算はロックの外で全原稿ぶん先に済ませる。
+    # 原稿ごとにロックを取って書き込むと、変更が無くても原稿数だけ structure.json を書き直してしまう。
+    $observations = New-Object 'System.Collections.Generic.List[object]'
     foreach ($snap in $list) {
         $index++
         if ($ProgressCallback) { & $ProgressCallback $index $list.Count ([string]$snap.workbookId) ([string]$snap.displayName) }
         $id = [string]$snap.workbookId
         try { $full = Join-Safe ([string]$paths.submissionDir) ([string]$snap.relativePath) } catch { continue }
         if (-not (Test-Path -LiteralPath $full)) {
-            $didMissing = Update-StructureLocked $Language {
-                param($st)
-                $found = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $id } | Select-Object -First 1)
-                if ($found.Count -eq 0) { return $false }
-                $w = $found[0]
-                $wasMissing = ([string]$w.status -eq 'missing')
-                Set-NoteProperty $w 'status' 'missing'
-                if (-not $wasMissing) {
-                    $cat = Get-WorkbookPackId $w
-                    $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
-                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'source-updated' '元原稿が見つかりません'
-                }
-                return (-not $wasMissing)
-            }
-            if ($didMissing) { $changed += $id }
+            $observations.Add([pscustomobject]@{ id = $id; missing = $true })
             continue
         }
         $item = Get-Item -LiteralPath $full
@@ -6454,43 +6462,83 @@ function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null,
         $hash = [string](Get-DataProperty $snap 'currentExcelHash' '')
         $mustHash = $ForceHash -or $knownTicks -ne $ticks -or $knownSize -ne $size -or [string]::IsNullOrWhiteSpace($hash)
         if ($mustHash) { try { $hash = New-StableHash $full; $hashed++ } catch { $hash = '' } } else { $metadataOnly++ }
-        $did = Update-StructureLocked $Language {
+        $observations.Add([pscustomobject]@{ id = $id; missing = $false; ticks = $ticks; size = $size; modified = $modified; hash = $hash })
+    }
+    $changed = @()
+    if ($observations.Count -gt 0) {
+        # ロック内では最新の structure に結果を当てる。スキャン中に削除された原稿は飛ばす。
+        # 実際に値が変わったときだけ保存する。
+        $applied = Update-StructureLocked $Language {
             param($st)
-            $found = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $id } | Select-Object -First 1)
-            if ($found.Count -eq 0) { return $false }
-            $w = $found[0]
-            $previousHash = [string](Get-DataProperty $w 'currentExcelHash' '')
-            $previousStatus = [string](Get-DataProperty $w 'status' '')
-            $lastRendered = [string](Get-DataProperty $w 'lastRenderedExcelHash' '')
-            $updatedStatus = Get-SourceUpdatedStatus $w
-            Set-NoteProperty $w 'currentExcelModifiedAt' $modified
-            # ハッシュを取得できなかった回は、更新時刻とサイズも据え置く。
-            # 新しいメタデータと古いハッシュを組にして保存すると、次回のスキャンが
-            # 「メタデータ一致」で再ハッシュを省略し、更新済みの原稿を最新と誤判定する。
-            if (-not [string]::IsNullOrWhiteSpace($hash)) {
-                Set-NoteProperty $w 'currentExcelLastWriteUtcTicks' $ticks
-                Set-NoteProperty $w 'currentExcelSize' $size
-                Set-NoteProperty $w 'currentExcelHash' $hash
+            $dirty = $false
+            $changedIds = New-Object 'System.Collections.Generic.List[string]'
+            $workbooksById = @{}
+            foreach ($wb in @(Get-Array $st.workbooks)) {
+                $key = [string]$wb.workbookId
+                if (-not $workbooksById.ContainsKey($key)) { $workbooksById[$key] = $wb }
             }
-            $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $w))
-            $stale = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and (([string]::IsNullOrWhiteSpace($hash)) -or $hash -ne $lastRendered -or $profileOld)
-            if ($stale) {
-                Set-NoteProperty $w 'status' $updatedStatus
-                foreach ($page in @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id -and -not [string]::IsNullOrWhiteSpace([string]$_.contentPdf) })) { Set-NoteProperty $page 'status' 'stale' }
-                $newlyDetected = ($previousStatus -ne $updatedStatus) -or ($previousHash -ne $hash)
-                if ($newlyDetected) {
-                    $cat = Get-WorkbookPackId $w
-                    $vols = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $id } | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
-                    Mark-VolumeNeedsRebuild $st $Language $cat $vols 'source-updated' '元原稿が1件更新されました'
+            $pagesById = @{}
+            foreach ($page in @(Get-Array $st.pages)) {
+                $key = [string]$page.workbookId
+                if (-not $pagesById.ContainsKey($key)) { $pagesById[$key] = New-Object 'System.Collections.Generic.List[object]' }
+                $pagesById[$key].Add($page)
+            }
+            foreach ($obs in $observations) {
+                $id = [string]$obs.id
+                if (-not $workbooksById.ContainsKey($id)) { continue }
+                $w = $workbooksById[$id]
+                $wbPages = @()
+                if ($pagesById.ContainsKey($id)) { $wbPages = $pagesById[$id].ToArray() }
+                if ($obs.missing) {
+                    $wasMissing = ([string]$w.status -eq 'missing')
+                    if (Set-NotePropertyIfChanged $w 'status' 'missing') { $dirty = $true }
+                    if (-not $wasMissing) {
+                        $cat = Get-WorkbookPackId $w
+                        $vols = @($wbPages | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+                        $null = Mark-VolumeNeedsRebuild $st $Language $cat $vols 'source-updated' '元原稿が見つかりません'
+                        $dirty = $true
+                        $changedIds.Add($id)
+                    }
+                    continue
                 }
-                return $newlyDetected
+                $hash = [string]$obs.hash
+                $previousHash = [string](Get-DataProperty $w 'currentExcelHash' '')
+                $previousStatus = [string](Get-DataProperty $w 'status' '')
+                $lastRendered = [string](Get-DataProperty $w 'lastRenderedExcelHash' '')
+                $updatedStatus = Get-SourceUpdatedStatus $w
+                if (Set-NotePropertyIfChanged $w 'currentExcelModifiedAt' $obs.modified) { $dirty = $true }
+                # ハッシュを取得できなかった回は、更新時刻とサイズも据え置く。
+                # 新しいメタデータと古いハッシュを組にして保存すると、次回のスキャンが
+                # 「メタデータ一致」で再ハッシュを省略し、更新済みの原稿を最新と誤判定する。
+                if (-not [string]::IsNullOrWhiteSpace($hash)) {
+                    if (Set-NotePropertyIfChanged $w 'currentExcelLastWriteUtcTicks' $obs.ticks) { $dirty = $true }
+                    if (Set-NotePropertyIfChanged $w 'currentExcelSize' $obs.size) { $dirty = $true }
+                    if (Set-NotePropertyIfChanged $w 'currentExcelHash' $hash) { $dirty = $true }
+                }
+                $profileOld = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and ((Get-IntDataProperty $w 'renderProfileVersion' 0) -lt (Get-RequiredSourceRenderProfileVersion $w))
+                $stale = (-not [string]::IsNullOrWhiteSpace($lastRendered)) -and (([string]::IsNullOrWhiteSpace($hash)) -or $hash -ne $lastRendered -or $profileOld)
+                if ($stale) {
+                    if (Set-NotePropertyIfChanged $w 'status' $updatedStatus) { $dirty = $true }
+                    foreach ($page in @($wbPages | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.contentPdf) })) {
+                        if (Set-NotePropertyIfChanged $page 'status' 'stale') { $dirty = $true }
+                    }
+                    $newlyDetected = ($previousStatus -ne $updatedStatus) -or ($previousHash -ne $hash)
+                    if ($newlyDetected) {
+                        $cat = Get-WorkbookPackId $w
+                        $vols = @($wbPages | ForEach-Object { [string]$_.volume } | Where-Object { $_ -and $_ -ne 'none' } | Select-Object -Unique)
+                        $null = Mark-VolumeNeedsRebuild $st $Language $cat $vols 'source-updated' '元原稿が1件更新されました'
+                        $dirty = $true
+                        $changedIds.Add($id)
+                    }
+                    continue
+                }
+                if ([string]::IsNullOrWhiteSpace($lastRendered)) {
+                    if ([string]$w.status -ne 'render-error') { if (Set-NotePropertyIfChanged $w 'status' 'new') { $dirty = $true } }
+                } else { if (Set-NotePropertyIfChanged $w 'status' 'rendered-unchecked') { $dirty = $true } }
             }
-            if ([string]::IsNullOrWhiteSpace($lastRendered)) {
-                if ([string]$w.status -ne 'render-error') { Set-NoteProperty $w 'status' 'new' }
-            } else { Set-NoteProperty $w 'status' 'rendered-unchecked' }
-            return $false
+            return [ordered]@{ changedIds = $changedIds.ToArray(); __noStructureWrite = (-not $dirty) }
         }
-        if ($did) { $changed += $id }
+        $changed = @($applied['changedIds'])
     }
     return [ordered]@{ changedWorkbookIds=@($changed | Select-Object -Unique); scanned=$scanned; hashed=$hashed; metadataOnly=$metadataOnly; forceHash=[bool]$ForceHash }
 }
