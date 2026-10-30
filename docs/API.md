@@ -540,6 +540,18 @@ categoryは必須です。省略・不正値はHTTP 400です。
 
 `displayState`は`blocked`、`needs-rebuild`、`output-missing`、`not-built`、`built`です。
 
+各出力先の`snapshot.physicalPages`（`GET /api/v2/outputs/readiness`、`/api/state`の`finalReadiness`も同じ）は、提出用PDFの1物理ページを1要素で返します。頁は出力先ごとに1から数えます。変換PDFの無いページは含みません。
+
+| 項目 | 値 |
+| --- | --- |
+| `outputPageNumber` | 出力先内の物理ページ番号（1から） |
+| `side` | `right`（奇数頁）／`left`（偶数頁）。製本のパンチ穴シフト（`ReportPdfComposer`）と同じ規則 |
+| `spreadIndex` | 見開きの番号。`floor(outputPageNumber/2)`。1頁は見開き0の右、2・3頁は見開き1 |
+| `pagePartIndex`／`pagePartCount` | 同じ`pageId`の中で何枚目か（1から）／使用ページ範囲を反映した全枚数 |
+| `sourcePdfPageNumber` | 変換PDF内のページ番号 |
+
+`side`・`spreadIndex`・`pagePartIndex`・`pagePartCount`は表示用で、入力の指紋（`fingerprint`）には含めません。追加しても「再出力が必要」の判定は変わりません。
+
 ## POST /api/final/build
 
 volumeとcategoryは必須です。
