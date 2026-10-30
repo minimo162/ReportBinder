@@ -279,6 +279,7 @@ function renderGlobalHeader(){} function renderNavBadges(){} function renderStep
 function renderSummary(){} function renderDashboardOverview(){} function renderFinalOverview(){}
 function renderPages(){} function renderPageOverview(){} function renderVolumeLinks(){}
 function isModalOpen(){return false;} function syncPreviewOrganizerControls(){}
+function schedulePdfImagePaneRefresh(){}
 const oldGet=loadFinalReadiness({render:false});
 if(requests.length!==1||!requests[0].url.includes('pack_custom'))throw new Error('initial readiness GET missing');
 applyPageMutationResult({result:{pages:[{pageId:'new'}],affectedVolumes:['ja-main']},state:{
@@ -327,6 +328,7 @@ function activePackRecord(){return activePack;} function configured(){return tru
 function normalizeStatePayload(payload){return payload;}
 function targetVolume(id){return String(id||'');} function log(){} function renderAll(){}
 let draggingRow=null, pagesRendered=0; function renderPages(){pagesRendered++;}
+let paneRefreshes=0; function schedulePdfImagePaneRefresh(){paneRefreshes++;}
 function showMessage(){} const snapshotHistoryResponseCache=new Map(); let historyPanelsInitialized=false;
 function api(url){
   if(url==='/api/state')return Promise.resolve({structure:{pages:[]},packProgress:{},finalReadiness:{}});
@@ -339,6 +341,9 @@ if(ready.displayState!=='needs-rebuild'||ready.status!=='needs-rebuild')throw ne
 if(pagesRendered<1)throw new Error('thumbnail board was not redrawn after readiness arrived');
 const renderedBeforeDrag=pagesRendered; draggingRow={}; renderSpreadBoardIfVisible();
 if(pagesRendered!==renderedBeforeDrag)throw new Error('thumbnail board was rebuilt in the middle of a drag');
+// 横パネルはドラッグ中でも readiness の頁数表に追従する（描画は schedulePdfImagePaneRefresh が1フレームにまとめる）。
+const paneBeforeDrag=paneRefreshes; renderSpreadBoardIfVisible();
+if(paneRefreshes!==paneBeforeDrag+1)throw new Error('PDF image pane was not refreshed after readiness arrived');
 """
     completed = subprocess.run(["node", "--input-type=module", "-"], input=refresh_functions + "\n" + refresh_harness, text=True, encoding="utf-8", capture_output=True)
     assert completed.returncode == 0, completed.stdout + completed.stderr
