@@ -1494,7 +1494,7 @@ for needed in ['Invoke-ThirdPartyCheck $true', 'Assert-StagedDependencies', 'JAV
                "$excludedTopLevelNames", "'tmp'"]:
     if needed not in package_release: raise SystemExit(f'release dependency gate missing: {needed}')
 for needed in ['[switch]$SharedFolderOnly', 'function Remove-SharedFolderDevelopmentFiles', 'function Assert-SharedFolderLayout',
-               'ReportBinder_共有フォルダー用_', "'資料をPDFにまとめる.cmd'", 'Start-Process']:
+               'ReportBinder_共有フォルダー用_', "'資料をPDFにまとめる.cmd'", 'Invoke-Item -LiteralPath $sharedFolder']:
     if needed not in package_release: raise SystemExit(f'shared-folder release feature missing: {needed}')
 _shared_cleanup = package_release.split('function Remove-SharedFolderDevelopmentFiles', 1)[1].split('\nfunction ', 1)[0]
 for needed in ["'app\\lib\\pdfbox\\src'", "'app\\tools\\fixtures'", "'app\\tools\\selfcheck.py'",
@@ -1523,6 +1523,25 @@ for needed in ['Move-Item -LiteralPath $StageRoot', 'catch {', 'Copy-DirectoryCo
 _new_shared = package_release.split('function New-SharedFolderRelease', 1)[1].split('\nfunction ', 1)[0]
 if 'Move-Item -LiteralPath $stage' in _new_shared:
     raise SystemExit('shared release must publish through the OneDrive-safe fallback helper')
+# 2026-10-30 共有用フォルダー作成後に別の場所が開いていた。Write-IntegrityManifest の
+# Write-Output が戻り値へ混ざってパスが配列になり、explorer へ手組みのクォートで渡していた。
+_integrity_body = package_release.split('function Write-IntegrityManifest', 1)[1].split('\nfunction ', 1)[0]
+if 'Write-Output' in _integrity_body:
+    raise SystemExit('Write-IntegrityManifest must not emit to the pipeline (it pollutes the release path return value)')
+for needed in ['[void](Write-IntegrityManifest $stage)', '[void](Copy-ReleaseSource $stage)',
+               '[void](Assert-SharedFolderLayout $stage)', 'if ($published -ne $target)', 'return $target']:
+    if needed not in _new_shared:
+        raise SystemExit(f'shared release must return only the created folder path: {needed}')
+if 'return [string]$TargetRoot' not in _publish_shared:
+    raise SystemExit('Publish-SharedFolderStage must return only the created folder path')
+if 'explorer.exe' in _shared_release_entry or '-ArgumentList' in _shared_release_entry:
+    raise SystemExit('shared release must not hand-quote the folder path to explorer.exe')
+for needed in ['if (-not $NoOpen)', 'Test-Path -LiteralPath $sharedFolder -PathType Container',
+               'Invoke-Item -LiteralPath $sharedFolder', 'Write-Warning']:
+    if needed not in _shared_release_entry:
+        raise SystemExit(f'shared release must open the created folder safely: {needed}')
+if _shared_release_entry.index('-PathType Container') > _shared_release_entry.index('Invoke-Item -LiteralPath'):
+    raise SystemExit('shared release must check the folder exists before opening it')
 if 'app/thirdparty-cache/' not in (root/'.gitignore').read_text(encoding='utf-8'):
     raise SystemExit('third-party cache must be ignored by git')
 

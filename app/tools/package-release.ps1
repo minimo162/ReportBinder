@@ -169,7 +169,9 @@ function Write-IntegrityManifest([string]$StageRoot) {
         files = $files
     }
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
-    Write-Output ("integrity manifest: {0} files" -f $count)
+    # パイプラインへ出力すると呼び出し元の戻り値（作成したフォルダーのパス）へ混ざり、
+    # 配列になったパスでエクスプローラーが別の場所を開いていた。表示だけにする。
+    Write-Host ("integrity manifest: {0} files" -f $count)
 }
 
 function Write-ReleaseManifest([string]$StageRoot, [string]$Flavor, [bool]$IncludeJava) {
@@ -322,7 +324,7 @@ function Publish-SharedFolderStage([string]$StageRoot, [string]$TargetRoot) {
     $moveMessage = ''
     $publishedByMove = $false
     try {
-        Move-Item -LiteralPath $StageRoot -Destination $TargetRoot
+        [void](Move-Item -LiteralPath $StageRoot -Destination $TargetRoot)
         $publishedByMove = $true
     } catch {
         $moveMessage = $_.Exception.Message
@@ -338,7 +340,7 @@ function Publish-SharedFolderStage([string]$StageRoot, [string]$TargetRoot) {
             try {
                 New-Item -ItemType Directory -Path $TargetRoot -Force | Out-Null
                 New-Item -ItemType File -Path $buildingMarker -Force | Out-Null
-                Copy-DirectoryContents -SourceDir $StageRoot -DestinationDir $TargetRoot
+                [void](Copy-DirectoryContents -SourceDir $StageRoot -DestinationDir $TargetRoot)
             } catch {
                 if (Test-Path -LiteralPath $TargetRoot) {
                     Remove-Item -LiteralPath $TargetRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -349,8 +351,8 @@ function Publish-SharedFolderStage([string]$StageRoot, [string]$TargetRoot) {
     }
 
     try {
-        Assert-StagedDependencies -StageRoot $TargetRoot -IncludeJava $true
-        Assert-SharedFolderLayout $TargetRoot
+        [void](Assert-StagedDependencies -StageRoot $TargetRoot -IncludeJava $true)
+        [void](Assert-SharedFolderLayout $TargetRoot)
         $buildingMarker = Join-Path $TargetRoot '_作成中.txt'
         if (Test-Path -LiteralPath $buildingMarker) {
             Remove-Item -LiteralPath $buildingMarker -Force
@@ -365,7 +367,8 @@ function Publish-SharedFolderStage([string]$StageRoot, [string]$TargetRoot) {
     if (-not $publishedByMove) {
         Write-Warning ("フォルダー移動が拒否されたため、内容コピーで安全に作成しました: {0}" -f $moveMessage)
     }
-    return $TargetRoot
+    # 呼び出し元はこの戻り値をそのまま開くので、作成したフォルダーのパス1つだけを返す。
+    return [string]$TargetRoot
 }
 
 function New-SharedFolderRelease {
@@ -374,20 +377,26 @@ function New-SharedFolderRelease {
     $stage = Join-Path $tempBase 'ReportBinder'
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
-        Copy-ReleaseSource $stage
-        Remove-RuntimeFiles $stage
-        Remove-ReleaseDevelopmentFiles $stage
-        Remove-SharedFolderDevelopmentFiles $stage
-        Write-ReleaseManifest $stage 'shared-folder-offline' $true
+        # 戻り値は作成したフォルダーのパス1つだけにする。途中の処理が何か出力すると
+        # 戻り値が配列になり、完了後に別の場所を開いてしまうため、出力は全て捨てる。
+        [void](Copy-ReleaseSource $stage)
+        [void](Remove-RuntimeFiles $stage)
+        [void](Remove-ReleaseDevelopmentFiles $stage)
+        [void](Remove-SharedFolderDevelopmentFiles $stage)
+        [void](Write-ReleaseManifest $stage 'shared-folder-offline' $true)
         # マニフェストは全ファイル削除が終わった後に作る。順序を変えると、削除済みの
         # ファイルが記録されて利用者側の検証が必ず失敗する。
-        Write-IntegrityManifest $stage
-        Assert-StagedDependencies -StageRoot $stage -IncludeJava $true
-        Assert-SharedFolderLayout $stage
+        [void](Write-IntegrityManifest $stage)
+        [void](Assert-StagedDependencies -StageRoot $stage -IncludeJava $true)
+        [void](Assert-SharedFolderLayout $stage)
 
         $targetBase = Join-Path $OutputDir ("ReportBinder_共有フォルダー用_{0}" -f $stamp)
-        $target = Get-UniqueReleasePath $targetBase
-        return (Publish-SharedFolderStage -StageRoot $stage -TargetRoot $target)
+        $target = [string](Get-UniqueReleasePath $targetBase)
+        $published = [string](Publish-SharedFolderStage -StageRoot $stage -TargetRoot $target)
+        if ($published -ne $target) {
+            throw ("作成したフォルダーのパスを正しく受け取れませんでした: {0}" -f $published)
+        }
+        return $target
     } finally {
         if (Test-Path -LiteralPath $tempBase) {
             Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction SilentlyContinue
@@ -407,13 +416,13 @@ function New-ReleaseZip([string]$Suffix, [bool]$IncludeJava) {
             $java = Join-Path $stage 'app\lib\java'
             if (Test-Path -LiteralPath $java) { Remove-Item -LiteralPath $java -Recurse -Force }
         }
-        Write-ReleaseManifest $stage $Suffix $IncludeJava
-        Write-IntegrityManifest $stage
-        Assert-StagedDependencies -StageRoot $stage -IncludeJava $IncludeJava
+        [void](Write-ReleaseManifest $stage $Suffix $IncludeJava)
+        [void](Write-IntegrityManifest $stage)
+        [void](Assert-StagedDependencies -StageRoot $stage -IncludeJava $IncludeJava)
         $zip = Join-Path $OutputDir "ReportBinder_V5_${Suffix}_${stamp}.zip"
         if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-        New-Utf8Zip $stage $zip
-        return $zip
+        [void](New-Utf8Zip $stage $zip)
+        return [string]$zip
     } finally {
         if (Test-Path -LiteralPath $tempBase) {
             Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction SilentlyContinue
@@ -452,10 +461,17 @@ if ($SharedFolderOnly) {
     $sharedFolder = New-SharedFolderRelease
     Write-Host "共有フォルダー用の完成フォルダーを作成しました:`n$sharedFolder"
     if (-not $NoOpen) {
-        try {
-            Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $sharedFolder)
-        } catch {
-            Write-Warning "エクスプローラーを開けませんでした。作成先を手動で開いてください: $sharedFolder"
+        # explorer.exe へ手組みのクォートで渡すと、パスが崩れたときに既定の場所
+        # （ドキュメント等）が開く。作成したフォルダーがあることを確かめてから直接開く。
+        if ([string]::IsNullOrWhiteSpace($sharedFolder) -or
+            -not (Test-Path -LiteralPath $sharedFolder -PathType Container)) {
+            Write-Warning "作成したフォルダーが見つからないため開きませんでした。作成先を手動で開いてください: $sharedFolder"
+        } else {
+            try {
+                Invoke-Item -LiteralPath $sharedFolder
+            } catch {
+                Write-Warning "エクスプローラーを開けませんでした。作成先を手動で開いてください: $sharedFolder"
+            }
         }
     }
     exit 0
