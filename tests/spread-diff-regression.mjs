@@ -345,7 +345,9 @@ function newHooks() {
 assert.match(extractFunction('handleBoardRowKeydown'), /openSpreadMoveForCard\(row\)/, 'M on a card must open the position move');
 assert.match(extractFunction('handleSpreadCellKeydown'), /openSpreadMoveForCard\(cell\)/, 'M on a spread cell must open the position move');
 assert.match(extractFunction('isAnyModalOpen'), /isSpreadMoveOpen\(\)/, 'the before/after dialog must block board shortcuts like Ctrl+Z');
-assert.ok(extractFunction('beginPointerPageDrag').includes("if (pageBoardView === 'spread') return;"), 'the spread view must stay drag-free');
+// 見るだけの判定は見開き・PDFイメージで共通（isReadOnlyBoardView）。
+assert.ok(extractFunction('beginPointerPageDrag').includes('if (isReadOnlyBoardView()) return;'), 'the spread view must stay drag-free');
+assert.match(extractFunction('isReadOnlyBoardView'), /view==='spread'\|\|view==='pdf'/, 'the spread view must be read-only');
 for (const name of ['openSpreadMoveDialog', 'runSpreadMovePreview', 'reloadSpreadMoveBase', 'closeSpreadMoveDialog']) {
   assert.ok(!extractFunction(name).includes('/api/v2/items/reorder'), `${name} must not save`);
 }
