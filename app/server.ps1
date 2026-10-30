@@ -7508,8 +7508,10 @@ function Set-PageReorderPlacement($Structure, [string]$Language, [string]$PackId
         }
     }
     foreach ($volume in $Allowed) { [void](Renumber-VolumeOrder $Structure $volume $PackId) }
-    Apply-DefaultNumberingPerVolume $Language $Structure $PackId
-    return ,@($affected)
+    [void](Apply-DefaultNumberingPerVolume $Language $Structure $PackId)
+    # 要素ごとに流す。呼び出し側は @() で受ける。,@() で返すと @(...) が配列を1要素として
+    # 包み、2出力先以上が変わったとき [string[]] へ "ja-main ja-appendix" として渡っていた。
+    return @($affected)
 }
 
 function Reorder-Pages([string]$Language, $Body) {

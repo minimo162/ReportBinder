@@ -2611,6 +2611,10 @@ for needed in ('Read-StructureUnlocked', 'Assert-PageReorderRequest', 'Set-PageR
         raise SystemExit(f'the spread preview is missing {needed}')
 if 'Assert-PageReorderRequest' not in _ps_function(server, 'Reorder-Pages', 'server.ps1'):
     raise SystemExit('Reorder-Pages must share the reorder validation with the spread preview')
+# ,@() で返すと呼び出し側の @(...) が配列を1要素に包み、2出力先以上の並べ替えで
+# Mark-VolumeNeedsRebuild に連結された出力先名が渡る。
+if 'return ,@($affected)' in _ps_function(server, 'Set-PageReorderPlacement', 'server.ps1'):
+    raise SystemExit('Set-PageReorderPlacement must stream the affected volumes, not wrap them with ,@()')
 _spread_route = server.split("$path -eq '/api/v2/outputs/spread-preview'", 1)[1].split('\n        if ($method', 1)[0]
 for needed in ('ConvertTo-PageReorderVolumes', "Test-ConfigHasKey $body 'baseLayout'", 'Get-SpreadPreview $language $request'):
     if needed not in _spread_route:
