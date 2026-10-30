@@ -461,7 +461,7 @@ if ($SharedFolderOnly) {
     $sharedFolder = New-SharedFolderRelease
     Write-Host "共有フォルダー用の完成フォルダーを作成しました:`n$sharedFolder"
     if (-not $NoOpen) {
-        # explorer.exe へ手組みのクォートで渡すと、パスが崩れたときに既定の場所
+        # エクスプローラーへ手組みのクォートで渡すと、パスが崩れたときに既定の場所
         # （ドキュメント等）が開く。作成したフォルダーがあることを確かめてから直接開く。
         if ([string]::IsNullOrWhiteSpace($sharedFolder) -or
             -not (Test-Path -LiteralPath $sharedFolder -PathType Container)) {
