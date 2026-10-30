@@ -1806,7 +1806,8 @@ for forbidden in ["Join-Path $trimmed '_reportbinder'", "Join-Path $trimmed '出
 _publish = server.split('function Publish-DocumentPackPdfToSharedLocked',1)[1].split('\nfunction ',1)[0]
 for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
                'Get-SafePublishPackName',
-               '"{0}_{1}_{2}" -f $stamp, $packName, $userName',
+               '$baseFolderName = "{0}_{1}" -f $stamp, $packName',
+               "'.publishing-' + $userName", 'publishedBy = $userName', 'userName = $userName',
                '$fileName = [IO.Path]::GetFileName($sourceFull)', "'.publishing-'",
                'Move-Item -LiteralPath $stagingDir -Destination $publishDir',
                "$ready.displayState -ne 'built'"]:
@@ -1819,6 +1820,8 @@ if _move_at < 0 or _unhide_at < 0 or 'Clear-PublishHiddenAttribute $stagedPdf' n
     raise SystemExit('the published folder and PDFs must not keep the staging hidden attribute')
 for forbidden in ["Join-Path ([string]$paths.submissionDir) '共有発行'",
                   "Get-Date -Format 'yyyyMMdd_HHmmss'",
+                  # 発行フォルダー名にユーザー名を入れない（誰が発行したかは publishedBy と履歴に残す）。
+                  '"{0}_{1}_{2}" -f $stamp, $packName, $userName',
                   '$fileName = "{0}_{1}_{2}.pdf"']:
     if forbidden in _publish:
         raise SystemExit(f'obsolete shared publish layout remains: {forbidden}')

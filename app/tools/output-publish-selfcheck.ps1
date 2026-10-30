@@ -205,6 +205,12 @@ foreach ($file in @($published.files)) {
     Assert-OutputTest ([IO.Path]::GetDirectoryName([string]$file.sharedPath) -eq [string]$published.sharedFolder) 'publish-all split the targets across folders.'
 }
 Assert-OutputTest (@(Get-SharedEntries | Where-Object { $_ -like '.publishing-*' }).Count -eq 0) 'A staging folder was left behind after publishing.'
+# 発行フォルダー名は「日時_一式名」だけ。誰が発行したかは publishedBy に残す。
+$publisher = Get-SafePublishUserName
+Assert-OutputTest ([string]$published.folderName -match ('^\d{4}_\d{6}_' + [regex]::Escape((Get-SafePublishPackName '発行の一式')) + '$')) "The published folder name is not 'MMdd_HHmmss_<pack>': $($published.folderName)"
+Assert-OutputTest (-not ([string]$published.folderName).EndsWith('_' + $publisher)) 'The published folder name still contains the Windows user name.'
+Assert-OutputTest ([IO.Path]::GetFileName([string]$published.sharedFolder) -eq [string]$published.folderName) 'folderName does not match the published folder.'
+Assert-OutputTest ([string]$published.publishedBy -eq $publisher) 'publishedBy no longer records the Windows user name.'
 $sharedBefore = @(Get-SharedEntries)
 
 # 1冊でも最新でなければ何もコピーしない。

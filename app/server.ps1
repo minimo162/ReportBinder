@@ -9349,7 +9349,8 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
     $userName = Get-SafePublishUserName
     $packName = Get-SafePublishPackName ([string](Get-DataProperty $scope.pack 'displayName' $packId))
     $stamp = Get-Date -Format 'MMdd_HHmmss'
-    $baseFolderName = "{0}_{1}_{2}" -f $stamp, $packName, $userName
+    # 発行名にユーザー名を入れない。作業用 .publishing-{user} と publishedBy には残す。
+    $baseFolderName = "{0}_{1}" -f $stamp, $packName
     $folderName = $baseFolderName
     $publishDir = Join-Path $submissionDir $folderName
     $suffix = 2
