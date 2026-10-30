@@ -122,4 +122,74 @@ assert.ok(buildJob.lastIndexOf('renderVolumeLinks()') > buildJob.indexOf("active
 const direct = source.match(/await\s+boardSavePromise\b/g) || [];
 assert.equal(direct.length, 0, 'await awaitBoardSave() instead of the raw boardSavePromise queue');
 
+// 位置を指定した移動（planPageMove）。純粋関数として取り出して確かめる。
+const planPageMove = new Function(`${extractFunction('planPageMove')}\nreturn planPageMove;`)();
+const lanesFixture = () => ({ 'ja-main': ['m1', 'm2', 'm3', 'm4', 'm5'], 'ja-supp': ['s1', 's2', 's3', 's4', 's5', 's6'], none: ['u1'] });
+{
+  // 補足6→本体3
+  const input = lanesFixture();
+  const frozen = JSON.stringify(input);
+  const plan = planPageMove(input, ['s6'], 'ja-main', 3);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.volumes['ja-main'], ['m1', 'm2', 's6', 'm3', 'm4', 'm5'], 'supplement 6 must become main 3');
+  assert.deepEqual(plan.volumes['ja-supp'], ['s1', 's2', 's3', 's4', 's5']);
+  assert.deepEqual(plan.volumes.none, ['u1']);
+  assert.equal(JSON.stringify(input), frozen, 'planPageMove must not mutate its input');
+}
+{
+  // 範囲の移動は、選んだ順ではなく今の並び順のまま1かたまりで入れる。
+  const plan = planPageMove(lanesFixture(), ['s4', 's2', 's3'], 'ja-main', 2);
+  assert.deepEqual(plan.volumes['ja-main'], ['m1', 's2', 's3', 's4', 'm2', 'm3', 'm4', 'm5'], 'a moved range must keep its board order');
+  assert.deepEqual(plan.movedIds, ['s2', 's3', 's4']);
+  assert.deepEqual(plan.volumes['ja-supp'], ['s1', 's5', 's6']);
+  // 出力先をまたいで選んでも、出力先の順→並び順でまとめる。
+  const mixed = planPageMove(lanesFixture(), ['s1', 'm4'], 'none', 1);
+  assert.deepEqual(mixed.volumes.none, ['m4', 's1', 'u1']);
+}
+{
+  // 同じ出力先の中での移動。位置は動かすページを抜いた後の並びで数える。
+  const forward = planPageMove(lanesFixture(), ['m1'], 'ja-main', 3);
+  assert.deepEqual(forward.volumes['ja-main'], ['m2', 'm3', 'm1', 'm4', 'm5']);
+  const backward = planPageMove(lanesFixture(), ['m5'], 'ja-main', 1);
+  assert.deepEqual(backward.volumes['ja-main'], ['m5', 'm1', 'm2', 'm3', 'm4']);
+  const inPlace = planPageMove(lanesFixture(), ['m2', 'm3'], 'ja-main', 2);
+  assert.deepEqual(inPlace.volumes['ja-main'], ['m1', 'm2', 'm3', 'm4', 'm5'], 'moving a range onto itself must not change the order');
+}
+{
+  // 末尾（省略・null・'end'・最後の次の番号）。今までの「移動先」ボタンと同じ結果になる。
+  for (const position of [undefined, null, 'end', 6]) {
+    const plan = planPageMove(lanesFixture(), ['s6', 's1'], 'ja-main', position);
+    assert.deepEqual(plan.volumes['ja-main'], ['m1', 'm2', 'm3', 'm4', 'm5', 's1', 's6'], `position ${String(position)} must append`);
+  }
+  // 同じ出力先の中で末尾へ。抜いた後は4枚なので5番目が末尾。
+  assert.deepEqual(planPageMove(lanesFixture(), ['m1'], 'ja-main', 5).volumes['ja-main'], ['m2', 'm3', 'm4', 'm5', 'm1']);
+  // 空の出力先や、まだ並びに無い出力先へも入れられる。
+  assert.deepEqual(planPageMove({ 'ja-main': ['m1'], 'ja-supp': [] }, ['m1'], 'ja-supp', 1).volumes, { 'ja-main': [], 'ja-supp': ['m1'] });
+  assert.deepEqual(planPageMove({ 'ja-main': ['m1'] }, ['m1'], 'en-main').volumes, { 'ja-main': [], 'en-main': ['m1'] });
+  // 並びに無いIDは指定順で後ろに付ける（今までの移動と同じく落とさない）。
+  assert.deepEqual(planPageMove(lanesFixture(), ['x9', 's2'], 'none').movedIds, ['s2', 'x9']);
+  // 文字列の番号も受け付ける。
+  assert.deepEqual(planPageMove(lanesFixture(), ['s6'], 'ja-main', '3').volumes['ja-main'], ['m1', 'm2', 's6', 'm3', 'm4', 'm5']);
+}
+{
+  // 範囲外の位置や移動先の無い指定は拒否し、並びを変えない。
+  for (const position of [0, -1, 7, 2.5, NaN, '', 'abc', '3a', true]) {
+    const input = lanesFixture();
+    const plan = planPageMove(input, ['s6'], 'ja-main', position);
+    assert.equal(plan.ok, false, `position ${String(position)} must be rejected`);
+    assert.equal(plan.error, 'position-out-of-range');
+    assert.equal(plan.maxPosition, 6);
+    assert.deepEqual(plan.volumes, lanesFixture(), 'a rejected plan must keep the original order');
+  }
+  assert.equal(planPageMove(lanesFixture(), ['m1'], 'ja-main', 6).ok, false, 'within the same lane the end is one past the remaining pages');
+  assert.equal(planPageMove(lanesFixture(), ['s6'], '', 1).error, 'target-missing');
+  assert.equal(planPageMove(lanesFixture(), [], 'ja-main', 1).error, 'no-pages');
+}
+// 「移動先」ボタンとプレビューからの移動は、末尾に足す処理ではなく planPageMove を通す。
+for (const name of ['movePageIdsToVolume', 'moveCurrentPreviewPageToVolume']) {
+  const body = extractFunction(name);
+  assert.match(body, /planPageMove\(/, `${name} must build the reorder through planPageMove`);
+  assert.doesNotMatch(body, /\]\.push\((?:\.\.\.ids|pageId)\)/, `${name} must not append the moved pages by hand`);
+}
+
 console.log('page-board save queue regression ok');

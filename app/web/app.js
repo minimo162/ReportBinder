@@ -2701,7 +2701,7 @@ async function moveSelectedPagesToVolume(volume, btn) {
 }
 // Shared by the 移動先 buttons and by dropping a drag onto a volume tab, so both
 // routes produce the same reorder request, undo entry and toast.
-async function movePageIdsToVolume(pageIds, volume, btn) {
+async function movePageIdsToVolume(pageIds, volume, btn, position=null) {
   const target=String(volume||'');const ids=asArray(pageIds).map(String).filter(id=>!!getPage(id));
   if(!ids.length){showMessage('warn','ページを選択してください','移動するカードをクリックして選んでください。');return;}
   if(!(await waitForQueuedPageLayoutMutation()))return;
@@ -2711,10 +2711,12 @@ async function movePageIdsToVolume(pageIds, volume, btn) {
   await runBusy(btn,async()=>{
     // 見開きのマスは並びの読み取り元ではない。Undo の before は状態から読む。
     const beforeVolumes=pageBoardView==='spread'?pageVolumesFromState():collectBoardVolumes();
-    const first=activeTargetVolumes()[0]||mainVolume(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),selected=new Set(ids);
+    const first=activeTargetVolumes()[0]||mainVolume();let volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]]));
     const activePages=pagesForActivePreset();
-    for(const p of [...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(p);if(!id||selected.has(id))continue;const v=(p.enabled===false||String(p.volume||first)==='none')?'none':String(p.volume||first);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
-    if(!volumes[target])volumes[target]=[];volumes[target].push(...ids);
+    for(const p of [...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(p);if(!id)continue;const v=(p.enabled===false||String(p.volume||first)==='none')?'none':String(p.volume||first);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
+    const plan=planPageMove(volumes,ids,target,position);
+    if(!plan.ok){showMessage('warn','移動先の位置を指定し直してください',plan.maxPosition?`${assignmentVolumeLabel(target)}の1〜${plan.maxPosition}番目を指定してください。`:'移動先がありません。');return;}
+    volumes=plan.volumes;ids.splice(0,ids.length,...plan.movedIds);
     setPageSaveStatus('saving','保存中…');
     try{
       const response=await api('/api/v2/items/reorder',{method:'POST',body:pageApiBody({volumes})});
@@ -4497,6 +4499,33 @@ function pageVolumesFromState(pages=pagesForActivePreset()) {
   }
   return volumes;
 }
+// 位置を指定した移動の並びを作る純粋関数。volumes（出力先ごとのページIDの並び）は変えずに
+// 写しを返す。position は移動先の何番目に置くか（1から数え、動かすページを抜いた後の並びで
+// 数える）。省略・null・'end' は末尾。動かすページは今の並び順のまま1かたまりで入れ、並びに
+// 無いIDは指定順で後ろに付ける。範囲外の位置や移動先の無い指定は ok:false で拒否する。
+function planPageMove(volumes, pageIds, target, position=null) {
+  const lanes={};
+  for(const [key,ids] of Object.entries(volumes||{}))lanes[key]=Array.isArray(ids)?ids.map(String):[];
+  const targetKey=String(target??'');
+  if(!targetKey)return {ok:false,error:'target-missing',volumes:lanes};
+  const wanted=[...new Set((Array.isArray(pageIds)?pageIds:[]).map(String).filter(Boolean))];
+  if(!wanted.length)return {ok:false,error:'no-pages',volumes:lanes};
+  const wantedSet=new Set(wanted),found=new Set();
+  for(const ids of Object.values(lanes))for(const id of ids)if(wantedSet.has(id))found.add(id);
+  const moved=[...found,...wanted.filter(id=>!found.has(id))];
+  const next={};
+  for(const [key,ids] of Object.entries(lanes))next[key]=ids.filter(id=>!wantedSet.has(id));
+  if(!next[targetKey])next[targetKey]=[];
+  const lane=next[targetKey];
+  let index=lane.length;
+  if(position!==null&&position!==undefined&&position!=='end'){
+    const n=typeof position==='number'?position:(/^\s*\d+\s*$/.test(String(position))?Number(position):NaN);
+    if(!Number.isInteger(n)||n<1||n>lane.length+1)return {ok:false,error:'position-out-of-range',volumes:lanes,maxPosition:lane.length+1};
+    index=n-1;
+  }
+  lane.splice(index,0,...moved);
+  return {ok:true,volumes:next,movedIds:moved,target:targetKey,index};
+}
 function numericSheetSequenceIsDefault(pages=pagesForActivePreset(), volumeSnapshot=null) {
   // The persisted page state is authoritative for normal renders, API
   // responses, and pack switches.  A caller may pass an explicit optimistic
@@ -5605,7 +5634,7 @@ function syncPreviewOrganizerControls(){
 async function navigatePreviewPage(delta){
   if(!previewOrganizerMode)return;syncPreviewOrganizerControls();const index=previewPageIds.indexOf(currentPreviewPageId),nextIndex=index+Number(delta||0);if(index<0||nextIndex<0||nextIndex>=previewPageIds.length)return;const page=getPage(previewPageIds[nextIndex]);if(page)await previewPage(resolvedPageId(page),page,{preserveFocus:true});
 }
-async function moveCurrentPreviewPageToVolume(volume,btn){
+async function moveCurrentPreviewPageToVolume(volume,btn,position=null){
   const target=String(volume||'');
   if(!(await waitForQueuedPageLayoutMutation()))return;
   const page=getPage(currentPreviewPageId);
@@ -5616,9 +5645,11 @@ async function moveCurrentPreviewPageToVolume(volume,btn){
     const current=getPage(currentPreviewPageId);if(!current||assignedPageVolume(current)===target)return;
     if(pageMutationBusy)return;
     pageMutationBusy=true;updateBulkSelectionLabel();
-    const beforeVolumes=collectBoardVolumes(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),pageId=resolvedPageId(current),activePages=pagesForActivePreset();
-    for(const candidate of[...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(candidate);if(!id||id===pageId)continue;const assigned=assignedPageVolume(candidate);if(!volumes[assigned])volumes[assigned]=[];volumes[assigned].push(id);}
-    if(!volumes[target])volumes[target]=[];volumes[target].push(pageId);
+    const beforeVolumes=collectBoardVolumes(),laneVolumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),pageId=resolvedPageId(current),activePages=pagesForActivePreset();
+    for(const candidate of[...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(candidate);if(!id)continue;const assigned=assignedPageVolume(candidate);if(!laneVolumes[assigned])laneVolumes[assigned]=[];laneVolumes[assigned].push(id);}
+    const plan=planPageMove(laneVolumes,[pageId],target,position);
+    if(!plan.ok){pageMutationBusy=false;updateBulkSelectionLabel();setPageSaveStatus('saved','保存済み');showMessage('warn','移動先の位置を指定し直してください',plan.maxPosition?`${assignmentVolumeLabel(target)}の1〜${plan.maxPosition}番目を指定してください。`:'移動先がありません。');return;}
+    const volumes=plan.volumes;
     try{const body=pageApiBody({volumes});const response=await api('/api/v2/items/reorder',{method:'POST',body});applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');rememberPageLayoutUndo('プレビューからのページ移動',beforeVolumes);syncPreviewOrganizerControls();showMessage('ok','ページを移動しました',`${current.title||current.sheetName||'ページ'}を${assignmentVolumeLabel(target)}へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()}],8000);}catch(error){setPageSaveStatus('error','保存できません');showMessage('danger','ページを移動できません',userFriendlyError(error.message),error.detail||error.stack||error.message);}finally{pageMutationBusy=false;updateBulkSelectionLabel();renderPageOverview();}
   });
 }
