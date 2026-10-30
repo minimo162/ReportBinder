@@ -12,6 +12,7 @@
 # - 改名後に旧名のシートが新しく現れても、ページIDが重ならず保存できる
 # - 以前の版が未振り分けに残したページを、起動時の読み込みで整理する
 # - 物理ページの頁・左右・見開きの番号が、出力先ごとに1頁＝右から数えた値になる（指紋は変わらない）
+# - 見開きの試算（Get-SpreadPreview）は保存せず、確定（Reorder-Pages）と同じ検証をし、after が確定後と一致する
 $ErrorActionPreference = 'Stop'
 $testsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $testsRoot
@@ -297,6 +298,99 @@ Assert-PhysicalPage $rangePhysical[2] 3 'right' 1 $idOp 1 2 2 '範囲指定後�
 Assert-PhysicalPage $rangePhysical[3] 4 'left' 2 $idOp 2 2 3 '範囲指定後の本体4頁（営利の3ページ目）'
 $snapRange = Get-FinalBuildInputSnapshot (Get-Structure 'ja') 'ja' 'ja-main' $spreadPackId
 Assert-SheetTest ([string]$snapRange.fingerprint -ne [string]$snapBefore.fingerprint) 'Changing the page range no longer changes the fingerprint.'
+
+# ---- 見開きの試算（保存しない before/after） ------------------------------------------
+Set-TestPagePlacement $wbSpread '損益' 'ja-main' 20 $null
+Set-TestPagePlacement $wbSpread '営利' 'ja-main' 30 $null
+# 未振り分けから入れるページ（2頁）と、変換PDFが無く頁数がわからないページ。
+$wbExtra = New-TestWorkbook $spreadPackId 'all-visible'
+[void](Invoke-TestRender $wbExtra 'all-visible' @(@{name='追加'}, @{name='未作成'}))
+Write-TestContentPdf $wbExtra '追加' 2
+$idExtra = Resolve-PageId @(Get-TestPage $wbExtra '追加')[0]
+$idMissing = Resolve-PageId @(Get-TestPage $wbExtra '未作成')[0]
+Assert-SheetTest ((Test-Unassigned @(Get-TestPage $wbExtra '追加')[0]) -and (Test-Unassigned @(Get-TestPage $wbExtra '未作成')[0])) 'New pages for the preview test were not unassigned.'
+
+function New-TestReorderBody($Volumes, [string]$BaseLayout = $null) {
+    $request = [ordered]@{ packId=$spreadPackId; volumes=$Volumes }
+    if ($null -ne $BaseLayout) { $request['baseLayout'] = $BaseLayout }
+    return (ConvertTo-Json $request -Depth 6 | ConvertFrom-Json)
+}
+function Get-TestPhysicalKey($Pages) {
+    return (@($Pages | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.outputPageNumber, $_.side, $_.spreadIndex, $_.pageId, $_.sourcePdfPageNumber, $_.numberingMode }) -join ';')
+}
+function Get-TestPreviewError($Body) {
+    try { [void](Get-SpreadPreview 'ja' $Body); return $null } catch { return $_.Exception }
+}
+# 補足1頁の付録を本体の2頁目へ、未振り分けの2枚を補足へ。
+$proposal = [ordered]@{ 'ja-main'=@($idCover,$idAppendix,$idPl,$idOp); 'ja-appendix'=@($idExtra,$idMissing); none=@() }
+$structurePath = Join-Path (Get-WorkspacePath 'ja') 'structure.json'
+$spreadHistoryDir = Get-LayoutHistoryDir 'ja' ([string](Get-LayoutScopeInfo (Get-Structure 'ja') $spreadPackId $false).storageId)
+$hashBefore = (Get-FileHash -LiteralPath $structurePath -Algorithm SHA256).Hash
+$historyBefore = @(Get-ChildItem -LiteralPath $spreadHistoryDir -File -Filter '*.json' -ErrorAction SilentlyContinue).Count
+$readinessMainBefore = Get-TestPhysicalKey (Get-TestPhysicalPages $spreadPackId 'ja-main')
+$layoutBefore = Get-PageLayoutFingerprint (Get-Structure 'ja') $spreadPackId
+
+$preview = Get-SpreadPreview 'ja' (New-TestReorderBody $proposal $layoutBefore)
+Assert-SheetTest ([string]$preview.layoutFingerprint -eq $layoutBefore) 'The preview did not return the current layout fingerprint.'
+Assert-SheetTest ((@($preview.before.Keys) -join ',') -eq 'main,appendix' -and (@($preview.after.Keys) -join ',') -eq 'main,appendix') "The preview targets were '$(@($preview.after.Keys) -join ',')'."
+$beforeMain = @($preview.before['main'].physicalPages)
+Assert-SheetTest ((Get-TestPhysicalKey $beforeMain) -eq $readinessMainBefore) 'The preview before does not match the readiness physical pages.'
+Assert-SheetTest ([int]$preview.before['main'].pageCount -eq 6 -and [int]$preview.before['appendix'].pageCount -eq 1) 'The preview before page counts are wrong.'
+Assert-SheetTest (@($preview.before['appendix'].unknownPageIds).Count -eq 0) 'The preview before reported unknown pages in 補足.'
+$afterMain = @($preview.after['main'].physicalPages)
+Assert-SheetTest ($afterMain.Count -eq 7 -and [int]$preview.after['main'].pageCount -eq 7) "本体 after the move should have 7 physical pages, got $($afterMain.Count)."
+Assert-PhysicalPage $afterMain[0] 1 'right' 0 $idCover 1 1 1 '試算後の本体1頁（表紙）'
+Assert-PhysicalPage $afterMain[1] 2 'left' 1 $idAppendix 1 1 1 '試算後の本体2頁（付録）'
+Assert-PhysicalPage $afterMain[2] 3 'right' 1 $idPl 1 2 1 '試算後の本体3頁（損益1/2は左から右へ反転）'
+Assert-PhysicalPage $afterMain[6] 7 'right' 3 $idOp 3 3 3 '試算後の本体7頁（営利3/3）'
+$afterAppendix = $preview.after['appendix']
+Assert-SheetTest ([int]$afterAppendix.pageCount -eq 2) "補足 after the move should have 2 physical pages, got $($afterAppendix.pageCount)."
+Assert-PhysicalPage @($afterAppendix.physicalPages)[0] 1 'right' 0 $idExtra 1 2 1 '試算後の補足1頁（追加1/2）'
+Assert-SheetTest ((@($afterAppendix.unknownPageIds) -join ',') -eq $idMissing) "unknownPageIds was '$(@($afterAppendix.unknownPageIds) -join ',')', expected the page without a PDF."
+Assert-SheetTest (((@($preview.changedVolumes) | Sort-Object) -join ',') -eq 'ja-appendix,ja-main,none') "changedVolumes was '$(@($preview.changedVolumes) -join ',')'."
+
+# 試算は何も保存しない。共有キャッシュの構造も書き換えない。
+Assert-SheetTest ((Get-FileHash -LiteralPath $structurePath -Algorithm SHA256).Hash -eq $hashBefore) 'The preview wrote structure.json.'
+Assert-SheetTest (@(Get-ChildItem -LiteralPath $spreadHistoryDir -File -Filter '*.json' -ErrorAction SilentlyContinue).Count -eq $historyBefore) 'The preview saved a layout snapshot.'
+Assert-SheetTest ((Get-TestPhysicalKey (Get-TestPhysicalPages $spreadPackId 'ja-main')) -eq $readinessMainBefore) 'The preview changed the cached structure.'
+Assert-SheetTest ((Get-PageLayoutFingerprint (Get-Structure 'ja') $spreadPackId) -eq $layoutBefore) 'The preview changed the page layout.'
+
+# 出力先IDでの指定（targets）も同じ結果になる。
+$targetsBody = (ConvertTo-Json ([ordered]@{ packId=$spreadPackId; targets=[ordered]@{ main=$proposal['ja-main']; appendix=$proposal['ja-appendix']; unassigned=@() } }) -Depth 6 | ConvertFrom-Json)
+$targetsPreview = Get-SpreadPreview 'ja' ([pscustomobject][ordered]@{ packId=$spreadPackId; volumes=(ConvertTo-PageReorderVolumes 'ja' $targetsBody) })
+Assert-SheetTest ((Get-TestPhysicalKey ($targetsPreview.after['main'].physicalPages)) -eq (Get-TestPhysicalKey $afterMain)) 'The targets form gave a different preview.'
+
+# 確定と同じ検証をする（未知のID・重複・欠落・不正な出力先）。どれも保存しない。
+$badCases = @(
+    @{ label='unknown id'; volumes=[ordered]@{ 'ja-main'=@($idCover,$idPl,$idOp,'page_unknown') } },
+    @{ label='duplicate id'; volumes=[ordered]@{ 'ja-main'=@($idCover,$idPl,$idOp,$idCover) } },
+    @{ label='dropped page'; volumes=[ordered]@{ 'ja-main'=@($idCover,$idPl) } },
+    @{ label='invalid volume'; volumes=[ordered]@{ 'ja-other'=@($idCover) } }
+)
+foreach ($case in $badCases) {
+    $err = Get-TestPreviewError (New-TestReorderBody $case.volumes)
+    Assert-SheetTest ($err -is [System.ArgumentException]) "The preview accepted a bad request ($($case.label)): $err"
+}
+$err = Get-TestPreviewError ([pscustomobject][ordered]@{ packId=$spreadPackId })
+Assert-SheetTest ($err -is [System.ArgumentException]) 'The preview accepted a request without volumes.'
+# 古い並びに対する試算は 409（structure-conflict）で止める。
+$err = Get-TestPreviewError (New-TestReorderBody $proposal ('0' * 64))
+Assert-SheetTest (Test-StructureConflictError $err) "A stale baseLayout was not rejected as a conflict: $err"
+Assert-SheetTest ((Get-FileHash -LiteralPath $structurePath -Algorithm SHA256).Hash -eq $hashBefore) 'A rejected preview wrote structure.json.'
+
+# 試算の after は、同じ案を確定したあとの物理ページと一致する。
+$committed = Reorder-Pages 'ja' (New-TestReorderBody $proposal $layoutBefore)
+Assert-SheetTest (-not [string]::IsNullOrWhiteSpace([string]$committed.layoutSnapshotId)) 'Committing the move did not save a layout snapshot.'
+Assert-SheetTest ((Get-TestPhysicalKey (Get-TestPhysicalPages $spreadPackId 'ja-main')) -eq (Get-TestPhysicalKey $afterMain)) 'The committed 本体 differs from the preview after.'
+Assert-SheetTest ((Get-TestPhysicalKey (Get-TestPhysicalPages $spreadPackId 'ja-appendix')) -eq (Get-TestPhysicalKey ($afterAppendix.physicalPages))) 'The committed 補足 differs from the preview after.'
+Assert-SheetTest ([string]$committed.layoutFingerprint -ne $layoutBefore) 'The committed layout fingerprint did not change.'
+# 確定後に前の指紋で試算すると衝突になる。
+$err = Get-TestPreviewError (New-TestReorderBody $proposal $layoutBefore)
+Assert-SheetTest (Test-StructureConflictError $err) 'A preview against the pre-commit layout was not rejected.'
+# 並びが同じ案は、before と after が同じになる。
+$samePreview = Get-SpreadPreview 'ja' (New-TestReorderBody $proposal ([string]$committed.layoutFingerprint))
+Assert-SheetTest (@($samePreview.changedVolumes).Count -eq 0) 'An unchanged proposal reported changed volumes.'
+Assert-SheetTest ((Get-TestPhysicalKey ($samePreview.before['main'].physicalPages)) -eq (Get-TestPhysicalKey ($samePreview.after['main'].physicalPages))) 'An unchanged proposal changed the physical pages.'
 
 Write-Output 'sheet-assignment regression ok'
 '@
