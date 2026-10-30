@@ -7441,6 +7441,77 @@ function Invoke-RenderJobFromFile([string]$JobPath) {
 }
 
 
+# 送られた並びを変更前の構成と突き合わせる（H-2）。確定（Reorder-Pages）と試算
+# （Get-SpreadPreview）の両方が使う。以前は空のレーンや一部だけのレーンも受け入れ、
+# 送られなかったページを古い order のまま残して並びを不定にしたうえで成功を返していた。
+# 未知のID・重複・送られたレーンに今あるページの欠落はどれも、画面の読み取りか送信の
+# 不具合なので受け付けない。$Structure は読むだけで書き換えない。
+function Assert-PageReorderRequest($Structure, [string]$PackId, [string[]]$Allowed, $VolumeObject) {
+    if ($null -eq $VolumeObject) { throw [System.ArgumentException]::new('volumes が必要です。') }
+    $workbookIds = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks | Where-Object { Test-WorkbookPack $_ $PackId })) { $workbookIds[[string]$wb.workbookId] = $true }
+    $pageMap = @{}
+    foreach ($page in @(Get-Array $Structure.pages | Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) })) { $pageMap[(Resolve-PageId $page)] = $page }
+    $currentByVolume = @{}
+    $sentIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($property in $VolumeObject.PSObject.Properties) {
+        $volume = [string]$property.Name
+        if ($Allowed -notcontains $volume) { throw [System.ArgumentException]::new("不正なvolumeです: $volume") }
+        $currentByVolume[$volume] = @(Get-Array $Structure.pages | Where-Object {
+            $workbookIds.ContainsKey([string]$_.workbookId) -and (
+                ($volume -eq 'none' -and ([string]$_.volume -eq 'none' -or $_.enabled -eq $false)) -or
+                ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
+            )
+        } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_} | ForEach-Object { Resolve-PageId $_ })
+        foreach ($id in @(Get-Array $property.Value | ForEach-Object { [string]$_ })) {
+            if (-not $pageMap.ContainsKey($id)) { throw [System.ArgumentException]::new("この一式に無いページが含まれています: $id。画面を読み込み直してから、もう一度操作してください。") }
+            if (-not $sentIds.Add($id)) { throw [System.ArgumentException]::new("同じページが2回含まれています: $id。画面を読み込み直してから、もう一度操作してください。") }
+        }
+    }
+    foreach ($volume in @($currentByVolume.Keys)) {
+        $dropped = @($currentByVolume[$volume] | Where-Object { -not $sentIds.Contains([string]$_) })
+        if ($dropped.Count -gt 0) {
+            throw [System.ArgumentException]::new(("ページ構成の内容が不完全なため保存していません（{0} の {1} ページが含まれていません）。画面を読み込み直してから、もう一度操作してください。" -f $volume, $dropped.Count))
+        }
+    }
+    # 並びが今と同じレーンは書き換えない（保存前のスナップショットも作らない）。
+    $changedVolumes = @()
+    foreach ($property in $VolumeObject.PSObject.Properties) {
+        $volume = [string]$property.Name
+        $desiredIds = @(Get-Array $property.Value | ForEach-Object { [string]$_ })
+        if ((@($currentByVolume[$volume]) -join "`n") -ne ($desiredIds -join "`n")) { $changedVolumes += $volume }
+    }
+    return [ordered]@{ pageMap = $pageMap; changedVolumes = @($changedVolumes) }
+}
+
+# 検証済みの並びをページの記録へ書き込む。保存はしない（呼び出し側が決める）。
+# 戻り値は並びが変わった出力先（未振り分けを除く。移動元も含む）。
+function Set-PageReorderPlacement($Structure, [string]$Language, [string]$PackId, [string[]]$Allowed, $VolumeObject, $Validated) {
+    $affected = New-Object System.Collections.Generic.HashSet[string]
+    $pageMap = $Validated.pageMap
+    foreach ($property in $VolumeObject.PSObject.Properties) {
+        $volume = [string]$property.Name
+        if (@($Validated.changedVolumes) -notcontains $volume) { continue }
+        if ($volume -ne 'none') { [void]$affected.Add($volume) }
+        $desiredIds = @(Get-Array $property.Value | ForEach-Object { [string]$_ })
+        for ($i=0; $i -lt $desiredIds.Count; $i++) {
+            $id = $desiredIds[$i]
+            if (-not $pageMap.ContainsKey($id)) { continue }
+            $page = $pageMap[$id]
+            $oldVolume = [string](Get-DataProperty $page 'volume' 'none')
+            if ($oldVolume -ne 'none') { [void]$affected.Add($oldVolume) }
+            Set-NoteProperty $page 'volume' $volume
+            Set-NoteProperty $page 'enabled' ($volume -ne 'none')
+            Set-NoteProperty $page 'order' (($i+1)*10)
+            Set-NoteProperty $page 'orderManual' $true
+            Set-NoteProperty $page 'updatedAt' (New-NowIso)
+        }
+    }
+    foreach ($volume in $Allowed) { [void](Renumber-VolumeOrder $Structure $volume $PackId) }
+    Apply-DefaultNumberingPerVolume $Language $Structure $PackId
+    return ,@($affected)
+}
+
 function Reorder-Pages([string]$Language, $Body) {
     $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
     $baseLayout = Get-RequestedBaseLayout $Body
@@ -7449,65 +7520,74 @@ function Reorder-Pages([string]$Language, $Body) {
         $cat = [string](Resolve-DocumentPackScope $structure $requestedScope $false).packId
         $allowed = @(Get-PackVolumeList $Language (Resolve-DocumentPackScope $structure $requestedScope $false).pack $true)
         $volumeObject = $Body.volumes
-        if ($null -eq $volumeObject) { throw [System.ArgumentException]::new('volumes が必要です。') }
-        $workbookIds = @{}
-        foreach ($wb in @(Get-Array $structure.workbooks | Where-Object { Test-WorkbookPack $_ $cat })) { $workbookIds[[string]$wb.workbookId] = $true }
-        $pageMap = @{}
-        foreach ($page in @(Get-Array $structure.pages | Where-Object { $workbookIds.ContainsKey([string]$_.workbookId) })) { $pageMap[(Resolve-PageId $page)] = $page }
-        # 送られた並びを変更前の構成と突き合わせてから書き込む（H-2）。以前は空のレーンや
-        # 一部だけのレーンも受け入れ、送られなかったページを古い order のまま残して
-        # 並びを不定にしたうえで成功を返していた。未知のID・重複・送られたレーンに
-        # 今あるページの欠落はどれも、画面の読み取りか送信の不具合なので保存しない。
-        $currentByVolume = @{}
-        $sentIds = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($property in $volumeObject.PSObject.Properties) {
-            $volume = [string]$property.Name
-            if ($allowed -notcontains $volume) { throw [System.ArgumentException]::new("不正なvolumeです: $volume") }
-            $currentByVolume[$volume] = @(Get-Array $structure.pages | Where-Object {
-                $workbookIds.ContainsKey([string]$_.workbookId) -and (
-                    ($volume -eq 'none' -and ([string]$_.volume -eq 'none' -or $_.enabled -eq $false)) -or
-                    ($volume -ne 'none' -and [string]$_.volume -eq $volume -and $_.enabled -ne $false)
-                )
-            } | Sort-Object {[double](Get-DataProperty $_ 'order' 0)}, {Resolve-PageId $_} | ForEach-Object { Resolve-PageId $_ })
-            foreach ($id in @(Get-Array $property.Value | ForEach-Object { [string]$_ })) {
-                if (-not $pageMap.ContainsKey($id)) { throw [System.ArgumentException]::new("この一式に無いページが含まれています: $id。画面を読み込み直してから、もう一度操作してください。") }
-                if (-not $sentIds.Add($id)) { throw [System.ArgumentException]::new("同じページが2回含まれています: $id。画面を読み込み直してから、もう一度操作してください。") }
-            }
-        }
-        foreach ($volume in @($currentByVolume.Keys)) {
-            $dropped = @($currentByVolume[$volume] | Where-Object { -not $sentIds.Contains([string]$_) })
-            if ($dropped.Count -gt 0) {
-                throw [System.ArgumentException]::new(("ページ構成の内容が不完全なため保存していません（{0} の {1} ページが含まれていません）。画面を読み込み直してから、もう一度操作してください。" -f $volume, $dropped.Count))
-            }
-        }
-        $affected = New-Object System.Collections.Generic.HashSet[string]
+        $validated = Assert-PageReorderRequest $structure $cat $allowed $volumeObject
         $layoutSnapshotId = ''
-        foreach ($property in $volumeObject.PSObject.Properties) {
-            $volume = [string]$property.Name
-            $desiredIds = @(Get-Array $property.Value | ForEach-Object { [string]$_ })
-            $currentIds = @($currentByVolume[$volume])
-            $sameSequence = (($currentIds -join "`n") -eq ($desiredIds -join "`n"))
-            if ($sameSequence) { continue }
-            if ([string]::IsNullOrWhiteSpace($layoutSnapshotId)) { $layoutSnapshotId = Save-LayoutSnapshot $Language $cat 'reorder' $structure }
-            if ($volume -ne 'none') { [void]$affected.Add($volume) }
-            for ($i=0; $i -lt $desiredIds.Count; $i++) {
-                $id = $desiredIds[$i]
-                if (-not $pageMap.ContainsKey($id)) { continue }
-                $page = $pageMap[$id]
-                $oldVolume = [string](Get-DataProperty $page 'volume' 'none')
-                if ($oldVolume -ne 'none') { [void]$affected.Add($oldVolume) }
-                Set-NoteProperty $page 'volume' $volume
-                Set-NoteProperty $page 'enabled' ($volume -ne 'none')
-                Set-NoteProperty $page 'order' (($i+1)*10)
-                Set-NoteProperty $page 'orderManual' $true
-                Set-NoteProperty $page 'updatedAt' (New-NowIso)
-            }
-        }
-        foreach ($volume in $allowed) { [void](Renumber-VolumeOrder $structure $volume $cat) }
-        Apply-DefaultNumberingPerVolume $Language $structure $cat
+        if (@($validated.changedVolumes).Count -gt 0) { $layoutSnapshotId = Save-LayoutSnapshot $Language $cat 'reorder' $structure }
+        $affected = @(Set-PageReorderPlacement $structure $Language $cat $allowed $volumeObject $validated)
         if ($affected.Count -gt 0) { Mark-VolumeNeedsRebuild $structure $Language $cat @($affected) 'reorder' 'ページ構成を変更しました' }
         return [ordered]@{ pages=$structure.pages; volumes=$structure.volumes; affectedVolumes=@($affected); layoutSnapshotId=$layoutSnapshotId; updatedAt=(New-NowIso) }
     } $baseLayout $requestedScope
+}
+
+# 並べ替えと試算の要求は volumes（内部の volume ID）か targets（出力先ID）で受け取る。
+function ConvertTo-PageReorderVolumes([string]$Language, $Body) {
+    $volumes = Get-DataProperty $Body 'volumes' $null
+    if ($null -ne $volumes) { return $volumes }
+    $targets = Get-DataProperty $Body 'targets' $null
+    if ($null -eq $targets) { throw 'targets が必要です。' }
+    $volumeMap = [ordered]@{}
+    foreach ($property in $targets.PSObject.Properties) {
+        $targetId = ([string]$property.Name).Trim().ToLowerInvariant()
+        $volume = if ($targetId -in @('none','unassigned')) { 'none' } else { Get-LegacyVolumeFromTargetId $Language $targetId }
+        # none と unassigned、または不正な targetId どうしが同じレーンになると、
+        # 後のものが前のものを黙って上書きしていた。
+        if ($volumeMap.Contains($volume)) { throw [System.ArgumentException]::new("同じ出力先が2回指定されています: $targetId") }
+        $volumeMap[$volume] = @(Get-Array $property.Value)
+    }
+    return [pscustomobject]$volumeMap
+}
+
+# 見開きの試算。案どおりに並べたときの物理ページを、出力先ごとに before/after で返す。
+# structure.json にもページ構成の保存履歴にも書かず、ロックも取らない。
+# 共有キャッシュ（Get-Structure）の構造を書き換えないよう、ファイルから読み直した写しに
+# 案を当てる。before も同じ写しから作る。readiness は並べ替えのあと遅れて更新されるため、
+# それを before に使うと、古い before と新しい after を比べてしまうことがある。
+function Get-SpreadPreview([string]$Language, $Body) {
+    $requestedScope = [string](Get-DataProperty $Body 'packId' (Get-DataProperty $Body 'category' ''))
+    $baseLayout = Get-RequestedBaseLayout $Body
+    $structure = Read-StructureUnlocked $Language
+    $scope = Resolve-DocumentPackScope $structure $requestedScope $false
+    $cat = [string]$scope.packId
+    $currentLayout = Get-PageLayoutFingerprint $structure $cat
+    if (-not [string]::IsNullOrWhiteSpace($baseLayout) -and $baseLayout -ne $currentLayout) { throw (New-StructureConflictError $baseLayout $currentLayout) }
+    $allowed = @(Get-PackVolumeList $Language $scope.pack $true)
+    $volumeObject = Get-DataProperty $Body 'volumes' $null
+    $validated = Assert-PageReorderRequest $structure $cat $allowed $volumeObject
+    $targetIds = @(Get-PackTargetIds $Language $scope.pack)
+    $before = Get-SpreadPreviewTargets $structure $Language $cat $targetIds
+    [void](Set-PageReorderPlacement $structure $Language $cat $allowed $volumeObject $validated)
+    $after = Get-SpreadPreviewTargets $structure $Language $cat $targetIds
+    return [ordered]@{ packId=$cat; layoutFingerprint=$currentLayout; changedVolumes=@($validated.changedVolumes); before=$before; after=$after }
+}
+
+# 出力先ごとの物理ページ。unknownPageIds は出力先に入っているのに変換PDFが無く、
+# 頁数がわからないページ（physicalPages に出てこない）。
+function Get-SpreadPreviewTargets($Structure, [string]$Language, [string]$PackId, [string[]]$TargetIds) {
+    $targets = [ordered]@{}
+    foreach ($targetId in $TargetIds) {
+        $volume = Get-LegacyVolumeFromTargetId $Language $targetId
+        $snap = Get-FinalBuildInputSnapshot $Structure $Language $volume $PackId
+        $physical = @($snap.physicalPages)
+        $known = @{}
+        foreach ($entry in $physical) { $known[[string]$entry.pageId] = $true }
+        $unknown = @()
+        foreach ($page in @($snap.pages)) {
+            $pageId = Resolve-PageId $page
+            if (-not $known.ContainsKey($pageId)) { $unknown += $pageId }
+        }
+        $targets[$targetId] = [ordered]@{ targetId=$targetId; volume=$volume; pageCount=[int]$snap.pageCount; itemCount=[int]$snap.itemCount; physicalPages=@($physical); unknownPageIds=@($unknown) }
+    }
+    return $targets
 }
 
 
@@ -9558,21 +9638,7 @@ function Handle-Api($Context) {
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/items/reorder') {
             $body = Read-BodyJson $Context.Request
-            $volumes = Get-DataProperty $body 'volumes' $null
-            if ($null -eq $volumes) {
-                $targets = Get-DataProperty $body 'targets' $null
-                if ($null -eq $targets) { throw 'targets が必要です。' }
-                $volumeMap = [ordered]@{}
-                foreach ($property in $targets.PSObject.Properties) {
-                    $targetId = ([string]$property.Name).Trim().ToLowerInvariant()
-                    $volume = if ($targetId -in @('none','unassigned')) { 'none' } else { Get-LegacyVolumeFromTargetId $language $targetId }
-                    # none と unassigned、または不正な targetId どうしが同じレーンになると、
-                    # 後のものが前のものを黙って上書きしていた。
-                    if ($volumeMap.Contains($volume)) { throw [System.ArgumentException]::new("同じ出力先が2回指定されています: $targetId") }
-                    $volumeMap[$volume] = @(Get-Array $property.Value)
-                }
-                $volumes = [pscustomobject]$volumeMap
-            }
+            $volumes = ConvertTo-PageReorderVolumes $language $body
             $request = [pscustomobject][ordered]@{ packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); volumes=$volumes }
             # Keep the optimistic-lock fingerprint supplied by the browser.
             # Rebuilding the request without it silently disabled conflict
@@ -9616,6 +9682,15 @@ function Handle-Api($Context) {
                 $targets[$targetId] = Get-FinalBuildReadiness $structure $language $volume ([string]$scope.packId)
             }
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; packId=[string]$scope.packId; targets=$targets }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/spread-preview') {
+            # 保存しない試算。要求は /api/v2/items/reorder と同じ形で、baseLayout が今の並びと
+            # 違えば 409 structure-conflict を返す。
+            $body = Read-BodyJson $Context.Request
+            $volumes = ConvertTo-PageReorderVolumes $language $body
+            $request = [pscustomobject][ordered]@{ packId=[string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')); volumes=$volumes }
+            if (Test-ConfigHasKey $body 'baseLayout') { Set-NoteProperty $request 'baseLayout' ([string](Get-DataProperty $body 'baseLayout' '')) }
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; preview=(Get-SpreadPreview $language $request) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/build') {
             $body = Read-BodyJson $Context.Request

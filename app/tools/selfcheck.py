@@ -2601,6 +2601,20 @@ for flavor in ('Reorder-Pages', 'Update-Page'):
     _body = _ps_function(server, flavor, 'server.ps1')
     if 'Get-RequestedBaseLayout' not in _body or '$baseLayout $requestedScope' not in _body:
         raise SystemExit(f'{flavor} must forward the caller layout fingerprint')
+# 見開きの試算は保存しない。検証は確定（Reorder-Pages）と同じ関数を通す。
+_spread_preview = _ps_function(server, 'Get-SpreadPreview', 'server.ps1')
+for forbidden in ('Update-StructureLocked', 'Write-StructureUnlocked', 'Save-LayoutSnapshot', 'Mark-VolumeNeedsRebuild', 'Get-Structure '):
+    if forbidden in _spread_preview:
+        raise SystemExit(f'the spread preview must not save or touch the shared structure cache: {forbidden}')
+for needed in ('Read-StructureUnlocked', 'Assert-PageReorderRequest', 'Set-PageReorderPlacement', 'Get-PageLayoutFingerprint', 'New-StructureConflictError', 'Get-RequestedBaseLayout'):
+    if needed not in _spread_preview:
+        raise SystemExit(f'the spread preview is missing {needed}')
+if 'Assert-PageReorderRequest' not in _ps_function(server, 'Reorder-Pages', 'server.ps1'):
+    raise SystemExit('Reorder-Pages must share the reorder validation with the spread preview')
+_spread_route = server.split("$path -eq '/api/v2/outputs/spread-preview'", 1)[1].split('\n        if ($method', 1)[0]
+for needed in ('ConvertTo-PageReorderVolumes', "Test-ConfigHasKey $body 'baseLayout'", 'Get-SpreadPreview $language $request'):
+    if needed not in _spread_route:
+        raise SystemExit(f'the spread preview route is missing {needed}')
 if '409' not in server or "code = 'structure-conflict'" not in server:
     raise SystemExit('a layout conflict must answer 409 with a structure-conflict code')
 for needed in ['function activeLayoutFingerprint', 'function rememberLayoutFingerprint',

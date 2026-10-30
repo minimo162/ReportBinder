@@ -1,5 +1,16 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 見開きの before/after を作る試算APIを追加（2026-10-30）
+
+- 並べ替えの案を保存せずに試算する`POST /api/v2/outputs/spread-preview`を加えた。要求は`POST /api/v2/items/reorder`と同じ形（`volumes`または`targets`、`baseLayout`）で、出力先ごとの物理ページ（頁・左右・見開き、`pageCount`、`unknownPageIds`）を before/after で返す。画面からはまだ使っていない。
+- 試算は`structure.json`から読み直した写しに案を当て、`Get-FinalBuildInputSnapshot`で物理ページを作る。`structure.json`、ページ構成の保存履歴、「再出力が必要」の印のどれにも書かず、ロックも取らない。共有キャッシュ（`Get-Structure`）の構造も書き換えない。before も同じ写しから作るので、遅れて届く readiness の古い頁・左右と比べてしまうことがない。
+- 並べ替えの検証（未知のID・重複・送られたレーンの欠落・不正な出力先）と並びの書き込みを`Assert-PageReorderRequest`・`Set-PageReorderPlacement`に切り出し、確定（`Reorder-Pages`）と試算の両方で使うようにした。`targets`から`volumes`への読み替えも`ConvertTo-PageReorderVolumes`にまとめた。確定の動き（並びが同じレーンは書き換えない、変わるときだけ保存前のスナップショットを作る）は変えていない。
+- `baseLayout`が今の並びと違う試算は409 `structure-conflict`で止める。応答の`layoutFingerprint`は確定の`baseLayout`にそのまま使える。
+- `unknownPageIds`は、出力先に入っているのに変換PDFが無く頁数がわからないページ。変換PDFのページ数は、既存のパス・サイズ・更新時刻をキーにしたキャッシュから読む。
+- `tests/sheet-assignment-regression.ps1`に、試算の前後で`structure.json`と保存履歴とキャッシュの構造が変わらないこと、before が readiness と一致すること、未振り分けから入れるページと PDF未作成のページ（`unknownPageIds`）、左右が反転するページ、`targets`での指定、IDの検証、`baseLayout`の食い違い（確定前の指紋での試算を含む）、試算の after と確定後の物理ページが一致すること、並びが同じ案では before と after が同じになることの検査を加えた。`app/tools/selfcheck.py`に、試算が保存しないことと検証を共有していることの静的検査を加えた。
+- docs/API.md に`POST /api/v2/outputs/spread-preview`を記載した。
+- RuntimeVersion `2026.10.30.6`へ更新した。
+
 ## 位置を指定した移動の純粋関数 planPageMove を追加（2026-10-30）
 
 - 見開きの before/after（段階2）の準備として、出力先ごとの並びから「指定した出力先の何番目へ動かす」並びを作る純粋関数`planPageMove(volumes, pageIds, target, position)`を`app.js`に加えた。位置は1から数え、動かすページを抜いた後の並びで数える（例: 補足6→本体3）。省略・`null`・`'end'`は末尾。範囲外の位置（0、負、小数、末尾の次より後ろ、数字以外）と移動先の無い指定は`ok:false`で拒否し、並びを変えない。入力の並びは書き換えない。

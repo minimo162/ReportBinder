@@ -27,7 +27,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 > | `POST /api/v2/sources/scan-updates` | `POST /api/scan-updates` |
 > | `PATCH /api/v2/items/{itemId}` | `POST /api/pages/update` |
 >
-> `POST /api/v2/items/reorder` と `PATCH /api/v2/items/{itemId}` は `baseLayout` を受け取り、現行レイアウトの指紋と一致しない場合に409 `structure-conflict`を返します。画面は直前のレスポンスに含まれる `layoutFingerprint` を次の変更の `baseLayout` として送ってください。
+> `POST /api/v2/items/reorder`、`PATCH /api/v2/items/{itemId}`、`POST /api/v2/outputs/spread-preview` は `baseLayout` を受け取り、現行レイアウトの指紋と一致しない場合に409 `structure-conflict`を返します。画面は直前のレスポンスに含まれる `layoutFingerprint` を次の変更の `baseLayout` として送ってください。
 
 - `GET /api/v2/state`: `packs / sources / units / items / artifacts / outputs / packProgress`を返す。`packProgress`は未提出必須原稿に加え、`overdueRequiredCount / dueSoonRequiredCount / nearestRequiredDueDate`で期限超過・7日以内・次の期限を集計する
 - `GET /api/v2/pack-templates`: 組み込みテンプレートと利用者定義ひな形を返す
@@ -56,6 +56,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
 - `POST /api/v2/layout/restore`: 保存済みのページ構成を同じ資料パックへ復元する
 - `GET /api/v2/outputs/readiness?packId={packId}`: 本体・補足の出力可否と再出力理由を返す
+- `POST /api/v2/outputs/spread-preview`: 並べ替えの案を保存せずに試算し、出力先ごとの物理ページ（頁・左右・見開き）を before/after で返す（現行UIは未使用）。要求と検証は`POST /api/v2/items/reorder`と同じ
 - `POST /api/v2/outputs/build`: 資料パックの提出用PDFを出力するジョブを開始し、`job`（`jobId`・`status`・`total`）を返す。HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると進捗ポーリングも中止も受け付けられない。実処理は子プロセスで走る
 - `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない
@@ -552,6 +553,34 @@ categoryは必須です。省略・不正値はHTTP 400です。
 
 `side`・`spreadIndex`・`pagePartIndex`・`pagePartCount`は表示用で、入力の指紋（`fingerprint`）には含めません。追加しても「再出力が必要」の判定は変わりません。
 
+## POST /api/v2/outputs/spread-preview
+
+並べ替えの案を当てたときの物理ページを、確定前に before/after で見比べるための試算です。**何も保存しません**（`structure.json`、ページ構成の保存履歴、出力先の「再出力が必要」の印のどれも変えません）。要求は`POST /api/v2/items/reorder`と同じ形（`volumes`または`targets`）で、同じ検証をします。空のレーン、ページの欠落、この一式に無いID、同じIDの重複、不正な出力先は400です。`baseLayout`が今の並びの指紋と違えば409 `structure-conflict`を返します（古い並びに対して試算しないため）。
+
+```json
+{ "packId": "pack_...", "baseLayout": "…", "volumes": { "ja-main": ["page_a", "page_c", "page_b"], "ja-appendix": [], "none": [] } }
+```
+
+```json
+{
+  "ok": true,
+  "apiVersion": 2,
+  "preview": {
+    "packId": "pack_...",
+    "layoutFingerprint": "…",
+    "changedVolumes": ["ja-main"],
+    "before": { "main": { "targetId": "main", "volume": "ja-main", "pageCount": 6, "itemCount": 3, "physicalPages": [], "unknownPageIds": [] }, "appendix": { } },
+    "after":  { "main": { "targetId": "main", "volume": "ja-main", "pageCount": 7, "itemCount": 4, "physicalPages": [], "unknownPageIds": ["page_x"] }, "appendix": { } }
+  }
+}
+```
+
+- `before`・`after`は資料パックの出力先ごと（キーは`targetId`）で、`physicalPages`の各要素は readiness の`snapshot.physicalPages`と同じ形です。`after`は同じ案を`POST /api/v2/items/reorder`で確定したあとの readiness と一致します。
+- `before`も、readiness ではなく要求を受けた時点の構成から作り直します。readiness は並べ替えのあと遅れて更新されるためです。
+- `unknownPageIds`は、出力先に入っているのに変換PDFが無く頁数がわからないページです。`physicalPages`には出てこないので、それより後ろの頁・左右は確定値ではありません。
+- `layoutFingerprint`は試算に使った並びの指紋です。確定の`baseLayout`にそのまま使えます。
+- 変換PDFのページ数は、パス・サイズ・更新時刻をキーにしたキャッシュ（`Get-PdfPageCount`）から読みます。
+
 ## POST /api/final/build
 
 volumeとcategoryは必須です。
@@ -685,6 +714,7 @@ GET   /api/v2/layout/snapshots?packId=pack_...
 POST  /api/v2/layout/restore/preview
 POST  /api/v2/layout/restore
 GET   /api/v2/outputs/readiness?packId=pack_...
+POST  /api/v2/outputs/spread-preview
 POST  /api/v2/outputs/build
 POST  /api/v2/outputs/file
 POST  /api/v2/outputs/publish
