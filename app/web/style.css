@@ -869,6 +869,42 @@ main.shell.pages-shell .focused-board.thumbnail-board .page-thumb-card{grid-temp
 .spread-right.band-mid::after,.spread-right.band-end::after{left:-8px;border-top-left-radius:0;border-bottom-left-radius:0}
 .spread-cell-dimmed{opacity:.35}
 @media(max-width:760px){.spread-board{padding:10px}.spread-wrap{padding:10px}.spread-list{gap:12px}.spread-sheet{width:100%;grid-template-columns:minmax(0,1fr) 2px minmax(0,1fr)}}
+/* PDFイメージ（見るだけ）。出力先ごとに1つのPDFとして、灰色の背景に白い紙を縦に連続表示する。
+   紙の幅は大きさスライダー（--page-thumbnail-min）。縦横比は描いた canvas から取り、読み込み前は A4縦。 */
+.pdf-image-board{display:block;padding:14px var(--s-5) 18px;background:var(--surface-subtle)}
+.pdf-image-board>.page-status-banner,.pdf-image-board>.page-filter-empty{margin:0 0 12px}
+.pdf-image-board .volume-panel{margin-bottom:14px;overflow:visible;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface)}
+.pdf-image-board .volume-head{padding:12px 14px;align-items:flex-start;border-bottom:1px solid var(--border)}
+.pdf-image-board .volume-panel.pdf-image-unassigned{border-color:var(--attention-border);background:var(--attention-subtle)}
+.pdf-image-unassigned-strip{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:10px 14px;font-size:14px}
+.pdf-image-unassigned-strip span{color:var(--text-secondary)}
+.pdf-image-wrap{padding:12px 14px 18px}
+.pdf-image-file-break{margin:0 0 10px;color:var(--text-secondary);font-size:14px;font-weight:600;text-align:center}
+.pdf-image-summary{align-items:center}
+.pdf-image-file-name{color:var(--text-secondary);font-size:14px;overflow-wrap:anywhere}
+.pdf-image-blocked{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px}
+.pdf-image-empty{padding:10px 12px;border:1px dashed var(--border-strong);border-radius:var(--r-md);color:var(--text-secondary);font-size:14px}
+.pdf-image-list{display:flex;flex-direction:column;align-items:center;gap:12px;padding:16px 12px;border-radius:var(--r-md);background:#8e939b}
+.pdf-image-sheet{position:relative;width:var(--page-thumbnail-min,190px);max-width:100%;border-radius:2px;outline:0;cursor:default;content-visibility:auto;contain-intrinsic-size:auto var(--page-thumbnail-min,190px) auto calc(var(--page-thumbnail-min,190px) * 1.414)}
+.pdf-image-paper{border:0;border-radius:0;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.28),0 4px 12px rgba(0,0,0,.18)}
+.pdf-image-sheet:focus-visible .pdf-image-paper{outline:3px solid #fff;outline-offset:2px}
+.pdf-image-sheet.selected-row .pdf-image-paper{outline:3px solid var(--accent);outline-offset:2px}
+.pdf-image-sheet.new-page-row .pdf-image-paper{outline:3px solid var(--attention);outline-offset:2px}
+/* 紙ごとのラベルは控えめに。ホバー・フォーカス・選択のときだけ出す。 */
+.pdf-image-caption{position:absolute;left:0;right:0;bottom:0;z-index:3;display:none;padding:4px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:rgba(27,28,30,.8);color:#fff;font-size:14px}
+.pdf-image-sheet:hover .pdf-image-caption,.pdf-image-sheet:focus-visible .pdf-image-caption,.pdf-image-sheet.selected-row .pdf-image-caption{display:block}
+.pdf-image-unknown .pdf-image-paper-missing{border:2px dashed var(--border-strong);background:#f7f8fa;box-shadow:none}
+.pdf-image-missing{position:absolute;inset:0;display:grid;align-content:center;justify-items:center;gap:6px;padding:12px;text-align:center;color:var(--text-secondary);font-size:14px}
+.pdf-image-missing>span:last-child{overflow-wrap:anywhere}
+.pdf-image-stale .pdf-image-paper::after{content:"";position:absolute;inset:0;z-index:1;background:repeating-linear-gradient(135deg,rgba(194,120,3,.14) 0 8px,transparent 8px 16px);pointer-events:none}
+.pdf-image-stale-band{position:absolute;left:0;right:0;top:0;z-index:2;padding:4px 6px;background:var(--attention-subtle);color:var(--attention);font-size:14px;font-weight:600;text-align:center}
+.pdf-image-checking{position:absolute;right:6px;bottom:6px;z-index:2;padding:1px 6px;border-radius:var(--r-sm);background:rgba(27,28,30,.72);color:#fff;font-size:14px}
+.pdf-image-error{padding:0 6px;border:1px solid var(--danger-border);border-radius:var(--r-sm);background:var(--danger-subtle);color:var(--danger);font-size:14px;font-weight:600}
+.pdf-image-paper>.pdf-image-error{position:absolute;left:6px;bottom:6px;z-index:2}
+.pdf-image-range-note{margin-top:6px;padding:4px 8px;border:1px solid var(--attention-border);border-radius:var(--r-sm);background:var(--attention-subtle);color:var(--attention);font-size:14px}
+.pdf-image-dimmed{opacity:.35}
+.page-keyboard-hint-pdf{white-space:normal}
+@media(max-width:760px){.pdf-image-board{padding:10px}.pdf-image-wrap{padding:10px}.pdf-image-list{padding:12px 8px}}
 /* 位置を指定した移動の before/after。差分は色だけでなく、記号と文言（.spread-diff-badge）でも示す。 */
 .modal-card.spread-move-dialog{width:min(1280px,calc(100vw - 32px));height:calc(100vh - 48px)}
 .spread-move-controls{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 16px;padding:12px 16px;border-bottom:1px solid var(--border)}

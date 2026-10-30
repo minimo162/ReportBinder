@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v204', 'style.css?v=20261030_v125']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v205', 'style.css?v=20261030_v126']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v204' not in html:
+if 'app.js?v=20261030_v205' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v204' not in html:
+if 'app.js?v=20261030_v205' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2987,6 +2987,56 @@ for needed in ["'server'", "'observed'", "'unknown'", 'isLatestPdfWorkbook(workb
         raise SystemExit(f'the PDF image page count table is incomplete: {needed}')
 if 'PdfImage' in appjs.split('function buildSpreadLayout(', 1)[1].split('\nfunction ', 1)[0]:
     raise SystemExit('buildSpreadLayout must keep using only the server physicalPages')
+# PDFイメージ表示（見るだけ）。表示切替は4つ。見るだけの判定は isReadOnlyBoardView に共通化し、
+# ドラッグ・Alt+矢印・Undo の before・readiness 読み直し時の描き直しで見開きと同じ扱いにする。
+_view_switch = html.split('class="segmented page-view-switch"', 1)[1].split('</div>', 1)[0]
+for needed in ['id="page-view-thumbnail-btn"', 'id="page-view-detail-btn"', 'id="page-view-spread-btn"', 'id="page-view-pdf-btn"']:
+    if needed not in _view_switch:
+        raise SystemExit(f'the page view switch must have four buttons: {needed}')
+if _view_switch.count('<button ') != 4:
+    raise SystemExit('the page view switch must have exactly four buttons')
+if '<symbol id="i-pdf-pages"' not in html or 'page-keyboard-hint-pdf' not in html:
+    raise SystemExit('the PDF image view needs its icon and keyboard hint')
+if "bind('page-view-pdf-btn','click',()=>setPageBoardView('pdf'))" not in appjs:
+    raise SystemExit('the PDF image button must switch the board view')
+if "function isReadOnlyBoardView(view=pageBoardView){return view==='spread'||view==='pdf';}" not in appjs:
+    raise SystemExit('the read-only board view check must cover spread and pdf')
+for _name, needed in [('beginPointerPageDrag', 'if (isReadOnlyBoardView()) return;'),
+                      ('handleBoardRowKeydown', 'isReadOnlyBoardView()&&e.altKey'),
+                      ('movePageIdsToVolume', 'isReadOnlyBoardView()?pageVolumesFromState():collectBoardVolumes()'),
+                      ('renderSpreadBoardIfVisible', 'isReadOnlyBoardView()')]:
+    if needed not in appjs.split(f'function {_name}(', 1)[1].split('\nfunction ', 1)[0]:
+        raise SystemExit(f'{_name} must use the shared read-only board check: {needed}')
+if "pageBoardView === 'spread') return;" in appjs or "pageBoardView==='spread'&&e.altKey" in appjs:
+    raise SystemExit('drag/Alt+arrow must not be stopped only in the spread view (PDF image is read-only too)')
+for needed in ["saved === 'pdf'", "view === 'pdf'"]:
+    if needed not in appjs:
+        raise SystemExit(f'the PDF image view must be restorable and selectable: {needed}')
+_pdf_volume = appjs.split('function pdfImageVolumeContentHtml(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['spread-lane-index', 'buildPdfImageLayout(laneIds,pdfImagePageCounts', 'pdf-image-list', 'data-set-page-board-view="spread"']:
+    if needed not in _pdf_volume:
+        raise SystemExit(f'the PDF image volume is incomplete: {needed}')
+_pdf_sheet = appjs.split('function pdfImageSheetHtml(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['data-page-thumbnail=', 'data-thumbnail-page="${escapeAttr(entry.sourcePdfPageNumber)}"', 'data-thumbnail-allow-stale="1"']:
+    if needed not in _pdf_sheet:
+        raise SystemExit(f'PDF image sheets must draw the used page and allow stale PDFs: {needed}')
+for banned in ['outputPageNumber', 'side', 'spreadIndex', 'data-volume', 'page-row']:
+    if banned in _pdf_sheet.replace('new-page-row', '') or banned in _pdf_volume.replace('data-volume="${escapeAttr(volume)}" hidden', ''):
+        raise SystemExit(f'PDF image sheets must not show page numbers/sides or act as reorderable cards: {banned}')
+_pump = appjs.split('function pumpPageThumbnailQueue(', 1)[1].split('\nfunction ', 1)[0]
+if '(pagePreviewAvailable(page)||(canvas.dataset.thumbnailAllowStale&&page.contentPdf))' not in _pump:
+    raise SystemExit('only canvases marked allow-stale may draw an outdated converted PDF')
+if 'schedulePdfImageCountRefresh()' not in _pump:
+    raise SystemExit('a newly learned page count must redraw the PDF image view')
+_render_pages = appjs.split('function renderPages() {', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["pageBoardView==='pdf'?collectPdfImagePageCounts(", 'pdfImageCountsSignature(pdfImagePageCounts)', "'pdf-image-board'", 'isReadOnlyBoardView()?spreadReadinessSignature():null']:
+    if needed not in _render_pages:
+        raise SystemExit(f'renderPages must build and track the PDF image page counts: {needed}')
+for needed in ['.pdf-image-board{', '.pdf-image-list{', '.pdf-image-sheet{', '.pdf-image-stale', '.pdf-image-unknown', '.pdf-image-paper-missing', '.pdf-image-file-break{', 'content-visibility:auto']:
+    if needed not in css:
+        raise SystemExit(f'the PDF image view needs its style: {needed}')
+if 'three' in appjs.split('// ---- PDFイメージ（見るだけ） ----', 1)[1].split('\n// 位置を指定した移動の before/after', 1)[0].lower() or 'webgl' in appjs.lower():
+    raise SystemExit('the PDF image view must stay on canvas 2D / DOM (no three.js / WebGL)')
 
 # --- はじめて開いた人が最初に見る画面で見つかった欠陥 (2026-08-15) ---
 

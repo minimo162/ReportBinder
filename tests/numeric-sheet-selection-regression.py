@@ -255,6 +255,7 @@ if(finalReadinessEpoch!==1)throw new Error('readiness invalidation epoch did not
         extract_js_function(app, "applyPageMutationResult"),
         extract_js_function(app, "stampFinalReadinessReceived"),
         extract_js_function(app, "renderSpreadBoardIfVisible"),
+        extract_js_function(app, "isReadOnlyBoardView"),
     ])
     race_harness = r"""
 const finalReadinessInFlight = new Map();
@@ -315,6 +316,7 @@ if(!state.finalReadiness.pack_b||state.finalReadiness.pack_a)throw new Error('la
         extract_js_function(app, "advanceFinalReadinessEpoch"), refresh,
         extract_js_function(app, "stampFinalReadinessReceived"),
         extract_js_function(app, "renderSpreadBoardIfVisible"),
+        extract_js_function(app, "isReadOnlyBoardView"),
     ])
     refresh_harness = r"""
 const finalReadinessInFlight = new Map();
