@@ -905,6 +905,29 @@ main.shell.pages-shell .focused-board.thumbnail-board .page-thumb-card{grid-temp
 .pdf-image-dimmed{opacity:.35}
 .page-keyboard-hint-pdf{white-space:normal}
 @media(max-width:760px){.pdf-image-board{padding:10px}.pdf-image-wrap{padding:10px}.pdf-image-list{padding:12px 8px}}
+/* 横パネル「PDFイメージを横に表示」（サムネイル・詳細）。盤面の右に、表示中の出力先の物理ページを
+   小さく縦に並べる。パネルは盤面とは別にスクロールし、上部に留まる。1100px 未満では出さない。 */
+.page-pdf-pane-toggle.active{border-color:var(--accent-border);background:var(--accent-subtle);color:var(--accent-active)}
+.page-board-layout{min-width:0}
+.page-board-layout.with-pdf-pane{display:grid;grid-template-columns:minmax(0,1fr) 248px;gap:12px;align-items:start}
+.page-board-layout.with-pdf-pane>#page-board{min-width:0;margin-right:0}
+.page-pdf-image-pane{position:sticky;top:calc(var(--header-h) + var(--step-h) + 132px);max-height:calc(100vh - var(--header-h) - var(--step-h) - 148px);margin-top:14px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--border);border-radius:var(--r-lg);background:#8e939b}
+#page-pdf-image-pane[hidden]{display:none}
+.pdf-pane-head{position:sticky;top:0;z-index:4;display:grid;gap:2px;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--surface);font-size:14px}
+.pdf-pane-head span{color:var(--text-secondary)}
+.pdf-pane-head small{color:var(--text-tertiary);font-size:14px;line-height:1.4}
+.pdf-pane-list{display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px 10px}
+.pdf-pane-sheet{display:flex;flex-direction:column;gap:4px;width:100%;max-width:200px;padding:0;border:0;background:transparent;color:#fff;text-align:left;cursor:pointer}
+.pdf-pane-sheet:hover .pdf-pane-paper{outline:2px solid rgba(255,255,255,.75);outline-offset:2px}
+.pdf-pane-sheet:focus-visible .pdf-pane-paper{outline:3px solid #fff;outline-offset:2px}
+.pdf-pane-sheet.selected .pdf-pane-paper{outline:3px solid var(--accent);outline-offset:2px}
+.pdf-pane-paper{border-radius:0}
+.pdf-pane-paper-missing{border:2px dashed var(--border-strong);background:#f7f8fa;color:var(--text-secondary);font-size:14px;text-align:center}
+.pdf-pane-flag{position:absolute;left:0;right:0;top:0;z-index:2;padding:2px 4px;background:var(--attention-subtle);color:var(--attention);font-size:14px;font-weight:600;text-align:center}
+.pdf-pane-caption{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+.pdf-pane-caption b{margin-right:6px;font-variant-numeric:tabular-nums}
+.pdf-pane-empty{margin:0;padding:14px 12px;color:#fff;font-size:14px}
+@media(max-width:1099px){.page-pdf-image-pane{display:none}.page-board-layout.with-pdf-pane{display:block}}
 /* 位置を指定した移動の before/after。差分は色だけでなく、記号と文言（.spread-diff-badge）でも示す。 */
 .modal-card.spread-move-dialog{width:min(1280px,calc(100vw - 32px));height:calc(100vh - 48px)}
 .spread-move-controls{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 16px;padding:12px 16px;border-bottom:1px solid var(--border)}

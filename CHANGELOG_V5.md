@@ -1,5 +1,24 @@
 ﻿# ReportBinder V5 実装履歴
 
+## サムネイル・詳細で並べ替えながら、横のパネルで提出用PDFの並びを確かめられるようにした（2026-10-30）
+
+- 目的: PDFイメージ表示は見るだけなので、並べ替えの操作と並びの確認を行き来する必要があった。サムネイル・詳細の盤面の右に、表示中の出力先の物理ページを小さく縦に並べ、操作しながら提出用PDFの並びを見られるようにする。three.js／WebGL は使わず、PDFイメージと同じ PDF.js（canvas 2D）と DOM／CSS で描く。
+- ツールバー（`page-command-bar`）にトグル「PDFイメージを横に表示」（`page-pdf-pane-toggle`）を足した。状態は sessionStorage（`ReportBinderPdfImagePane`）に保存する。選択中に隠れる検索欄側ではなく、選択中も出ている側に置いた。見開き・PDFイメージ表示では盤面そのものが並びなので、トグルを出さない。
+- パネル（`<aside id="page-pdf-image-pane">`）は`#page-board`の外の兄弟要素で、盤面＋パネルの2列にする（パネル幅 248px）。パネルは盤面とは別にスクロールし、画面上部に留まる。画面幅 1100px 未満では出さず、トグルを無効にして title で「画面が狭いため PDFイメージ表示に切り替えてください」と案内する（幅が戻れば自動で出す）。
+- 表示する出力先は、タブで選んでいる出力先。「全体」（と未振り分け）では最後に選択したページの出力先、無ければ前回出した出力先、それも無ければ最初の出力先（`pdfImagePaneTargetVolume`）。見出しは「〇〇（提出用PDF）約 N ページ」。
+- 並びは盤面のDOM（`collectBoardVolumes`）から読み、頁数表（`collectPdfImagePageCounts`）と`buildPdfImageLayout`で組む（PDFイメージ表示と同じ作り方）。`schedulePdfImagePaneRefresh`が rAF で1回にまとめ、並びが変わらなければ作り直さない（描いた canvas を捨てない）。呼び出し点は次のとおり。
+  - `scheduleBoardSave`の先頭: ドラッグ・キーボードの並べ替えで DOM が変わった直後、保存を待たずに新しい順で出す。
+  - `renderPages`の末尾: 一括移動・元に戻す／やり直す・保存失敗や 409 の競合で盤面が状態へ戻ったとき、パネルも戻る。
+  - `syncPageSelectionUi`: 盤面で選んでいるページを、パネルの紙の枠で強調する。
+  - `renderSpreadBoardIfVisible`: readiness が届いて頁数表が変わったとき（詳細表示でも）。
+  - 描画キュー: 変換PDFを開いて頁数が分かったとき。
+- 紙は物理ページ1枚ずつ（複数ページのシートは使用ページ範囲の全ページ）。古い変換PDFは古い版を描いて斜線と「変換PDFが古い」、PDF未作成は点線の紙（作成エラーはその旨）、頁数の分からないページは1枚分で「頁数確認中」。頁・左右は出さない。
+- パネルの紙をクリックすると、盤面の対応カードへスクロールして選ぶ（Ctrl/Cmd・Shift も盤面と同じ選択処理`handlePageCardSelection`）。絞り込み・折りたたみで盤面に出ていないときは、その旨を案内する。ダブルクリックでそのページをプレビューする。
+- パネルの canvas は描画キュー・キャッシュをサムネイルと共用し、パネル専用の IntersectionObserver（root＝パネル）で見る。盤面の`preparePageThumbnails`はパネルの canvas を観測対象から外し、描画待ちを空にしたあとはパネル側で観測し直す。`unobserve`は使わない。
+- パネルは data-volume も`.page-row`も持たないので、並びの保存（`collectBoardVolumes`）には混ざらない。見開きの`buildSpreadLayout`と、頁・左右をサーバー値で決める契約には手を入れていない。
+- 新規`tests/pdf-image-pane-regression.mjs`（selfcheck から実行）で、表示する出力先の決め方、保存前の DOM の並びへの追従、競合で盤面が戻ったときにパネルも戻ること、rAF でまとめて並びが同じなら作り直さないこと、頁数不明の「約」、古い変換PDF・PDF未作成の扱い、見るだけの表示・狭い画面では組まないこと、呼び出し点を確かめる。`app/tools/selfcheck.py`に、呼び出し点（保存要求より前の`schedulePdfImagePaneRefresh(collectBoardVolumes())`を含む）、パネル専用の Observer、マークアップの位置、トグルの置き場所、2列の CSS の静的検査を加えた。
+- RuntimeVersion `2026.10.30.18`、`app.js` `v20261030_v206`、`style.css` `v20261030_v127` へ更新した。
+
 ## ページ構成に「PDFイメージ」表示を加え、提出用PDFと同じ並びで1ページずつ見られるようにした（2026-10-30）
 
 - 目的: 今の並び順で提出用PDFを作ったら、どの順にどのページが並ぶかを、実際のPDFに近い見た目で確かめられるようにする。近づけるのは並びだけで、ページ番号の刻印・余白・パンチ穴シフト・しおりは再現しない。three.js／WebGL は使わず、既存の PDF.js（canvas 2D）と DOM／CSS で描く。

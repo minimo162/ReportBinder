@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v205', 'style.css?v=20261030_v126']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v206', 'style.css?v=20261030_v127']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v205' not in html:
+if 'app.js?v=20261030_v206' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v205' not in html:
+if 'app.js?v=20261030_v206' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3037,6 +3037,50 @@ for needed in ['.pdf-image-board{', '.pdf-image-list{', '.pdf-image-sheet{', '.p
         raise SystemExit(f'the PDF image view needs its style: {needed}')
 if 'three' in appjs.split('// ---- PDFイメージ（見るだけ） ----', 1)[1].split('\n// 位置を指定した移動の before/after', 1)[0].lower() or 'webgl' in appjs.lower():
     raise SystemExit('the PDF image view must stay on canvas 2D / DOM (no three.js / WebGL)')
+# 横パネル「PDFイメージを横に表示」（操作しながら見る）。並びは盤面のDOMから読み、ドラッグ・キー操作の
+# 直後（保存前）・描き直し・選択・readiness の到着・頁数が分かったときに rAF で組み直す。
+for _name, needed in [('scheduleBoardSave', 'schedulePdfImagePaneRefresh(collectBoardVolumes());'),
+                      ('renderPages', 'schedulePdfImagePaneRefresh();'),
+                      ('syncPageSelectionUi', 'schedulePdfImagePaneRefresh();'),
+                      ('renderSpreadBoardIfVisible', 'schedulePdfImagePaneRefresh();'),
+                      ('pumpPageThumbnailQueue', 'schedulePdfImagePaneRefresh();'),
+                      ('syncPageBoardViewControls', 'syncPdfImagePaneControls();')]:
+    if needed not in appjs.split(f'function {_name}(', 1)[1].split('\nfunction ', 1)[0]:
+        raise SystemExit(f'{_name} must keep the PDF image side pane in step: {needed}')
+_save_head = appjs.split('function scheduleBoardSave(', 1)[1].split('\nfunction ', 1)[0]
+if _save_head.index('schedulePdfImagePaneRefresh(') > _save_head.index('saveBoardOrder()'):
+    raise SystemExit('the side pane must follow the board order before the save request starts')
+_pane_schedule = appjs.split('function schedulePdfImagePaneRefresh(', 1)[1].split('\nfunction ', 1)[0]
+if 'requestAnimationFrame(' not in _pane_schedule or 'collectBoardVolumes()' not in _pane_schedule:
+    raise SystemExit('the side pane refresh must be rAF-batched and read the board DOM order')
+_pane_render = appjs.split('function renderPdfImagePane(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['pdfImagePaneTargetVolume(volumes)', 'collectPdfImagePageCounts(', 'buildPdfImageLayout(laneIds,counts']:
+    if needed not in _pane_render:
+        raise SystemExit(f'the side pane must build the physical page order like the PDF image view: {needed}')
+_pane_sheet = appjs.split('function pdfImagePaneSheetHtml(', 1)[1].split('\nfunction ', 1)[0]
+for banned in ['data-volume', 'page-row', 'data-page-id', 'outputPageNumber', 'side', 'spreadIndex']:
+    if banned in _pane_sheet.replace('data-pane-page-id', '') or banned in _pane_render:
+        raise SystemExit(f'side pane sheets must not be read as board lanes or show page numbers/sides: {banned}')
+_pane_observe = appjs.split('function observePdfImagePaneThumbnails(', 1)[1].split('\nfunction ', 1)[0]
+if 'root:pane' not in _pane_observe or 'unobserve' in _pane_observe:
+    raise SystemExit('the side pane needs its own thumbnail observer rooted at the pane')
+_prepare = appjs.split('function preparePageThumbnails(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ["!canvas.closest('#page-pdf-image-pane')", 'pdfImagePaneObserveDirty=true']:
+    if needed not in _prepare:
+        raise SystemExit(f'board thumbnails and side pane thumbnails must be observed separately: {needed}')
+_pane_markup = html.split('id="page-board-layout"', 1)[1].split('</section>', 1)[0]
+for needed in ['<div id="page-board"></div>', '<aside id="page-pdf-image-pane"', ' hidden></aside>']:
+    if needed not in _pane_markup:
+        raise SystemExit(f'the side pane must sit next to #page-board, outside it: {needed}')
+if 'id="page-pdf-pane-toggle"' not in html.split('id="page-command-bar"', 1)[1].split('id="page-volume-tabs"', 1)[0]:
+    raise SystemExit('the side pane toggle belongs to the page command bar')
+if 'id="page-pdf-pane-toggle"' in html.split('class="toolbar page-filter-tools"', 1)[1].split('class="toolbar page-selection-tools"', 1)[0]:
+    raise SystemExit('the side pane toggle must stay visible while pages are selected')
+if "sessionStorage.getItem('ReportBinderPdfImagePane')" not in appjs or 'PDF_IMAGE_PANE_MIN_WIDTH = 1100' not in appjs:
+    raise SystemExit('the side pane toggle must persist per session and stay off on narrow screens')
+for needed in ['.page-board-layout.with-pdf-pane{', '.page-pdf-image-pane{', '#page-pdf-image-pane[hidden]{display:none}', '@media(max-width:1099px){.page-pdf-image-pane{display:none}']:
+    if needed not in css:
+        raise SystemExit(f'the side pane needs its two-column style: {needed}')
 
 # --- はじめて開いた人が最初に見る画面で見つかった欠陥 (2026-08-15) ---
 
