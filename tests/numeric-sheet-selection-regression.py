@@ -253,12 +253,14 @@ if(finalReadinessEpoch!==1)throw new Error('readiness invalidation epoch did not
         extract_js_function(app, "advanceFinalReadinessEpoch"),
         extract_js_function(app, "markFinalReadinessStaleForPageMutation"),
         extract_js_function(app, "applyPageMutationResult"),
+        extract_js_function(app, "stampFinalReadinessReceived"),
+        extract_js_function(app, "renderSpreadBoardIfVisible"),
     ])
     race_harness = r"""
 const finalReadinessInFlight = new Map();
 let finalReadinessEpoch = 0, finalPreflightCheckedAt = '';
 let lastPageBoardRenderSignature = '';
-let activePackId = 'pack_custom', activePreset = 'bod', activeView = 'final';
+let activePackId = 'pack_custom', activePreset = 'bod', activeView = 'final', pageBoardView = 'thumbnail';
 let activePack = {packId:'pack_custom',category:''};
 let state = {structure:{pages:[{pageId:'old'}],volumes:{}},packProgress:{},finalReadiness:{
   pack_custom:{volumes:{'ja-main':{pageCount:2,status:'built',displayState:'built',outputPdf:'out.pdf',builtFingerprint:'old'}}}
@@ -311,10 +313,12 @@ if(!state.finalReadiness.pack_b||state.finalReadiness.pack_a)throw new Error('la
     refresh_functions = "\n".join([
         extract_js_function(app, "finalReadinessKey"), load_readiness,
         extract_js_function(app, "advanceFinalReadinessEpoch"), refresh,
+        extract_js_function(app, "stampFinalReadinessReceived"),
+        extract_js_function(app, "renderSpreadBoardIfVisible"),
     ])
     refresh_harness = r"""
 const finalReadinessInFlight = new Map();
-let finalReadinessEpoch=0, finalPreflightCheckedAt='', activePackId='pack_custom', activePreset='bod', activeView='pages';
+let finalReadinessEpoch=0, finalPreflightCheckedAt='', activePackId='pack_custom', activePreset='bod', activeView='pages', pageBoardView='thumbnail';
 let activePack={packId:'pack_custom',category:''};
 let state={finalReadiness:{pack_custom:{volumes:{'ja-main':{status:'built',displayState:'built',pageCount:2}}}}};
 function activePackRecord(){return activePack;} function configured(){return true;}
