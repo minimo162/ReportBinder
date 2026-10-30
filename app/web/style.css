@@ -773,8 +773,10 @@ main.shell.pages-shell .overview-board.thumbnail-board .thumbnail-wrap{height:au
 @media(max-width:1100px) and (min-width:801px){
   main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
-@media(max-width:800px) and (min-width:761px){
-  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:1fr}
+/* 760px以下の「レーンを縦に積む」規則は詳細度が低く、上の3列指定に負けていた。
+   幅600pxでも3レーンが横に並び、カードが潰れてボタンがはみ出していた。 */
+@media(max-width:800px){
+  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:minmax(0,1fr)}
 }
 @media(max-width:760px){
   main.shell.pages-shell .page-command-bar{flex-wrap:wrap;overflow:visible}
@@ -812,6 +814,13 @@ main.shell.pages-shell .focused-board.thumbnail-board .page-thumb-card{grid-temp
   main.shell.pages-shell .overview-board.thumbnail-board .volume-panel:not(.inbox) .thumbnail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   main.shell.pages-shell .overview-board.thumbnail-board .volume-panel.inbox .thumbnail-grid{grid-template-columns:1fr}
 }
+/* カード下端の「プレビュー」「設定」は、サムネイルの右の狭い列（2列表示では80px前後）に
+   置かれ、縮まない指定のため2つ合わせて約160pxがカードの外へはみ出していた。
+   操作の行はカードの全幅に置き、それでも足りない幅では折り返す。 */
+.thumbnail-board .page-thumb-card{grid-template-areas:"paper copy" "meta meta" "editor editor"}
+.thumbnail-board .page-thumb-meta{min-width:0}
+.page-thumb-settings-summary{flex:1 1 auto;min-width:0;max-width:100%;flex-wrap:wrap}
+.page-thumb-settings-summary>.btn{flex:0 1 auto;min-width:0;max-width:100%;height:auto;min-height:32px;white-space:normal}
 /* 動作環境診断が blocked のときだけ出る修復案内。既存の診断行の下、
    診断日時の上に挟まり、診断結果の枠の中に収まる。 */
 .diagnostics-advice{display:grid;gap:8px;padding:14px var(--s-5);border-top:1px solid var(--border)}

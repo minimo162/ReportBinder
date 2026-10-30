@@ -9104,6 +9104,19 @@ function Remove-StalePublishingFolders([string]$SubmissionDir, [string]$UserName
     }
 }
 
+# 作業用フォルダーに付けた隠し属性は、名前を変えても（Move-Item でも）フォルダーに残る。
+# 発行フォルダーとPDFは利用者が開くものなので、隠し属性を外し、外れたことを確かめる。
+# Windows 以外では、名前が「.」で始まらない限り隠し属性は立たないので、そのまま $true になる。
+function Clear-PublishHiddenAttribute([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::Hidden) -eq 0) { return $true }
+    $visible = [IO.FileAttributes]([int]$item.Attributes -band (-bnot [int][IO.FileAttributes]::Hidden))
+    if ([int]$visible -eq 0) { $visible = [IO.FileAttributes]::Normal }
+    try { $item.Attributes = $visible } catch { return $false }
+    $item.Refresh()
+    return (($item.Attributes -band [IO.FileAttributes]::Hidden) -eq 0)
+}
+
 # 渡したブロックは Invoke-WithLock の中で呼ばれる。PowerShell の変数は呼び出し元を
 # たどって解決されるので、Invoke-WithLock の引数と同じ名前（$Action）を使うと
 # 自分自身を呼び続ける。名前を分けておくこと。
@@ -9196,6 +9209,10 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
             if ((Normalize-FileHash (New-Sha256 $stagedPdf)) -ne [string]$entry.sha256) {
                 throw '共有用フォルダーへコピーしたPDFが、出力したPDFと一致しません。もう一度コピーしてください。'
             }
+            # Copy-Item は元のPDFの属性も写す。PDFは改名の前から隠さない。
+            if (-not (Clear-PublishHiddenAttribute $stagedPdf)) {
+                throw '共有用フォルダーにコピーしたPDFの隠し属性を外せませんでした。もう一度コピーしてください。'
+            }
         }
         while (Test-Path -LiteralPath $publishDir) {
             $folderName = "{0}_{1}" -f $baseFolderName, $suffix
@@ -9204,6 +9221,14 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
         }
         Move-Item -LiteralPath $stagingDir -Destination $publishDir
         $stagingDir = ''
+        # 隠し属性は作業用フォルダーだけのもの。改名した発行フォルダーと中のPDFには
+        # そのまま残るため、共有用フォルダーを開いても見えなかった。ここで外す。
+        # 外せなければ、見えない発行フォルダーを残さないよう消してから失敗にする。
+        $hiddenLeft = @(@($publishDir) + @($entries | ForEach-Object { Join-Path $publishDir ([string]$_.fileName) }) | Where-Object { -not (Clear-PublishHiddenAttribute $_) })
+        if ($hiddenLeft.Count -gt 0) {
+            Remove-Item -LiteralPath $publishDir -Recurse -Force -ErrorAction SilentlyContinue
+            throw '共有用フォルダーにコピーしたフォルダーの隠し属性を外せませんでした。もう一度コピーしてください。'
+        }
     } finally {
         if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
             Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue

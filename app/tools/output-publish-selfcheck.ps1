@@ -289,6 +289,46 @@ if ($env:OS -eq 'Windows_NT') {
     Assert-OutputTest (@($Script:StagingAttributes | Where-Object { ($_ -band [IO.FileAttributes]::Hidden) -eq 0 }).Count -eq 0) 'The staging folder was visible in the shared folder while copying.'
 }
 
+# ---- 隠し属性は作業用フォルダーだけ。発行フォルダーとPDFには残さない --------------------
+# 改名しても属性はフォルダーに残るため、以前は発行フォルダーごと見えなくなっていた。
+# 属性そのものは Windows でしか立たないので、どの環境でも「改名後の発行フォルダーと
+# 中のPDFを1つずつ見えるようにしたか」を呼び出しで確かめ、Windows では実際の属性も見る。
+$realClearHidden = ${function:Clear-PublishHiddenAttribute}
+$Script:ClearedPaths = @()
+$Script:FailClearOnPublishedFolder = $false
+$submissionFull = [IO.Path]::GetFullPath($submissionDir)
+function Clear-PublishHiddenAttribute([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $Script:ClearedPaths += $full
+    # 改名した後の発行フォルダー（共有ルート直下で「.」で始まらないもの）だけ失敗させる。
+    if ($Script:FailClearOnPublishedFolder -and [IO.Path]::GetDirectoryName($full) -eq $submissionFull -and [IO.Path]::GetFileName($full) -notlike '.*') { return $false }
+    return (& $realClearHidden $Path)
+}
+$onWindows = $env:OS -eq 'Windows_NT'
+# 出力したPDFが隠されていても、Copy-Item で写った属性を発行先に残さない。
+if ($onWindows) { (Get-Item -LiteralPath $mainPdf -Force).Attributes = (Get-Item -LiteralPath $mainPdf -Force).Attributes -bor [IO.FileAttributes]::Hidden }
+try { $visible = Publish-DocumentPackAllPdfsToShared 'ja' $publishId }
+finally { if ($onWindows) { (Get-Item -LiteralPath $mainPdf -Force).Attributes = [IO.FileAttributes]::Normal } }
+$visibleDir = [IO.Path]::GetFullPath([string]$visible.sharedFolder)
+Assert-OutputTest ([IO.Path]::GetFileName($visibleDir) -notlike '.*') 'The published folder kept a staging-style dot name.'
+Assert-OutputTest ($Script:ClearedPaths -contains $visibleDir) 'The hidden attribute was not cleared on the published folder after the rename.'
+foreach ($file in @($visible.files)) {
+    Assert-OutputTest ($Script:ClearedPaths -contains [IO.Path]::GetFullPath([string]$file.sharedPath)) "The hidden attribute was not checked on the published PDF $($file.fileName)."
+    Assert-OutputTest (Test-Path -LiteralPath ([string]$file.sharedPath) -PathType Leaf) "The published PDF $($file.fileName) is missing."
+}
+if ($onWindows) {
+    $hiddenItems = @(@(Get-Item -LiteralPath $visibleDir -Force) + @(Get-ChildItem -LiteralPath $visibleDir -Force -Recurse) | Where-Object { ($_.Attributes -band [IO.FileAttributes]::Hidden) -ne 0 })
+    Assert-OutputTest ($hiddenItems.Count -eq 0) ('The published folder or its PDFs are hidden: ' + (($hiddenItems | ForEach-Object { $_.FullName }) -join ', '))
+    Assert-OutputTest (@(Get-ChildItem -LiteralPath $submissionDir -Directory | Where-Object { $_.FullName -eq $visibleDir }).Count -eq 1) 'The published folder is not listed without -Force.'
+}
+# 隠し属性を外せなければ、見えない発行フォルダーを残さずに失敗にする。
+$sharedBefore = @(Get-SharedEntries)
+$Script:FailClearOnPublishedFolder = $true
+Assert-Throws { Publish-DocumentPackAllPdfsToShared 'ja' $publishId } '隠し属性を外せません' 'A published folder whose hidden attribute could not be cleared was reported as success.'
+Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|')) 'A published folder that stayed hidden was left in the shared folder.'
+$Script:FailClearOnPublishedFolder = $false
+Set-Item Function:\Clear-PublishHiddenAttribute $realClearHidden
+
 Write-Output 'output-publish selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)
