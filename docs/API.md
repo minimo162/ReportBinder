@@ -56,7 +56,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/layout/restore/preview`: 保存済み構成を復元した場合の適用数・差異を返す
 - `POST /api/v2/layout/restore`: 保存済みのページ構成を同じ資料パックへ復元する
 - `GET /api/v2/outputs/readiness?packId={packId}`: 本体・補足の出力可否と再出力理由を返す
-- `POST /api/v2/outputs/spread-preview`: 並べ替えの案を保存せずに試算し、出力先ごとの物理ページ（頁・左右・見開き）を before/after で返す（現行UIは未使用）。要求と検証は`POST /api/v2/items/reorder`と同じ
+- `POST /api/v2/outputs/spread-preview`: 並べ替えの案を保存せずに試算し、出力先ごとの物理ページ（頁・左右・見開き）を before/after で返す。ページ構成の「位置を指定して移動」が確定前の見比べに使う。要求と検証は`POST /api/v2/items/reorder`と同じ
 - `POST /api/v2/outputs/build`: 資料パックの提出用PDFを出力するジョブを開始し、`job`（`jobId`・`status`・`total`）を返す。HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると進捗ポーリングも中止も受け付けられない。実処理は子プロセスで走る
 - `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない

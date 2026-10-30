@@ -869,3 +869,36 @@ main.shell.pages-shell .focused-board.thumbnail-board .page-thumb-card{grid-temp
 .spread-right.band-mid::after,.spread-right.band-end::after{left:-8px;border-top-left-radius:0;border-bottom-left-radius:0}
 .spread-cell-dimmed{opacity:.35}
 @media(max-width:760px){.spread-board{padding:10px}.spread-wrap{padding:10px}.spread-list{gap:12px}.spread-sheet{width:100%;grid-template-columns:minmax(0,1fr) 2px minmax(0,1fr)}}
+/* 位置を指定した移動の before/after。差分は色だけでなく、記号と文言（.spread-diff-badge）でも示す。 */
+.modal-card.spread-move-dialog{width:min(1280px,calc(100vw - 32px));height:calc(100vh - 48px)}
+.spread-move-controls{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 16px;padding:12px 16px;border-bottom:1px solid var(--border)}
+.spread-move-controls .field{display:grid;gap:4px;color:var(--text-secondary);font-size:14px}
+.spread-move-controls select{min-width:160px;max-width:340px}
+.spread-move-pane-switch{display:none;margin-left:auto}
+.spread-move-summary{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin:10px 16px 0;padding:10px 12px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface-subtle);font-size:15px}
+.spread-move-summary span{color:var(--text-secondary);font-size:14px}
+.spread-move-summary.alert{border-color:#e0703a;background:#fdebe1;color:#8a3410}
+.spread-move-summary.error{border-color:var(--danger-border);background:var(--danger-subtle);color:var(--danger)}
+.spread-move-legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:8px 16px 0;padding:0;list-style:none;font-size:14px}
+.spread-move-legend li{padding:1px 8px;border-radius:var(--r-sm)}
+.spread-move-compare{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+.spread-move-volume{margin-bottom:18px}
+.spread-move-volume h3{margin:0 0 8px;font-size:16px}
+.spread-move-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+.spread-move-column{min-width:0;padding:10px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface-subtle)}
+.spread-move-column h4{margin:0 0 8px;font-size:15px}
+.spread-move-column .spread-list{gap:12px}
+.spread-move-column .spread-sheet{grid-template-columns:minmax(0,130px) 2px minmax(0,130px);background:var(--surface)}
+.spread-move-gap{align-self:center;color:var(--text-tertiary)}
+.spread-move-empty{margin:0;color:var(--text-secondary);font-size:14px}
+.spread-diff-badge{margin-top:4px;padding:1px 6px;border-radius:var(--r-sm);font-size:14px;font-weight:600}
+.spread-diff-cell.spread-diff-same{opacity:.55}
+.spread-diff-moved{box-shadow:inset 0 0 0 3px #2563eb}.spread-diff-moved .spread-diff-badge{background:#dbe7fd;color:#1d4ed8}
+.spread-diff-side{background:#fbd3bf}.spread-diff-side .spread-diff-badge{background:#e0703a;color:#fff}
+.spread-diff-shift{background:#fdf1bf}.spread-diff-shift .spread-diff-badge{background:#f5dc6a;color:#5c4300}
+.spread-diff-volume{box-shadow:inset 0 0 0 2px #7c3aed}.spread-diff-volume .spread-diff-badge{background:#ede4fd;color:#6127c7}
+.spread-diff-uncertain{background:repeating-linear-gradient(135deg,#f3f4f6 0 8px,#e5e7eb 8px 16px)}.spread-diff-uncertain .spread-diff-badge{background:#e5e7eb;color:var(--text-secondary)}
+.spread-diff-removed{box-shadow:inset 0 0 0 2px var(--danger)}.spread-diff-removed .spread-diff-badge{background:var(--danger-subtle);color:var(--danger)}
+.spread-move-legend .spread-diff-same{background:var(--surface-subtle);color:var(--text-secondary)}
+/* 画面が狭いときは before/after を切り替えて見る。 */
+@media(max-width:900px){.spread-move-pane-switch{display:inline-flex}.spread-move-columns{grid-template-columns:minmax(0,1fr)}.spread-move-compare.show-after .spread-move-column.before,.spread-move-compare.show-before .spread-move-column.after{display:none}}

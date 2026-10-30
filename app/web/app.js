@@ -434,7 +434,7 @@ function isConfirmModalOpen() { return !!$('confirm-modal') && !$('confirm-modal
 function isPackEditorOpen() { return !!$('pack-editor-modal') && !$('pack-editor-modal').classList.contains('hidden'); }
 function isTemplateManagerOpen() { return !!$('template-manager-modal') && !$('template-manager-modal').classList.contains('hidden'); }
 function isPageLayoutRevisionsOpen() { return !!$('page-layout-revisions-modal') && !$('page-layout-revisions-modal').classList.contains('hidden'); }
-function isAnyModalOpen() { return isModalOpen() || isDiffModalOpen() || isConfirmModalOpen() || isPackEditorOpen() || isTemplateManagerOpen() || isPageLayoutRevisionsOpen(); }
+function isAnyModalOpen() { return isModalOpen() || isDiffModalOpen() || isSpreadMoveOpen() || isConfirmModalOpen() || isPackEditorOpen() || isTemplateManagerOpen() || isPageLayoutRevisionsOpen(); }
 function shouldPreserveEditorDom() { return isEditing() || draggingRow !== null || isAnyModalOpen(); }
 function iconUse(id, cls='') { return `<svg class="icon ${cls}" aria-hidden="true"><use href="#${id}"></use></svg>`; }
 
@@ -1704,6 +1704,7 @@ function updateBulkSelectionLabel() {
     const alreadyThere=destination&&[...selectedPages].every(id=>assignedPageVolume(getPage(id))===destination);
     button.disabled=pageMutationBusy||count===0||alreadyThere;
   });
+  const spreadMove=$('spread-move-btn');if(spreadMove)spreadMove.disabled=pageMutationBusy||count===0||!activeTargetVolumes().length;
   const undoEntry=pageLayoutUndoStack[pageLayoutUndoStack.length-1],redoEntry=pageLayoutRedoStack[pageLayoutRedoStack.length-1],undo=$('page-layout-undo-btn'),redo=$('page-layout-redo-btn');
   if(undo){undo.disabled=pageMutationBusy||pageLayoutHistoryBusy||!undoEntry;undo.title=undoEntry?`${undoEntry.label}を元に戻す（Ctrl+Z）`:'元に戻せるページ構成変更はありません';undo.setAttribute('aria-label',undo.title);}
   if(redo){redo.disabled=pageMutationBusy||pageLayoutHistoryBusy||!redoEntry;redo.title=redoEntry?`${redoEntry.label}をやり直す（Ctrl+Shift+Z）`:'やり直せるページ構成変更はありません';redo.setAttribute('aria-label',redo.title);}
@@ -4739,6 +4740,275 @@ function spreadVolumeContentHtml(panel,pages,visibleIds){
   const summary=`${panel.title}（${layout.uncertainFrom?'約':''}${layout.pageCount}頁・${layout.spreads.length}見開き）`;
   return `<div class="spread-wrap volume-content">${index}<div class="spread-summary"><strong>${escapeHtml(summary)}</strong>${fresh}</div>${notes.join('')}<div class="spread-list" role="listbox" aria-label="${escapeAttr(`${panel.title}の見開き`)}" aria-multiselectable="true">${sheets}</div></div>`;
 }
+// 位置を指定した移動の before/after の差分。before/after は出力先ごとの buildSpreadLayout の
+// 結果（{[volume]: layout}）。物理ページは pageId＋sourcePdfPageNumber で突き合わせる。
+// 頁・左右が未確定のマス（PDF未作成のページより後ろ）は、出力先と前にあるページの組が
+// 同じなら頁も変わらないので「変化なし」、そうでなければ「未確定」とし、数え直した頁で
+// 左右の反転を言わない。movedIds は利用者が動かしたページ。
+function classifySpreadDiff(before, after, movedIds){
+  const moved=new Set((Array.isArray(movedIds)?movedIds:[]).map(String));
+  const keyOf=cell=>`${cell.pageId}|${cell.unknown?'?':cell.sourcePdfPageNumber}`;
+  const precedingOf=(cells,index)=>{const self=cells[index].pageId;return [...new Set(cells.slice(0,index).map(cell=>cell.pageId).filter(id=>id!==self))].sort().join('\n');};
+  const beforeIndex=new Map();
+  for(const [volume,layout] of Object.entries(before||{})){const cells=layout?.cells||[];cells.forEach((cell,index)=>beforeIndex.set(keyOf(cell),{volume,cell,cells,index}));}
+  const flags=new Map(),entries=[],removed=[],volumes={};
+  const counts={moved:0,side:0,shift:0,volume:0,uncertain:0,removed:0};
+  const sideRanges={};let firstAffected=null;
+  const lane=volume=>volumes[volume]||(volumes[volume]={beforeSpreads:new Set(),afterSpreads:new Set()});
+  for(const [volume,layout] of Object.entries(after||{})){
+    const cells=layout?.cells||[];lane(volume);
+    cells.forEach((cell,index)=>{
+      const key=keyOf(cell),prev=beforeIndex.get(key),from=prev?.cell||null;
+      const volumeChanged=!prev||prev.volume!==volume;
+      let uncertain=!!(cell.uncertain||from?.uncertain);
+      if(uncertain&&prev&&!volumeChanged&&precedingOf(prev.cells,prev.index)===precedingOf(cells,index))uncertain=false;
+      const certain=!!(from&&!cell.uncertain&&!from.uncertain);
+      const sideFlipped=certain&&from.side!==cell.side;
+      const shifted=certain&&!sideFlipped&&from.outputPageNumber!==cell.outputPageNumber;
+      // 元の位置へ置き直しただけのページは「移動」にしない（並びが同じ案は差分なし）。
+      const isMoved=moved.has(String(cell.pageId))&&(volumeChanged||from.position!==cell.position);
+      const kind=isMoved?'moved':uncertain?'uncertain':sideFlipped?'side':shifted?'shift':volumeChanged?'volume':'same';
+      const info={key,pageId:cell.pageId,kind,moved:isMoved,sideFlipped,shifted,volumeChanged,uncertain:uncertain&&kind!=='same',
+        fromVolume:prev?prev.volume:'none',volume,
+        before:from?{outputPageNumber:from.outputPageNumber,side:from.side,position:from.position,uncertain:!!from.uncertain}:null,
+        after:{outputPageNumber:cell.outputPageNumber,side:cell.side,position:cell.position,uncertain:!!cell.uncertain}};
+      flags.set(key,info);entries.push(info);
+      if(kind==='same')return;
+      lane(volume).afterSpreads.add(Math.floor(cell.position/2));
+      if(isMoved)counts.moved++;
+      if(sideFlipped){counts.side++;const n=cell.outputPageNumber,range=sideRanges[volume];sideRanges[volume]=range?[Math.min(range[0],n),Math.max(range[1],n)]:[n,n];}
+      // 動かしたページ自身の頁のずれは「移動」で数える。反転は動かしたページも数える。
+      if(kind==='shift')counts.shift++;
+      if(volumeChanged)counts.volume++;
+      if(kind==='uncertain')counts.uncertain++;
+      if(!firstAffected)firstAffected={volume,position:cell.position,spreadIndex:Math.floor(cell.position/2),outputPageNumber:cell.uncertain?0:cell.outputPageNumber,uncertain:!!cell.uncertain};
+    });
+  }
+  for(const [key,prev] of beforeIndex){
+    const spread=Math.floor(prev.cell.position/2),info=flags.get(key);
+    if(!info){const gone={key,pageId:prev.cell.pageId,kind:'removed',moved:moved.has(String(prev.cell.pageId)),sideFlipped:false,shifted:false,volumeChanged:true,uncertain:false,fromVolume:prev.volume,volume:'none',before:{outputPageNumber:prev.cell.outputPageNumber,side:prev.cell.side,position:prev.cell.position,uncertain:!!prev.cell.uncertain},after:null};flags.set(key,gone);removed.push(gone);counts.removed++;lane(prev.volume).beforeSpreads.add(spread);continue;}
+    if(info.kind!=='same')lane(prev.volume).beforeSpreads.add(spread);
+  }
+  if(!firstAffected&&removed.length){const first=removed[0];firstAffected={volume:first.fromVolume,position:first.before.position,spreadIndex:Math.floor(first.before.position/2),outputPageNumber:first.before.uncertain?0:first.before.outputPageNumber,uncertain:first.before.uncertain,beforeOnly:true};}
+  const changedVolumes=Object.keys(volumes).filter(volume=>volumes[volume].beforeSpreads.size||volumes[volume].afterSpreads.size);
+  return {keyOf,flags,entries,removed,volumes,changedVolumes,counts,sideRanges,firstAffected,changed:changedVolumes.length>0};
+}
+// 差分の要約。左右の反転が1枚でもあれば alert を立て、画面で赤橙に強調する。
+function spreadDiffSummary(diff, label=volume=>String(volume)){
+  if(!diff?.changed)return {text:'並びは変わりません',alert:false};
+  const c=diff.counts,parts=[];
+  if(c.side){const ranges=Object.entries(diff.sideRanges).map(([volume,[a,b]])=>`${label(volume)}${a===b?a:`${a}〜${b}`}頁`);parts.push(`左右が反転 ${c.side}枚（${ranges.join('、')}）`);}
+  if(c.shift)parts.push(`頁だけずれた ${c.shift}枚`);
+  if(c.moved)parts.push(`移動 ${c.moved}枚`);
+  if(c.uncertain)parts.push(`頁未確定 ${c.uncertain}枚`);
+  if(c.removed)parts.push(`出力先から外れる ${c.removed}枚`);
+  const first=diff.firstAffected;
+  if(first)parts.push(first.uncertain?`最初に影響する頁: ${label(first.volume)}の${first.position}枚目（頁未確定）`:`最初に影響する頁: ${label(first.volume)}${first.outputPageNumber}頁`);
+  return {text:parts.join('／'),alert:c.side>0};
+}
+// ---- 位置を指定した移動（見開きの before/after） ----
+// 試算API（spread-preview）で before/after を作り、「この並びで確定」を押すまで何も保存しない。
+// 確定は既存の reorder に試算の指紋を baseLayout として送り、Undo に積む。見開きの中では
+// ドラッグしない。サムネイル表示・詳細表示のドラッグは今までどおりすぐ保存する。
+let spreadMoveSession=null,spreadMoveReturnFocus=null;
+function isSpreadMoveOpen(){return !!$('spread-move-modal')&&!$('spread-move-modal').classList.contains('hidden');}
+// 確定と同じ並び（出力先ごと、未振り分けを含む）を状態から読む。見開きのマスからは読まない。
+function pageLaneVolumesForMove(){
+  const first=activeTargetVolumes()[0]||mainVolume(),volumes=Object.fromEntries([...activeTargetVolumes(),'none'].map(key=>[key,[]])),activePages=pagesForActivePreset();
+  for(const p of [...activePages].sort(compositionPageComparator(activePages))){const id=resolvedPageId(p);if(!id)continue;const v=(p.enabled===false||String(p.volume||first)==='none')?'none':String(p.volume||first);if(!volumes[v])volumes[v]=[];volumes[v].push(id);}
+  return volumes;
+}
+// 試算の応答（出力先ごと、キーは targetId）を、volume ごとの台紙にする。
+function spreadLayoutsFromPreview(side,volumes){
+  const layouts={};
+  for(const entry of Object.values(side||{})){const volume=String(entry?.volume||'');if(!volume)continue;layouts[volume]=buildSpreadLayout(asArray(volumes?.[volume]),asArray(entry?.physicalPages));}
+  return layouts;
+}
+async function openSpreadMoveDialog(pageIds,options={}){
+  const ids=[...new Set(asArray(pageIds).map(String).filter(id=>!!getPage(id)))];
+  if(!ids.length){showMessage('warn','ページを選択してください','移動するカードをクリックして選んでから「位置を指定して移動」を押してください。');return false;}
+  const targets=activeTargetVolumes();
+  if(!targets.length){showMessage('warn','出力先がありません','この一式には移動先になる出力先がありません。');return false;}
+  if(!(await waitForQueuedPageLayoutMutation()))return false;
+  const current=assignedPageVolume(getPage(ids[0])),wanted=String(options.target||'');
+  const packId=String(activePackRecord()?.packId||activePackId||'');
+  spreadMoveReturnFocus=options.returnFocus||document.activeElement;
+  spreadMoveSession={pageIds:ids,target:targets.includes(wanted)?wanted:targets.includes(current)?current:targets[0],position:'end',packId,beforeVolumes:pageLaneVolumesForMove(),baseLayout:activeLayoutFingerprint(packId),plan:null,preview:null,diff:null,error:'',conflict:false,loading:false,saving:false,seq:0,scrolledSeq:0,changedOnly:true,pane:'after'};
+  $('spread-move-modal')?.classList.remove('hidden');
+  renderSpreadMoveDialog();
+  requestAnimationFrame(()=>$('spread-move-target')?.focus());
+  return runSpreadMovePreview();
+}
+// 移動先・位置を変えるたびに試算し直す。古い試算の応答は捨てる。試算が終わるまでは確定できない。
+async function runSpreadMovePreview(){
+  const session=spreadMoveSession;if(!session)return false;
+  const seq=++session.seq;
+  session.preview=null;session.diff=null;session.error='';session.conflict=false;
+  const plan=planPageMove(session.beforeVolumes,session.pageIds,session.target,session.position);
+  session.plan=plan.ok?plan:null;
+  if(!plan.ok){session.loading=false;session.error=plan.maxPosition?`${assignmentVolumeLabel(session.target)}の1〜${plan.maxPosition}番目を指定してください。`:'移動先がありません。';renderSpreadMoveDialog();return false;}
+  session.loading=true;renderSpreadMoveDialog();
+  const body={packId:session.packId,volumes:plan.volumes};if(session.baseLayout)body.baseLayout=session.baseLayout;
+  try{
+    const response=await api('/api/v2/outputs/spread-preview',{method:'POST',body});
+    if(spreadMoveSession!==session||seq!==session.seq)return false;
+    const preview=response?.preview||{};
+    const before=spreadLayoutsFromPreview(preview.before,session.beforeVolumes),after=spreadLayoutsFromPreview(preview.after,plan.volumes);
+    session.preview={layoutFingerprint:String(preview.layoutFingerprint||session.baseLayout||''),before,after};
+    session.diff=classifySpreadDiff(before,after,plan.movedIds);
+    session.loading=false;renderSpreadMoveDialog();return true;
+  }catch(error){
+    if(spreadMoveSession!==session||seq!==session.seq)return false;
+    session.loading=false;
+    if(error.code==='structure-conflict'){session.conflict=true;session.error='ほかの画面でページ構成が変わりました。最新の並びを読み込んで、試算し直してください。';}
+    else session.error=userFriendlyError(error.message);
+    renderSpreadMoveDialog();return false;
+  }
+}
+// 楽観ロックで止まったとき。最新の構成を読み直し、同じページ・移動先・位置で試算し直す。
+async function reloadSpreadMoveBase(){
+  const session=spreadMoveSession;if(!session||session.saving)return false;
+  session.loading=true;session.error='';session.preview=null;session.diff=null;renderSpreadMoveDialog();
+  try{await refresh({authoritativeReadiness:true,render:false});}catch{}
+  if(spreadMoveSession!==session)return false;
+  lastPageBoardRenderSignature='';
+  renderGlobalHeader();renderNavBadges();renderStepBar();renderSummary();renderDashboardOverview();renderFinalOverview();renderPages();renderPageOverview();renderVolumeLinks();updateBulkSelectionLabel();
+  session.pageIds=session.pageIds.filter(id=>!!getPage(id));
+  if(!session.pageIds.length){closeSpreadMoveDialog();showMessage('warn','移動するページがなくなりました','ほかの画面でページが外されました。ページを選び直してください。');return false;}
+  session.beforeVolumes=pageLaneVolumesForMove();session.baseLayout=activeLayoutFingerprint(session.packId);
+  return runSpreadMovePreview();
+}
+async function confirmSpreadMove(){
+  const session=spreadMoveSession;
+  if(!session||session.saving||session.loading||session.conflict||!session.preview||!session.plan||!session.diff?.changed)return false;
+  // 試算の後で並びが変わっていたら、古い before/after のまま確定しない。
+  if(!pageVolumeSnapshotsEqual(pageLaneVolumesForMove(),session.beforeVolumes)||(session.baseLayout&&activeLayoutFingerprint(session.packId)!==session.baseLayout)){
+    session.preview=null;session.diff=null;session.conflict=true;session.error='試算の後でページ構成が変わりました。試算し直してから確定してください。';renderSpreadMoveDialog();return false;
+  }
+  if(!(await waitForQueuedPageLayoutMutation())||spreadMoveSession!==session||session.saving)return false;
+  const plan=session.plan,ids=[...plan.movedIds],target=plan.target;
+  const body={packId:session.packId,volumes:plan.volumes};const base=session.preview.layoutFingerprint||session.baseLayout;if(base)body.baseLayout=base;
+  session.saving=true;session.error='';pageMutationBusy=true;updateBulkSelectionLabel();renderSpreadMoveDialog();
+  setPageSaveStatus('saving','保存中…');
+  try{
+    const response=await api('/api/v2/items/reorder',{method:'POST',body});
+    applyPageMutationResult(response);setPageSaveStatus('saved','保存済み');
+    rememberPageLayoutUndo(`${ids.length}ページの移動（位置を指定）`,session.beforeVolumes,plan.volumes);
+    session.saving=false;closeSpreadMoveDialog(false);
+    if(activePageVolume!=='all'&&target!==activePageVolume){activePageVolume=target;pageVolumeAutoPicked=true;try{sessionStorage.setItem('ReportBinderActivePageVolume',activePageVolume);}catch{}}
+    selectedPages=new Set(ids);lastPageRangeAnchor=ids[ids.length-1]||'';lastPageBoardRenderSignature='';renderPages();syncPageSelectionUi();
+    showMessage('ok','ページ構成を保存しました',`${ids.length}ページを${assignmentVolumeLabel(target)}の${plan.index+1}番目へ移動しました。`,null,[{label:'元に戻す',handler:()=>undoLastPageLayout()},{label:'提出用PDFへ',view:'final'}],8000);
+    return true;
+  }catch(error){
+    setPageSaveStatus('error','保存できません');
+    if(error.code==='structure-conflict'){session.conflict=true;session.error='ほかの画面でページ構成が変わったため、保存していません。最新の並びを読み込んで、試算し直してください。';}
+    else session.error=`保存できません: ${userFriendlyError(error.message)}`;
+    return false;
+  }finally{
+    session.saving=false;pageMutationBusy=false;updateBulkSelectionLabel();renderPageOverview();
+    if(spreadMoveSession===session)renderSpreadMoveDialog();
+  }
+}
+// 取消・閉じるは何も保存しない（保存履歴も増えない）。保存中は閉じない。
+function closeSpreadMoveDialog(returnFocus=true){
+  if(spreadMoveSession?.saving)return false;
+  spreadMoveSession=null;
+  const modal=$('spread-move-modal');if(modal)modal.classList.add('hidden');
+  const compare=$('spread-move-compare');if(compare)compare.innerHTML='';
+  const focus=spreadMoveReturnFocus;spreadMoveReturnFocus=null;
+  if(returnFocus&&focus?.isConnected&&typeof focus.focus==='function')focus.focus();
+  return true;
+}
+function openSpreadMoveForCard(row){
+  const id=String(row?.dataset?.pageId||'');if(!id)return;
+  if(!selectedPages.has(id)){selectedPages.clear();selectedPages.add(id);lastPageRangeAnchor=id;syncPageSelectionUi();}
+  void openSpreadMoveDialog([...selectedPages],{returnFocus:row});
+}
+function openSpreadMoveFromPreview(){
+  const id=String(currentPreviewPageId||'');if(!id)return;
+  closePreview();
+  void openSpreadMoveDialog([id]);
+}
+const SPREAD_DIFF_MARKS={moved:'◆',side:'⇄',shift:'↓',volume:'⇢',uncertain:'？',removed:'×'};
+function spreadMoveBadgeText(info,label){
+  if(!info||info.kind==='same')return '';
+  const sideText=side=>side==='left'?'左':'右',b=info.before,a=info.after;
+  const turn=b&&a?(info.sideFlipped?`${sideText(b.side)}→${sideText(a.side)}`:info.shifted?`${b.outputPageNumber}→${a.outputPageNumber}`:''):'';
+  const move=`${label(info.fromVolume)}→${label(info.volume)}`;
+  const text=info.kind==='moved'?['移動',info.volumeChanged?move:'',turn].filter(Boolean).join(' '):info.kind==='side'||info.kind==='shift'?turn:info.kind==='volume'||info.kind==='removed'?move:'頁未確定';
+  return `${SPREAD_DIFF_MARKS[info.kind]||''} ${text}`;
+}
+function spreadMoveCellHtml(cell,info,label){
+  if(!cell)return '<div class="spread-slot-empty" aria-hidden="true"><span>（空き）</span></div>';
+  const page=getPage(cell.pageId),title=page?.title||page?.sheetName||cell.title||'ページ',kind=info?.kind||'same';
+  const pageText=cell.unknown?'頁数未確定':cell.uncertain?'頁未確定':`${cell.outputPageNumber} ${cell.side==='left'?'左':'右'}`;
+  const partText=cell.partCount>1?`${cell.partIndex}/${cell.partCount}`:'',badge=spreadMoveBadgeText(info,label);
+  const paper=cell.unknown||!pagePreviewAvailable(page)
+    ?`<div class="page-thumb-paper spread-paper spread-paper-unknown" aria-hidden="true"><span class="page-thumb-placeholder">${pagePreviewAvailable(page)?'頁数を確認中':'PDF未作成'}</span></div>`
+    :`<div class="page-thumb-paper spread-paper" aria-hidden="true"><canvas data-page-thumbnail="${escapeAttr(cell.pageId)}" data-thumbnail-page="${escapeAttr(cell.sourcePdfPageNumber)}"></canvas><span class="page-thumb-placeholder">読み込み中</span></div>`;
+  return `<div class="spread-cell spread-diff-cell spread-diff-${escapeAttr(kind)} spread-${cell.position%2===1?'right':'left'}" data-page-id="${escapeAttr(cell.pageId)}" aria-label="${escapeAttr(`${pageText}、${title}${partText?` ${partText}`:''}${badge?`、${badge}`:''}`)}">${paper}<div class="spread-cell-head"><b>${escapeHtml(pageText)}</b></div><div class="spread-cell-name"><strong title="${escapeAttr(title)}">${escapeHtml(title)}</strong>${partText?`<span class="spread-part">${escapeHtml(partText)}</span>`:''}</div>${badge?`<div class="spread-diff-badge">${escapeHtml(badge)}</div>`:''}</div>`;
+}
+function spreadMoveSheetsHtml(layout,diff,volume,side,changedOnly,label){
+  const lane=diff.volumes[volume],wanted=side==='before'?lane?.beforeSpreads:lane?.afterSpreads;
+  const spreads=asArray(layout?.spreads).filter(spread=>!changedOnly||wanted?.has(spread.index));
+  if(!layout||!asArray(layout.cells).length)return '<p class="spread-move-empty">ページはありません</p>';
+  if(!spreads.length)return '<p class="spread-move-empty">変化のある見開きはありません</p>';
+  const infoOf=cell=>cell?diff.flags.get(diff.keyOf(cell)):null;
+  let previous=-1;
+  return spreads.map(spread=>{
+    const gap=changedOnly&&previous>=0&&spread.index>previous+1?'<div class="spread-move-gap" aria-hidden="true">…</div>':'';previous=spread.index;
+    const range=[spread.left,spread.right].filter(Boolean).map(cell=>cell.uncertain?'?':String(cell.outputPageNumber));
+    return `${gap}<div class="spread-sheet spread-move-sheet" role="group" aria-label="${escapeAttr(`${side==='before'?'移動前':'移動後'} 見開き ${spread.index+1}（${range.join('・')}頁）`)}" data-spread-move-sheet="${escapeAttr(`${side}:${volume}:${spread.index}`)}">${spreadMoveCellHtml(spread.left,infoOf(spread.left),label)}<span class="spread-gutter" aria-hidden="true"></span>${spreadMoveCellHtml(spread.right,infoOf(spread.right),label)}</div>`;
+  }).join('');
+}
+function renderSpreadMoveDialog(){
+  const session=spreadMoveSession,modal=$('spread-move-modal');if(!session||!modal)return;
+  const label=volume=>assignmentVolumeLabel(volume);
+  const names=session.pageIds.map(id=>{const page=getPage(id);return page?.title||page?.sheetName||'ページ';});
+  const subtitle=$('spread-move-subtitle');if(subtitle)subtitle.textContent=`${names.length===1?names[0]:`${names[0]} ほか${names.length-1}ページ`}を動かした後の見開きを、確定する前に確かめます。確定するまで保存しません。`;
+  const targetSelect=$('spread-move-target');
+  if(targetSelect){targetSelect.innerHTML=activeTargetVolumes().map(volume=>`<option value="${escapeAttr(volume)}">${escapeHtml(label(volume))}</option>`).join('');targetSelect.value=session.target;targetSelect.disabled=session.saving;}
+  const positionSelect=$('spread-move-position');
+  if(positionSelect){
+    const moving=new Set(session.pageIds),lane=asArray(session.beforeVolumes[session.target]).filter(id=>!moving.has(String(id)));
+    const pageName=id=>{const page=getPage(id);return page?.title||page?.sheetName||'ページ';};
+    positionSelect.innerHTML=lane.map((id,index)=>`<option value="${index+1}">${index+1}番目（${escapeHtml(pageName(id))}の前）</option>`).join('')+`<option value="end">末尾（${lane.length+1}番目）</option>`;
+    positionSelect.value=String(session.position);positionSelect.disabled=session.saving;
+  }
+  const changedOnly=$('spread-move-changed-only');if(changedOnly){changedOnly.checked=session.changedOnly;}
+  document.querySelectorAll('[data-spread-move-pane]').forEach(button=>{const on=button.dataset.spreadMovePane===session.pane;button.classList.toggle('active',on);button.setAttribute('aria-pressed',String(on));});
+  const summary=$('spread-move-summary'),diff=session.diff;
+  if(summary){
+    const result=diff?spreadDiffSummary(diff,label):null;
+    summary.className=`spread-move-summary${session.error?' error':result?.alert?' alert':''}`;
+    summary.innerHTML=session.saving?'<strong>保存しています…</strong>'
+      :session.error?`<strong>${escapeHtml(session.error)}</strong>${session.conflict?'<button class="btn secondary compact" type="button" data-spread-move-reload>最新の並びで試算し直す</button>':''}`
+      :session.loading||!result?'<strong>移動後の頁・左右を試算しています…</strong><span>試算が終わるまで確定できません。</span>'
+      :`<strong>${escapeHtml(result.text)}</strong>`;
+  }
+  const accept=$('spread-move-accept');if(accept)accept.disabled=session.saving||session.loading||session.conflict||!session.preview||!diff?.changed;
+  const cancel=$('spread-move-cancel');if(cancel)cancel.disabled=session.saving;
+  const compare=$('spread-move-compare');if(!compare)return;
+  compare.className=`spread-move-compare show-${session.pane}`;
+  if(!session.preview||!diff){compare.innerHTML='';return;}
+  const order=[...activeTargetVolumes()],volumes=(session.changedOnly?diff.changedVolumes:order.filter(volume=>session.preview.before[volume]||session.preview.after[volume])).sort((a,b)=>order.indexOf(a)-order.indexOf(b));
+  compare.innerHTML=volumes.length?volumes.map(volume=>{
+    const before=session.preview.before[volume],after=session.preview.after[volume];
+    const count=layout=>layout?`${layout.uncertainFrom?'約':''}${layout.pageCount}頁`:'0頁';
+    return `<section class="spread-move-volume"><h3>${escapeHtml(label(volume))}</h3><div class="spread-move-columns"><div class="spread-move-column before"><h4>移動前（${escapeHtml(count(before))}）</h4><div class="spread-list">${spreadMoveSheetsHtml(before,diff,volume,'before',session.changedOnly,label)}</div></div><div class="spread-move-column after"><h4>移動後（${escapeHtml(count(after))}）</h4><div class="spread-list">${spreadMoveSheetsHtml(after,diff,volume,'after',session.changedOnly,label)}</div></div></div></section>`;
+  }).join(''):'<p class="spread-move-empty">並びは変わりません。移動先か位置を変えてください。</p>';
+  const canvases=[...compare.querySelectorAll('[data-page-thumbnail]')];
+  if(pageThumbnailObserver)canvases.forEach(canvas=>pageThumbnailObserver.observe(canvas));else canvases.forEach(queuePageThumbnail);
+  // 最初に影響する見開きまで送る（試算ごとに1回）。
+  const first=diff.firstAffected;
+  if(first&&session.scrolledSeq!==session.seq){
+    session.scrolledSeq=session.seq;
+    const side=first.beforeOnly?'before':'after';
+    if(first.beforeOnly&&session.pane==='after'){session.pane='before';compare.className='spread-move-compare show-before';document.querySelectorAll('[data-spread-move-pane]').forEach(button=>{const on=button.dataset.spreadMovePane==='before';button.classList.toggle('active',on);button.setAttribute('aria-pressed',String(on));});}
+    const sheet=[...compare.querySelectorAll('[data-spread-move-sheet]')].find(el=>el.dataset.spreadMoveSheet===`${side}:${first.volume}:${first.spreadIndex}`);
+    if(sheet)requestAnimationFrame(()=>sheet.scrollIntoView({block:'nearest',inline:'nearest'}));
+  }
+}
 function pageRowHtml(p, idx, filteredOut=false) {
   if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),true);
   const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
@@ -5193,6 +5463,7 @@ function handleSpreadCellKeydown(cell,e){
   const arrows=['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'];
   if(e.altKey&&arrows.includes(e.key)){e.preventDefault();showSpreadReorderGuidance();return;}
   if(e.key===' '||e.key==='Spacebar'){e.preventDefault();handleSpreadCellSelection(cell,e);return;}
+  if((e.key==='m'||e.key==='M')&&!e.altKey&&!e.ctrlKey&&!e.metaKey){e.preventDefault();openSpreadMoveForCard(cell);return;}
   if(e.key==='Enter'){const page=getPage(cell.dataset.pageId);if(pagePreviewAvailable(page)){e.preventDefault();previewPage(cell.dataset.pageId,page);}return;}
   if(![...arrows,'Home','End'].includes(e.key))return;
   const target=spreadCellKeyboardTarget(cell,e.key);if(!target)return;
@@ -5207,6 +5478,7 @@ function handleBoardRowKeydown(row,e){
   if(pageBoardView==='spread'&&e.altKey&&['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();showSpreadReorderGuidance();return;}
   if(!e.altKey){
     if(e.key==='F2'&&row.classList.contains('page-thumb-card')){e.preventDefault();setPageThumbnailEditor(row,true);return;}
+    if((e.key==='m'||e.key==='M')&&!e.ctrlKey&&!e.metaKey){e.preventDefault();openSpreadMoveForCard(row);return;}
     if(e.key===' '||e.key==='Spacebar'){e.preventDefault();handlePageCardSelection(row,e);return;}
     if(e.key==='Enter'){
       const page=getPage(row.dataset.pageId)||pageFallbackFromRow(row);
@@ -6138,6 +6410,14 @@ if(pageSearchInput)pageSearchInput.addEventListener('input',()=>{
 if(pageSearchClear)pageSearchClear.addEventListener('click',()=>{pageFilterText='';if(pageSearchInput){pageSearchInput.value='';pageSearchInput.focus();}pageSearchClear.classList.add('hidden');lastPageRangeAnchor='';lastPageBoardRenderSignature='';renderPages();});
 const pageThumbnailSizeInput=$('page-thumbnail-size');if(pageThumbnailSizeInput){pageThumbnailSizeInput.value=String(pageThumbnailSize);pageThumbnailSizeInput.addEventListener('input',()=>applyPageThumbnailSize(pageThumbnailSizeInput.value));pageThumbnailSizeInput.addEventListener('change',()=>{try{sessionStorage.setItem('ReportBinderPageThumbnailSize',String(pageThumbnailSize));}catch{}});}
 bind('bulk-none-btn','click',()=>moveSelectedPagesToVolume('none',$('bulk-none-btn')));
+bind('spread-move-btn','click',()=>openSpreadMoveDialog([...selectedPages],{returnFocus:$('spread-move-btn')}));
+bind('preview-move-position','click',()=>openSpreadMoveFromPreview());
+bind('spread-move-cancel','click',()=>closeSpreadMoveDialog());
+bind('spread-move-accept','click',()=>confirmSpreadMove());
+bind('spread-move-target','change',event=>{if(!spreadMoveSession)return;spreadMoveSession.target=String(event.target.value||'');spreadMoveSession.position='end';void runSpreadMovePreview();});
+bind('spread-move-position','change',event=>{if(!spreadMoveSession)return;const value=String(event.target.value||'end');spreadMoveSession.position=value==='end'?'end':Number(value);void runSpreadMovePreview();});
+bind('spread-move-changed-only','change',event=>{if(!spreadMoveSession)return;spreadMoveSession.changedOnly=!!event.target.checked;renderSpreadMoveDialog();});
+const spreadMoveModal=$('spread-move-modal');if(spreadMoveModal)spreadMoveModal.addEventListener('click',event=>{if(event.target===spreadMoveModal){closeSpreadMoveDialog();return;}const pane=event.target.closest('[data-spread-move-pane]');if(pane&&spreadMoveSession){spreadMoveSession.pane=String(pane.dataset.spreadMovePane||'after');renderSpreadMoveDialog();return;}if(event.target.closest('[data-spread-move-reload]'))void reloadSpreadMoveBase();});
 bind('register-selected-btn','click',()=>registerSelected($('register-selected-btn')));bind('unregister-selected-btn','click',()=>unregisterSelected($('unregister-selected-btn')));bind('render-selected-btn','click',()=>renderSelectedWorkbooks($('render-selected-btn')));bind('render-all-btn','click',()=>renderAllWorkbooks($('render-all-btn')));bind('sort-by-sheet-btn','click',()=>sortPagesByNumericSheet($('sort-by-sheet-btn')));bind('collect-numeric-sheets-btn','click',()=>collectNumericSheets($('collect-numeric-sheets-btn')));
 bind('build-all-btn','click',()=>buildAllVolumes($('build-all-btn')));
 bind('publish-all-btn','click',()=>publishAllFinalVolumes($('publish-all-btn')));
@@ -6198,12 +6478,12 @@ window.addEventListener('keydown',e=>{
     // clearActivePageSelection(), which unhighlighted the rows but left the
     // drag running, so the "cancelled" move still committed on drop.
     if(draggingRow){e.preventDefault();finishPointerDrag(false);return;}
-    if(isConfirmModalOpen())closeConfirmModal(false);else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('app-menu-popover')?.classList.contains('hidden'))closeAppMenu(true);else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
+    if(isConfirmModalOpen())closeConfirmModal(false);else if(isSpreadMoveOpen())closeSpreadMoveDialog();else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('app-menu-popover')?.classList.contains('hidden'))closeAppMenu(true);else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
     return;
   }
   if(isModalOpen()&&!isDiffModalOpen()&&previewOrganizerMode&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!e.target.matches('input,select,textarea')&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();void navigatePreviewPage(e.key==='ArrowLeft'?-1:1);return;}
   if(e.key!=='Tab')return;
-  const modal=isConfirmModalOpen()?$('confirm-modal'):(isPageLayoutRevisionsOpen()?$('page-layout-revisions-modal'):(isTemplateManagerOpen()?$('template-manager-modal'):(isPackEditorOpen()?$('pack-editor-modal'):(isDiffModalOpen()?$('diff-modal'):(isModalOpen()?$('preview-modal'):null)))));
+  const modal=isConfirmModalOpen()?$('confirm-modal'):isSpreadMoveOpen()?$('spread-move-modal'):(isPageLayoutRevisionsOpen()?$('page-layout-revisions-modal'):(isTemplateManagerOpen()?$('template-manager-modal'):(isPackEditorOpen()?$('pack-editor-modal'):(isDiffModalOpen()?$('diff-modal'):(isModalOpen()?$('preview-modal'):null)))));
   // The pack switcher and the app menu are NOT trapped: they have no scrim and a
   // click anywhere outside dismisses them, so they are non-modal popovers. They
   // get focus-in, Escape and focus-return instead; tabbing past closes them.
