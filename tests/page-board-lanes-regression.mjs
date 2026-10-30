@@ -183,7 +183,7 @@ const slotIds = spread => [spread.left, spread.right].map(cell => (cell ? `${cel
     'the spread view must not change what collectBoardVolumes reads');
 }
 
-// サムネイルのキャッシュは、描くページ番号ごとに分ける。サムネイル表示は従来どおり1枚目。
+// サムネイルのキャッシュは、描くページ番号ごとに分ける。番号を省けば1枚目。
 {
   const { pageThumbnailCacheKey } = new Function(`
     const getWorkbook=()=>({lastRenderedSnapshotId:'s',lastRenderedVersionId:'v'}),resolvedPageId=page=>String(page?.pageId||'');
@@ -193,6 +193,63 @@ const slotIds = spread => [spread.left, spread.right].map(cell => (cell ? `${cel
   const page = { pageId: 'B', contentPdf: 'B.pdf' };
   assert.equal(pageThumbnailCacheKey(page), pageThumbnailCacheKey(page, 1));
   assert.notEqual(pageThumbnailCacheKey(page, 1), pageThumbnailCacheKey(page, 2));
+}
+
+// サムネイルは使用ページ範囲の先頭ページを描き、複数ページの項目には「全N枚」を出す。
+{
+  const { pageFirstSourcePage, pagePartCountsFromPhysicalPages } = new Function(`
+    const resolvedPageId=page=>String(page?.pageId||'');
+    ${extractFunction('pageFirstSourcePage')}
+    ${extractFunction('pagePartCountsFromPhysicalPages')}
+    return { pageFirstSourcePage, pagePartCountsFromPhysicalPages };`)();
+  assert.equal(pageFirstSourcePage({ pageId: 'A' }), 1, 'no range draws page 1');
+  assert.equal(pageFirstSourcePage({ pageId: 'A', pageRange: null }), 1);
+  assert.equal(pageFirstSourcePage({ pageId: 'A', pageRange: { start: 3, end: 5 } }), 3, 'range 3-5 draws page 3');
+  assert.equal(pageFirstSourcePage({ pageId: 'A', pageRange: { start: 4, end: 4 } }), 4, 'single page 4 draws page 4');
+  assert.equal(pageFirstSourcePage({ pageId: 'A', pageRange: '3-5' }), 3);
+  assert.equal(pageFirstSourcePage({ pageId: 'A', pageRange: '4' }), 4);
+  assert.equal(pageFirstSourcePage({ pageId: 'A', pageRange: { start: 0 } }), 1, 'invalid starts fall back to page 1');
+
+  const parts = (pageId, start, count, from = 1) => Array.from({ length: count }, (_, i) => ({
+    pageId, outputPageNumber: from + i, pagePartIndex: i + 1, pagePartCount: count, sourcePdfPageNumber: start + i,
+  }));
+  const pages = [
+    { pageId: 'A' },
+    { pageId: 'B' },
+    { pageId: 'C', pageRange: { start: 3, end: 5 } },
+    { pageId: 'D', pageRange: { start: 2, end: 3 } },
+    { pageId: 'E', pageRange: { start: 1, end: 2 } },
+    { pageId: 'F' },
+  ];
+  const counts = pagePartCountsFromPhysicalPages(pages, [
+    [...parts('A', 1, 1), ...parts('B', 1, 5, 2), ...parts('C', 3, 3, 7)],
+    // D は範囲の開始を変えた直後で、readiness は古い範囲（1-2）のまま。
+    [...parts('D', 1, 2), ...parts('E', 1, 4, 3)],
+    undefined,
+  ]);
+  assert.deepEqual([...counts], [['B', 5], ['C', 3]],
+    'only multi-page items whose server range matches the current range get a count');
+  assert.ok(!counts.has('A'), 'single-page items get no badge');
+  assert.ok(!counts.has('D'), 'a stale start (range changed, readiness not reloaded) gets no badge');
+  assert.ok(!counts.has('E'), 'more parts than the current range allows is stale and gets no badge');
+  assert.ok(!counts.has('F'), 'pages missing from physicalPages get no badge');
+  // 移した直後で、古い出力先と新しい出力先の readiness が食い違うときは出さない。
+  const moved = pagePartCountsFromPhysicalPages([{ pageId: 'B' }], [parts('B', 1, 5), parts('B', 1, 3)]);
+  assert.equal(moved.size, 0, 'conflicting counts across targets get no badge');
+  assert.equal(pagePartCountsFromPhysicalPages([{ pageId: 'B' }], [parts('B', 1, 5), parts('B', 1, 5)]).get('B'), 5,
+    'the same count in two snapshots is not doubled');
+  assert.equal(pagePartCountsFromPhysicalPages(pages, null).size, 0);
+
+  const card = extractFunction('pageThumbnailHtml');
+  assert.ok(card.includes('data-thumbnail-page="${escapeAttr(pageFirstSourcePage(p))}"'),
+    'the thumbnail canvas must draw the first page of the used range');
+  assert.ok(card.includes('page-thumb-parts') && card.includes('pageThumbnailPartCounts.get(pid)'),
+    'multi-page items show the part count badge');
+  const render = extractFunction('renderPages');
+  assert.ok(render.includes('pagePartCountsFromPhysicalPages(') && render.includes('[...pageThumbnailPartCounts]'),
+    'renderPages must build the part counts and redraw when they change');
+  assert.ok(extractFunction('renderSpreadBoardIfVisible').includes("pageBoardView==='thumbnail'&&!draggingRow"),
+    'readiness reloads redraw thumbnails, but not in the middle of a drag');
 }
 
 // 見開きではドラッグと Alt+矢印の並べ替えを止め、Undo の before は状態から読む。

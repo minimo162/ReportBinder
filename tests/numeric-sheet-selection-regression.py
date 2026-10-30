@@ -324,6 +324,7 @@ let state={finalReadiness:{pack_custom:{volumes:{'ja-main':{status:'built',displ
 function activePackRecord(){return activePack;} function configured(){return true;}
 function normalizeStatePayload(payload){return payload;}
 function targetVolume(id){return String(id||'');} function log(){} function renderAll(){}
+let draggingRow=null, pagesRendered=0; function renderPages(){pagesRendered++;}
 function showMessage(){} const snapshotHistoryResponseCache=new Map(); let historyPanelsInitialized=false;
 function api(url){
   if(url==='/api/state')return Promise.resolve({structure:{pages:[]},packProgress:{},finalReadiness:{}});
@@ -332,6 +333,10 @@ function api(url){
 await refresh({authoritativeReadiness:true,render:false});
 const ready=state.finalReadiness.pack_custom.volumes['ja-main'];
 if(ready.displayState!=='needs-rebuild'||ready.status!=='needs-rebuild')throw new Error('refresh carried stale custom readiness');
+// サムネイル表示でも readiness が届いたら描き直す（「全N枚」のため）。ドラッグ中は描き直さない。
+if(pagesRendered<1)throw new Error('thumbnail board was not redrawn after readiness arrived');
+const renderedBeforeDrag=pagesRendered; draggingRow={}; renderSpreadBoardIfVisible();
+if(pagesRendered!==renderedBeforeDrag)throw new Error('thumbnail board was rebuilt in the middle of a drag');
 """
     completed = subprocess.run(["node", "--input-type=module", "-"], input=refresh_functions + "\n" + refresh_harness, text=True, encoding="utf-8", capture_output=True)
     assert completed.returncode == 0, completed.stdout + completed.stderr

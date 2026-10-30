@@ -89,6 +89,8 @@ const PAGE_DOCUMENT_CACHE_LIMIT = 8;
 let pageDocumentCacheClock = 0;
 // 開いた変換PDFの頁数（pageId → numPages）。PDFイメージ表示の頁数表で使う。
 const pdfImageObservedPageCounts = new Map();
+// サムネイルの「全N枚」バッジ用（pageId → 使用する枚数）。renderPages が readiness から作る。
+let pageThumbnailPartCounts = new Map();
 const PAGE_LAYOUT_HISTORY_LIMIT = 20;
 let lastFileRangeAnchor = '';
 let lastWorkbookRangeAnchor = '';
@@ -1172,8 +1174,11 @@ function stampFinalReadinessReceived(key=finalReadinessKey()){
   const entry=key?state?.finalReadiness?.[key]:null;
   if(entry&&typeof entry==='object')entry.receivedAt=Date.now();
 }
+// サムネイルも「全N枚」を readiness から出すので描き直す。枚数が変わらなければ
+// renderPages のシグネチャで止まる。ドラッグ中は盤面を作り直さない（保存後に描き直る）。
 function renderSpreadBoardIfVisible(){
-  if(activeView==='pages'&&pageBoardView==='spread')renderPages();
+  if(activeView!=='pages')return;
+  if(pageBoardView==='spread'||(pageBoardView==='thumbnail'&&!draggingRow))renderPages();
 }
 
 function reloadFinalReadinessAfterPageMutation(){
@@ -4619,7 +4624,8 @@ function renderPages() {
   const box=$('page-board');if(!box)return;renderPageTargetControls();const rawPages=pagesForActivePreset();const sourcePages=[...rawPages].sort(compositionPageComparator(rawPages));const visiblePages=applyPageFilters(sourcePages);const visibleIds=new Set(visiblePages.map(resolvedPageId));const allPages=sourcePages;
   const needsPdf=workbooksForActivePreset().filter(w=>!isLatestPdfWorkbook(w));const agg=aggregateFinalState();
   const targetSignature=activeTargetDefinitions().map(target=>[target.targetId,target.displayName,target.required,target.order]);
-  const signature=JSON.stringify([pageBoardView,activePageVolume,pageFilterText,showChangedOnly,[...pageVolumeCollapseOverrides.entries()],targetSignature,allPages.map(p=>{const w=getWorkbook(p.workbookId),cs=changeSummaryFor(p.workbookId);return[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,pageRangeText(p),p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf,p.sheetIndex,cs?.status,asArray(cs?.changedSheets),asArray(cs?.addedSheets),asArray(cs?.removedSheets),asArray(cs?.unknownSheets),asArray(p.warnings),w?.displayName,w?.fileName,w?.relativePath,w?.lastRenderedSnapshotId,w?.lastRenderedVersionId];}),needsPdf.map(w=>w.workbookId),agg.state,pageBoardView==='spread'?spreadReadinessSignature():null]);
+  pageThumbnailPartCounts=pageBoardView==='detail'?new Map():pagePartCountsFromPhysicalPages(allPages,activeTargetVolumes().map(volume=>volumeReadiness(volume)?.snapshot?.physicalPages));
+  const signature=JSON.stringify([pageBoardView,activePageVolume,pageFilterText,showChangedOnly,[...pageVolumeCollapseOverrides.entries()],targetSignature,allPages.map(p=>{const w=getWorkbook(p.workbookId),cs=changeSummaryFor(p.workbookId);return[resolvedPageId(p),p.order,p.volume,p.enabled,p.title,pageRangeText(p),p.numberingMode,p.numberingManual,p.orderManual,p.status,p.contentPdf,p.sheetIndex,cs?.status,asArray(cs?.changedSheets),asArray(cs?.addedSheets),asArray(cs?.removedSheets),asArray(cs?.unknownSheets),asArray(p.warnings),w?.displayName,w?.fileName,w?.relativePath,w?.lastRenderedSnapshotId,w?.lastRenderedVersionId];}),needsPdf.map(w=>w.workbookId),agg.state,pageBoardView==='spread'?spreadReadinessSignature():null,[...pageThumbnailPartCounts]]);
   if(lastPageBoardRenderSignature===signature&&box.childElementCount)return;lastPageBoardRenderSignature=signature;
   const scrollSnap=capturePageBoardScroll();selectedPages=new Set([...selectedPages].filter(id=>allPages.some(p=>resolvedPageId(p)===id)));
   const banners=[];const unassigned=allPages.filter(p=>String(p.volume)==='none'||p.enabled===false).length;
@@ -5044,19 +5050,56 @@ function pageRowHtml(p, idx, filteredOut=false) {
   const rowLabel=`${idx+1}ページ目 ${p.title||p.sheetName||'ページ'}`;
   return `<tr tabindex="0" aria-label="${escapeAttr(`${rowLabel}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー`)}" class="page-row ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}"><td class="seq-col"><span class="seq-badge" data-seq-cell>${idx+1}</span></td><td class="page-main-cell"><input class="title-input" data-page-title aria-label="${escapeAttr(`${rowLabel}のページ名`)}" value="${escapeAttr(p.title||'')}"><button class="file-link btn ghost" type="button" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${escapeHtml(wb?.displayName||wb?.fileName||'')} / ${escapeHtml(sourceUnitReference(wb,p.sheetName))}</button>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</td><td class="${hasPdf?'preview-trigger':''}" ${hasPdf?`data-preview-page="${escapeAttr(pid)}"`:''}>${pdfStatusForPage(p)} ${pageChangeBadge(p)}<div class="subtext">${escapeHtml(pagePdfSubtext(p))}</div></td><td><select data-page-numbering aria-label="${escapeAttr(`${rowLabel}のページ番号表示`)}"><option value="auto" ${numberingSelectValue(p)==='auto'?'selected':''}>自動</option><option value="none" ${numberingSelectValue(p)==='none'?'selected':''}>表示なし</option><option value="visible" ${numberingSelectValue(p)==='visible'?'selected':''}>表示</option></select><div class="subtext">${escapeHtml(numberingText(p,idx))}</div><label class="page-range-inline">使用ページ<input data-page-range aria-label="${escapeAttr(`${rowLabel}で使用するページ範囲`)}" value="${escapeAttr(pageRangeText(p))}" placeholder="すべて"></label></td></tr>`;
 }
+// 変換PDFのうち、提出用PDFに使う最初のページ（使用ページ範囲の開始。範囲なしは1）。
+// サムネイルはこのページを描く。範囲は {start,end}（サーバーで正規化済み）か「3-5」の文字列。
+function pageFirstSourcePage(page){
+  const range=page?.pageRange;
+  const start=typeof range==='string'?Number((/^\s*(\d+)/.exec(range)||[])[1]):Number(range?.start);
+  return Number.isFinite(start)&&start>=1?Math.floor(start):1;
+}
+// 複数ページの項目の枚数（pageId → 枚数。2枚以上だけ）を readiness の physicalPages から数える。
+// 頁・左右は使わない。範囲の開始が今の設定と違う・範囲より多い（範囲を変えた直後で
+// 読み直し前）ものと、出力先の間で食い違うもの（移した直後）は出さない。
+function pagePartCountsFromPhysicalPages(pages,physicalPageLists){
+  const found=new Map(),conflicts=new Set();
+  for(const list of (Array.isArray(physicalPageLists)?physicalPageLists:[])){
+    const groups=new Map();
+    for(const entry of (Array.isArray(list)?list:[])){
+      const id=String(entry?.pageId||'');if(!id)continue;
+      const number=Number(entry?.sourcePdfPageNumber)||0,group=groups.get(id)||{start:0,count:0,entries:0};
+      if(number>0&&(!group.start||number<group.start))group.start=number;
+      group.count=Math.max(group.count,Number(entry?.pagePartCount)||0);group.entries++;
+      groups.set(id,group);
+    }
+    for(const [id,group] of groups){
+      const count=Math.max(group.count,group.entries),previous=found.get(id);
+      if(previous&&(previous.start!==group.start||previous.count!==count))conflicts.add(id);
+      found.set(id,{start:group.start,count});
+    }
+  }
+  const counts=new Map();
+  for(const page of (Array.isArray(pages)?pages:[])){
+    const id=resolvedPageId(page),entry=found.get(id);
+    if(!entry||conflicts.has(id)||entry.count<2||entry.start!==pageFirstSourcePage(page))continue;
+    const range=page?.pageRange,end=typeof range==='string'?Number((/-\s*(\d+)\s*$/.exec(range)||/^\s*(\d+)\s*$/.exec(range)||[])[1]):Number(range?.end||range?.start);
+    if(range&&Number.isFinite(end)&&end>=entry.start&&entry.count>end-entry.start+1)continue;
+    counts.set(id,entry.count);
+  }
+  return counts;
+}
 function pageThumbnailHtml(p,idx,filteredOut=false){
   if(filteredOut)return filteredOutPageHtml(resolvedPageId(p),false);
-  const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p);
+  const wb=getWorkbook(p.workbookId),pid=resolvedPageId(p),hasPdf=pagePreviewAvailable(p),partCount=Number(pageThumbnailPartCounts.get(pid))||0;
   const warnings=asArray(p.warnings).filter(w=>!/縮尺例外|Zoom|倍率例外/.test(String(w))).map(userFriendlyError);
   const checked=selectedPages.has(pid),highlighted=highlightedPageIds.has(pid);
   const source=`${wb?.displayName||wb?.fileName||''} / ${sourceUnitReference(wb,p.sheetName)}`;
   const numbering=numberingSelectValue(p),range=pageRangeText(p),displayTitle=p.title||p.sheetName||'ページ';
   const editorId=`page-thumb-editor-${pid}`;
-  return `<article role="option" aria-selected="${checked}" tabindex="-1" class="page-row page-thumb-card ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}" aria-label="${escapeAttr(`${idx+1}ページ目 ${displayTitle}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー、F2で設定`)}" title="${escapeAttr(displayTitle)}"><div class="page-thumb-paper" data-page-surface aria-hidden="true"><canvas data-page-thumbnail="${escapeAttr(pid)}"></canvas><span class="page-thumb-placeholder">${hasPdf?'プレビューを読み込み中':'PDF未作成'}</span><span class="page-thumb-seq" data-seq-cell>${idx+1}</span></div><div class="page-thumb-copy"><strong title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</strong><span title="${escapeAttr(source)}">${escapeHtml(source)}</span>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</div><div class="page-thumb-meta"><span>${!hasPdf?pdfStatusForPage(p):''}</span><span class="page-thumb-settings-summary">${hasPdf?`<button tabindex="-1" class="btn ghost compact page-thumb-preview" type="button" data-preview-page="${escapeAttr(pid)}">プレビュー</button>`:''}<button tabindex="-1" class="btn ghost compact page-thumb-edit" type="button" data-thumb-edit aria-label="${escapeAttr(`${displayTitle}の設定を編集`)}" aria-controls="${escapeAttr(editorId)}" aria-expanded="false">${iconUse('i-edit')}設定</button></span></div><div id="${escapeAttr(editorId)}" class="page-thumb-editor" data-thumb-editor hidden><label>ページ名<input data-thumb-page-title value="${escapeAttr(p.title||'')}" data-original-value="${escapeAttr(p.title||'')}"></label><label>元PDFから使う範囲（複数ページの場合）<input data-thumb-page-range value="${escapeAttr(range)}" data-original-value="${escapeAttr(range)}" placeholder="すべて（例: 2-5）" inputmode="numeric"></label><label>ページ番号<select data-thumb-page-numbering data-original-value="${escapeAttr(numbering)}"><option value="auto" ${numbering==='auto'?'selected':''}>自動</option><option value="none" ${numbering==='none'?'selected':''}>表示なし</option><option value="visible" ${numbering==='visible'?'selected':''}>表示</option></select></label><div class="page-thumb-editor-actions"><button class="btn ghost compact" type="button" data-thumb-cancel>取消</button><button class="btn primary compact" type="button" data-thumb-save>保存</button></div></div></article>`;
+  return `<article role="option" aria-selected="${checked}" tabindex="-1" class="page-row page-thumb-card ${filteredOut?'page-filter-hidden':''} ${checked?'selected-row':''} ${highlighted?'new-page-row':''} ${p.status==='render-error'?'error-row':''}" data-page-id="${escapeAttr(pid)}" data-workbook-id="${escapeAttr(p.workbookId||'')}" data-sheet-name="${escapeAttr(p.sheetName||'')}" data-content-pdf="${escapeAttr(p.contentPdf||'')}" aria-label="${escapeAttr(`${idx+1}ページ目 ${displayTitle}${partCount>1?`（全${partCount}枚）`:''}。クリックで選択、Ctrl/Cmdで追加・解除、Shiftで範囲選択。ダブルクリックまたはEnterでプレビュー、F2で設定`)}" title="${escapeAttr(displayTitle)}"><div class="page-thumb-paper" data-page-surface aria-hidden="true"><canvas data-page-thumbnail="${escapeAttr(pid)}" data-thumbnail-page="${escapeAttr(pageFirstSourcePage(p))}"></canvas><span class="page-thumb-placeholder">${hasPdf?'プレビューを読み込み中':'PDF未作成'}</span><span class="page-thumb-seq" data-seq-cell>${idx+1}</span>${partCount>1?`<span class="page-thumb-parts">全${partCount}枚</span>`:''}</div><div class="page-thumb-copy"><strong title="${escapeAttr(displayTitle)}">${escapeHtml(displayTitle)}</strong><span title="${escapeAttr(source)}">${escapeHtml(source)}</span>${warnings.length?`<div class="page-warning">${warnings.map(escapeHtml).join('<br>')}</div>`:''}</div><div class="page-thumb-meta"><span>${!hasPdf?pdfStatusForPage(p):''}</span><span class="page-thumb-settings-summary">${hasPdf?`<button tabindex="-1" class="btn ghost compact page-thumb-preview" type="button" data-preview-page="${escapeAttr(pid)}">プレビュー</button>`:''}<button tabindex="-1" class="btn ghost compact page-thumb-edit" type="button" data-thumb-edit aria-label="${escapeAttr(`${displayTitle}の設定を編集`)}" aria-controls="${escapeAttr(editorId)}" aria-expanded="false">${iconUse('i-edit')}設定</button></span></div><div id="${escapeAttr(editorId)}" class="page-thumb-editor" data-thumb-editor hidden><label>ページ名<input data-thumb-page-title value="${escapeAttr(p.title||'')}" data-original-value="${escapeAttr(p.title||'')}"></label><label>元PDFから使う範囲（複数ページの場合）<input data-thumb-page-range value="${escapeAttr(range)}" data-original-value="${escapeAttr(range)}" placeholder="すべて（例: 2-5）" inputmode="numeric"></label><label>ページ番号<select data-thumb-page-numbering data-original-value="${escapeAttr(numbering)}"><option value="auto" ${numbering==='auto'?'selected':''}>自動</option><option value="none" ${numbering==='none'?'selected':''}>表示なし</option><option value="visible" ${numbering==='visible'?'selected':''}>表示</option></select></label><div class="page-thumb-editor-actions"><button class="btn ghost compact" type="button" data-thumb-cancel>取消</button><button class="btn primary compact" type="button" data-thumb-save>保存</button></div></div></article>`;
 }
 
 // pageNumber は変換PDF内のページ番号（physicalPages の sourcePdfPageNumber）。見開きでは
-// 複数ページのシートの2枚目以降も描く。サムネイル表示は従来どおり1枚目。
+// 複数ページのシートの2枚目以降も描く。サムネイル表示は使用ページ範囲の先頭（pageFirstSourcePage）。
 function pageDocumentCacheKey(page){const workbook=getWorkbook(page?.workbookId);return `${resolvedPageId(page)}|${String(page?.contentPdf||'')}|${String(workbook?.lastRenderedSnapshotId||'')}|${String(workbook?.lastRenderedVersionId||workbook?.lastRenderedAt||'')}`;}
 function pageThumbnailCacheKey(page,pageNumber=1){return `${pageDocumentCacheKey(page)}|p${Math.max(1,Math.floor(Number(pageNumber)||1))}`;}
 // 変換PDFの文書を借りる。返す release() を必ず呼ぶ。使用中（refs>0）の文書は追い出さない。
