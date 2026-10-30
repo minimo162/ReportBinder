@@ -2151,6 +2151,19 @@ function New-WorksheetPageId([string]$WorkbookId, [string]$SheetName) {
     return "$WorkbookId-$(Get-WorksheetStorageStem $SheetName)"
 }
 
+# 改名を引き継いだページは旧名から作ったIDを持ち続ける。後から同じ名前のシートが
+# 現れると同じIDになり、items の重複で structure.json の保存が拒否される。
+function New-UniqueWorksheetPageId($Structure, [string]$WorkbookId, [string]$SheetName) {
+    $base = New-WorksheetPageId $WorkbookId $SheetName
+    if ([string]::IsNullOrWhiteSpace($base)) { return $base }
+    $used = @{}
+    foreach ($page in @(Get-Array $Structure.pages)) { $used[(Resolve-PageId $page)] = $true }
+    $pageId = $base
+    $n = 2
+    while ($used.ContainsKey($pageId)) { $pageId = "$base-$n"; $n++ }
+    return $pageId
+}
+
 function Get-PageSheetIndex($Page) {
     $value = Get-DataProperty $Page 'sheetIndex' $null
     $parsed = 0
@@ -3643,25 +3656,68 @@ function Sort-NumericPagesWithinAnchors($Pages, $WorkbookMap) {
     return $result.ToArray()
 }
 
-function Set-ExcludedSheetPagesNotRendered($Structure, [string]$WorkbookId, [string[]]$ExcludedSheetNames, [string]$SelectionMode = 'numeric-only') {
-    if ((Normalize-ExcelSheetSelection $SelectionMode) -ne 'numeric-only') { return }
+# 半角数字だけのPDF化で対象外になったシート（半角数字以外・非表示）のページを
+# ページ構成から外す。以前は未振り分けへ戻して残していたが、一度もPDF化して
+# いない対象外シートはページにならないのに、PDF化済みだったシートだけが
+# 「出力しない」ページとして未振り分けに残り続け、件数と出力前の確認に出続けた。
+# 呼び出し側は外す前に復元ポイントを残すこと。外したページを返す。
+function Remove-SheetSelectionExcludedPages($Structure, [string]$WorkbookId, [string[]]$ExcludedSheetNames, [string]$SelectionMode = 'numeric-only') {
+    if ((Normalize-ExcelSheetSelection $SelectionMode) -ne 'numeric-only') { return @() }
     $excluded = @($ExcludedSheetNames | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($excluded.Count -eq 0) { return }
+    if ($excluded.Count -eq 0) { return @() }
     $excludedSet = @{}
     foreach ($name in $excluded) { $excludedSet[$name] = $true }
-    foreach ($page in @(Get-Array $Structure.pages | Where-Object { [string](Get-DataProperty $_ 'workbookId' '') -eq $WorkbookId })) {
+    $kept = @(); $removed = @()
+    foreach ($page in @(Get-Array $Structure.pages)) {
         $name = [string](Get-DataProperty $page 'sheetName' '')
-        if (-not $excludedSet.ContainsKey($name)) { continue }
-        # 配置・ページ名・ページ番号・使用範囲は保持する。今回の限定変換で古い
-        # contentPdfだけを再利用しないため、出力対象のアーティファクトを外す。
-        Set-NoteProperty $page 'volume' 'none'
-        Set-NoteProperty $page 'enabled' $false
-        Set-NoteProperty $page 'contentPdf' $null
-        Set-NoteProperty $page 'status' 'not-rendered'
-        Set-NoteProperty $page 'warnings' @('今回のPDF変換では半角数字シートだけを対象にしたため、PDF未作成です。')
-        Set-NoteProperty $page 'sheetSelectionExcluded' $true
-        Set-NoteProperty $page 'updatedAt' (New-NowIso)
+        if ([string](Get-DataProperty $page 'workbookId' '') -eq $WorkbookId -and $excludedSet.ContainsKey($name)) { $removed += $page }
+        else { $kept += $page }
     }
+    if ($removed.Count -gt 0) { $Structure.pages = @($kept) }
+    return @($removed)
+}
+
+# 以前の版が未振り分けへ戻して残したページ（上の関数の旧動作の残骸）を整理する。
+# 最後のPDF化が半角数字だけで、そのとき対象外として未振り分けへ移され、その後
+# PDF化も振り分けもされていないページだけを対象にする。出力先へ移したページや
+# 変換PDFのあるページには触れない。一式ごとに復元ポイントを残してから外す。
+function Remove-SheetSelectionResiduePages([string]$Language, $Structure) {
+    $numericOnly = @{}
+    foreach ($wb in @(Get-Array $Structure.workbooks)) {
+        if ([string](Get-DataProperty $wb 'sourceType' 'excel') -ne 'excel') { continue }
+        $mode = 'all-visible'
+        try { $mode = Normalize-ExcelSheetSelection ([string](Get-DataProperty $wb 'lastRenderedSheetSelectionMode' 'all-visible')) } catch { $mode = 'all-visible' }
+        if ($mode -eq 'numeric-only') { $numericOnly[[string](Get-DataProperty $wb 'workbookId' '')] = $wb }
+    }
+    $byPack = [ordered]@{}
+    foreach ($page in @(Get-Array $Structure.pages)) {
+        $workbookId = [string](Get-DataProperty $page 'workbookId' '')
+        if (-not $numericOnly.ContainsKey($workbookId)) { continue }
+        if (-not [bool](Get-DataProperty $page 'sheetSelectionExcluded' $false)) { continue }
+        if (-not [string]::IsNullOrWhiteSpace([string](Get-DataProperty $page 'contentPdf' ''))) { continue }
+        $unassigned = ([string](Get-DataProperty $page 'volume' 'none') -eq 'none' -or (Get-DataProperty $page 'enabled' $true) -eq $false)
+        if (-not $unassigned) { continue }
+        $packId = Get-WorkbookPackId $numericOnly[$workbookId]
+        if (-not $byPack.Contains($packId)) { $byPack[$packId] = @() }
+        $byPack[$packId] += $page
+    }
+    $removedIds = @{}
+    foreach ($packId in @($byPack.Keys)) {
+        $snapshotId = Save-LayoutSnapshot $Language $packId 'sheet-selection-cleanup' $Structure
+        # 復元ポイントを残せない一式は、次の起動まで整理しない。
+        if ([string]::IsNullOrWhiteSpace($snapshotId)) { continue }
+        foreach ($page in @($byPack[$packId])) { $removedIds[(Resolve-PageId $page)] = $true }
+    }
+    if ($removedIds.Count -eq 0) { return @() }
+    $removed = @(Get-Array $Structure.pages | Where-Object { $removedIds.ContainsKey((Resolve-PageId $_)) })
+    $Structure.pages = @(Get-Array $Structure.pages | Where-Object { -not $removedIds.ContainsKey((Resolve-PageId $_)) })
+    foreach ($packId in @($byPack.Keys)) {
+        try {
+            $pack = (Resolve-DocumentPackScope $Structure $packId $true).pack
+            foreach ($volume in @(Get-PackVolumeList $Language $pack $true)) { [void](Renumber-VolumeOrder $Structure $volume $packId) }
+        } catch { }
+    }
+    return @($removed)
 }
 
 function Render-Source([string]$Language, [string]$SourceId, $SharedHost = $null, [bool]$KeepHostOpen = $false, [scriptblock]$ProgressCallback = $null,
@@ -4157,6 +4213,19 @@ function Initialize-Or-MigrateStructure([string]$Language, [string]$DataDir = ''
         if ($version -eq 3) {
             $lastGood = Join-Path $workspace 'structure.json.last-good'
             if (-not (Test-Path -LiteralPath $lastGood)) { Write-JsonFile $lastGood $structure }
+            # 以前の版が未振り分けに残した対象外シートのページを整理する。復元ポイントは
+            # 設定済みの作業フォルダーに書くので、初回設定で別のフォルダーを準備している
+            # ときは行わない（次の起動で整理する）。
+            $sameWorkspace = $false
+            try { $sameWorkspace = ([IO.Path]::GetFullPath((Get-WorkspacePath $Language)) -eq [IO.Path]::GetFullPath($workspace)) } catch { $sameWorkspace = $false }
+            if ($sameWorkspace) {
+                $residue = @(Remove-SheetSelectionResiduePages $Language $structure)
+                if ($residue.Count -gt 0) {
+                    Write-StructureUnlocked $Language $structure $DataDir
+                    $Script:StructureReadCache.Clear()
+                    return [ordered]@{ created=$false; migrated=$false; removedSheetSelectionResiduePageCount=$residue.Count }
+                }
+            }
             return [ordered]@{ created=$false; migrated=$false }
         }
         $backups = @()
@@ -4441,9 +4510,13 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
     # Ctrl+Z からの復元経路も生き残る。
     $renameBySheetKey = @{}
     if ($removed.Count -gt 0) {
+        # 半角数字だけのPDF化で対象外になった新しい名前（例: 3→参考）へは引き継がない。
+        # 引き継ぐと旧ページが対象外のシートとして残り、未振り分けから消えなくなる。
+        # 非表示のシートは従来どおり引き継ぐ（表示中の全シートでは配置を保つため）。
         $newSheets = @($sortedSheets | Where-Object {
             $name = [string](Get-DataProperty $_ 'sheetName' '')
-            $name -and (-not $knownBySheet.ContainsKey($name.ToLowerInvariant()))
+            $key = $name.ToLowerInvariant()
+            $name -and (-not $knownBySheet.ContainsKey($key)) -and ($selected.ContainsKey($key) -or $hiddenNames.ContainsKey($key))
         })
         $pool = New-Object System.Collections.ArrayList
         foreach ($page in $removed) { [void]$pool.Add($page) }
@@ -4526,7 +4599,7 @@ function Update-WorkbookPagesFromInspection([string]$Language, $Structure, $Work
         # never been rendered. Existing records above retain their settings.
         if (-not $selected.ContainsKey($sheetKey)) { continue }
 
-        $pageId = New-WorksheetPageId $workbookId $sheet
+        $pageId = New-UniqueWorksheetPageId $Structure $workbookId $sheet
         $page = [pscustomobject][ordered]@{
             pageId=$pageId; workbookId=$workbookId; sheetName=$sheet; sheetIndex=$sheetIndex
             titleSource='A1'; detectedTitle=$title; title=$title
@@ -6176,14 +6249,19 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                 throw 'PDFを作成できませんでした。Excelの印刷設定または対象シートを確認してください。'
             }
             if ($ExcelSheetSelection -eq 'numeric-only' -and $excludedSheetNames.Count -gt 0) {
-                $warnings += "半角数字以外または非表示のExcelシート $($excludedSheetNames.Count) 件は今回のPDFに含めず、既存ページを未振り分けに戻しました。"
+                $warnings += "半角数字以外または非表示のExcelシート $($excludedSheetNames.Count) 件は今回のPDFに含めていません。"
             }
 
             # This copy is used only for the response/warning summary. The real
             # snapshot and layout mutation happen once, against the latest
             # structure, inside Update-StructureLocked below.
             $pageSync = Update-WorkbookPagesFromInspection $Language $structure $wb $allSheetInfos $allSheetNames $targetSheetNames $hiddenSheetNames $false
-            Set-ExcludedSheetPagesNotRendered $structure $WorkbookId $excludedSheetNames $ExcelSheetSelection
+            $selectionRemovedPages = @(Remove-SheetSelectionExcludedPages $structure $WorkbookId $excludedSheetNames $ExcelSheetSelection)
+            if ($selectionRemovedPages.Count -gt 0) {
+                $selectionRemovedLabel = [string]::Join('、', @($selectionRemovedPages | ForEach-Object { [string](Get-DataProperty $_ 'sheetName' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }))
+                $warnings += "PDF化の対象外になったシートのページをページ構成から外しました: $selectionRemovedLabel（シート名を半角数字に戻すか再表示してPDFを作成すると、ページとして戻ります）"
+                $steps += "対象外シートのページを削除: $selectionRemovedLabel"
+            }
             $selectionPack = (Resolve-DocumentPackScope $structure (Get-WorkbookPackId $wb) $true).pack
             foreach ($selectionVolume in @(Get-PackVolumeList $Language $selectionPack $true)) { [void](Renumber-VolumeOrder $structure $selectionVolume (Get-WorkbookPackId $wb)) }
             $removedPages = @(Get-Array (Get-DataProperty $pageSync 'removedPages' @()))
@@ -6211,8 +6289,9 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
             Set-WorkbookRenderedSheetSnapshot $wb (Get-DataProperty $pageSync 'sheetNames' @())
             $pages = @(Get-Array $structure.pages)
             foreach ($r in $rendered) {
-                $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
-                $p = @($pages | Where-Object { (Resolve-PageId $_) -eq $pageId -or ([string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq [string]$r.sheetName) } | Select-Object -First 1)
+                # シート名だけで探す。旧形式のID（例: wb-3）で探すと、3 から改名した
+                # ページが新しい「3」のPDFを受け取ってしまう（IDは改名後も旧名のまま）。
+                $p = @($pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq [string]$r.sheetName } | Select-Object -First 1)
                 if ($p.Count -gt 0) {
                     $rel = Get-RelativePathCompat $workspace ([string]$r.pdf)
                     Set-NoteProperty ($p[0]) 'contentPdf' $rel
@@ -6257,24 +6336,22 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
                     $excludedSetLocked = @{}; foreach ($excludedName in $excludedSheetNames) { $excludedSetLocked[[string]$excludedName] = $true }
                     $excludedPagesLocked = @(Get-Array $st.pages | Where-Object { [string]$_.workbookId -eq $WorkbookId -and $excludedSetLocked.ContainsKey([string]$_.sheetName) })
                     $selectionAffectedVolumesLocked = @($excludedPagesLocked | Where-Object { [string]$_.volume -and [string]$_.volume -ne 'none' } | ForEach-Object { [string]$_.volume } | Select-Object -Unique)
-                    $selectionNeedsSnapshotLocked = @($excludedPagesLocked | Where-Object { ([string]$_.volume -and [string]$_.volume -ne 'none') -or $_.enabled -ne $false }).Count -gt 0
+                    # 対象外のページは削除するので、未振り分けにあるだけのページでも復元ポイントを残す。
+                    $selectionNeedsSnapshotLocked = $excludedPagesLocked.Count -gt 0
                     if ($selectionNeedsSnapshotLocked) { [void](Save-LayoutSnapshot $Language (Get-WorkbookPackId $lw) 'sheet-selection' $st) }
                 }
                 # If the numeric exclusion already made a restore point, let it
                 # cover simultaneous rename/removal changes too. Otherwise the
                 # normal source-sheet change path creates its one snapshot.
                 $sync=Update-WorkbookPagesFromInspection $Language $st $lw $allSheetInfos $allSheetNames $targetSheetNames $hiddenSheetNames (-not $selectionNeedsSnapshotLocked)
-                Set-ExcludedSheetPagesNotRendered $st $WorkbookId $excludedSheetNames $ExcelSheetSelection
+                $selectionRemovedLocked = @(Remove-SheetSelectionExcludedPages $st $WorkbookId $excludedSheetNames $ExcelSheetSelection)
+                if ($sync -is [System.Collections.IDictionary]) { $sync['selectionRemovedPageIds'] = @($selectionRemovedLocked | ForEach-Object { Resolve-PageId $_ }) }
                 $selectionPackLocked = (Resolve-DocumentPackScope $st (Get-WorkbookPackId $lw) $true).pack
                 foreach ($selectionVolume in @(Get-PackVolumeList $Language $selectionPackLocked $true)) { [void](Renumber-VolumeOrder $st $selectionVolume (Get-WorkbookPackId $lw)) }
                 foreach ($r in $rendered) {
-                    $pageId = "$WorkbookId-$([regex]::Replace([string]$r.sheetName, '[^0-9A-Za-z]+', '-'))"
-                    # Unrestricted worksheet names use stable hashed page IDs. The legacy
-                    # sanitized ID above cannot identify Japanese-only names, so retain the
-                    # same workbook/sheet fallback used by the in-memory render result.
+                    # シート名だけで探す（上の応答用の処理と同じ理由で旧形式のIDは使わない）。
                     $pg = @(Get-Array $st.pages | Where-Object {
-                        (Resolve-PageId $_) -eq $pageId -or
-                        ([string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq [string]$r.sheetName)
+                        [string]$_.workbookId -eq $WorkbookId -and [string]$_.sheetName -eq [string]$r.sheetName
                     } | Select-Object -First 1)
                     if ($pg.Count) {
                         Set-NoteProperty $pg[0] 'contentPdf' (Get-RelativePathCompat $workspace ([string]$r.pdf))
@@ -8059,8 +8136,10 @@ function Get-FinalBuildFingerprint($Snapshot) { return [string](Get-DataProperty
 # ファイル（H-1）、手で差し替えたり編集したりしたファイルを「最新」として発行しない。
 # 確定は構成のロックの中で行うので、作業ファイルのうちに求めたハッシュを渡せる
 # （置き換えは移動なので中身は同じ）。大きなPDFをロックの中で読み直さない。
+# Get-Item は -Force が無いと隠しファイルを返さない（Test-Path は見つける）。出力したPDFに
+# 隠し属性が付いていると、あるのに「見つかりません」になるため、照合では必ず -Force を付ける。
 function Get-OutputPdfIntegrity([string]$Path, [string]$KnownHash = '') {
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $hash = if ([string]::IsNullOrWhiteSpace($KnownHash)) { New-Sha256 $Path } else { $KnownHash }
     return [ordered]@{ size=[int64]$item.Length; lastWriteUtcTicks=[string]$item.LastWriteTimeUtc.Ticks; sha256=(Normalize-FileHash $hash) }
 }
@@ -8069,7 +8148,7 @@ function Get-OutputPdfIntegrity([string]$Path, [string]$KnownHash = '') {
 function Get-OutputPdfIntegrityProblem($State, [string]$Path, [bool]$CheckHash = $false) {
     $record = Get-DataProperty $State 'outputIntegrity' $null
     if ($null -eq $record) { return $null }
-    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if ($null -eq $item) { return '出力したPDFが見つかりません。' }
     if ([int64]$item.Length -ne [int64](Get-DataProperty $record 'size' -1) -or [string]$item.LastWriteTimeUtc.Ticks -ne [string](Get-DataProperty $record 'lastWriteUtcTicks' '')) {
         return '出力したPDFが、出力した後に変更または上書きされています。'

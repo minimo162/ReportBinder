@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -106,10 +106,32 @@ for _ps1 in sorted((root/'app').rglob('*.ps1')):
 # Windows PowerShell 5.1 は BOM の無い .ps1 を ANSI として読む。日本語の文字列を
 # 照合する検査スクリプトでは、照合する側だけが化けて検査が必ず失敗する（または空振りする）。
 # 一覧に無いものも含め、ASCII 以外の文字を含む .ps1 はすべて BOM 付きにする。
-for _ps1 in sorted((root/'app').rglob('*.ps1')):
+# tests/ の .ps1 も CI の門で powershell.exe -File により実行されるため対象にする。
+for _ps1 in sorted([*(root/'app').rglob('*.ps1'), *(root/'tests').rglob('*.ps1')]):
     _raw = _ps1.read_bytes()
     if not _raw.startswith(b'\xef\xbb\xbf') and any(byte > 0x7f for byte in _raw):
         raise SystemExit(f'PowerShell with non-ASCII text must be UTF-8 BOM: {_ps1.relative_to(root).as_posix()}')
+# 関数が return @(...) しても、出力はパイプラインで展開され、1件なら配列でなくなる。
+# Windows PowerShell 5.1 では単独の PSCustomObject に .Count が無く（$null になる。6.1 で追加）、
+# pwsh 7 では通る件数の比較が Windows だけで外れる。コマンドの結果に .Count・[n] を
+# 使うときは @() で包む。意図して単独のオブジェクトを数えるときは行末に # ps51-count-ok を付ける。
+# 1件のオブジェクト（コレクション自体・ファイル情報など）を返すものは対象外。
+# Get-DataProperty は保存値（主に辞書）をそのまま返す。配列の値は呼び出し側が Get-Array で包む。
+_ps_command = r'(?!(?:New-Object|Get-Item|Get-Date|Join-Path|Split-Path|ConvertFrom-Json|Get-DataProperty)\b)[A-Z][A-Za-z]*-[A-Z][A-Za-z0-9]*'
+for _ps1 in sorted([*(root/'app').rglob('*.ps1'), *(root/'tests').rglob('*.ps1')]):
+    _lines = _ps1.read_text(encoding='utf-8-sig').splitlines()
+    for _lineno, _line in enumerate(_lines, 1):
+        if '# ps51-count-ok' in _line: continue
+        _where = f'{_ps1.relative_to(root).as_posix()}:{_lineno}'
+        if re.search(r'(?<![@$\w])\(\s*' + _ps_command + r'\b[^()\r\n]*(?:\([^()\r\n]*\)[^()\r\n]*)*\)(?:\.Count\b|\[\d+\])', _line):
+            raise SystemExit(f'wrap command output in @() before .Count/[n] (Windows PowerShell 5.1): {_where}')
+        _assigned = re.match(r'\s*(\$\w+)\s*=\s*' + _ps_command + r'\b', _line)
+        if not _assigned: continue
+        _var = re.escape(_assigned.group(1))
+        for _next in _lines[_lineno:_lineno + 10]:
+            if re.match(r'\s*' + _var + r'\s*=', _next) or '# ps51-count-ok' in _next: break
+            if re.search(_var + r'(?:\.Count\b|\[\d+\])', _next):
+                raise SystemExit(f'wrap command output in @() before .Count/[n] (Windows PowerShell 5.1): {_where}')
 
 launcher_cmd=(root/'資料をPDFにまとめる.cmd').read_text(encoding='utf-8-sig')
 for needed in ['app\\launch.ps1', 'start "" /b', 'powershell.exe']:
@@ -123,6 +145,12 @@ for needed in ['app\\tools\\package-release.ps1', '-SharedFolderOnly', 'pause']:
         raise SystemExit(f'shared-folder CMD regression: {needed}')
 
 server=(root/'app/server.ps1').read_text(encoding='utf-8-sig')
+# 出力したPDFの照合（M-2）は、隠し属性の付いたPDFも見つけなければならない。
+# Get-Item は -Force が無いと隠しファイルを返さず、Windows で「出力したPDFが見つかりません」になる。
+_integrity_at=server.find('function Get-OutputPdfIntegrity(')
+_integrity=server[_integrity_at:server.find('function Get-FinalBuildReadiness', _integrity_at)]
+if _integrity_at < 0 or _integrity.count('Get-Item -LiteralPath $Path -Force') != 2:
+    raise SystemExit('output PDF integrity checks must use Get-Item -Force so hidden PDFs are found')
 
 
 for needle in [
@@ -2122,6 +2150,10 @@ _locked_render_commit = server.split('$pageSync = Update-StructureLocked $Langua
 for needed in ['[string]$_.workbookId -eq $WorkbookId', '[string]$_.sheetName -eq [string]$r.sheetName']:
     if needed not in _locked_render_commit:
         raise SystemExit(f'unrestricted worksheet render commit fallback missing: {needed}')
+# 旧形式のID（<原稿>-<数字>）でPDFの書き戻し先を探すと、改名したページが同じ名前の
+# 新しいシートのPDFを受け取る。シート名だけで探す。振る舞いは tests/sheet-assignment-regression.ps1。
+if "[regex]::Replace([string]$r.sheetName" in server.split('function Render-Workbook(',1)[1].split('\nfunction ',1)[0]:
+    raise SystemExit('rendered PDFs must be matched to pages by sheet name, not by the legacy page ID')
 for needed in ['未振り分け（出力しない）', '出力先へ移したページだけ',
                '半角数字順に並べ直す', '未振り分けへ戻す', 'assignment-guide']:
     if needed not in html + appjs:
@@ -2774,7 +2806,8 @@ for needed in [
     "lastRenderedSheetSelectionMode",
     "excelSheetSelectionMode",
     "sheetSelectionByWorkbook",
-    'Set-ExcludedSheetPagesNotRendered',
+    'Remove-SheetSelectionExcludedPages',
+    'Remove-SheetSelectionResiduePages',
     "PDFやページ構成は変更していません",
     "sheetSelectionExcluded",
     "noNumericTarget",
@@ -2790,13 +2823,16 @@ for needed in [
     if needed not in server and needed not in appjs:
         raise SystemExit(f'numeric-sheet selection regression coverage missing: {needed}')
 _numeric_render = server.split('function Render-Workbook(', 1)[1].split('\nfunction ', 1)[0]
-for needed in ["$ExcelSheetSelection -eq 'numeric-only'", 'targetSheetNames.Count -eq 0', 'Update-WorkbookPagesFromInspection', 'Set-ExcludedSheetPagesNotRendered']:
+for needed in ["$ExcelSheetSelection -eq 'numeric-only'", 'targetSheetNames.Count -eq 0', 'Update-WorkbookPagesFromInspection', 'Remove-SheetSelectionExcludedPages']:
     if needed not in _numeric_render:
         raise SystemExit(f'numeric-only render safety missing: {needed}')
-_numeric_excluded = server.split('function Set-ExcludedSheetPagesNotRendered', 1)[1].split('\nfunction ', 1)[0]
-for needed in ["volume' 'none", "enabled' $false", "sheetSelectionExcluded"]:
-    if needed not in _numeric_excluded:
-        raise SystemExit(f'excluded sheet page preservation missing: {needed}')
+# 対象外になったシートのページは未振り分けへ戻さずページ構成から外す。戻すと
+# PDF化済みだったシートだけが「出力しない」ページとして残り続けた。
+_numeric_excluded = server.split('function Remove-SheetSelectionExcludedPages', 1)[1].split('\nfunction ', 1)[0]
+if '$Structure.pages = @($kept)' not in _numeric_excluded or "volume' 'none" in _numeric_excluded:
+    raise SystemExit('excluded sheet pages must be removed, not parked in the unassigned lane')
+if "Remove-SheetSelectionResiduePages $Language $structure" not in server.split('function Initialize-Or-MigrateStructure', 1)[1].split('\nfunction ', 1)[0]:
+    raise SystemExit('leftover excluded pages from older builds must be cleaned when the workspace is opened')
 _numeric_job = server.split('function Invoke-RenderJobFromFile', 1)[1].split('\nfunction ', 1)[0]
 if 'sheetSelectionByWorkbook' not in _numeric_job or 'Render-Source $language $id $excel $true $callback' not in _numeric_job:
     raise SystemExit('render jobs must pin and pass sheet selection mode through Render-Source')

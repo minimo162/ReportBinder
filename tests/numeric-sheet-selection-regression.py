@@ -418,15 +418,10 @@ def test_production_server_contracts():
     assert "Sort-PagesByNumericDefault $withNew" in insertion
     rank_helper = extract_ps_function(server, "Get-NumericSheetSortRank")
     assert "length = $ordinal.Length" in rank_helper and "ordinal = $ordinal" in rank_helper
-    excluded = extract_ps_function(server, "Set-ExcludedSheetPagesNotRendered")
-    for statement in (
-        "Set-NoteProperty $page 'volume' 'none'",
-        "Set-NoteProperty $page 'enabled' $false",
-        "Set-NoteProperty $page 'contentPdf' $null",
-        "Set-NoteProperty $page 'status' 'not-rendered'",
-        "Set-NoteProperty $page 'sheetSelectionExcluded' $true",
-    ):
-        assert statement in excluded, f"production exclusion contract missing: {statement}"
+    excluded = extract_ps_function(server, "Remove-SheetSelectionExcludedPages")
+    # Excluded sheets leave the page composition instead of staying in none.
+    assert "$Structure.pages = @($kept)" in excluded
+    assert "Set-NoteProperty $page 'volume' 'none'" not in excluded
     comparison = extract_ps_function(server, "Render-SnapshotForComparison")
     assert "Get-SnapshotRenderSheetSelection" in comparison
     assert "$BaselineVersionId" in comparison

@@ -74,7 +74,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 }
 ```
 
-`numeric-only`のPDF作成では、非該当または非表示の既存Excelページの`pageId`・ページ名・番号・使用範囲などの設定を保持したまま、`contentPdf`を消去し、`status=not-rendered`、`sheetSelectionExcluded=true`、`volume=none`、`enabled=false`にする。`all-visible`へ戻すと再び表示シートをPDF化する。Excelから変換PDFへ書き出す処理自体は、シートと分割PDFの対応を保つためタブ順で行う。ページ構成の初期配置と、画面上の「半角数字順に並べ直す」は、半角数字シートを数値順に配置する。
+`numeric-only`のPDF作成では、非該当または非表示になった既存Excelページを、復元ポイント（`sheet-selection`）を残してページ構成から外す。未振り分けには残さない。半角数字のシートを改名して非該当になった場合も、旧名のページを改名後のシートへ引き継がずに外す。シート名を半角数字へ戻すか再表示して再度PDF化すると、シート名から決まる同じ`pageId`の新しいページとして戻る。以前の版が`volume=none`・`sheetSelectionExcluded=true`で残したページ（変換PDFなし、未振り分けのもの）は、起動時の読み込みで復元ポイント（`sheet-selection-cleanup`）を残して整理する。`all-visible`へ戻すと再び表示シートをPDF化する。Excelから変換PDFへ書き出す処理自体は、シートと分割PDFの対応を保つためタブ順で行う。ページ構成の初期配置と、画面上の「半角数字順に並べ直す」は、半角数字シートを数値順に配置する。
 
 既存のECM/BOD/DMM操作は引き続きV4 APIと互換です。組み込みテンプレートの`acceptedSourceTypes`は`excel / word / pdf / powerpoint`です。
 
