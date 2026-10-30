@@ -396,8 +396,20 @@ function getPageByWorkbookSheet(workbookId, sheetName) {
 function volumeReadiness(volume, preset=activePreset) {
   const key=activePackRecord()?.category ? preset : (activePackId||preset);
   return state?.finalReadiness?.[key]?.volumes?.[volume] || {
-    canBuild:false, pageCount:0, status:'not-built', displayState:'not-built', blockers:[], staleReasons:[], outputPdf:'', outputPdfExists:false
+    loaded:false, canBuild:false, pageCount:0, status:'not-built', displayState:'not-built', blockers:[], staleReasons:[], outputPdf:'', outputPdfExists:false
   };
+}
+// readiness の pageCount は manifest に入った物理出力頁数で、変換PDFが未作成だと
+// 振り分け済みでも0になる。出力先に「ページがあるか」は振り分け件数 itemCount で見る。
+// itemCount を返さない古い応答だけ pageCount で代用する。
+function targetItemCount(ready) {
+  const raw=ready?.itemCount ?? ready?.snapshot?.itemCount;
+  if(raw!==undefined&&raw!==null&&raw!=='')return Number(raw)||0;
+  return Number(ready?.pageCount||0);
+}
+// まだ readiness を受け取っていない出力先（volumeReadiness の既定値）。
+function targetReadinessPending(ready) {
+  return !ready||ready.loaded===false;
 }
 function activeReadinessItems() {
   return activeTargetVolumes().map(volume => ({volume, ready:volumeReadiness(volume)})).filter(x => Number(x.ready.pageCount || 0) > 0);
@@ -1526,7 +1538,7 @@ function renderFinalOverview() {
   const entries=activeTargetDefinitions().map(target=>({target,volume:targetVolume(target.targetId),ready:volumeReadiness(targetVolume(target.targetId))}));
   const preflight=renderFinalPreflight(entries);
   const unassigned=Number(preflight?.unassigned||0);
-  const visibleEntries=entries.filter(entry=>entry.target?.required!==false||Number(entry.ready?.pageCount||0)>0);
+  const visibleEntries=entries.filter(entry=>entry.target?.required!==false||targetItemCount(entry.ready)>0);
   const grid=$('final-target-grid');
   // Skip the rebuild when nothing changed. loadFinalPanels() repaints once after
   // its fetch, and blowing away innerHTML for an identical result made the cards
@@ -1537,7 +1549,9 @@ function renderFinalOverview() {
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
     const blockers=asArray(ready.blockers),reasons=asArray(ready.staleReasons).slice(0,3);const display=String(ready.displayState||'not-built');
     let title='提出用PDFは未出力',cls='neutral',body='出力すると、この出力先の提出用PDFを作成します。';
-    if(Number(ready.pageCount||0)===0){title='出力ページがありません';body='ページ構成でこの出力先にページを設定してください。';}
+    const pending=targetReadinessPending(ready),empty=!pending&&!ready.readinessError&&targetItemCount(ready)===0;
+    if(pending){title='出力先の状態を確認中';body='この出力先の状態を読み込んでいます。';}
+    else if(empty){title='出力ページがありません';body='ページ構成でこの出力先にページを設定してください。';}
     else if(display==='blocked'){title='提出用PDFを出力できません';cls='danger';body=`<ul class="blocker-list">${blockers.slice(0,3).map(b=>`<li>${escapeHtml(b.message||'出力条件を確認してください。')}</li>`).join('')}</ul>`;}
     else if(display==='needs-rebuild'){title='再出力が必要';cls='attention';body=reasons.length?`<ul class="reason-list">${reasons.map(r=>`<li><span>${escapeHtml(r.detail||'入力が変更されました')}</span><time>${escapeHtml(formatDateTime(r.at))}</time></li>`).join('')}</ul>`:'入力が変更されています。';}
     else if(display==='output-missing'){title='前回出力が見つかりません';cls='attention';body='ファイルが削除または移動されています。もう一度出力してください。';}
@@ -1545,13 +1559,13 @@ function renderFinalOverview() {
     else if(display==='built'){title='提出用PDFは最新です';body=`最終出力 ${escapeHtml(formatDateTime(ready.lastBuiltAt))}`;}
     const dot=cls==='neutral'?'':'<span class="status-dot"></span>';
     setHtmlIfChanged(box,`<div class="freshness-title ${cls}">${dot}${escapeHtml(title)}</div>${typeof body==='string'&&body.startsWith('<')?body:`<p class="caption">${escapeHtml(body)}</p>`}`);
-    if(btn)btn.disabled=Number(ready.pageCount||0)===0||blockers.length>0;
-    if(fix)fix.classList.toggle('hidden',blockers.length===0||Number(ready.pageCount||0)===0);
+    if(btn)btn.disabled=pending||empty||blockers.length>0;
+    if(fix)fix.classList.toggle('hidden',pending||empty||blockers.length===0);
   };
   // Bind only when the markup was actually replaced: re-running addEventListener
   // on surviving nodes would stack duplicate handlers and fire a second build.
   for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-reveal]')?.addEventListener('click',event=>revealFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
-  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>Number(ready.pageCount||0)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;setClassIfChanged(allBtn,`btn ${activeFinalJobId?'primary busy':'primary'}`);setTextIfChanged(allBtn,hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力');}
+  const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>!targetReadinessPending(ready)&&targetItemCount(ready)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;setClassIfChanged(allBtn,`btn ${activeFinalJobId?'primary busy':'primary'}`);setTextIfChanged(allBtn,hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力');}
   const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));setHtmlIfChanged(history,rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>');}
   renderPackReview();
   renderVolumeLinks();
@@ -1564,18 +1578,23 @@ function renderFinalPreflight(entries=[]) {
   const missingRequired=requiredRequirements.filter(requirement=>!workbooks.some(workbook=>String(workbook?.requirementId||'')===String(requirement?.requirementId||'')&&String(workbook?.status||'')!=='missing'));
   const conversionPending=workbooks.filter(workbook=>!isLatestPdfWorkbook(workbook));
   const unassigned=unresolvedPageCount();
-  const requiredTargets=entries.filter(entry=>entry.target?.required!==false),emptyRequiredTargets=requiredTargets.filter(entry=>Number(entry.ready?.pageCount||0)===0);
-  const blockedTargets=entries.filter(entry=>Number(entry.ready?.pageCount||0)>0&&asArray(entry.ready?.blockers).filter(blocker=>String(blocker?.code||'')!=='no-pages').length>0);
+  // 必須原稿の問題は「必須原稿」「変換PDF」で数えるので、出力先の問題には重ねて数えない。
+  const pendingTargets=entries.filter(entry=>targetReadinessPending(entry.ready)),loadedTargets=entries.filter(entry=>!targetReadinessPending(entry.ready));
+  const requiredTargets=loadedTargets.filter(entry=>entry.target?.required!==false),emptyRequiredTargets=requiredTargets.filter(entry=>!entry.ready?.readinessError&&targetItemCount(entry.ready)===0);
+  const targetBlocker=blocker=>{const code=String(blocker?.code||'');return code!=='no-pages'&&!code.startsWith('required-source-');};
+  const blockedTargets=loadedTargets.filter(entry=>(entry.ready?.readinessError||targetItemCount(entry.ready)>0)&&asArray(entry.ready?.blockers).filter(targetBlocker).length>0);
   const settings=packForPreset()?.settings||{},pattern=String(settings.outputFileNamePattern||'{packName}_{targetName}_{yyyyMMdd}.pdf').trim();
   const checks=[];
   checks.push({label:'必須原稿',state:missingRequired.length?'danger':'ok',detail:requiredRequirements.length?(missingRequired.length?`${missingRequired.length}件が未提出です`:`必要原稿 ${requiredRequirements.length}件を提出済みです`):(requiredWorkbooks.length?`${requiredWorkbooks.length}件を必須原稿として管理しています`:'必須原稿の指定はありません'),view:'excel'});
   checks.push({label:'変換PDF',state:workbooks.length===0||conversionPending.length?'danger':'ok',detail:workbooks.length===0?'原稿がまだ登録されていません':conversionPending.length?`${conversionPending.length}件の作成・更新が必要です`:`${workbooks.length}件すべて最新です`,view:'excel'});
   checks.push({label:'ページ構成',state:unassigned?'attention':'ok',detail:unassigned?`${unassigned}ページが未振り分けです`:'未振り分けページはありません',view:'pages'});
   const targetProblems=emptyRequiredTargets.length+blockedTargets.length;
-  checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':'excel'});
+  // readiness が届く前は判定できないので確認中として出し、出力を止める問題には数えない。
+  if(!targetProblems&&pendingTargets.length)checks.push({label:'出力先',state:'attention',pending:true,detail:'出力先の状態を確認しています',view:'final'});
+  else checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':'excel'});
   checks.push({label:'出力ファイル名',state:pattern?'ok':'danger',detail:pattern?'出力名を設定済み':'出力ファイル名を設定してください',view:'final',focus:'pack-output-pattern'});
   const problems=checks.filter(check=>check.state!=='ok'),completed=checks.filter(check=>check.state==='ok');
-  const problemCount=problems.length,hardProblemCount=problems.filter(check=>check.label!=='ページ構成').length,ready=problemCount===0;
+  const problemCount=problems.length,hardProblemCount=problems.filter(check=>check.label!=='ページ構成'&&!check.pending).length,ready=problemCount===0;
   // The whole block is re-rendered by every renderAll(), so an aria-live region
   // here re-read the full preflight text on unrelated edits. Announce only when
   // the outcome actually changes.
