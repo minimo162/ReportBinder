@@ -404,6 +404,15 @@ for needed in ['grid-template-columns:repeat(auto-fill,minmax(min(100%,232px),1f
                'main.shell.pages-shell .overview-board.thumbnail-board{display:grid;align-items:start;grid-template-columns:repeat(3,minmax(0,1fr))}']:
     if needed not in appjs + css:
         raise SystemExit(f'20-page lane density or pointer scrolling contract missing: {needed}')
+# 「プレビュー」「設定」はサムネイル右の狭い列に置くとカードの外へはみ出す。操作の行は
+# カードの全幅に置いて折り返せるようにし、760px以下ではレーンを1列に積む。
+for needed in ['.thumbnail-board .page-thumb-card{grid-template-areas:"paper copy" "meta meta" "editor editor"}',
+               '.page-thumb-settings-summary{flex:1 1 auto;min-width:0;max-width:100%;flex-wrap:wrap}',
+               '@media(max-width:800px){\n  main.shell.pages-shell .overview-board.thumbnail-board{grid-template-columns:minmax(0,1fr)}']:
+    if needed not in css:
+        raise SystemExit(f'page card actions must stay inside the card: {needed}')
+if '@media(max-width:800px) and (min-width:761px)' in css:
+    raise SystemExit('lanes below 761px must fold to one column')
 if "pages.length>=12?'high-volume':''" in appjs or '.volume-panel.high-volume' in css:
     raise SystemExit('page card geometry must not change at a page-count threshold')
 for needle in ['--accent:#5e6ad2','--sidebar-w:248px','backdrop-filter','box-shadow:none','.badge.attention','background:var(--attention-subtle)','font-weight:600','.modal-card','.drop-placeholder','.notice{position:fixed','.diff-dialog{width:min(1800px,94vw)','.diff-viewers.overlay-mode','@media(max-width:1100px)','.thumbnail-grid','.page-command-bar.has-selection','.page-thumb-editor','.page-thumb-card.editing']:
@@ -1609,7 +1618,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261029_v193', 'style.css?v=20260822_v121']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v194', 'style.css?v=20261030_v122']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1664,7 +1673,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261029_v193' not in html:
+if 'app.js?v=20261030_v194' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1690,7 +1699,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261029_v193' not in html:
+if 'app.js?v=20261030_v194' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1775,6 +1784,11 @@ for needed in ['Get-SafePublishUserName', "Get-Date -Format 'MMdd_HHmmss'",
                "$ready.displayState -ne 'built'"]:
     if needed not in _publish:
         raise SystemExit(f'safe shared publishing is missing: {needed}')
+# 作業用フォルダーの隠し属性は改名しても残る。改名の後に発行フォルダーと中のPDFから外す。
+_move_at = _publish.find('Move-Item -LiteralPath $stagingDir -Destination $publishDir')
+_unhide_at = _publish.find('Clear-PublishHiddenAttribute $_', _move_at)
+if _move_at < 0 or _unhide_at < 0 or 'Clear-PublishHiddenAttribute $stagedPdf' not in _publish:
+    raise SystemExit('the published folder and PDFs must not keep the staging hidden attribute')
 for forbidden in ["Join-Path ([string]$paths.submissionDir) '共有発行'",
                   "Get-Date -Format 'yyyyMMdd_HHmmss'",
                   '$fileName = "{0}_{1}_{2}.pdf"']:
