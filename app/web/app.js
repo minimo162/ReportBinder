@@ -4723,6 +4723,79 @@ function buildSpreadLayout(laneIds, physicalPages, options={}){
   }
   return {cells,spreads,pageCount:position,unknownPageIds,orphanPageIds,uncertainFrom,uncertainReason};
 }
+// 使用ページ範囲の終わり（範囲なし・終わりなしは0＝変換PDFの最後まで）。
+function pageLastSourcePage(page){
+  const range=page?.pageRange;if(!range)return 0;
+  const end=typeof range==='string'?Number((/-\s*(\d+)\s*$/.exec(range)||/^\s*(\d+)\s*$/.exec(range)||[])[1]):Number(range?.end||range?.start);
+  return Number.isFinite(end)&&end>=1?Math.floor(end):0;
+}
+// PDFイメージ表示の頁数表（pageId → {start,count,source,stale,clamped}）。並べ替えでは頁数が
+// 変わらないので、この表と並びだけで物理ページの並びを組める（readiness の再計算を待たない）。
+// 優先順: 1) readiness の physicalPages（全出力先。範囲反映済み） 2) 開いた変換PDFの頁数
+// （observedCounts: pageId → numPages）と使用ページ範囲 3) 不明（1枚分。count=1）。
+// readinessVolumes は physicalPages の配列か readiness（snapshot.physicalPages）の配列。
+// physicalPages は範囲の開始が今の設定と違う・範囲より多い・出力先の間で食い違うときは使わない
+// （範囲を変えた直後で読み直し前）。範囲の終わりが変換PDFの頁数を超えるときは、頁数が
+// 分かっていれば存在する頁までにする（clamped）。stale は変換PDFが原稿より古い（
+// isLatestPdfWorkbook が false）。頁・左右はここでは扱わない（見開きはサーバー値のまま）。
+function collectPdfImagePageCounts(readinessVolumes, observedCounts, pages){
+  const found=new Map(),conflicts=new Set();
+  for(const volume of (Array.isArray(readinessVolumes)?readinessVolumes:[])){
+    const list=Array.isArray(volume)?volume:(Array.isArray(volume?.snapshot?.physicalPages)?volume.snapshot.physicalPages:[]);
+    const groups=new Map();
+    for(const entry of list){
+      const id=String(entry?.pageId||'');if(!id)continue;
+      const number=Number(entry?.sourcePdfPageNumber)||0,group=groups.get(id)||{start:0,count:0,entries:0};
+      if(number>0&&(!group.start||number<group.start))group.start=number;
+      group.count=Math.max(group.count,Number(entry?.pagePartCount)||0);group.entries++;
+      groups.set(id,group);
+    }
+    for(const [id,group] of groups){
+      const count=Math.max(group.count,group.entries),previous=found.get(id);
+      if(previous&&(previous.start!==group.start||previous.count!==count))conflicts.add(id);
+      found.set(id,{start:group.start,count});
+    }
+  }
+  const observed=observedCounts instanceof Map?observedCounts:new Map();
+  const counts=new Map();
+  for(const page of (Array.isArray(pages)?pages:[])){
+    const id=resolvedPageId(page);if(!id)continue;
+    const workbook=getWorkbook(page?.workbookId),stale=!!(workbook&&!isLatestPdfWorkbook(workbook));
+    const start=pageFirstSourcePage(page),end=pageLastSourcePage(page),numPages=Math.floor(Number(observed.get(id))||0);
+    const clamp=(count,source)=>{
+      if(numPages>0&&start+count-1>numPages)return {start,count:Math.max(0,numPages-start+1),source,stale,clamped:true};
+      return {start,count,source,stale,clamped:false};
+    };
+    if(!page?.contentPdf){counts.set(id,{start,count:1,source:'unknown',stale,clamped:false});continue;}
+    const server=found.get(id);
+    if(server&&server.count>0&&!conflicts.has(id)&&server.start===start&&!(end&&server.count>end-start+1)){counts.set(id,clamp(server.count,'server'));continue;}
+    if(numPages>0){counts.set(id,clamp(end?Math.max(0,end-start+1):Math.max(0,numPages-start+1),'observed'));continue;}
+    counts.set(id,{start,count:1,source:'unknown',stale,clamped:false});
+  }
+  return counts;
+}
+// PDFイメージ表示の並び（1出力先＝1つのPDF）。laneIds は出力先の並び（未振り分けは渡さない）、
+// counts は collectPdfImagePageCounts の結果。頁数の分からないページは1枚分の場所を取り、
+// 不明・古い変換PDF・readiness 待ち（options.pending）があれば approximate（「約 N ページ」）。
+// 頁・左右は持たない（buildSpreadLayout のサーバー確定値の契約には触れない）。
+function buildPdfImageLayout(laneIds, counts, options={}){
+  const table=counts instanceof Map?counts:new Map();
+  const ids=(Array.isArray(laneIds)?laneIds:[]).map(id=>String(id||'')).filter(Boolean);
+  const sheets=[],unknownPageIds=[],stalePageIds=[],clampedPageIds=[];
+  ids.forEach((pageId,laneIndex)=>{
+    const entry=table.get(pageId),stale=!!entry?.stale;
+    if(stale)stalePageIds.push(pageId);
+    if(!entry||entry.source==='unknown'){
+      unknownPageIds.push(pageId);
+      sheets.push({pageId,laneIndex,partIndex:1,partCount:1,sourcePdfPageNumber:Math.max(1,Number(entry?.start)||1),unknown:true,stale});
+      return;
+    }
+    if(entry.clamped)clampedPageIds.push(pageId);
+    const start=Math.max(1,Number(entry.start)||1),count=Math.max(0,Math.floor(Number(entry.count)||0));
+    for(let index=0;index<count;index++)sheets.push({pageId,laneIndex,partIndex:index+1,partCount:count,sourcePdfPageNumber:start+index,unknown:false,stale});
+  });
+  return {sheets,pageCount:sheets.length,approximate:!!(unknownPageIds.length||stalePageIds.length||options.pending),unknownPageIds,stalePageIds,clampedPageIds};
+}
 function spreadReadinessSignature(){
   return activeTargetVolumes().map(volume=>{
     const ready=volumeReadiness(volume),snapshot=ready?.snapshot||{};
