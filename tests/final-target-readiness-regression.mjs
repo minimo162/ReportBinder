@@ -153,4 +153,91 @@ assert.ok(renderFinalBody.includes('!targetReadinessPending(ready)&&targetItemCo
 assert.ok(!/Number\(ready\.pageCount\|\|0\)===0/.test(renderFinalBody), 'card must not judge emptiness by physical pageCount');
 assert.ok(source.includes("entry.target?.required!==false||targetItemCount(entry.ready)>0"), 'optional targets must be shown by itemCount');
 
+// ---- 出力完了の前に始まった readiness 要求を、完了後の表示に使わない ----
+// 症状: PDFを何度作成しても「再出力が必要」のまま、再起動で直る。
+// loadFinalPanels({force:true}) が進行中の古い要求を使い回し、出力前の応答で表示していた。
+async function readinessHarness() {
+  const requests = [];
+  const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+  const api = url => {
+    if (!url.includes('readiness')) return Promise.resolve({});
+    const d = deferred();
+    requests.push({ url, resolve: status => d.resolve({ volumes: { 'ja-main': { status, displayState: status } } }) });
+    return d.promise;
+  };
+  const env = {
+    api,
+    configured: () => true,
+    activePackRecord: () => ({ packId: 'custom1' }),
+    activePackId: 'custom1', activePreset: 'custom1',
+    targetVolume: id => id,
+    log: (...args) => { throw new Error(`unexpected log: ${args.join(' ')}`); },
+    activeView: 'final',
+    renderGlobalHeader() {}, renderNavBadges() {}, renderStepBar() {}, renderFinalOverview() {}, renderVolumeLinks() {},
+    renderSpreadBoardIfVisible() {},
+    loadFinalArchives: () => Promise.resolve(), loadPackReview: () => Promise.resolve(),
+  };
+  const names = Object.keys(env);
+  const factory = new Function(...names, [
+    'let state = { finalReadiness: {} }, finalPreflightCheckedAt = "";',
+    'const finalReadinessInFlight = new Map();',
+    'let finalReadinessEpoch = 0, finalPanelsInFlight = null;',
+    extractFunction('finalReadinessKey'),
+    extractFunction('advanceFinalReadinessEpoch'),
+    // extractFunction は `function` から切り出すので async を付け直す。
+    'async ' + extractFunction('loadFinalReadiness'),
+    'async ' + extractFunction('loadFinalPanels'),
+    'return { loadFinalPanels, loadFinalReadiness, advanceFinalReadinessEpoch, readiness: () => state.finalReadiness.custom1?.volumes?.["ja-main"]?.status };',
+  ].join('\n'));
+  return { requests, ...factory(...names.map(name => env[name])) };
+}
+const flush = () => new Promise(r => setTimeout(r, 0));
+
+{
+  // 出力前に読込が始まり、出力完了後に force で読み直す。
+  const h = await readinessHarness();
+  const before = h.loadFinalPanels({ render: false });
+  assert.equal(h.requests.length, 1);
+  const after = h.loadFinalPanels({ force: true, render: false });
+  assert.equal(h.requests.length, 2, 'force は進行中の readiness 要求を使い回さず取り直す');
+  h.requests[0].resolve('needs-rebuild'); // 出力前の応答が後から届く
+  h.requests[1].resolve('built');
+  await Promise.all([before, after]); await flush();
+  assert.equal(h.readiness(), 'built', '出力前に始まった応答で「再出力が必要」に戻さない');
+  assert.equal(h.requests.length, 2, '新しい要求が既にあれば捨てた応答の再取得はそれを使い回す');
+}
+
+{
+  // 古い応答が新しい応答より後に届いても上書きしない。
+  const h = await readinessHarness();
+  const before = h.loadFinalPanels({ render: false });
+  const after = h.loadFinalPanels({ force: true, render: false });
+  h.requests[1].resolve('built');
+  await after; await flush();
+  h.requests[0].resolve('needs-rebuild');
+  await before; await flush();
+  assert.equal(h.readiness(), 'built');
+  assert.equal(h.requests.length, 2);
+}
+
+{
+  // 世代ずれで捨てた応答は、取り直しが無ければ1回だけ取り直す。
+  const h = await readinessHarness();
+  const first = h.loadFinalReadiness({ render: false });
+  h.advanceFinalReadinessEpoch();
+  h.requests[0].resolve('needs-rebuild');
+  await first; await flush();
+  assert.equal(h.readiness(), undefined, '世代ずれの応答は使わない');
+  assert.equal(h.requests.length, 2, '捨てた応答の代わりを1回取り直す');
+  h.advanceFinalReadinessEpoch();
+  h.requests[1].resolve('needs-rebuild');
+  await flush(); await flush();
+  assert.equal(h.requests.length, 2, '取り直しは1回だけ（繰り返さない）');
+  // 取り直しが世代内に届けば反映する。
+  const again = h.loadFinalReadiness({ render: false });
+  h.requests[2].resolve('built');
+  await again; await flush();
+  assert.equal(h.readiness(), 'built');
+}
+
 console.log('final target readiness regression ok');

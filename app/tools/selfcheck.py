@@ -350,6 +350,11 @@ get_block=server.split('function Get-Structure',1)[1].split('function Update-Str
 if 'Write-StructureUnlocked' in get_block or re.search(r'(?m)^\s*Initialize-Or-MigrateStructure\b', get_block): raise SystemExit('Get-Structure must stay read-only')
 for needed in ['$Script:StructureReadCache', 'LastWriteTimeUtc.Ticks', '$file.Length']:
     if needed not in get_block: raise SystemExit(f'Get-Structure cold-read cache missing: {needed}')
+# last-good に切り替えて読んだ1つ前の版を、今のファイルの版としてキャッシュしない。
+if 'if ($Script:StructureReadUsedLastGood) { return $structure }' not in get_block.split('$Script:StructureReadCache[$cacheKey] =',1)[0]:
+    raise SystemExit('Get-Structure must not cache a structure recovered from structure.json.last-good')
+if '$Script:StructureReadUsedLastGood = $true' not in server.split('function Read-StructureUnlocked',1)[1].split('\nfunction ',1)[0]:
+    raise SystemExit('Read-StructureUnlocked must report when it fell back to structure.json.last-good')
 _update_structure = server.split('function Update-StructureLocked',1)[1].split('\nfunction ',1)[0]
 if '$Script:StructureReadCache.Clear()' not in _update_structure:
     raise SystemExit('structure writes must invalidate the read cache')
@@ -1665,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v203', 'style.css?v=20261030_v125']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v204', 'style.css?v=20261030_v125']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1719,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v203' not in html:
+if 'app.js?v=20261030_v204' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1745,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v203' not in html:
+if 'app.js?v=20261030_v204' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3129,6 +3134,8 @@ if pdf_image_layout_regression.returncode != 0:
 # 出力前チェックの「出力先」は振り分け件数（itemCount）で空かどうかを見る。物理出力頁数
 # （pageCount）で見ると、変換PDF未作成の出力先を「ページがありません」と誤判定した。
 # readiness 未取得のあいだは確認中で、出力を止める問題に数えない。
+# 出力完了後の loadFinalPanels({force:true}) は出力前に始まった readiness 要求を使い回さず、
+# 世代ずれで捨てた応答は1回だけ取り直す（「再出力が必要」が再起動まで残った不具合）。
 final_target_regression = subprocess.run([_node, str(root / 'tests/final-target-readiness-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
 if final_target_regression.returncode != 0:
     raise SystemExit('final target readiness regression failed: ' + (final_target_regression.stdout + final_target_regression.stderr).strip())

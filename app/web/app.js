@@ -1094,13 +1094,17 @@ function finalReadinessLoaded(){
   return !!state?.finalReadiness?.[key];
 }
 // Load everything the final screen needs, then paint once.
+// force: 進行中の読込を使い回さない。出力完了の前に始まった readiness の要求が
+// 完了後の表示になり、「再出力が必要」が残り続けていた。区切り番号を進めて古い応答を捨て、取り直す。
 async function loadFinalPanels(options = {}){
-  if(!finalPanelsInFlight){
-    finalPanelsInFlight=Promise.allSettled([
+  if(options.force)advanceFinalReadinessEpoch();
+  if(!finalPanelsInFlight||options.force){
+    const panels=Promise.allSettled([
       loadFinalReadiness({render:false}),
       loadFinalArchives(),
       loadPackReview({render:false})
-    ]).finally(()=>{finalPanelsInFlight=null;});
+    ]).finally(()=>{if(finalPanelsInFlight===panels)finalPanelsInFlight=null;});
+    finalPanelsInFlight=panels;
   }
   await finalPanelsInFlight;
   if(options.render===false) return;
@@ -1123,10 +1127,17 @@ async function loadFinalReadiness(options){
     // second read after this request settles.
     // Also check the pack key: switching packs while the request is in flight
     // must never let the old response overwrite the newly active pack.
-    if(requestEpoch!==finalReadinessEpoch||finalReadinessKey()!==requestKey)return;
+    if(finalReadinessKey()!==requestKey)return;
+    if(requestEpoch!==finalReadinessEpoch){
+      // 捨てた応答の代わりを1回だけ取り直す。区切り番号を進めた側が既に取り直していれば
+      // loadFinalReadiness がその要求を使い回すので、二重には取得しない。待たずに予約し、
+      // 届いたら自分で描く（元の呼び出し元はもう描画を終えている）。今の世代の応答が既に届いていれば取り直さない。
+      if(!options.retried&&state.finalReadiness?.[requestKey]?.epoch!==finalReadinessEpoch)void loadFinalReadiness({retried:true});
+      return;
+    }
     state.finalReadiness=state.finalReadiness||{};
     const volumes=r.volumes||Object.fromEntries(Object.entries(r.targets||{}).map(([targetId,ready])=>[targetVolume(targetId),ready]));
-    state.finalReadiness[requestKey]={volumes,receivedAt:Date.now()};
+    state.finalReadiness[requestKey]={volumes,receivedAt:Date.now(),epoch:requestEpoch};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
     if(options.render!==false&&activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
     // 見開きの頁・左右は readiness の physicalPages から描く。読み直しが届いたら「更新中」を外す。
@@ -6365,6 +6376,7 @@ async function runFinalBuildJob(targetIds){
           // Was: refresh() painted, then loadFinalReadiness() painted again a
           // network round trip later, with the progress panel still up and then
           // vanishing - three visual states in a row, seen as flicker.
+          // 状態を取り直してから、force で出力前に始まった readiness 要求を捨てて最新を取る。
           await refresh({render:false});
           await loadFinalPanels({force:true, render:false});
           hideProgressPanel();
