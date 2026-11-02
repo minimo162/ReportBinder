@@ -1,5 +1,16 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 差分画面: 計算方法の補足文を消し、メッセージ欄をPDF画像に重ねないようにした（2026-11-02）
+
+- 目的: 原稿単位の比較画面（`#diff-modal`）で、`#diff-state-message` が左右のPDF画像の上端にほぼ不透明な帯として重なり、表題・見出し行・日付などページ上部の変更箇所を隠していた。しかも中身は「PDF内の文字情報を照合し、…を補足しました。」のような計算方法の説明で、利用者には要らなかった。変更点PDF（`server.ps1`）には元から出ていない。
+- `selectDiffSemanticResult`: `mode` が `numeric`・`row`（ページ単位と文書全体）・`layout`・`text-fragment`・`numeric-supplement` のときの「〜を照合し、〜しました。」6件の `message` を空にした（`mode` と枠は変えていない）。`document-reflow` は枠が0件になる理由なので、「このページの変更は別のページにあります（改ページで移動しただけです）。」に短くして残した。
+- `buildDiffBrowserPage`: `analysis.fallbackUsed`／`analysis.alignmentAdjusted` のときの計算方法の説明を出さないようにし、描画ノイズとして枠を外したときの文を「このページに目に見える変更はありません。」にした。状態を知らせる文（位置を絞り込めないためページ全体を強調、同じ原稿内の別ページに変更あり、ページサイズ違い、`mappingMessage`、比較できない理由、エラー）はそのまま残した。
+- `style.css`: `.diff-state-message` を `position:absolute; z-index:6; inset:…` から通常の流れ（`position:static; flex:none; margin:8px 12px 0`）に変え、見出しを避けるための `inset:52px 12px auto` の上書きを消した。どの文が出ても画像の表示欄より上に1行として並び、画像に重ならない。
+- テスト: `tests/diff-regression.mjs` に、既存の各ケース（numeric・text-fragment・row・重複行・横並びの表・文書全体の row・layout・rich report の row／numeric・image）で `message` が空であること、`document-reflow` が枠0件で短い文を返すことを足した。`app/tools/selfcheck.py` から補足文そのものを要求していた3か所（数値の照合・行の照合・ノイズ除外）を外し、代わりに `message` に「照合し」を含む文を書くこと・計算方法の説明4種を禁止し、残す状態メッセージの存在、`.diff-state-message` が `position:static` で `position:absolute`／`fixed`・`inset`・`z-index` を持たないこと、回帰テストの存在を検査するようにした。
+- `docs/API.md` の `GET /api/history/diff-detail` に、`message`／`mappingMessage` を画像に重ねず表示し、ブラウザ側の計算方法の説明は出さないことを書いた（応答の形は変えていない）。`diff-worker.js` とその `?v=` は変えていない。
+- 見開きの `buildSpreadLayout` と頁・左右をサーバー値で決める契約には手を入れていない。three.js／WebGL は使っていない。PowerShell の変更は無い（PowerShell 5.1 で使えない構文は入れていない）。
+- RuntimeVersion `2026.10.30.27`、`app.js` `v20261030_v215`、`style.css` `v20261030_v131` へ更新した。
+
 ## 提出用PDF一式の変更点: 変更点PDFを共有用フォルダーへ提出用PDFといっしょにコピーできるようにした（2026-11-02）
 
 - 目的: 出力先ごとの変更点PDF（前回共有用フォルダーへコピーした版 → 今の提出用PDF）を、既存の「共有用フォルダーにコピー」と同じ発行フォルダーへ提出用PDFと一緒に入れ、受け取った人が前回の提出からの変更を紙やPDFで確かめられるようにする。確認画面の「変更点PDFもいっしょにコピーする」は最初からチェックあり。組み込み一式は版を保存していないので対象外のまま。

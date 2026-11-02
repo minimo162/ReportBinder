@@ -383,4 +383,20 @@ assert.ok(richColorRaster.regions.every(region=>region.width<.12&&region.height<
 assert.equal(app.shouldSuppressDiffRasterNoise(richStableText,richStableText,richColorRaster,richColorRaster.regions,WIDTH,HEIGHT),false,
   'actual rich-report font-color pixels are not classified as raster noise');
 
+// The diff screen shows no calculation notes. Only the document-reflow case keeps a
+// short state message because it explains why the page has no highlighted box.
+const docPage1Semantic=app.selectDiffSemanticResult(docBefore[0],docAfter[0],600,200,{},[],docPage1);
+assert.equal(docPage1Semantic.mode,'row');
+const docReflowSemantic=app.selectDiffSemanticResult(docBefore[1],docAfter[1],600,200,{},[],{...docPage2,documentChanged:true});
+assert.equal(docReflowSemantic.mode,'document-reflow');assert.equal(docReflowSemantic.regions.length,0);
+assert.equal(docReflowSemantic.message,'このページの変更は別のページにあります（改ページで移動しただけです）。');
+const spacingSemantic=app.selectDiffSemanticResult(spacingBefore,spacingAfter,600,400,{rowStructureAdjusted:true,fallbackUsed:false},[]);
+assert.equal(spacingSemantic.mode,'layout');
+const imageOnlySemantic=app.selectDiffSemanticResult(stableText,stableText,1200,900,{fallbackUsed:false},glyphNoise);
+assert.equal(imageOnlySemantic.mode,'image');
+for(const [name,semantic] of Object.entries({numeric,cumulativeText,row,duplicateRow,sideBySideSemantic,richRowSemantic,
+  richRowIntegrated,richRowRemovedIntegrated,richNumeric,docPage1Semantic,spacingSemantic,imageOnlySemantic})){
+  assert.equal(semantic.message,'',`${name} (${semantic.mode}) must not show a calculation note over the diff`);
+}
+
 console.log('diff regression tests OK');

@@ -3876,11 +3876,11 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
   // A small numeric-only edit is stronger evidence than PDF.js row grouping. Excel
   // PDFs sometimes duplicate a glyph run on a nearby baseline and fake an extra row.
   if(textDiff.numericOnly&&textRegions.length>0&&textRegions.length<=8){
-    return {mode:'numeric',regions:mergeDiffRegionsWithText([],textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所だけを強調しました。'};
+    return {mode:'numeric',regions:mergeDiffRegionsWithText([],textRegions),message:''};
   }
   if(documentRowDiff?.confident&&documentRowDiff.documentChanged){
-    if(documentRowDiff.regions.length)return {mode:'row',regions:mergeDiffRegionsWithText([],documentRowDiff.regions),message:'PDF文書全体の文字行を照合し、追加・削除された段落だけを強調しました。'};
-    return {mode:'document-reflow',regions:[],suppressRaster:true,message:'変更箇所は別ページにあり、このページは改ページによる移動だけのため強調を省略しました。'};
+    if(documentRowDiff.regions.length)return {mode:'row',regions:mergeDiffRegionsWithText([],documentRowDiff.regions),message:''};
+    return {mode:'document-reflow',regions:[],suppressRaster:true,message:'このページの変更は別のページにあります（改ページで移動しただけです）。'};
   }
   const pageRowDiff=buildTextRowStructureDiffResult(beforeItems,afterItems,width,height);
   const tableRowDiff=pageRowDiff.confident?pageRowDiff:buildLocalizedTextRowStructureDiffResult(beforeItems,afterItems,width,height,analysis);
@@ -3888,11 +3888,11 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
   // Text-row LCS alone is not enough. Require an independent raster row-shift signal
   // so harmless PDF text fragmentation cannot replace a valid numeric result.
   if(rowDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,rowDiff.regions)){
-    return {mode:'row',regions:mergeDiffRegionsWithText([],rowDiff.regions),message:'PDF内の文字行を照合し、追加・削除された行だけを強調しました。'};
+    return {mode:'row',regions:mergeDiffRegionsWithText([],rowDiff.regions),message:''};
   }
   const layoutDiff=buildTextLayoutShiftDiffResult(beforeItems,afterItems,width,height);
   if(layoutDiff.confident&&diffHasLocalizedRowSignal(analysis,imageRegions,layoutDiff.regions)){
-    return {mode:'layout',regions:mergeDiffRegionsWithText([],layoutDiff.regions),message:'PDF内の文字配置を照合し、行間や境界が変わった箇所だけを強調しました。'};
+    return {mode:'layout',regions:mergeDiffRegionsWithText([],layoutDiff.regions),message:''};
   }
   const fragmentDiff=buildTextFragmentDiffResult(beforeItems,afterItems,width,height);
   if(fragmentDiff.confident){
@@ -3900,10 +3900,10 @@ function selectDiffSemanticResult(beforeItems,afterItems,width,height,analysis,i
     // fragments with exact PDF text boxes. This keeps cumulative cell edits visible
     // without exposing every antialiasing fragment produced by a simultaneous resize.
     const structuralRegions=imageRegions.filter(region=>region?.before&&region?.after||Number(region?.confidence||0)>=.9);
-    return {mode:'text-fragment',regions:mergeDiffRegionsWithText(structuralRegions,fragmentDiff.regions),message:'PDF内の文字情報を照合し、各世代で追加・削除・変更された箇所を補足しました。'};
+    return {mode:'text-fragment',regions:mergeDiffRegionsWithText(structuralRegions,fragmentDiff.regions),message:''};
   }
   if(textRegions.length){
-    return {mode:'numeric-supplement',regions:mergeDiffRegionsWithText(imageRegions,textRegions),message:'PDF内の文字情報を照合し、数値が変わった箇所を補足しました。'};
+    return {mode:'numeric-supplement',regions:mergeDiffRegionsWithText(imageRegions,textRegions),message:''};
   }
   return {mode:'image',regions:imageRegions,message:''};
 }
@@ -4001,8 +4001,6 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
         ?Promise.all([extractDiffPdfDocumentTextPages('before',sheet),extractDiffPdfDocumentTextPages('after',sheet)]).catch(()=>null)
         :Promise.resolve(null);
       analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);
-      if(analysis.fallbackUsed)message='小さい差分を検出したため、最も可能性の高い箇所を強調しています。';
-      else if(analysis.alignmentAdjusted)message='行・列の追加や幅・倍率による位置ずれを補正して差分を絞り込みました。';
       setDiffBrowserProgress(true,'PDF内の文字を照合しています。',85);
       const textPair=await textPromise;
       const documentTextPair=await documentTextPromise;
@@ -4014,7 +4012,7 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
         if(semantic.message)message=semantic.message;
         if(semantic.suppressRaster)noiseSuppressed=true;
         if(semantic.mode!=='row'&&shouldSuppressDiffRasterNoise(textPair[0],textPair[1],analysis,regions,width,height)){
-          regions=[];noiseSuppressed=true;message='PDF内の文字と配置が一致したため、微小な画像描画ノイズを除外しました。';
+          regions=[];noiseSuppressed=true;message='このページに目に見える変更はありません。';
         }
       }
       if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
