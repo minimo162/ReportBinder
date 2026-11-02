@@ -169,6 +169,13 @@ const diffPdfTextDocumentCache = new Map();
 const diffBrowserPageCache = new Map();
 const diffDetailResponseCache = new Map();
 let diffDetailOpenSerial = 0;
+// 保存済み出力の一覧。変更点の入口（出力先カード）と「ほかの版と比べる」の選択欄でも使う。
+// 組み込み一式は版を比べられないので覚えない（loaded=false）。
+let finalArchivesState = { packId:'', loaded:false, list:[] };
+// 提出用PDF一式の変更点（#pack-change-modal）。通し番号は openDiffDetail と同じく古い応答を捨てるため。
+let packChangeState = { volume:'', targetId:'', fromBuildId:'', toBuildId:'', requestPath:'', changes:null, archives:[], filter:'all', showAll:false };
+let packChangeOpenSerial = 0;
+let packChangeReturnFocus = null;
 const DIFF_RENDER_SCALE = 120 / 72;
 const DIFF_PAGE_CACHE_LIMIT = 6;
 const DIFF_PDF_CACHE_LIMIT = 16;
@@ -472,7 +479,7 @@ function isConfirmModalOpen() { return !!$('confirm-modal') && !$('confirm-modal
 function isPackEditorOpen() { return !!$('pack-editor-modal') && !$('pack-editor-modal').classList.contains('hidden'); }
 function isTemplateManagerOpen() { return !!$('template-manager-modal') && !$('template-manager-modal').classList.contains('hidden'); }
 function isPageLayoutRevisionsOpen() { return !!$('page-layout-revisions-modal') && !$('page-layout-revisions-modal').classList.contains('hidden'); }
-function isAnyModalOpen() { return isModalOpen() || isDiffModalOpen() || isSpreadMoveOpen() || isConfirmModalOpen() || isPackEditorOpen() || isTemplateManagerOpen() || isPageLayoutRevisionsOpen(); }
+function isAnyModalOpen() { return isModalOpen() || isDiffModalOpen() || isSpreadMoveOpen() || isConfirmModalOpen() || isPackEditorOpen() || isTemplateManagerOpen() || isPageLayoutRevisionsOpen() || isPackChangeOpen(); }
 function shouldPreserveEditorDom() { return isEditing() || draggingRow !== null || isAnyModalOpen(); }
 function iconUse(id, cls='') { return `<svg class="icon ${cls}" aria-hidden="true"><use href="#${id}"></use></svg>`; }
 
@@ -1620,7 +1627,7 @@ function renderFinalOverview() {
   // Skip the rebuild when nothing changed. loadFinalPanels() repaints once after
   // its fetch, and blowing away innerHTML for an identical result made the cards
   // blink for no reason. Same signature trick renderPages() uses.
-  const gridHtml=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="final-path hidden" data-final-path></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><button class="btn secondary hidden" type="button" data-final-reveal>保存先フォルダーを開く</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a></div></section>`).join('');
+  const gridHtml=visibleEntries.map(({target,volume,ready})=>`<section class="card final-card" data-final-volume="${escapeAttr(volume)}"><div class="card-head"><div><h3>${escapeHtml(target.displayName||target.targetId)}（提出用PDF）</h3><p><strong class="large-number">${Number(ready.pageCount||0)}</strong> ページ</p></div><svg class="icon card-icon"><use href="#i-file-pdf"/></svg></div><div class="freshness" data-final-state></div><div class="final-path hidden" data-final-path></div><div class="card-actions"><button class="btn secondary" type="button" data-final-build>${unassigned?`${unassigned}ページを除外して${escapeHtml(target.displayName||target.targetId)}だけ出力`:`${escapeHtml(target.displayName||target.targetId)}だけ出力`}</button><button class="btn secondary hidden" type="button" data-final-publish>共有用フォルダーにコピー</button><button class="btn ghost hidden" type="button" data-final-fix>原稿・変換PDFへ →</button><button class="btn secondary hidden" type="button" data-final-reveal>保存先フォルダーを開く</button><a class="btn ghost hidden" href="#" data-final-open>前回出力を開く</a><button class="btn ghost hidden" type="button" data-final-changes>前回コピーしたときからの変更点を見る</button></div><p class="caption final-changes-note hidden" data-final-changes-note>はじめての出力なので、比べるものがありません。</p></section>`).join('');
   const gridChanged=setHtmlIfChanged(grid,gridHtml);
   const renderFreshness=(ready,card)=>{
     const box=card?.querySelector('[data-final-state]'),btn=card?.querySelector('[data-final-build]'),fix=card?.querySelector('[data-final-fix]');if(!box)return;
@@ -1641,7 +1648,7 @@ function renderFinalOverview() {
   };
   // Bind only when the markup was actually replaced: re-running addEventListener
   // on surviving nodes would stack duplicate handlers and fire a second build.
-  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-reveal]')?.addEventListener('click',event=>revealFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});}
+  for(const entry of visibleEntries){const card=grid?.querySelector(`[data-final-volume="${CSS.escape(entry.volume)}"]`);renderFreshness(entry.ready,card);if(!gridChanged)continue;card?.querySelector('[data-final-build]')?.addEventListener('click',event=>buildVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-publish]')?.addEventListener('click',event=>publishFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-fix]')?.addEventListener('click',()=>setActiveView('excel'));card?.querySelector('[data-final-reveal]')?.addEventListener('click',event=>revealFinalVolume(entry.volume,event.currentTarget));card?.querySelector('[data-final-open]')?.addEventListener('click',event=>{event.preventDefault();openFinalVolume(entry.volume,activePreset);});card?.querySelector('[data-final-changes]')?.addEventListener('click',event=>openPackChanges(entry.volume,event.currentTarget));}
   const allBtn=$('build-all-btn'),buildable=entries.map(entry=>entry.ready).filter(ready=>!targetReadinessPending(ready)&&targetItemCount(ready)>0);if(allBtn){const hardProblems=Number(preflight?.hardProblemCount||0);allBtn.disabled=buildable.length===0||hardProblems>0||!!activeFinalJobId;setClassIfChanged(allBtn,`btn ${activeFinalJobId?'primary busy':'primary'}`);setTextIfChanged(allBtn,hardProblems?`先に${hardProblems}項目を確認`:'提出用PDFをまとめて出力');}
   const history=$('final-history');if(history){const rows=entries.filter(entry=>entry.ready.outputPdf||entry.ready.lastBuiltAt).map(entry=>({label:`${entry.target.displayName||entry.target.targetId} PDF`,r:entry.ready}));setHtmlIfChanged(history,rows.length?`<div class="history-row header"><span>出力日時</span><span>種類</span><span>ページ数</span><span>状態</span><span>ファイル</span></div>${rows.map(({label,r})=>`<div class="history-row"><span>${escapeHtml(formatDateTime(r.lastBuiltAt))}</span><span>${escapeHtml(label)}</span><span>${Number(r.pageCount||0)}ページ</span><span>${badge(r.displayState==='built'?'最新':r.displayState==='output-missing'?'ファイルなし':'再出力必要',r.displayState==='built'?'neutral':'attention')}</span><span class="history-file">${escapeHtml(outputFileName(r.outputPdf))}</span></div>`).join('')}`:'<div class="empty-state">まだ出力していません。「提出用PDFをまとめて出力」を押すと、ここに出力日時が残ります。</div>');}
   renderPackReview();
@@ -2294,6 +2301,11 @@ function renderVolumeLinks() {
       else{pathBox.classList.add('hidden');}
     }
     if(reveal){setClassIfChanged(reveal,`btn secondary${available?'':' hidden'}`);}
+    // 変更点の入口。比べる版が2つ以上あるときだけ出し、1つだけなら理由を小さく出す。
+    const changes=card.querySelector('[data-final-changes]'),changesNote=card.querySelector('[data-final-changes-note]');
+    const entry=packChangeEntryState(volume,r,activePackIsBuiltIn(),finalArchivesState,String(activePackId||''));
+    if(changes){changes.classList.toggle('hidden',!entry.show);setTextIfChanged(changes,entry.label);}
+    if(changesNote)changesNote.classList.toggle('hidden',!entry.note);
     card.classList.toggle('has-output',fresh);
   });
   // まとめてコピーは、ページの入っている出力先がすべて最新で出力済みのときだけ出す。
@@ -6978,6 +6990,15 @@ bind('preview-prev-page','click',()=>navigatePreviewPage(-1));bind('preview-next
 bind('diff-close','click',closeDiffDetail);
 bind('diff-export-summary','click',exportDiffSummary);
 const diffModal=$('diff-modal');if(diffModal)diffModal.addEventListener('click',e=>{if(e.target===diffModal)closeDiffDetail();});
+// 提出用PDF一式の変更点。行・丸ボタンは描き直すたびに作り直すので、親で受ける。
+bind('pack-change-close','click',closePackChanges);
+const packChangeModal=$('pack-change-modal');if(packChangeModal)packChangeModal.addEventListener('click',e=>{if(e.target===packChangeModal)closePackChanges();});
+bind('pack-change-summary','click',e=>{const btn=e.target.closest('[data-pack-change-filter]');if(!btn)return;packChangeState.filter=String(btn.dataset.packChangeFilter||'all');renderPackChangeSummary();renderPackChangeList();});
+bind('pack-change-show-all','change',e=>{packChangeState.showAll=!!e.target.checked;renderPackChangeList();});
+bind('pack-change-list','click',e=>{const btn=e.target.closest('[data-pack-change-detail]');if(!btn)return;void openPackChangeDetail(asArray(packChangeState.changes?.pages)[Number(btn.dataset.packChangeDetail)],btn);});
+bind('pack-change-compare','click',()=>{void comparePackChangeVersions();});
+bind('pack-change-default','click',()=>{void loadPackChanges({});});
+bind('final-archive-history','click',e=>{const btn=e.target.closest('[data-archive-compare]');if(!btn)return;void openPackChanges(String(btn.dataset.archiveVolume||''),btn,{fromBuildId:String(btn.dataset.archiveCompare||'')});});
 bind('diff-mode-side','click',()=>{diffViewState.mode='side';applyDiffMode();});
 bind('diff-mode-overlay','click',()=>{diffViewState.mode='overlay';applyDiffMode();});
 bind('diff-highlight','change',applyDiffHighlightSettings);
@@ -7018,12 +7039,12 @@ window.addEventListener('keydown',e=>{
     // clearActivePageSelection(), which unhighlighted the rows but left the
     // drag running, so the "cancelled" move still committed on drop.
     if(draggingRow){e.preventDefault();finishPointerDrag(false);return;}
-    if(isConfirmModalOpen())closeConfirmModal(false);else if(isSpreadMoveOpen())closeSpreadMoveDialog();else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isModalOpen())closePreview();else if(!$('app-menu-popover')?.classList.contains('hidden'))closeAppMenu(true);else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
+    if(isConfirmModalOpen())closeConfirmModal(false);else if(isSpreadMoveOpen())closeSpreadMoveDialog();else if(isPageLayoutRevisionsOpen())closePageLayoutRevisions();else if(isTemplateManagerOpen())closeTemplateManager();else if(isPackEditorOpen())closePackEditor();else if(isDiffModalOpen())closeDiffDetail();else if(isPackChangeOpen())closePackChanges();else if(isModalOpen())closePreview();else if(!$('app-menu-popover')?.classList.contains('hidden'))closeAppMenu(true);else if(!$('pack-menu')?.classList.contains('hidden'))closePackMenu(true);else if(activeView==='pages'&&selectedPages.size)clearActivePageSelection();
     return;
   }
   if(isModalOpen()&&!isDiffModalOpen()&&previewOrganizerMode&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!e.target.matches('input,select,textarea')&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();void navigatePreviewPage(e.key==='ArrowLeft'?-1:1);return;}
   if(e.key!=='Tab')return;
-  const modal=isConfirmModalOpen()?$('confirm-modal'):isSpreadMoveOpen()?$('spread-move-modal'):(isPageLayoutRevisionsOpen()?$('page-layout-revisions-modal'):(isTemplateManagerOpen()?$('template-manager-modal'):(isPackEditorOpen()?$('pack-editor-modal'):(isDiffModalOpen()?$('diff-modal'):(isModalOpen()?$('preview-modal'):null)))));
+  const modal=isConfirmModalOpen()?$('confirm-modal'):isSpreadMoveOpen()?$('spread-move-modal'):(isPageLayoutRevisionsOpen()?$('page-layout-revisions-modal'):(isTemplateManagerOpen()?$('template-manager-modal'):(isPackEditorOpen()?$('pack-editor-modal'):(isDiffModalOpen()?$('diff-modal'):(isPackChangeOpen()?$('pack-change-modal'):(isModalOpen()?$('preview-modal'):null))))));
   // The pack switcher and the app menu are NOT trapped: they have no scrim and a
   // click anywhere outside dismisses them, so they are non-modal popovers. They
   // get focus-in, Escape and focus-return instead; tabbing past closes them.
@@ -7250,13 +7271,220 @@ function volumeLabel(v){
 async function loadFinalArchives(){
   const box=$('final-archive-history');
   if(!box)return;
-  if(!activePackRecord()?.packId){box.innerHTML='<div class="caption">一式を作成すると出力履歴が表示されます。</div>';return;}
+  if(!activePackRecord()?.packId){finalArchivesState={packId:'',loaded:false,list:[]};box.innerHTML='<div class="caption">一式を作成すると出力履歴が表示されます。</div>';return;}
+  const builtIn=activePackIsBuiltIn(),packId=String(activePackId||'');
   try{
-    const r=await api(activePackIsBuiltIn()?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(activePackId)}`);
+    const r=await api(builtIn?`/api/final/archives?category=${encodeURIComponent(activePreset)}`:`/api/v2/outputs/archives?packId=${encodeURIComponent(packId)}`);
+    // 読み込み中に一式を切り替えたら、前の一式の一覧で上書きしない。
+    if(!builtIn&&String(activePackId||'')!==packId)return;
     const list=asArray(r.archives);
+    finalArchivesState=builtIn?{packId:'',loaded:false,list:[]}:{packId,loaded:true,list};
     if(!list.length){setHtmlIfChanged(box,'<div class="caption">保存された出力はまだありません。提出用PDFを出力すると、その時点のPDFを自動で保存します。</div>');return;}
-    setHtmlIfChanged(box,list.slice(0,20).map(a=>`<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(a.builtAt))}</span><span>${escapeHtml(volumeLabel(a.volume))}</span><span class="subtext">${escapeHtml(String(a.outputFileName||''))}（${Number(a.pageCount||0)}ページ）</span></div>`).join(''));
-  }catch(e){box.innerHTML=`<div class="caption">読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
+    setHtmlIfChanged(box,list.slice(0,20).map(a=>{
+      const marks=builtIn?'':[a.isCurrent?badge('今の提出用PDF','neutral'):'',a.publishedAt?badge(a.isLastPublished?'前回コピーした版':'共有にコピー済み','neutral'):''].join(' ');
+      const toBuildId=builtIn?'':packChangeDefaultToBuildId(list,a.volume);
+      const compare=toBuildId&&String(a.buildId||'')&&String(a.buildId)!==toBuildId?`<button class="btn ghost compact" type="button" data-archive-compare="${escapeAttr(String(a.buildId))}" data-archive-volume="${escapeAttr(String(a.volume||''))}">今の版と比べる</button>`:'';
+      return `<div class="history-row"><span class="date-col">${escapeHtml(formatDateTime(a.builtAt))}</span><span>${escapeHtml(volumeLabel(a.volume))}</span><span class="subtext">${escapeHtml(String(a.outputFileName||''))}（${Number(a.pageCount||0)}ページ）</span><span>${marks}</span><span>${compare}</span></div>`;
+    }).join(''));
+  }catch(e){finalArchivesState={packId:'',loaded:false,list:[]};box.innerHTML=`<div class="caption">読み込めません：${escapeHtml(userFriendlyError(e.message))}</div>`;}
+}
+
+// ---- 提出用PDF一式の変更点（出力先ごと。GET /api/v2/outputs/changes）----
+// 頁番号・左右はアーカイブに記録されたサーバーの値をそのまま出し、画面では数え直さない・推定しない。
+function isPackChangeOpen(){const modal=$('pack-change-modal');return !!modal&&!modal.classList.contains('hidden');}
+// 「今の版」= 出力先の isCurrent の版。無ければ最後に出力した版（一覧は新しい順）。サーバーの既定と同じ。
+function packChangeDefaultToBuildId(list,volume){
+  const rows=asArray(list).filter(a=>String(a?.volume||'')===String(volume||''));
+  return String((rows.find(a=>a?.isCurrent)||rows[0])?.buildId||'');
+}
+// 出力先カードの入口。組み込み一式は版を保存しないので出さない。保存済み出力が1つだけなら理由だけを出す。
+function packChangeEntryState(volume,readiness,builtIn,archivesState,packId){
+  const hidden={show:false,note:false,label:'前回コピーしたときからの変更点を見る'};
+  if(builtIn)return hidden;
+  if(!archivesState?.loaded||String(archivesState.packId||'')!==String(packId||''))return hidden;
+  const built=!!(readiness?.outputPdf||readiness?.lastBuiltAt);
+  const rows=asArray(archivesState.list).filter(a=>String(a?.volume||'')===String(volume||''));
+  if(!built||!rows.length)return hidden;
+  if(rows.length<2)return {...hidden,note:true};
+  const published=rows.some(a=>a?.isLastPublished);
+  return {show:true,note:false,label:published?'前回コピーしたときからの変更点を見る':'前回の出力からの変更点を見る'};
+}
+function packChangeRequestPath(packId,targetId,fromBuildId='',toBuildId=''){
+  const params=new URLSearchParams({packId:String(packId||''),targetId:String(targetId||'')});
+  if(fromBuildId)params.set('fromBuildId',String(fromBuildId));
+  if(toBuildId)params.set('toBuildId',String(toBuildId));
+  return `/api/v2/outputs/changes?${params.toString()}`;
+}
+function packChangeSideLabel(side){return {right:'右',left:'左'}[String(side||'')]||'';}
+// 記録された左右が無い（古い形式の版）ときは頁番号だけを出す。
+function packChangePageLabel(page,side){
+  const number=Number(page||0);if(!number)return 'なし';
+  const sideLabel=packChangeSideLabel(side);
+  return `p.${number}${sideLabel?`（${sideLabel}）`:''}`;
+}
+const PACK_CHANGE_KIND_LABELS={content:'内容が変わった','same-look':'原稿は更新されたが、見た目は同じ','maybe-content':'内容が変わった可能性あり（くわしく見てください）',unavailable:'比べられません（前の版の記録が残っていません）',added:'増えたページ',removed:'なくなったページ',moved:'場所が変わった',side:'左右が入れ替わった',renamed:'名前が変わった',unchanged:'変わっていない'};
+function packChangeKindLabels(row){
+  return asArray(row?.kinds).map(kind=>{
+    if(kind==='moved'&&row?.shiftOnly)return '前のページが増減したためずれた';
+    if(kind==='renamed'&&row?.fromTitle)return `名前が変わった（${String(row.fromTitle)} → ${String(row.title||'')}）`;
+    return PACK_CHANGE_KIND_LABELS[kind]||String(kind||'');
+  }).filter(Boolean);
+}
+// 前のページの増減でずれただけのページ（左右は変わっていない）。一覧では最初は折りたたむ。
+function packChangeIsShiftOnly(row){
+  const kinds=asArray(row?.kinds);
+  return !!row?.shiftOnly&&kinds.includes('moved')&&kinds.every(kind=>['moved','unchanged','same-look'].includes(kind));
+}
+function packChangeIsQuiet(row){
+  const kinds=asArray(row?.kinds);
+  return !kinds.length||kinds.every(kind=>['unchanged','same-look'].includes(kind));
+}
+function packChangeVisibleRows(pages,filter='all',showAll=false){
+  const rows=asArray(pages);
+  if(filter&&filter!=='all')return rows.filter(row=>asArray(row?.kinds).includes(filter));
+  if(showAll)return rows;
+  return rows.filter(row=>!packChangeIsQuiet(row)&&!packChangeIsShiftOnly(row));
+}
+function packChangeSummaryDefinitions(changes){
+  const counts=changes?.counts||{};
+  const definitions=[
+    ['all','変わったページ',Number(counts.changed||0),true],
+    ['content','内容が変わった',Number(counts.content||0),true],
+    ['maybe-content','変わった可能性あり',Number(counts.maybeContent||0),Number(counts.maybeContent||0)>0],
+    ['added','増えた',Number(counts.added||0),true],
+    ['removed','なくなった',Number(counts.removed||0),true],
+    ['moved','場所が変わった',Number(counts.moved||0),true],
+    // 左右は両方の版に記録があるときだけ比べている。記録が無いのに 0 と出すと「入れ替わりなし」と読まれる。
+    ['side','左右が入れ替わった',Number(counts.side||0),!!changes?.hasSides],
+    ['renamed','名前が変わった',Number(counts.renamed||0),Number(counts.renamed||0)>0],
+    ['unavailable','比べられません',Number(counts.unavailable||0),Number(counts.unavailable||0)>0]
+  ];
+  return definitions.filter(item=>item[3]).map(([key,label,count])=>({key,label,count}));
+}
+function packChangeVersionHtml(heading,version,kind,changes){
+  if(!version)return `<div class="pack-change-version"><span class="eyebrow">${escapeHtml(heading)}</span><strong>なし</strong></div>`;
+  const pages=`${Number(version.pageCount||0)}ページ`;
+  let line=`${formatDateTime(version.builtAt)} に出力した版（${pages}）`;
+  if(kind==='from'&&changes?.fromReason==='published'&&version.publishedAt)line=`${formatDateTime(version.publishedAt)} にコピーした版（${pages}）`;
+  const extra=[];
+  if(kind==='from'&&changes?.fromReason==='previous')extra.push('1つ前に出力した版');
+  if(kind==='from'&&version.publishedAt&&changes?.fromReason!=='published')extra.push('共有にコピー済み');
+  if(kind==='from'&&version.folderName)extra.push(`発行フォルダー ${version.folderName}`);
+  if(kind==='to'&&version.isCurrent)extra.push(version.isLatest?'今の提出用PDF':'最後に出力した版');
+  if(kind==='to'&&version.outputFileName)extra.push(String(version.outputFileName));
+  return `<div class="pack-change-version"><span class="eyebrow">${escapeHtml(heading)}</span><strong>${escapeHtml(line)}</strong>${extra.length?`<small>${escapeHtml(extra.join('・'))}</small>`:''}</div>`;
+}
+function packChangeRowHtml(row,index){
+  const name=[String(row?.sourceName||''),String(row?.sheetName||row?.title||'')].filter(Boolean).join(' / ')||String(row?.title||'');
+  const kinds=packChangeKindLabels(row);
+  const detail=row?.detailAvailable&&row?.sourceId?`<button class="btn ghost compact" type="button" data-pack-change-detail="${index}">くわしく見る</button>`:'';
+  return `<div class="pack-change-row"><span class="pack-change-pages"><strong>今回 ${escapeHtml(packChangePageLabel(row?.toPage,row?.toSide))}</strong><small>← 前回 ${escapeHtml(packChangePageLabel(row?.fromPage,row?.fromSide))}</small></span><span class="pack-change-name">${escapeHtml(name)}</span><span class="pack-change-kinds">${kinds.map(label=>`<span class="badge neutral">${escapeHtml(label)}</span>`).join(' ')}${row?.message?`<small>${escapeHtml(String(row.message))}</small>`:''}</span><span>${detail}</span></div>`;
+}
+function packChangeArchiveOptionLabel(a){
+  const parts=[`${formatDateTime(a?.builtAt)} 出力（${Number(a?.pageCount||0)}ページ）`];
+  if(a?.isCurrent)parts.push('今の提出用PDF');
+  if(a?.publishedAt)parts.push(a?.isLastPublished?'前回コピーした版':'共有にコピー済み');
+  return parts.join('・');
+}
+function renderPackChangeOtherVersions(changes){
+  const from=$('pack-change-from'),to=$('pack-change-to');if(!from||!to)return;
+  const rows=asArray(packChangeState.archives).filter(a=>String(a?.volume||'')===packChangeState.volume&&String(a?.buildId||''));
+  const options=selected=>rows.map(a=>`<option value="${escapeAttr(String(a.buildId))}"${String(a.buildId)===selected?' selected':''}>${escapeHtml(packChangeArchiveOptionLabel(a))}</option>`).join('');
+  from.innerHTML=options(String(changes?.from?.buildId||''));
+  to.innerHTML=options(String(changes?.to?.buildId||''));
+  const compare=$('pack-change-compare');if(compare)compare.disabled=rows.length<2;
+  $('pack-change-default')?.classList.toggle('hidden',changes?.defaultPair!==false);
+  const hint=$('pack-change-other-hint');if(hint)hint.textContent=rows.length<2?'比べられる保存済み出力が2つ以上ありません。':'古い版を「比べる元」、新しい版を「比べる先」にします。逆に選んだときは入れ替えて比べます。';
+}
+function renderPackChangeList(){
+  const list=$('pack-change-list');if(!list)return;
+  const changes=packChangeState.changes;
+  const pages=asArray(changes?.pages);
+  const visible=packChangeVisibleRows(pages,packChangeState.filter,packChangeState.showAll);
+  const folded=packChangeState.filter==='all'&&!packChangeState.showAll?pages.filter(packChangeIsShiftOnly).length:0;
+  const foldedNote=folded?`<p class="caption">前のページが増減したためにずれただけのページ ${folded}件は折りたたんでいます（「変わっていないページ・ずれただけのページも表示」で出ます）。</p>`:'';
+  list.innerHTML=(visible.length?visible.map(row=>packChangeRowHtml(row,pages.indexOf(row))).join(''):'<div class="empty-state">この条件に当てはまるページはありません。</div>')+foldedNote;
+}
+function renderPackChangeSummary(){
+  const box=$('pack-change-summary');if(!box)return;
+  box.innerHTML=packChangeSummaryDefinitions(packChangeState.changes).map(({key,label,count})=>`<button class="${escapeAttr(key)} ${packChangeState.filter===key?'active':''}" type="button" data-pack-change-filter="${escapeAttr(key)}" aria-pressed="${packChangeState.filter===key}">${escapeHtml(label)} ${count}</button>`).join('');
+}
+function renderPackChanges(changes,archives){
+  packChangeState.changes=changes||null;packChangeState.archives=asArray(archives);
+  const status=String(changes?.status||'');
+  const ready=status==='ready';
+  const fromHeading=changes?.fromReason==='selected'?'比べる元':'前回',toHeading=changes?.defaultPair===false?'比べる先':'今回';
+  const versions=$('pack-change-versions');
+  if(versions)versions.innerHTML=ready||changes?.to?`${packChangeVersionHtml(fromHeading,changes?.from,'from',changes)}<b aria-hidden="true">→</b>${packChangeVersionHtml(toHeading,changes?.to,'to',changes)}`:'';
+  const notes=asArray(changes?.notes).map(note=>String(note?.message||'')).filter(Boolean);
+  if(!ready&&changes?.message&&!notes.includes(String(changes.message)))notes.unshift(String(changes.message));
+  const notesBox=$('pack-change-notes');if(notesBox)notesBox.innerHTML=notes.map(text=>`<p class="caption">${escapeHtml(text)}</p>`).join('');
+  $('pack-change-summary')?.classList.toggle('hidden',!ready);
+  $('pack-change-show-all-wrap')?.classList.toggle('hidden',!ready);
+  $('pack-change-list')?.classList.toggle('hidden',!ready);
+  if($('pack-change-subtitle'))$('pack-change-subtitle').textContent=ready?`変わったページ ${Number(changes?.counts?.changed||0)}／全 ${Number(changes?.counts?.total||0)}ページ`:'';
+  if(ready){renderPackChangeSummary();renderPackChangeList();}
+  renderPackChangeOtherVersions(changes);
+}
+function renderPackChangeError(message){
+  packChangeState.changes=null;
+  if($('pack-change-versions'))$('pack-change-versions').innerHTML='';
+  if($('pack-change-notes'))$('pack-change-notes').innerHTML=`<p class="caption">変更点を読み込めません：${escapeHtml(message)}</p>`;
+  ['pack-change-summary','pack-change-show-all-wrap','pack-change-list'].forEach(id=>$(id)?.classList.add('hidden'));
+  if($('pack-change-subtitle'))$('pack-change-subtitle').textContent='';
+}
+async function loadPackChangeArchives(packId){
+  if(finalArchivesState.loaded&&String(finalArchivesState.packId||'')===String(packId||''))return asArray(finalArchivesState.list);
+  try{return asArray((await api(`/api/v2/outputs/archives?packId=${encodeURIComponent(packId)}`)).archives);}catch{return [];}
+}
+// 比べる組み合わせを切り替えたとき、前の組み合わせの応答（成功・失敗とも）で画面を上書きしない。
+// openDiffDetail と同じ通し番号と要求パスの照合。
+async function loadPackChanges(range={}){
+  const serial=++packChangeOpenSerial;
+  const packId=String(activePackId||''),fromBuildId=String(range?.fromBuildId||''),toBuildId=String(range?.toBuildId||'');
+  const requestPath=packChangeRequestPath(packId,packChangeState.targetId,fromBuildId,toBuildId);
+  packChangeState.fromBuildId=fromBuildId;packChangeState.toBuildId=toBuildId;packChangeState.requestPath=requestPath;
+  packChangeState.filter='all';
+  if($('pack-change-notes'))$('pack-change-notes').innerHTML='<p class="caption">変更点を読み込んでいます。</p>';
+  const stale=()=>serial!==packChangeOpenSerial||!isPackChangeOpen()||packChangeState.requestPath!==requestPath;
+  try{
+    const [response,archives]=await Promise.all([api(requestPath),loadPackChangeArchives(packId)]);
+    if(stale())return;
+    renderPackChanges(response?.changes||null,archives);
+  }catch(error){if(stale())return;renderPackChangeError(userFriendlyError(error.message));}
+}
+function openPackChanges(volume,opener,range={}){
+  const targetId=targetIdFromVolume(volume);if(!targetId||activePackIsBuiltIn())return;
+  const modal=$('pack-change-modal');if(!modal)return;
+  packChangeReturnFocus=opener||document.activeElement;
+  packChangeState={volume:String(volume||''),targetId,fromBuildId:'',toBuildId:'',requestPath:'',changes:null,archives:[],filter:'all',showAll:false};
+  if($('pack-change-show-all'))$('pack-change-show-all').checked=false;
+  if($('pack-change-other'))$('pack-change-other').open=false;
+  if($('pack-change-title'))$('pack-change-title').textContent=`${volumeLabel(volume)}の変更点`;
+  if($('pack-change-subtitle'))$('pack-change-subtitle').textContent='';
+  if($('pack-change-versions'))$('pack-change-versions').innerHTML='';
+  ['pack-change-summary','pack-change-show-all-wrap','pack-change-list'].forEach(id=>$(id)?.classList.add('hidden'));
+  modal.classList.remove('hidden');
+  requestAnimationFrame(()=>$('pack-change-close')?.focus());
+  return loadPackChanges(range);
+}
+function closePackChanges(){
+  const modal=$('pack-change-modal');if(!modal||modal.classList.contains('hidden'))return;
+  packChangeOpenSerial++;modal.classList.add('hidden');
+  const focus=packChangeReturnFocus;packChangeReturnFocus=null;
+  if(focus?.isConnected&&typeof focus.focus==='function')focus.focus();
+}
+// 「くわしく見る」: 原稿単位の比較画面を、その原稿の前回の版→今回の版で開く。
+function openPackChangeDetail(row,opener){
+  if(!row?.detailAvailable||!row?.sourceId)return;
+  return openDiffDetail(String(row.sourceId),opener,{fromSnapshotId:String(row.fromSnapshotId||''),toSnapshotId:String(row.toSnapshotId||'')});
+}
+function comparePackChangeVersions(){
+  const from=String($('pack-change-from')?.value||''),to=String($('pack-change-to')?.value||'');
+  const hint=$('pack-change-other-hint');
+  if(!from||!to)return;
+  if(from===to){if(hint)hint.textContent='同じ版が選ばれています。異なる2つの版を選んでください。';return;}
+  return loadPackChanges({fromBuildId:from,toBuildId:to});
 }
 
 // ---- V5-P1(#12): 版の履歴・差分・保護（手動pin / 2版差分 / 過去content-pdf表示）----
