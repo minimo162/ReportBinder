@@ -14,7 +14,7 @@ required = [
     'app/tools/install-thirdparty.ps1','app/tools/install-thirdparty.cmd','app/tools/verify-thirdparty.ps1','app/tools/select-folder.ps1','app/tools/package-release.ps1',
     'app/tools/diff-image-pages.ps1','app/tools/diff-image-batch.ps1','app/tools/DiffImageEngine.cs',
     'app/tools/fixtures/structure-v1-ja.json','app/tools/fixtures/structure-mixed-order.json',
-    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/output-publish-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
+    'app/tools/fixtures/structure-v2-generalized-ja.json','app/tools/fixtures/structure-v3-migration-expected.json','app/tools/schema-v3-selfcheck.ps1','app/tools/output-publish-selfcheck.ps1','app/tools/pack-change-selfcheck.ps1','app/tools/source-adapter-selfcheck.ps1',
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v210', 'style.css?v=20261030_v127']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v211', 'style.css?v=20261030_v127']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v210' not in html:
+if 'app.js?v=20261030_v211' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v210' not in html:
+if 'app.js?v=20261030_v211' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1888,6 +1888,35 @@ _archive_list = _publish_server_function('Get-FinalArchives')
 for needed in ['isLastPublished =', 'isCurrent =', 'hasPageMap =', 'publishedAt =', 'folderName =', 'Get-OutputPdfIntegrityProblem']:
     if needed not in _archive_list:
         raise SystemExit(f'the archive list must say which output is current and which was copied: {needed}')
+# 一式の変更点（GET /api/v2/outputs/changes）。振る舞いは pack-change-selfcheck.ps1 が見る。
+# ここでは、対応付けがファイルを読まない純粋な関数であること、頁・左右をアーカイブの記録から
+# 取り数え直さないこと（見開きの契約）、既定の組み合わせが発行の記録を使うことを見る。
+if "$path -eq '/api/v2/outputs/changes'" not in server or 'Get-PackChangeSummary $language' not in server:
+    raise SystemExit('GET /api/v2/outputs/changes must be routed to Get-PackChangeSummary')
+_pack_compare = _publish_server_function('Compare-PackArchivePageMaps')
+for forbidden in ['Read-JsonFile', 'Get-VisualHashes', 'Test-Path', 'Get-Structure', 'Write-JsonFile', '% 2', '%2']:
+    if forbidden in _pack_compare:
+        raise SystemExit(f'Compare-PackArchivePageMaps must stay a pure function that never decides sides itself: {forbidden}')
+for needed in ['Get-PackChangeItemKey', "'side'", "'moved'", 'shiftOnly', 'partCountChanged', 'Get-PackChangePageHash', '$hasSides']:
+    if needed not in _pack_compare:
+        raise SystemExit(f'Compare-PackArchivePageMaps lost part of the page matching: {needed}')
+_pack_map = _publish_server_function('Get-PackArchivePageMap')
+if "'physicalPages'" not in _pack_map or "side = ''" not in _pack_map or '%' in _pack_map:
+    raise SystemExit('old archives without physicalPages must leave sides empty, never infer them')
+if 'outputPageNumber' in _publish_server_function('Get-PackChangeItemKey').split("return ('output:'", 1)[0]:
+    raise SystemExit('pages must be matched by item, not by output page number')
+_pack_pair = _publish_server_function('Resolve-PackChangePair')
+for needed in ['Get-LastPublishedBuildId', 'Get-FinalArchives', "'isCurrent'", 'Get-PublishRecords', 'Assert-SafeStorageSegment $fromRequested', 'Assert-SafeStorageSegment $toRequested', '[ArgumentException]::new']:
+    if needed not in _pack_pair:
+        raise SystemExit(f'the default comparison pair must come from the publish records and the current output: {needed}')
+if 'Get-HistoryTimeline' in _pack_pair:
+    raise SystemExit('the default comparison pair must not read the (unwritten) history timeline')
+_pack_summary = _publish_server_function('Get-PackChangeSummary')
+for needed in ['Get-FinalArchiveRecord', 'Compare-PackArchivePageMaps', 'Get-PackChangeVisualHashes', "'summary.json'", "'complete'", 'PackChangeAlgorithmVersion', "'unsupported'"]:
+    if needed not in _pack_summary:
+        raise SystemExit(f'the pack change summary is missing a safeguard: {needed}')
+if "'exports\\change-reports'" not in _publish_server_function('Get-PackChangeReportDir'):
+    raise SystemExit('pack change results must be kept under exports\\change-reports')
 # H-1: 出力先パスの重なりの検査そのものは output-publish-selfcheck.ps1 が振る舞いで見る。
 # ここでは、組版（Java）より前に両方の出力経路から呼ばれていることを見る。
 for _fn in ['function Build-DocumentPackPdf', 'function Invoke-FinalBuildTransaction']:

@@ -10124,6 +10124,13 @@ function Handle-Api($Context) {
             $scope = Resolve-DocumentPackScope $structure $packId $true
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; packId=[string]$scope.packId; archives=(Get-FinalArchives $language ([string]$scope.packId)) }); return
         }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/changes') {
+            # 出力先ごとの変更点（前回コピーした版 → 今の提出用PDF）。マニフェストと見た目のハッシュを
+            # 読むだけなので、その場で計算して返す。別の出力先の版や存在しない版は 400。
+            $query = $Context.Request.QueryString
+            $changes = Get-PackChangeSummary $language ([string]$query['packId']) ([string]$query['targetId']) ([string]$query['fromBuildId']) ([string]$query['toBuildId'])
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; changes=$changes }); return
+        }
         if ($method -eq 'GET' -and $path -eq '/api/state') {
             Write-JsonResponse $Context 200 (Get-StatePayload $language); return
         }
@@ -13569,6 +13576,654 @@ function Get-LastPublishedBuildId([string]$Language, [string]$PackId, [string]$T
     $records = @(Get-PublishRecords $Language $PackId $volume 1)
     if ($records.Count -eq 0) { return '' }
     return [string](Get-DataProperty $records[0] 'buildId' '')
+}
+
+# ---- 提出用PDF一式の変更点（出力先単位） ----------------------------------
+# 比べる版はアーカイブ1件（buildId）。アーカイブは書き換わらないので、組み合わせごとの
+# 計算結果を exports\change-reports の下に覚える。頁・左右・台紙はアーカイブに記録された
+# 値をそのまま使い、数え直さない（見開きの契約。左右を決めるのは Get-FinalBuildInputSnapshot だけ）。
+$Script:PackChangeAlgorithmVersion = 1
+
+# アーカイブの manifest から比べるためのページ表を作る。physicalPages の無い古い形式は
+# pages[]（sourcePageStart/End）から出力ページ番号だけを順に数え、左右・台紙は空のまま
+# にする（推定して埋めない）。
+function Get-PackArchivePageMap($Manifest) {
+    $sectionTitles = @{}
+    $manifestPages = @(Get-Array (Get-DataProperty $Manifest 'pages' @()))
+    foreach ($entry in $manifestPages) {
+        $entryPageId = [string](Get-DataProperty $entry 'pageId' '')
+        if (-not [string]::IsNullOrWhiteSpace($entryPageId) -and -not $sectionTitles.ContainsKey($entryPageId)) {
+            $sectionTitles[$entryPageId] = [string](Get-DataProperty $entry 'sectionTitle' '')
+        }
+    }
+    $physical = @(Get-Array (Get-DataProperty $Manifest 'physicalPages' @()))
+    $pages = New-Object System.Collections.ArrayList
+    if ($physical.Count -gt 0) {
+        foreach ($p in $physical) {
+            $pagePageId = [string](Get-DataProperty $p 'pageId' '')
+            [void]$pages.Add([pscustomobject][ordered]@{
+                outputPageNumber = Get-IntDataProperty $p 'outputPageNumber' 0
+                side = [string](Get-DataProperty $p 'side' '')
+                spreadIndex = Get-DataProperty $p 'spreadIndex' $null
+                itemId = [string](Get-DataProperty $p 'itemId' '')
+                pageId = $pagePageId
+                sourceId = [string](Get-DataProperty $p 'sourceId' '')
+                sourceKey = [string](Get-DataProperty $p 'sourceKey' '')
+                pagePartIndex = Get-IntDataProperty $p 'pagePartIndex' 1
+                pagePartCount = Get-IntDataProperty $p 'pagePartCount' 1
+                sourcePdfPageNumber = Get-IntDataProperty $p 'sourcePdfPageNumber' 1
+                title = [string](Get-DataProperty $p 'title' '')
+                sectionTitle = $(if ($sectionTitles.ContainsKey($pagePageId)) { [string]$sectionTitles[$pagePageId] } else { '' })
+            })
+        }
+    } else {
+        $number = 0
+        foreach ($entry in $manifestPages) {
+            $start = Get-IntDataProperty $entry 'sourcePageStart' 1
+            $end = Get-IntDataProperty $entry 'sourcePageEnd' $start
+            if ($end -lt $start) { continue }
+            $partCount = $end - $start + 1
+            for ($sourcePage = $start; $sourcePage -le $end; $sourcePage++) {
+                $number++
+                [void]$pages.Add([pscustomobject][ordered]@{
+                    outputPageNumber = $number
+                    side = ''
+                    spreadIndex = $null
+                    itemId = [string](Get-DataProperty $entry 'itemId' '')
+                    pageId = [string](Get-DataProperty $entry 'pageId' '')
+                    sourceId = [string](Get-DataProperty $entry 'sourceId' '')
+                    sourceKey = [string](Get-DataProperty $entry 'sourceKey' '')
+                    pagePartIndex = $sourcePage - $start + 1
+                    pagePartCount = $partCount
+                    sourcePdfPageNumber = $sourcePage
+                    title = [string](Get-DataProperty $entry 'title' '')
+                    sectionTitle = [string](Get-DataProperty $entry 'sectionTitle' '')
+                })
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{ hasSides = ($physical.Count -gt 0); pages = @($pages) }
+}
+
+# 同じ原稿（項目）のページを束ねるキー。itemId が無ければ pageId。出力ページ番号は使わない
+# （使うと、前に1ページ増えただけで後ろが全部「増えた／なくなった」になる）。
+function Get-PackChangeItemKey($Page) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$Page.itemId)) { return ('item:' + [string]$Page.itemId) }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Page.pageId)) { return ('page:' + [string]$Page.pageId) }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Page.sourceId)) { return ('source:' + [string]$Page.sourceId + '|' + [string]$Page.sourceKey) }
+    return ('output:' + [string]$Page.outputPageNumber)
+}
+
+# metadata.sourceWorkbooks から 原稿ID → 出力に使った版（snapshotId / versionId）の表を作る。
+function Get-PackChangeSourceVersions($Metadata) {
+    $map = @{}
+    foreach ($sw in @(Get-Array (Get-DataProperty $Metadata 'sourceWorkbooks' @()))) {
+        $workbookId = [string](Get-DataProperty $sw 'workbookId' '')
+        if ([string]::IsNullOrWhiteSpace($workbookId) -or $map.ContainsKey($workbookId)) { continue }
+        $map[$workbookId] = [pscustomobject][ordered]@{
+            workbookId = $workbookId
+            snapshotId = [string](Get-DataProperty $sw 'snapshotId' '')
+            versionId = [string](Get-DataProperty $sw 'versionId' '')
+            fileName = [string](Get-DataProperty $sw 'fileName' '')
+        }
+    }
+    return $map
+}
+
+function Get-PackChangeVersionKey([string]$WorkbookId, [string]$SnapshotId, [string]$VersionId) {
+    return ($WorkbookId + '|' + $SnapshotId + '|' + $VersionId).ToLowerInvariant()
+}
+
+# 単位の sourceKey から、見た目のハッシュ（visual-hashes.json の sheets[].sheetName）の名前を引く。
+# Excel は「worksheet:<シート名>」、PDF・Word は「page:N」→「Page N」、PowerPoint は「slide:N」→「Slide N」。
+function Get-PackChangeHashSheetName([string]$SourceKey) {
+    $key = [string]$SourceKey
+    if ($key -match '^worksheet:(.+)$') { return [string]$matches[1] }
+    if ($key -match '^page:(\d+)$') { return ('Page ' + [string]$matches[1]) }
+    if ($key -match '^slide:(\d+)$') { return ('Slide ' + [string]$matches[1]) }
+    return $key
+}
+
+# 1ページの見た目のハッシュ。state: ok（取れた）／none（記録が無い・まだ解析していない）／
+# missing（その版の記録が掃除などで消えている）。$VisualHashes は版のキー → visual-hashes の中身
+# （記録が消えていれば文字列 'missing'）。ファイルは読まない。
+function Get-PackChangePageHash($VisualHashes, $Versions, $Page) {
+    $none = [pscustomobject]@{ state = 'none'; hash = '' }
+    $sourceId = [string]$Page.sourceId
+    if ([string]::IsNullOrWhiteSpace($sourceId) -or $null -eq $Versions -or -not $Versions.ContainsKey($sourceId)) { return $none }
+    $version = $Versions[$sourceId]
+    if ([string]::IsNullOrWhiteSpace([string]$version.snapshotId) -or [string]::IsNullOrWhiteSpace([string]$version.versionId)) { return $none }
+    $key = Get-PackChangeVersionKey $sourceId ([string]$version.snapshotId) ([string]$version.versionId)
+    if ($null -eq $VisualHashes -or -not $VisualHashes.ContainsKey($key)) { return $none }
+    $entry = $VisualHashes[$key]
+    if ($null -eq $entry) { return $none }
+    if ($entry -is [string]) {
+        if ($entry -eq 'missing') { return [pscustomobject]@{ state = 'missing'; hash = '' } }
+        return $none
+    }
+    $sheetName = Get-PackChangeHashSheetName ([string]$Page.sourceKey)
+    $sheet = @(Get-Array (Get-DataProperty $entry 'sheets' @()) | Where-Object { [string](Get-DataProperty $_ 'sheetName' '') -eq $sheetName } | Select-Object -First 1)
+    if ($sheet.Count -eq 0) { return $none }
+    $hashes = @(Get-Array (Get-DataProperty $sheet[0] 'pageHashes' @()))
+    $index = [int]$Page.sourcePdfPageNumber - 1
+    if ($index -lt 0 -or $index -ge $hashes.Count) { return $none }
+    $hash = Normalize-FileHash ([string]$hashes[$index])
+    if ([string]::IsNullOrWhiteSpace($hash)) { return $none }
+    return [pscustomobject]@{ state = 'ok'; hash = $hash }
+}
+
+function New-PackChangeCounts {
+    return [ordered]@{
+        content = 0; sameLook = 0; maybeContent = 0; unavailable = 0
+        added = 0; removed = 0; moved = 0; shifted = 0; side = 0; renamed = 0
+        unchanged = 0; changed = 0; partCountChanged = 0; total = 0
+    }
+}
+
+# 2つのアーカイブ（manifest・metadata）のページを対応付け、変わったことを分類する。
+# 副作用なし（ファイルを読まない）。見た目のハッシュは呼び出し側が $VisualHashes で渡す。
+# kinds: content（内容が変わった）／same-look（原稿は更新されたが見た目は同じ）／
+# maybe-content（内容が変わった可能性あり）／unavailable（比べられない）／added／removed／
+# moved（場所が変わった）／side（左右が入れ替わった）／renamed（名前が変わった）／unchanged。
+function Compare-PackArchivePageMaps($FromManifest, $FromMetadata, $ToManifest, $ToMetadata, $VisualHashes = $null) {
+    $fromMap = Get-PackArchivePageMap $FromManifest
+    $toMap = Get-PackArchivePageMap $ToManifest
+    # 左右の入れ替わりは、両方の版に記録があるときだけ見る。
+    $hasSides = ([bool]$fromMap.hasSides -and [bool]$toMap.hasSides)
+    $fromVersions = Get-PackChangeSourceVersions $FromMetadata
+    $toVersions = Get-PackChangeSourceVersions $ToMetadata
+
+    $fromGroups = [ordered]@{}
+    foreach ($p in @($fromMap.pages)) {
+        $k = Get-PackChangeItemKey $p
+        if (-not $fromGroups.Contains($k)) { $fromGroups[$k] = New-Object System.Collections.ArrayList }
+        [void]$fromGroups[$k].Add($p)
+    }
+    $toGroups = [ordered]@{}
+    foreach ($p in @($toMap.pages)) {
+        $k = Get-PackChangeItemKey $p
+        if (-not $toGroups.Contains($k)) { $toGroups[$k] = New-Object System.Collections.ArrayList }
+        [void]$toGroups[$k].Add($p)
+    }
+
+    # 同じ項目のページは pagePartIndex の小さい方から順に対応させ、余りを増えた・なくなったにする。
+    $pairs = New-Object System.Collections.ArrayList
+    $groupKeys = New-Object System.Collections.ArrayList
+    foreach ($k in @($toGroups.Keys)) { [void]$groupKeys.Add($k) }
+    foreach ($k in @($fromGroups.Keys)) { if (-not $toGroups.Contains($k)) { [void]$groupKeys.Add($k) } }
+    foreach ($k in @($groupKeys)) {
+        $toParts = @()
+        $fromParts = @()
+        if ($toGroups.Contains($k)) { $toParts = @($toGroups[$k] | Sort-Object { [int]$_.pagePartIndex }, { [int]$_.outputPageNumber }) }
+        if ($fromGroups.Contains($k)) { $fromParts = @($fromGroups[$k] | Sort-Object { [int]$_.pagePartIndex }, { [int]$_.outputPageNumber }) }
+        $partCountChanged = ($fromParts.Count -gt 0 -and $toParts.Count -gt 0 -and $fromParts.Count -ne $toParts.Count)
+        $max = [Math]::Max($fromParts.Count, $toParts.Count)
+        for ($i = 0; $i -lt $max; $i++) {
+            [void]$pairs.Add([pscustomobject]@{
+                from = $(if ($i -lt $fromParts.Count) { $fromParts[$i] } else { $null })
+                to = $(if ($i -lt $toParts.Count) { $toParts[$i] } else { $null })
+                partCountChanged = $partCountChanged
+                fromPartCount = $fromParts.Count
+                toPartCount = $toParts.Count
+            })
+        }
+    }
+
+    # 「前のページが増減したためにずれただけ」を見分けるため、ページ番号ごとに、それより前に
+    # 増えたページ数（今回側）・なくなったページ数（前回側）を数えておく。
+    $toMax = 0; $fromMax = 0
+    foreach ($p in @($toMap.pages)) { if ([int]$p.outputPageNumber -gt $toMax) { $toMax = [int]$p.outputPageNumber } }
+    foreach ($p in @($fromMap.pages)) { if ([int]$p.outputPageNumber -gt $fromMax) { $fromMax = [int]$p.outputPageNumber } }
+    $addedAt = New-Object 'int[]' ($toMax + 2)
+    $removedAt = New-Object 'int[]' ($fromMax + 2)
+    foreach ($pair in @($pairs)) {
+        if ($null -eq $pair.from -and $null -ne $pair.to) { $addedAt[[int]$pair.to.outputPageNumber]++ }
+        if ($null -ne $pair.from -and $null -eq $pair.to) { $removedAt[[int]$pair.from.outputPageNumber]++ }
+    }
+    $addedBefore = New-Object 'int[]' ($toMax + 2)
+    for ($n = 1; $n -le $toMax + 1; $n++) { $addedBefore[$n] = $addedBefore[$n - 1] + $addedAt[$n - 1] }
+    $removedBefore = New-Object 'int[]' ($fromMax + 2)
+    for ($n = 1; $n -le $fromMax + 1; $n++) { $removedBefore[$n] = $removedBefore[$n - 1] + $removedAt[$n - 1] }
+
+    $counts = New-PackChangeCounts
+    $rows = New-Object System.Collections.ArrayList
+    $partChangedItems = @{}
+    foreach ($pair in @($pairs)) {
+        $f = $pair.from
+        $t = $pair.to
+        $kinds = New-Object System.Collections.ArrayList
+        $shiftOnly = $false
+        $message = ''
+        $fromVersion = $null
+        $toVersion = $null
+        if ($null -ne $f -and $fromVersions.ContainsKey([string]$f.sourceId)) { $fromVersion = $fromVersions[[string]$f.sourceId] }
+        if ($null -ne $t -and $toVersions.ContainsKey([string]$t.sourceId)) { $toVersion = $toVersions[[string]$t.sourceId] }
+        if ($null -eq $f) {
+            [void]$kinds.Add('added')
+        } elseif ($null -eq $t) {
+            [void]$kinds.Add('removed')
+        } else {
+            $sameVersion = ([string]$f.sourceId -eq [string]$t.sourceId -and $null -ne $fromVersion -and $null -ne $toVersion -and
+                -not [string]::IsNullOrWhiteSpace([string]$toVersion.versionId) -and
+                [string]$fromVersion.snapshotId -eq [string]$toVersion.snapshotId -and [string]$fromVersion.versionId -eq [string]$toVersion.versionId)
+            $samePlace = ([string]$f.sourceKey -eq [string]$t.sourceKey -and [int]$f.sourcePdfPageNumber -eq [int]$t.sourcePdfPageNumber)
+            if (-not ($sameVersion -and $samePlace)) {
+                $fromHash = Get-PackChangePageHash $VisualHashes $fromVersions $f
+                $toHash = Get-PackChangePageHash $VisualHashes $toVersions $t
+                if ([string]$fromHash.state -eq 'missing' -or [string]$toHash.state -eq 'missing') {
+                    [void]$kinds.Add('unavailable')
+                    $message = '比べられません（前の版の記録が残っていません）'
+                } elseif ([string]$fromHash.state -eq 'ok' -and [string]$toHash.state -eq 'ok') {
+                    if ([string]$fromHash.hash -eq [string]$toHash.hash) { [void]$kinds.Add('same-look') } else { [void]$kinds.Add('content') }
+                } else {
+                    [void]$kinds.Add('maybe-content')
+                }
+            }
+            if ([int]$f.outputPageNumber -ne [int]$t.outputPageNumber) {
+                [void]$kinds.Add('moved')
+                $expectedShift = $addedBefore[[int]$t.outputPageNumber] - $removedBefore[[int]$f.outputPageNumber]
+                $shiftOnly = (([int]$t.outputPageNumber - [int]$f.outputPageNumber) -eq $expectedShift)
+            }
+            # 記録された左右どうしの比較。新しく左右を決めるのではない。
+            if ($hasSides -and -not [string]::IsNullOrWhiteSpace([string]$f.side) -and -not [string]::IsNullOrWhiteSpace([string]$t.side) -and [string]$f.side -ne [string]$t.side) {
+                [void]$kinds.Add('side')
+            }
+            if ([string]$f.title -cne [string]$t.title) { [void]$kinds.Add('renamed') }
+            if ($kinds.Count -eq 0) { [void]$kinds.Add('unchanged') }
+        }
+        if ([bool]$pair.partCountChanged) {
+            $partMessage = ('この原稿のページ数が変わりました（前回 {0} → 今回 {1}）' -f [int]$pair.fromPartCount, [int]$pair.toPartCount)
+            $message = $(if ($message) { $message + ' / ' + $partMessage } else { $partMessage })
+        }
+        $page = $(if ($null -ne $t) { $t } else { $f })
+        $sourceId = [string]$page.sourceId
+        $sourceName = [string]$page.sectionTitle
+        if ([string]::IsNullOrWhiteSpace($sourceName)) {
+            $versionForName = $(if ($null -ne $toVersion) { $toVersion } else { $fromVersion })
+            if ($null -ne $versionForName) { $sourceName = [string]$versionForName.fileName }
+        }
+        $fromSnapshotId = $(if ($null -ne $fromVersion) { [string]$fromVersion.snapshotId } else { '' })
+        $toSnapshotId = $(if ($null -ne $toVersion) { [string]$toVersion.snapshotId } else { '' })
+        $fromVersionId = $(if ($null -ne $fromVersion) { [string]$fromVersion.versionId } else { '' })
+        $toVersionId = $(if ($null -ne $toVersion) { [string]$toVersion.versionId } else { '' })
+        # 「くわしく見る」（原稿単位の比較）に渡せるのは、同じ原稿の別の版が両方わかるときだけ。
+        $detailAvailable = ($null -ne $f -and $null -ne $t -and [string]$f.sourceId -eq [string]$t.sourceId -and
+            -not [string]::IsNullOrWhiteSpace($sourceId) -and
+            -not [string]::IsNullOrWhiteSpace($fromSnapshotId) -and -not [string]::IsNullOrWhiteSpace($toSnapshotId) -and
+            ($fromSnapshotId -ne $toSnapshotId -or $fromVersionId -ne $toVersionId) -and
+            -not $kinds.Contains('unavailable'))
+        [void]$rows.Add([ordered]@{
+            toPage = $(if ($null -ne $t) { [int]$t.outputPageNumber } else { $null })
+            toSide = $(if ($null -ne $t -and [bool]$toMap.hasSides) { [string]$t.side } else { '' })
+            toSpreadIndex = $(if ($null -ne $t -and [bool]$toMap.hasSides) { $t.spreadIndex } else { $null })
+            fromPage = $(if ($null -ne $f) { [int]$f.outputPageNumber } else { $null })
+            fromSide = $(if ($null -ne $f -and [bool]$fromMap.hasSides) { [string]$f.side } else { '' })
+            fromSpreadIndex = $(if ($null -ne $f -and [bool]$fromMap.hasSides) { $f.spreadIndex } else { $null })
+            itemId = [string]$page.itemId
+            pageId = [string]$page.pageId
+            sourceId = $sourceId
+            sourceName = $sourceName
+            title = [string]$page.title
+            fromTitle = $(if ($null -ne $f) { [string]$f.title } else { '' })
+            sheetKey = [string]$page.sourceKey
+            sheetName = Get-PackChangeHashSheetName ([string]$page.sourceKey)
+            pagePartIndex = [int]$page.pagePartIndex
+            fromPartCount = [int]$pair.fromPartCount
+            toPartCount = [int]$pair.toPartCount
+            partCountChanged = [bool]$pair.partCountChanged
+            kinds = @($kinds)
+            shiftOnly = $shiftOnly
+            # 画像の比較（枠・変化の割合）は変更点PDFを作るときに埋める。一覧はハッシュだけで決める。
+            changedRatio = $null
+            regionCount = $null
+            fromSnapshotId = $fromSnapshotId
+            fromVersionId = $fromVersionId
+            toSnapshotId = $toSnapshotId
+            toVersionId = $toVersionId
+            detailAvailable = [bool]$detailAvailable
+            message = $message
+            sortKey = 0.0
+        })
+        if ([bool]$pair.partCountChanged) { $partChangedItems[(Get-PackChangeItemKey $page)] = $true }
+        foreach ($kind in @($kinds)) {
+            switch ([string]$kind) {
+                'content' { $counts.content++ }
+                'same-look' { $counts.sameLook++ }
+                'maybe-content' { $counts.maybeContent++ }
+                'unavailable' { $counts.unavailable++ }
+                'added' { $counts.added++ }
+                'removed' { $counts.removed++ }
+                'moved' { $counts.moved++; if ($shiftOnly) { $counts.shifted++ } }
+                'side' { $counts.side++ }
+                'renamed' { $counts.renamed++ }
+                'unchanged' { $counts.unchanged++ }
+            }
+        }
+        $isChanged = @($kinds | Where-Object { [string]$_ -notin @('unchanged','same-look') }).Count -gt 0
+        if ($isChanged) { $counts.changed++ }
+        $counts.total++
+    }
+    $counts.partCountChanged = $partChangedItems.Count
+
+    # 並びは今回のページ番号順。なくなったページは、前回の並びで直前にあった（今回にも残る）
+    # ページのすぐ後ろに置く。
+    $lastToPage = 0.0
+    $fromOrdered = @($rows | Where-Object { $null -ne $_.fromPage } | Sort-Object { [int]$_.fromPage })
+    foreach ($row in $fromOrdered) {
+        if ($null -ne $row.toPage) { $lastToPage = [double]$row.toPage }
+        else { $row.sortKey = $lastToPage + 0.5 + ([double]$row.fromPage / 1000000.0) }
+    }
+    foreach ($row in @($rows)) { if ($null -ne $row.toPage) { $row.sortKey = [double]$row.toPage } }
+    $sorted = @($rows | Sort-Object { [double]$_.sortKey })
+    foreach ($row in $sorted) { $row.Remove('sortKey') }
+
+    return [pscustomobject][ordered]@{
+        algorithmVersion = $Script:PackChangeAlgorithmVersion
+        hasSides = $hasSides
+        fromHasPageMap = [bool]$fromMap.hasSides
+        toHasPageMap = [bool]$toMap.hasSides
+        fromPageCount = @($fromMap.pages).Count
+        toPageCount = @($toMap.pages).Count
+        # 見た目のハッシュがまだ無い・版の記録が無いページがあれば、後で結果が変わりうる。
+        complete = ([int]$counts.maybeContent -eq 0 -and [int]$counts.unavailable -eq 0)
+        counts = $counts
+        pages = @($sorted)
+    }
+}
+
+# 比べた結果を覚えておくフォルダー（変更点PDFもここに作る）。
+function Get-PackChangeReportDir([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId) {
+    $storageId = Get-FinalArchiveStorageId $PackId
+    $safeTarget = Assert-SafeStorageSegment $TargetId 'targetId'
+    $safeFrom = Assert-SafeStorageSegment $FromBuildId 'fromBuildId'
+    $safeTo = Assert-SafeStorageSegment $ToBuildId 'toBuildId'
+    return (Join-Path (Join-Path (Join-Path (Join-Path (Get-WorkspacePath $Language) 'exports\change-reports') $storageId) $safeTarget) ($safeFrom + '__' + $safeTo))
+}
+
+# 古い順・新しい順を決める。builtAt は秒までなので、同じ秒の出力は buildId（ミリ秒の時刻）で決める。
+function Compare-PackChangeRowAge($A, $B) {
+    $c = [string]::CompareOrdinal([string](Get-DataProperty $A 'builtAt' ''), [string](Get-DataProperty $B 'builtAt' ''))
+    if ($c -eq 0) { $c = [string]::CompareOrdinal([string](Get-DataProperty $A 'buildId' ''), [string](Get-DataProperty $B 'buildId' '')) }
+    return $c
+}
+
+# 既定の組み合わせ（§4.2）を決める。比べる先＝今の提出用PDF（なければ最後に出力した版）、
+# 比べる元＝前回共有用フォルダーへコピーした版（なければ、比べる先の1つ前の出力）。
+# fromBuildId / toBuildId を指定したら、その版を使う（同じ出力先の保存済み出力だけ）。
+function Resolve-PackChangePair([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId = '', [string]$ToBuildId = '') {
+    $volume = Get-LegacyVolumeFromTargetId $Language $TargetId
+    $fromRequested = ([string]$FromBuildId).Trim()
+    $toRequested = ([string]$ToBuildId).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($fromRequested)) { $fromRequested = Assert-SafeStorageSegment $fromRequested 'fromBuildId' }
+    if (-not [string]::IsNullOrWhiteSpace($toRequested)) { $toRequested = Assert-SafeStorageSegment $toRequested 'toBuildId' }
+    $notes = New-Object System.Collections.ArrayList
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($row in @(Get-FinalArchives $Language $PackId | Where-Object { [string](Get-DataProperty $_ 'volume' '') -eq $volume })) { [void]$rows.Add($row) }
+    # 一覧（出力先ごとに新しい50件）に無い古い版を指定されたら、アーカイブを直接読む。
+    # 別の出力先の版は、この出力先のフォルダーに無いので見つからない（400）。
+    $findRow = {
+        param([string]$Id)
+        $found = @($rows | Where-Object { [string](Get-DataProperty $_ 'buildId' '') -eq $Id } | Select-Object -First 1)
+        if ($found.Count -gt 0) { return $found[0] }
+        $record = Get-FinalArchiveRecord $Language $PackId $volume $Id
+        if ($null -eq $record) { return $null }
+        $extra = [ordered]@{ buildId = [string]$record.buildId; builtAt = [string]$record.builtAt; volume = $volume; pageCount = [int]$record.pageCount; outputFileName = [string]$record.outputFileName; outputPdfSha256 = [string]$record.outputPdfSha256; publishedAt = ''; folderName = ''; isLastPublished = $false; isCurrent = $false; hasPageMap = [bool]$record.hasPageMap }
+        [void]$rows.Add($extra)
+        return $extra
+    }
+    $previousOf = {
+        param($Row)
+        $older = @($rows | Where-Object { (Compare-PackChangeRowAge $_ $Row) -lt 0 } | Sort-Object @{ Expression = { [string](Get-DataProperty $_ 'builtAt' '') }; Descending = $true }, @{ Expression = { [string](Get-DataProperty $_ 'buildId' '') }; Descending = $true } | Select-Object -First 1)
+        if ($older.Count -gt 0) { return $older[0] }
+        return $null
+    }
+    $fromRow = $null
+    $toRow = $null
+    $fromReason = 'none'
+    if (-not [string]::IsNullOrWhiteSpace($toRequested)) {
+        $toRow = & $findRow $toRequested
+        if ($null -eq $toRow) { throw [ArgumentException]::new('指定された比べる先の版は、この出力先の保存済み出力にありません。') }
+    } else {
+        $current = @($rows | Where-Object { [bool](Get-DataProperty $_ 'isCurrent' $false) } | Select-Object -First 1)
+        if ($current.Count -gt 0) { $toRow = $current[0] }
+        else {
+            $newest = @($rows | Sort-Object @{ Expression = { [string](Get-DataProperty $_ 'builtAt' '') }; Descending = $true }, @{ Expression = { [string](Get-DataProperty $_ 'buildId' '') }; Descending = $true } | Select-Object -First 1)
+            if ($newest.Count -gt 0) {
+                $toRow = $newest[0]
+                [void]$notes.Add([ordered]@{ code = 'not-current'; message = '今の提出用PDFは、原稿が変わったあとにまだ出力していないか、出力した後に変更されています。最後に出力した版と比べています。' })
+            }
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($fromRequested)) {
+        $fromRow = & $findRow $fromRequested
+        if ($null -eq $fromRow) { throw [ArgumentException]::new('指定された比べる元の版は、この出力先の保存済み出力にありません。') }
+        $fromReason = 'selected'
+    } elseif ($null -ne $toRow) {
+        $publishedRow = $null
+        $lastPublished = Get-LastPublishedBuildId $Language $PackId $TargetId
+        if (-not [string]::IsNullOrWhiteSpace($lastPublished)) {
+            try { $publishedRow = & $findRow $lastPublished } catch { $publishedRow = $null }
+            if ($null -eq $publishedRow) {
+                [void]$notes.Add([ordered]@{ code = 'published-missing'; message = '前回コピーした版の保存済み出力が見つからないため、1つ前に出力した版と比べています。' })
+            }
+        } else {
+            # 最後のコピーに buildId が無くても、コピーしたPDFのハッシュと同じアーカイブがあればそれが前回の版。
+            $lastRecord = @(Get-PublishRecords $Language $PackId $volume 1)
+            if ($lastRecord.Count -gt 0) {
+                $publishedSha = Normalize-FileHash ([string](Get-DataProperty $lastRecord[0] 'sha256' ''))
+                if (-not [string]::IsNullOrWhiteSpace($publishedSha)) {
+                    $bySha = @($rows | Where-Object { (Normalize-FileHash ([string](Get-DataProperty $_ 'outputPdfSha256' ''))) -eq $publishedSha } | Select-Object -First 1)
+                    if ($bySha.Count -gt 0) { $publishedRow = $bySha[0] }
+                }
+            }
+        }
+        if ($null -ne $publishedRow -and [string](Get-DataProperty $publishedRow 'buildId' '') -ne [string](Get-DataProperty $toRow 'buildId' '') -and (Compare-PackChangeRowAge $publishedRow $toRow) -lt 0) {
+            $fromRow = $publishedRow
+            $fromReason = 'published'
+        } else {
+            $fromRow = & $previousOf $toRow
+            if ($null -ne $fromRow) { $fromReason = 'previous' }
+            if ($null -ne $publishedRow -and [string](Get-DataProperty $publishedRow 'buildId' '') -eq [string](Get-DataProperty $toRow 'buildId' '')) {
+                [void]$notes.Add([ordered]@{ code = 'same-as-published'; message = '前回コピーしてから、まだ出力し直していません。1つ前に出力した版と比べています。' })
+            } elseif ($null -eq $publishedRow -and [string]::IsNullOrWhiteSpace($lastPublished) -and $null -ne $fromRow) {
+                [void]$notes.Add([ordered]@{ code = 'not-published'; message = '（まだ共有用フォルダーにコピーしていないため、1つ前に出力した版と比べています）' })
+            }
+        }
+    }
+    $swapped = $false
+    if ($null -ne $fromRow -and $null -ne $toRow) {
+        if ([string](Get-DataProperty $fromRow 'buildId' '') -eq [string](Get-DataProperty $toRow 'buildId' '')) {
+            if (-not [string]::IsNullOrWhiteSpace($fromRequested) -or -not [string]::IsNullOrWhiteSpace($toRequested)) { throw [ArgumentException]::new('同じ版どうしは比べられません。別の版を選んでください。') }
+            $fromRow = $null
+            $fromReason = 'none'
+        } elseif ((Compare-PackChangeRowAge $fromRow $toRow) -gt 0) {
+            $swapRow = $fromRow; $fromRow = $toRow; $toRow = $swapRow
+            $swapped = $true
+            [void]$notes.Add([ordered]@{ code = 'swapped'; message = '古い版から新しい版の向きに入れ替えて比べます。' })
+        }
+    }
+    return [pscustomobject][ordered]@{
+        volume = $volume
+        fromBuildId = $(if ($null -ne $fromRow) { [string](Get-DataProperty $fromRow 'buildId' '') } else { '' })
+        toBuildId = $(if ($null -ne $toRow) { [string](Get-DataProperty $toRow 'buildId' '') } else { '' })
+        fromRow = $fromRow
+        toRow = $toRow
+        defaultPair = ([string]::IsNullOrWhiteSpace($fromRequested) -and [string]::IsNullOrWhiteSpace($toRequested))
+        fromReason = $fromReason
+        swapped = $swapped
+        notes = @($notes)
+    }
+}
+
+# アーカイブに記録された原稿の版ごとに、見た目のハッシュを読む。その版の記録（スナップショット）が
+# 消えていれば 'missing'、まだ解析していなければ $null。
+function Get-PackChangeVisualHashes([string]$Language, [object[]]$Metadatas) {
+    $table = @{}
+    foreach ($meta in @($Metadatas)) {
+        foreach ($sw in @(Get-Array (Get-DataProperty $meta 'sourceWorkbooks' @()))) {
+            $workbookId = [string](Get-DataProperty $sw 'workbookId' '')
+            $snapshotId = [string](Get-DataProperty $sw 'snapshotId' '')
+            $versionId = [string](Get-DataProperty $sw 'versionId' '')
+            if ([string]::IsNullOrWhiteSpace($workbookId) -or [string]::IsNullOrWhiteSpace($snapshotId) -or [string]::IsNullOrWhiteSpace($versionId)) { continue }
+            $key = Get-PackChangeVersionKey $workbookId $snapshotId $versionId
+            if ($table.ContainsKey($key)) { continue }
+            $value = $null
+            try {
+                $snapshotDir = Get-SnapshotDir $Language $workbookId $snapshotId
+                if (-not (Test-Path -LiteralPath $snapshotDir -PathType Container)) { $value = 'missing' }
+                else { $value = Get-VisualHashes $Language $workbookId $snapshotId $versionId }
+            } catch { $value = $null }
+            $table[$key] = $value
+        }
+    }
+    return $table
+}
+
+function New-PackChangeVersionInfo($Record, $Row, [int]$PhysicalPageCount, [bool]$IsLatest) {
+    return [ordered]@{
+        buildId = [string]$Record.buildId
+        builtAt = [string]$Record.builtAt
+        pageCount = $PhysicalPageCount
+        itemCount = [int]$Record.pageCount
+        outputFileName = [string]$Record.outputFileName
+        outputPdfSha256 = [string]$Record.outputPdfSha256
+        hasPageMap = [bool]$Record.hasPageMap
+        publishedAt = [string](Get-DataProperty $Row 'publishedAt' '')
+        folderName = [string](Get-DataProperty $Row 'folderName' '')
+        isLastPublished = [bool](Get-DataProperty $Row 'isLastPublished' $false)
+        isCurrent = [bool](Get-DataProperty $Row 'isCurrent' $false)
+        isLatest = $IsLatest
+    }
+}
+
+# GET /api/v2/outputs/changes の本体。比べる版を決め、2つのアーカイブを対応付ける。
+# 結果は summary.json に覚える（見た目のハッシュが揃っていない結果は、後で変わりうるので使い回さない）。
+function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId = '', [string]$ToBuildId = '') {
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackId $true
+    $packId = [string]$scope.packId
+    $targetId = ([string]$TargetId).Trim().ToLowerInvariant()
+    if (-not [bool]$scope.builtIn) { $targetId = Assert-PackTargetId $Language $scope.pack $TargetId }
+    $volume = Get-LegacyVolumeFromTargetId $Language $targetId
+    $result = [ordered]@{
+        packId = $packId
+        targetId = $targetId
+        volume = $volume
+        status = 'ready'
+        message = ''
+        defaultPair = $true
+        fromReason = 'none'
+        swapped = $false
+        from = $null
+        to = $null
+        hasSides = $false
+        complete = $true
+        counts = (New-PackChangeCounts)
+        pages = @()
+        notes = @()
+        # 変更点PDFはまだ作れない（作成・共有コピーへの同梱は後の版で足す）。
+        report = [ordered]@{ exists = $false; reportId = ''; publishable = $false; reason = 'not-available' }
+    }
+    if ([bool]$scope.builtIn) {
+        $result.status = 'unsupported'
+        $result.message = '組み込みの一式は出力の版を保存していないため、変更点を比べられません。'
+        return $result
+    }
+    $pair = Resolve-PackChangePair $Language $packId $targetId $FromBuildId $ToBuildId
+    $notes = New-Object System.Collections.ArrayList
+    foreach ($note in @($pair.notes)) { [void]$notes.Add($note) }
+    $result.defaultPair = [bool]$pair.defaultPair
+    $result.fromReason = [string]$pair.fromReason
+    $result.swapped = [bool]$pair.swapped
+    if ([string]::IsNullOrWhiteSpace([string]$pair.toBuildId)) {
+        $result.status = 'no-output'
+        $result.message = 'まだ出力していないため、比べるものがありません。'
+        $result.notes = @($notes)
+        return $result
+    }
+    $toRecord = Get-FinalArchiveRecord $Language $packId $volume ([string]$pair.toBuildId)
+    if ($null -eq $toRecord) {
+        $result.status = 'unavailable'
+        $result.message = '比べる先の保存済み出力が読めません（記録とPDFの中身が合いません）。'
+        $result.notes = @($notes)
+        return $result
+    }
+    $isLatest = $false
+    if ([bool](Get-DataProperty $pair.toRow 'isCurrent' $false)) {
+        try { $isLatest = ([string](Get-FinalBuildReadiness $structure $Language $volume $packId).displayState -eq 'built') } catch { $isLatest = $false }
+        if (-not $isLatest -and [bool]$pair.defaultPair) {
+            [void]$notes.Add([ordered]@{ code = 'not-latest'; message = '今の提出用PDFは、原稿が変わったあとにまだ出力していません。先に出力してから比べると、最新の内容との違いが分かります。' })
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$pair.fromBuildId)) {
+        $toMap = Get-PackArchivePageMap $toRecord.manifest
+        $result.to = New-PackChangeVersionInfo $toRecord $pair.toRow (@($toMap.pages).Count) $isLatest
+        $result.status = 'no-baseline'
+        $result.message = 'はじめての出力なので、比べるものがありません。'
+        $result.notes = @($notes)
+        return $result
+    }
+    $fromRecord = Get-FinalArchiveRecord $Language $packId $volume ([string]$pair.fromBuildId)
+    if ($null -eq $fromRecord) {
+        $toMap = Get-PackArchivePageMap $toRecord.manifest
+        $result.to = New-PackChangeVersionInfo $toRecord $pair.toRow (@($toMap.pages).Count) $isLatest
+        $result.status = 'unavailable'
+        $result.message = '比べる元の保存済み出力が読めません（記録とPDFの中身が合いません）。'
+        $result.notes = @($notes)
+        return $result
+    }
+
+    $comparison = $null
+    $cachePath = ''
+    try { $cachePath = Join-Path (Get-PackChangeReportDir $Language $packId $targetId ([string]$fromRecord.buildId) ([string]$toRecord.buildId)) 'summary.json' } catch { $cachePath = '' }
+    if ($cachePath -and (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        try {
+            $cached = Read-JsonFile $cachePath $null
+            if ($null -ne $cached -and
+                [int](Get-DataProperty $cached 'algorithmVersion' 0) -eq [int]$Script:PackChangeAlgorithmVersion -and
+                (Normalize-FileHash ([string](Get-DataProperty $cached 'fromOutputPdfSha256' ''))) -eq [string]$fromRecord.outputPdfSha256 -and
+                (Normalize-FileHash ([string](Get-DataProperty $cached 'toOutputPdfSha256' ''))) -eq [string]$toRecord.outputPdfSha256 -and
+                [bool](Get-DataProperty (Get-DataProperty $cached 'comparison' $null) 'complete' $false)) {
+                $comparison = Get-DataProperty $cached 'comparison' $null
+            }
+        } catch { $comparison = $null }
+    }
+    if ($null -eq $comparison) {
+        $hashes = Get-PackChangeVisualHashes $Language @($fromRecord.metadata, $toRecord.metadata)
+        $comparison = Compare-PackArchivePageMaps $fromRecord.manifest $fromRecord.metadata $toRecord.manifest $toRecord.metadata $hashes
+        # 覚えられなくても比較は返す（次も計算し直すだけ）。
+        if ($cachePath) {
+            try {
+                Write-JsonFile $cachePath ([ordered]@{
+                    schemaVersion = 1
+                    algorithmVersion = $Script:PackChangeAlgorithmVersion
+                    packId = $packId; targetId = $targetId
+                    fromBuildId = [string]$fromRecord.buildId; toBuildId = [string]$toRecord.buildId
+                    fromOutputPdfSha256 = [string]$fromRecord.outputPdfSha256; toOutputPdfSha256 = [string]$toRecord.outputPdfSha256
+                    createdAt = New-NowIso
+                    comparison = $comparison
+                })
+            } catch { }
+        }
+    }
+    $result.from = New-PackChangeVersionInfo $fromRecord $pair.fromRow ([int](Get-DataProperty $comparison 'fromPageCount' 0)) $false
+    $result.to = New-PackChangeVersionInfo $toRecord $pair.toRow ([int](Get-DataProperty $comparison 'toPageCount' 0)) $isLatest
+    $result.hasSides = [bool](Get-DataProperty $comparison 'hasSides' $false)
+    $result.complete = [bool](Get-DataProperty $comparison 'complete' $false)
+    $result.counts = Get-DataProperty $comparison 'counts' (New-PackChangeCounts)
+    $result.pages = @(Get-Array (Get-DataProperty $comparison 'pages' @()))
+    if (-not [bool](Get-DataProperty $comparison 'fromHasPageMap' $false) -or -not [bool](Get-DataProperty $comparison 'toHasPageMap' $false)) {
+        [void]$notes.Add([ordered]@{ code = 'no-page-map'; message = 'この版は古い形式のため、ページの左右までは比べられません。' })
+    }
+    if ([int](Get-DataProperty $result.counts 'changed' 0) -eq 0) {
+        $noChangeMessage = $(if ([string]$pair.fromReason -eq 'published') { '前回コピーしたときから、変わったページはありません。' } else { '比べた2つの版のあいだで、変わったページはありません。' })
+        [void]$notes.Add([ordered]@{ code = 'no-changes'; message = $noChangeMessage })
+    }
+    if ([int](Get-DataProperty $result.counts 'unavailable' 0) -gt 0) {
+        [void]$notes.Add([ordered]@{ code = 'some-unavailable'; message = '前の版の記録が残っていないページは比べられません（ほかのページは比べています）。' })
+    }
+    $result.notes = @($notes)
+    return $result
 }
 
 
