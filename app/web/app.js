@@ -6857,7 +6857,8 @@ async function cancelActiveFinalJob(){
 
 // ---- 共有用フォルダーへのコピーに変更点PDFを同梱する（includeChangeReports）----
 // 付けられるのは「前回コピーした版 → 今の提出用PDF」の変更点PDFだけ（サーバーの report.attachable）。
-// まだ作っていなければ、先に作ってからコピーする。コピーの処理の中では作らない（作成には時間が
+// 既定では付けない（確認画面のチェックは最初は外してある）。チェックを付けたときだけ、
+// まだ作っていなければ先に作ってからコピーする。コピーの処理の中では作らない（作成には時間が
 // かかり、その間ずっと出力のロックを持つことになるため）。付けてよいかはコピーのときにサーバーが確かめ直す。
 function publishChangeReportPlan(items){
   const ready=[],create=[];
@@ -6877,7 +6878,7 @@ async function loadPublishChangeReportPlan(volumes){
   }
   return publishChangeReportPlan(items);
 }
-// 確認画面。キャンセルなら null。付けられる変更点PDFが無ければ、今までどおり確認なしでコピーする。
+// 確認画面。チェックは最初は外してあり、付けたときだけ変更点PDFを作る・同梱する。キャンセルなら null。付けられる変更点PDFが無ければ、今までどおり確認なしでコピーする。
 async function confirmPublishChangeReports(plan,title){
   if(!plan?.offer)return {includeChangeReports:false};
   const names=[...plan.ready,...plan.create].map(item=>item.label).join('、');
@@ -6885,9 +6886,9 @@ async function confirmPublishChangeReports(plan,title){
   const accepted=await confirmAction({
     title,
     message:'共有用フォルダーに発行フォルダーを作り、提出用PDFをコピーします。',
-    detail:`変更点PDF（前回コピーしたときからの変更点をまとめた確認用のPDF。提出物ではありません）を、提出用PDFと同じ発行フォルダーに入れられます。対象：${names}`+(createNames?`\n${createNames}の変更点PDFはまだ作っていないため、先に作ってからコピーします。`:''),
+    detail:`変更点PDF（前回コピーしたときからの変更点をまとめた確認用のPDF。提出物ではありません）を、提出用PDFと同じ発行フォルダーに入れられます。対象：${names}`+(createNames?`\nチェックを付けると、まだ作っていない${createNames}の変更点PDFを先に作ってからコピーします。`:''),
     confirmLabel:'コピーする',
-    check:{label:'変更点PDFもいっしょにコピーする',checked:true,confirmLabelChecked:createNames?'変更点PDFを作ってからコピーする':'コピーする'}
+    check:{label:'変更点PDFもいっしょにコピーする',checked:false,confirmLabelChecked:createNames?'変更点PDFを作ってからコピーする':'コピーする'}
   });
   if(!accepted)return null;
   return {includeChangeReports:confirmCheckState()};
