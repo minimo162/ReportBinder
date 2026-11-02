@@ -450,11 +450,16 @@ Assert-ChangeTest (-not [bool]$tamperedReport.report.exists -and [string]$tamper
 Assert-Throws { Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4 } '変わっています' 'A tampered change report was opened.'
 # 作り直すと、置き換えた report.pdf と meta.json がそろう。
 Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build3; toBuildId = $build4; statusPath = $reportStatusPath })
+$remadeJob = Read-JsonFile $reportStatusPath $null
+Assert-ChangeTest ([string]$remadeJob.status -eq 'completed') "Re-making a tampered report failed: $($remadeJob.status) $($remadeJob.message) $(@($remadeJob.errors | ForEach-Object { [string]$_.detail }) -join ' | ')"
 Assert-ChangeTest ([bool](Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4).report.exists) 'Re-making a tampered report did not replace it.'
+Assert-ChangeTest (@(Get-ChildItem -LiteralPath $reportDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.tmp' }).Count -eq 0) 'Re-making a report left a temporary file behind.'
 
 # 共有コピーへの同梱: 既定の組み合わせ（前回コピーした2回目 → 今の6回目）で作ったものだけ publishable。
 # 画面の「いっしょにコピーできる」は、コピーのときと同じ Resolve-PublishableChangeReport で決める。
 Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build2; toBuildId = $build6; statusPath = $reportStatusPath })
+$attachJob = Read-JsonFile $reportStatusPath $null
+Assert-ChangeTest ([string]$attachJob.status -eq 'completed') "The default pair report job failed: $($attachJob.status) $($attachJob.message)"
 $attachSummary = Get-PackChangeSummary 'ja' $packId 'main'
 Assert-ChangeTest ([string]$attachSummary.from.buildId -eq $build2 -and [string]$attachSummary.to.buildId -eq $build6 -and [bool]$attachSummary.report.exists) "The default pair report was not made: $($attachSummary.report | ConvertTo-Json -Compress)"
 Assert-ChangeTest ([bool]$attachSummary.report.attachable -and [bool]$attachSummary.report.publishable -and [string]$attachSummary.report.reason -eq 'publishable') "A made last-copy → current report was not offered for the shared copy: $($attachSummary.report | ConvertTo-Json -Compress)"

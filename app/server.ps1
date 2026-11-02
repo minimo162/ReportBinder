@@ -14899,13 +14899,25 @@ function Invoke-PackChangeReportJobCore($Job) {
 
         if (-not (Test-Path -LiteralPath $reportDir)) { New-Item -ItemType Directory -Path $reportDir -Force | Out-Null }
         $reportSha = Normalize-FileHash (New-Sha256 $workPdf)
-        $tmpPdf = Join-Path $reportDir ('report.pdf.tmp.' + [Guid]::NewGuid().ToString('N'))
-        Copy-Item -LiteralPath $workPdf -Destination $tmpPdf -Force
-        if ((Normalize-FileHash (New-Sha256 $tmpPdf)) -ne $reportSha) { throw '変更点PDFを保存先へ書き込めませんでした。' }
-        $metaPath = Join-Path $reportDir 'meta.json'
-        # 古い meta.json が新しい report.pdf を「作成済み」と言わないよう、先に外す。
-        if (Test-Path -LiteralPath $metaPath) { Remove-Item -LiteralPath $metaPath -Force }
-        Move-FileAtomicCompat $tmpPdf (Join-Path $reportDir 'report.pdf')
+        # 保存先は exports\change-reports\<packId>\<targetId>\<from>__<to> と深い。GUID 全体を付けた一時名だと
+        # そこだけ MAX_PATH を超えるので（TEMP の下で約 266 文字）、一時名は短くする。
+        $tmpPdf = Join-Path $reportDir ('rpt-' + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.tmp')
+        $reportPdf = Join-Path $reportDir 'report.pdf'
+        try {
+            Copy-Item -LiteralPath $workPdf -Destination $tmpPdf -Force
+            if ((Normalize-FileHash (New-Sha256 $tmpPdf)) -ne $reportSha) { throw '変更点PDFを保存先へ書き込めませんでした。' }
+            $metaPath = Join-Path $reportDir 'meta.json'
+            # 古い meta.json が新しい report.pdf を「作成済み」と言わないよう、先に外す。
+            if (Test-Path -LiteralPath $metaPath) { Remove-Item -LiteralPath $metaPath -Force }
+            # 作り直しでは古い report.pdf を先に消してから移す（File.Replace は長いパスで失敗することがあり、
+            # meta.json を外した時点で古い report.pdf は作成済みではないので、置き換えの原子性は要らない）。
+            if (Test-Path -LiteralPath $reportPdf) {
+                try { Remove-Item -LiteralPath $reportPdf -Force -ErrorAction Stop } catch { throw '前に作った変更点PDFを置き換えられませんでした。開いているアプリを閉じてから、もう一度作ってください。' }
+            }
+            Move-FileAtomicCompat $tmpPdf $reportPdf
+        } finally {
+            if (Test-Path -LiteralPath $tmpPdf) { Remove-Item -LiteralPath $tmpPdf -Force -ErrorAction SilentlyContinue }
+        }
         Write-Utf8NoBomFile (Join-Path $reportDir 'report.html') $html
         Write-JsonFile $metaPath ([ordered]@{
             schemaVersion = 1
