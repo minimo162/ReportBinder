@@ -230,7 +230,7 @@ function renderPackChangeError(message){errors.push(message);}
 }
 
 // ---- 変更点PDF（確認用） -------------------------------------------------------------
-const reportHelpers = ['packChangeReportBody', 'packChangeReportView'].map(extractFunction).join('\n') + '\n'
+const reportHelpers = ['packChangeReportBody', 'packChangeReportView', 'packChangeReportCopyNote'].map(extractFunction).join('\n') + '\n'
   + source.slice(source.indexOf('const PACK_CHANGE_REPORT_TERMINAL='), source.indexOf('];', source.indexOf('const PACK_CHANGE_REPORT_TERMINAL=')) + 2);
 const readyChanges = (extra = {}) => ({ status: 'ready', from: { buildId: 'b1' }, to: { buildId: 'b3' }, report: { exists: false, reason: 'not-created' }, ...extra });
 {
@@ -355,6 +355,135 @@ function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChang
   ctx.pending.shift().d.reject(new Error('boom'));
   await creating;
   assert.equal(ctx.renders.length, rendersBefore, 'a failure after closing must not repaint');
+}
+
+// ---- 共有用フォルダーへのコピーに変更点PDFを同梱する ------------------------------------
+const publishHelpers = ['publishChangeReportPlan', 'publishChangeReportNote'].map(extractFunction).join('\n');
+{
+  const ctx = browserContext();
+  vm.runInContext(stubs + reportHelpers + publishHelpers, ctx);
+  const item = (targetId, report, status = 'ready') => ({ volume: `v-${targetId}`, targetId, label: targetId, changes: { status, from: { buildId: 'b1' }, to: { buildId: 'b2' }, report } });
+  // 付けられるのは attachable（前回コピーした版 → 今の提出用PDF）だけ。作成済みなら ready、未作成なら create。
+  const plan = ctx.publishChangeReportPlan([
+    item('main', { attachable: true, publishable: true, exists: true }),
+    item('appendix', { attachable: true, publishable: false, exists: false }),
+    item('picked', { attachable: false, publishable: false, exists: true }),
+    item('first', { attachable: true, publishable: true }, 'no-baseline'),
+  ]);
+  assert.equal(plan.offer, true);
+  assert.deepEqual([...plan.ready.map(i => i.targetId)], ['main']);
+  assert.deepEqual([...plan.create.map(i => i.targetId)], ['appendix'], 'a report for another pair must never be offered for the copy');
+  assert.equal(ctx.publishChangeReportPlan([item('picked', { attachable: false, exists: true })]).offer, false);
+  // 欄の説明: 同梱できる／作り直すとできる／この組み合わせはしない。
+  assert.match(ctx.packChangeReportView(readyChanges({ report: { exists: true, attachable: true, publishable: true } }), null).status, /いっしょにコピーできます/);
+  assert.match(ctx.packChangeReportView(readyChanges({ report: { exists: true, attachable: true, publishable: false } }), null).status, /作り直すとコピーできます/);
+  assert.match(ctx.packChangeReportView(readyChanges({ report: { exists: true, attachable: false } }), null).status, /共有用フォルダーにはコピーしません/);
+  // 通知: 付けたものを書き、はじめての出力先など当たり前の理由は書かない。
+  const note = ctx.publishChangeReportNote({ changeReports: [{ fileName: 'a_変更点.pdf' }], changeReportsSkipped: [{ targetName: '補足', reason: 'not-published', message: 'まだ' }, { targetName: '本体2', reason: 'outdated', message: '作り直すとコピーできます。' }] }, true);
+  assert.match(note, /a_変更点\.pdf/); assert.match(note, /本体2の変更点PDFは付けていません/); assert.ok(!note.includes('補足'));
+  assert.equal(ctx.publishChangeReportNote({ changeReports: [{ fileName: 'a_変更点.pdf' }] }, false), '');
+}
+
+function makePublishContext({ changes, confirm = true, checked = true, reportJob = { status: 'completed' } }) {
+  const elements = new Map();
+  const el = id => {
+    if (!elements.has(id)) {
+      const classes = new Set(['hidden']);
+      elements.set(id, { id, innerHTML: '', textContent: '', value: '', disabled: false, checked: false, className: '', onchange: null,
+        classList: { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c), toggle: (c, on) => { if (on === undefined ? !classes.has(c) : on) classes.add(c); else classes.delete(c); } } });
+    }
+    return elements.get(id);
+  };
+  const ctx = browserContext({ calls: [], messages: [], confirms: [] });
+  vm.runInContext(stubs + helpers + reportHelpers + publishHelpers + `
+var activePackId='pack_1',activePreset='p',activeFinalJobId='';
+var confirmResolver=null,confirmReturnFocus=null;
+var document={activeElement:null};
+function requestAnimationFrame(){}
+function $(id){return __el(id);}
+function isConfirmModalOpen(){return false;}
+function closeConfirmModal(){}
+function sleep(){return Promise.resolve();}
+function volumeLabel(v){return v==='v-main'?'本体':v;}
+function targetIdFromVolume(v){return String(v).replace(/^v-/,'');}
+function activePackIsBuiltIn(){return false;}
+function awaitPageMutationsIdle(){return Promise.resolve(true);}
+function showMessage(type,title,message){messages.push({type,title,message});}
+async function runBusy(btn,fn){await fn();}
+async function api(path,options){
+  calls.push({path,body:options?.body||null});
+  if(path.startsWith('/api/v2/outputs/changes?'))return {changes:__changes};
+  if(path==='/api/v2/outputs/changes/report')return {job:{jobId:'job_1',status:'running'}};
+  if(path.startsWith('/api/v2/outputs/changes/report/status'))return {job:__reportJob};
+  if(path==='/api/v2/outputs/publish')return {result:{sharedPath:'S:\\\\x\\\\a.pdf',changeReports:options.body.includeChangeReports?[{fileName:'a_変更点.pdf'}]:[]}};
+  throw new Error('unexpected '+path);
+}
+` + ['confirmAction', 'confirmCheckState', 'loadPublishChangeReportPlan', 'confirmPublishChangeReports', 'runPackChangeReportJob', 'createPublishChangeReports', 'preparePublishChangeReports', 'publishFinalVolume'].map(extractFunction).join('\n'), Object.assign(ctx, { __el: el, __changes: changes, __reportJob: reportJob }));
+  // 確認画面の「コピーする」「キャンセル」とチェックを真似る。
+  ctx.closeConfirmModal = () => {};
+  const realConfirm = ctx.confirmAction;
+  ctx.confirmAction = opts => {
+    const p = realConfirm(opts);
+    ctx.confirms.push({ opts, accept: el('confirm-accept').textContent, wrapHidden: el('confirm-check-wrap').classList.contains('hidden'), checked: el('confirm-check').checked });
+    if (!checked) { el('confirm-check').checked = false; el('confirm-check').onchange?.(); ctx.confirms.at(-1).acceptAfterUncheck = el('confirm-accept').textContent; }
+    ctx.confirmResolver(confirm);
+    return p;
+  };
+  return ctx;
+}
+const attachChanges = report => ({ status: 'ready', from: { buildId: 'b1' }, to: { buildId: 'b2' }, report });
+{
+  // 作成済み: チェックありの確認を出し、そのままコピーすると includeChangeReports:true。
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: true, exists: true }) });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.confirms.length, 1);
+  assert.equal(ctx.confirms[0].wrapHidden, false); assert.equal(ctx.confirms[0].checked, true, 'the copy-together box must start checked');
+  assert.equal(ctx.confirms[0].accept, 'コピーする');
+  const publish = ctx.calls.find(c => c.path === '/api/v2/outputs/publish');
+  assert.equal(publish.body.includeChangeReports, true);
+  assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/changes/report').length, 0, 'a made report must not be made again');
+  assert.match(ctx.messages.at(-1).message, /a_変更点\.pdf/);
+}
+{
+  // 未作成: ボタンは「変更点PDFを作ってからコピーする」。先に作ってからコピーする。
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false, exists: false }) });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.confirms[0].accept, '変更点PDFを作ってからコピーする');
+  const order = ctx.calls.map(c => c.path.split('?')[0]);
+  const created = order.indexOf('/api/v2/outputs/changes/report'), published = order.indexOf('/api/v2/outputs/publish');
+  assert.ok(created >= 0 && published > created, `the report must be made before the copy: ${order.join(', ')}`);
+  assert.deepEqual({ ...ctx.calls[created].body }, { packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b2' });
+  assert.equal(ctx.calls[published].body.includeChangeReports, true);
+}
+{
+  // 作れなかったら、何もコピーしない。
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false }), reportJob: { status: 'failed', message: 'この PC では変更点PDFを作れませんでした。' } });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/publish').length, 0, 'a failed report must stop the copy');
+  assert.match(ctx.messages.at(-1).title, /コピーしていません/);
+}
+{
+  // チェックを外すと、作らずに提出用PDFだけ。ボタンの文言も戻る。
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false }), checked: false });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.confirms[0].acceptAfterUncheck, 'コピーする');
+  assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/changes/report').length, 0);
+  assert.equal(ctx.calls.find(c => c.path === '/api/v2/outputs/publish').body.includeChangeReports, false);
+}
+{
+  // キャンセルなら何もしない。付けられるものが無ければ、今までどおり確認なしでコピーする。
+  let ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: true, exists: true }), confirm: false });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/publish').length, 0);
+  ctx = makePublishContext({ changes: attachChanges({ attachable: false, exists: true }) });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.confirms.length, 0);
+  assert.equal(ctx.calls.find(c => c.path === '/api/v2/outputs/publish').body.includeChangeReports, false);
+  // 確認の部品: check を渡さない確認ではチェック欄を出さず、状態も false。
+  ctx.confirms.length = 0;
+  void ctx.confirmAction({ title: 'x' });
+  assert.equal(ctx.confirms[0].wrapHidden, true);
+  assert.equal(ctx.confirmCheckState(), false);
 }
 
 console.log('pack change view regression ok');

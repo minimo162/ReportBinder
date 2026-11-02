@@ -2011,7 +2011,9 @@ async function submitRelink(btn) {
       : `${r.fileName} に付け替えました。ページの並び順と出力先はそのままです。変換PDFを作成し直してください。`);
   });
 }
-function confirmAction({title='操作を実行しますか？',message='',detail='',confirmLabel='実行する',danger=false}={}) {
+// check={label,checked,confirmLabelChecked} を渡すとチェック欄を出す。押した後のチェックの状態は
+// confirmCheckState() で読む。チェックで押す内容が変わるときは、ボタンの文言も合わせて変える。
+function confirmAction({title='操作を実行しますか？',message='',detail='',confirmLabel='実行する',danger=false,check=null}={}) {
   if(isConfirmModalOpen())closeConfirmModal(false);
   confirmReturnFocus=document.activeElement;
   $('confirm-title').textContent=title;
@@ -2020,11 +2022,20 @@ function confirmAction({title='操作を実行しますか？',message='',detail
   detailBox.textContent=detail||'';
   detailBox.classList.toggle('hidden',!detail);
   const accept=$('confirm-accept');
-  accept.textContent=confirmLabel;
+  const checkBox=$('confirm-check');
+  const acceptLabel=()=>check&&checkBox?.checked&&check.confirmLabelChecked?String(check.confirmLabelChecked):confirmLabel;
+  $('confirm-check-wrap')?.classList.toggle('hidden',!check);
+  if($('confirm-check-label'))$('confirm-check-label').textContent=check?String(check.label||''):'';
+  if(checkBox){checkBox.checked=!!check&&check.checked!==false;checkBox.onchange=check?()=>{accept.textContent=acceptLabel();}:null;}
+  accept.textContent=acceptLabel();
   accept.className=`btn ${danger?'danger':'primary'}`;
   $('confirm-modal').classList.remove('hidden');
   requestAnimationFrame(()=>$('confirm-cancel')?.focus());
   return new Promise(resolve=>{confirmResolver=resolve;});
+}
+function confirmCheckState(){
+  const wrap=$('confirm-check-wrap');
+  return !!wrap&&!wrap.classList.contains('hidden')&&!!$('confirm-check')?.checked;
 }
 
 function closeAppMenu(focusButton=false){
@@ -6768,20 +6779,114 @@ async function cancelActiveFinalJob(){
   }
 }
 
+// ---- 共有用フォルダーへのコピーに変更点PDFを同梱する（includeChangeReports）----
+// 付けられるのは「前回コピーした版 → 今の提出用PDF」の変更点PDFだけ（サーバーの report.attachable）。
+// まだ作っていなければ、先に作ってからコピーする。コピーの処理の中では作らない（作成には時間が
+// かかり、その間ずっと出力のロックを持つことになるため）。付けてよいかはコピーのときにサーバーが確かめ直す。
+function publishChangeReportPlan(items){
+  const ready=[],create=[];
+  for(const item of asArray(items)){
+    const changes=item?.changes;
+    if(String(changes?.status||'')!=='ready'||!changes?.report?.attachable)continue;
+    if(changes.report.publishable)ready.push(item);else create.push(item);
+  }
+  return {offer:ready.length+create.length>0,ready,create};
+}
+async function loadPublishChangeReportPlan(volumes){
+  const packId=String(activePackId||''),items=[];
+  for(const volume of asArray(volumes)){
+    const targetId=targetIdFromVolume(volume);if(!targetId)continue;
+    // 変更点を読めなくても、提出用PDFのコピーは今までどおりできる。
+    try{items.push({volume,targetId,label:volumeLabel(volume),changes:(await api(packChangeRequestPath(packId,targetId)))?.changes||null});}catch{}
+  }
+  return publishChangeReportPlan(items);
+}
+// 確認画面。キャンセルなら null。付けられる変更点PDFが無ければ、今までどおり確認なしでコピーする。
+async function confirmPublishChangeReports(plan,title){
+  if(!plan?.offer)return {includeChangeReports:false};
+  const names=[...plan.ready,...plan.create].map(item=>item.label).join('、');
+  const createNames=plan.create.map(item=>item.label).join('、');
+  const accepted=await confirmAction({
+    title,
+    message:'共有用フォルダーに発行フォルダーを作り、提出用PDFをコピーします。',
+    detail:`変更点PDF（前回コピーしたときからの変更点をまとめた確認用のPDF。提出物ではありません）を、提出用PDFと同じ発行フォルダーに入れられます。対象：${names}`+(createNames?`\n${createNames}の変更点PDFはまだ作っていないため、先に作ってからコピーします。`:''),
+    confirmLabel:'コピーする',
+    check:{label:'変更点PDFもいっしょにコピーする',checked:true,confirmLabelChecked:createNames?'変更点PDFを作ってからコピーする':'コピーする'}
+  });
+  if(!accepted)return null;
+  return {includeChangeReports:confirmCheckState()};
+}
+async function runPackChangeReportJob(body,onProgress=null){
+  let job=(await api('/api/v2/outputs/changes/report',{method:'POST',body}))?.job||{};
+  const jobId=String(job.jobId||'');
+  while(jobId&&!PACK_CHANGE_REPORT_TERMINAL.includes(String(job.status||''))){
+    if(onProgress)onProgress(job);
+    await sleep(1000);
+    job=(await api(`/api/v2/outputs/changes/report/status?jobId=${encodeURIComponent(jobId)}`))?.job||{};
+  }
+  return job;
+}
+// まだ作っていない変更点PDFを作る。作れなかった出力先を返す（1つでもあればコピーしない）。
+async function createPublishChangeReports(plan){
+  const failed=[];
+  for(const item of asArray(plan?.create)){
+    const body=packChangeReportBody(item.changes,activePackId,item.targetId);
+    if(!body){failed.push({label:item.label,message:'比べる2つの版が分かりません。'});continue;}
+    try{
+      const job=await runPackChangeReportJob(body,progress=>showMessage('','変更点PDFを作っています',`${item.label}の変更点PDF：${String(progress?.message||'')}（${Math.max(0,Math.min(100,Number(progress?.percent||0)))}%）`,null,[],0));
+      if(String(job?.status||'')!=='completed')failed.push({label:item.label,message:String(job?.message||'変更点PDFを作れませんでした。')});
+    }catch(e){failed.push({label:item.label,message:userFriendlyError(e.message)});}
+  }
+  return failed;
+}
+// コピーの通知に添える、変更点PDFの結果。はじめての出力先など、付けないのが当たり前のものは書かない。
+function publishChangeReportNote(result,requested){
+  if(!requested)return '';
+  const quiet=['not-published','same-as-published','no-build'];
+  const lines=[];
+  const attached=asArray(result?.changeReports).map(r=>String(r?.fileName||'')).filter(Boolean);
+  if(attached.length)lines.push(`変更点PDF（${attached.join('、')}）もいっしょにコピーしました。`);
+  for(const skipped of asArray(result?.changeReportsSkipped)){
+    if(quiet.includes(String(skipped?.reason||'')))continue;
+    lines.push(`${String(skipped?.targetName||skipped?.targetId||'')}の変更点PDFは付けていません：${String(skipped?.message||'')}`);
+  }
+  return lines.length?`\n${lines.join('\n')}`:'';
+}
+// 確認と、必要なら変更点PDFの作成。コピーしないときは null。
+async function preparePublishChangeReports(volumes,title){
+  const plan=await loadPublishChangeReportPlan(volumes);
+  const choice=await confirmPublishChangeReports(plan,title);
+  if(!choice)return null;
+  if(choice.includeChangeReports&&plan.create.length){
+    const failed=await createPublishChangeReports(plan);
+    if(failed.length){
+      showMessage('warn','変更点PDFを作れなかったため、コピーしていません',`${failed.map(f=>`${f.label}：${f.message}`).join('\n')}\n変更点PDFを付けずにコピーするときは、「変更点PDFもいっしょにコピーする」のチェックを外してください。`,null,[],0);
+      return null;
+    }
+  }
+  return choice;
+}
+
 async function publishFinalVolume(volume,btn) {
   await runBusy(btn,async()=>{
     if(activeFinalJobId){showMessage('warn','提出用PDFを出力中です','出力が終わってから、もう一度共有用フォルダーにコピーしてください。');return;}
     if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
     const custom=!activePackIsBuiltIn();
-    const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume)}:{volume,category:activePreset}});
+    let includeChangeReports=false;
+    if(custom){
+      const choice=await preparePublishChangeReports([volume],`${volumeLabel(volume)}PDFを共有用フォルダーにコピーしますか？`);
+      if(!choice)return;
+      includeChangeReports=!!choice.includeChangeReports;
+    }
+    const response=await api(custom?'/api/v2/outputs/publish':'/api/final/publish',{method:'POST',body:custom?{packId:activePackId,targetId:targetIdFromVolume(volume),includeChangeReports}:{volume,category:activePreset}});
     const result=response.result||{};
     // 発行フォルダー名だけでは、どのドライブのどこに出来たのか画面から辿れない。
     // 第4引数の detail は danger 以外では描かれないので、そこに載せても出ない。
     // sharedPath はサーバーが返しているので、ローカル出力の通知と同じ形に揃える。
     showMessage('ok',`${volumeLabel(volume)}PDFを共有用フォルダーにコピーしました`,
-      result.sharedPath
+      (result.sharedPath
         ?`${String(result.sharedPath)} に保存しました。`
-        :`${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`,
+        :`${result.folderName||'発行フォルダー'} に ${result.fileName||'PDF'} を保存しました。`)+publishChangeReportNote(result,includeChangeReports),
       result,[],0);
   });
 }
@@ -6792,13 +6897,18 @@ async function publishAllFinalVolumes(btn) {
   await runBusy(btn,async()=>{
     if(activeFinalJobId){showMessage('warn','提出用PDFを出力中です','出力が終わってから、もう一度共有用フォルダーにコピーしてください。');return;}
     if(!(await awaitPageMutationsIdle())){showMessage('warn','ページ構成を保存できなかったためコピーしていません','ページ構成を確認してから、もう一度コピーしてください。');return;}
-    const response=await api('/api/v2/outputs/publish-all',{method:'POST',body:{packId:activePackId}});
+    // サーバーがまとめてコピーするのは、ページの入っている出力先だけ。
+    const volumes=activePackIsBuiltIn()?[]:activeTargetDefinitions().map(target=>targetVolume(target.targetId)).filter(volume=>targetItemCount(volumeReadiness(volume))>0);
+    const choice=await preparePublishChangeReports(volumes,'提出用PDFをまとめて共有用フォルダーにコピーしますか？');
+    if(!choice)return;
+    const includeChangeReports=!!choice.includeChangeReports;
+    const response=await api('/api/v2/outputs/publish-all',{method:'POST',body:{packId:activePackId,includeChangeReports}});
     const result=response.result||{};
     const names=asArray(result.files).map(file=>String(file?.fileName||'')).filter(Boolean);
     showMessage('ok','提出用PDFをまとめて共有用フォルダーにコピーしました',
-      result.sharedFolder
+      (result.sharedFolder
         ?`${String(result.sharedFolder)} に ${names.join('、')||'PDF'} を保存しました。`
-        :`${result.folderName||'発行フォルダー'} に ${names.join('、')||'PDF'} を保存しました。`,
+        :`${result.folderName||'発行フォルダー'} に ${names.join('、')||'PDF'} を保存しました。`)+publishChangeReportNote(result,includeChangeReports),
       result,[],0);
   });
 }
@@ -7502,6 +7612,13 @@ function packChangeReportBody(changes,packId,targetId){
   if(String(changes?.status||'')!=='ready'||!fromBuildId||!toBuildId||!packId||!targetId)return null;
   return {packId:String(packId),targetId:String(targetId),fromBuildId,toBuildId};
 }
+// 作った変更点PDFを共有用フォルダーへ同梱できるか（サーバーの report.attachable・publishable）。
+// 同梱できるのは「前回コピーした版 → 今の提出用PDF」の組み合わせで作ったものだけ。
+function packChangeReportCopyNote(report){
+  if(report?.publishable)return '共有用フォルダーにコピーするときに、提出用PDFといっしょにコピーできます。';
+  if(report?.attachable)return '変更点PDFは、今の提出用PDFに合わせて作り直すとコピーできます。';
+  return 'この組み合わせの変更点PDFは、共有用フォルダーにはコピーしません（コピーできるのは、前回コピーした版と今の提出用PDFの組み合わせだけです）。';
+}
 // 変更点PDFの欄の見え方。job は作成中・作成後のジョブ（無ければ null）。
 function packChangeReportView(changes,job){
   const hidden={show:false,busy:false,canCreate:false,canOpen:false,createLabel:'変更点をPDFにする',status:'',percent:0};
@@ -7512,9 +7629,9 @@ function packChangeReportView(changes,job){
     const percent=Math.max(0,Math.min(100,Number(job.percent||0)));
     return {...hidden,show:true,busy:true,createLabel:'変更点PDFを作っています',status:`${String(job.message||'変更点PDFを作っています。')}（${percent}%）`,percent};
   }
-  if(job&&status==='completed')return {...hidden,show:true,canOpen:true,status:'変更点PDFを作りました。「開く」で確かめられます。'};
+  if(job&&status==='completed')return {...hidden,show:true,canOpen:true,status:`変更点PDFを作りました。「開く」で確かめられます。${packChangeReportCopyNote(report)}`};
   if(job&&status)return {...hidden,show:true,canCreate:true,createLabel:'もう一度PDFにする',status:String(job.message||'変更点PDFを作れませんでした。')};
-  if(report.exists)return {...hidden,show:true,canOpen:true,status:`変更点PDFは作成済みです${report.createdAt?`（${formatDateTime(report.createdAt)}）`:''}。`};
+  if(report.exists)return {...hidden,show:true,canOpen:true,status:`変更点PDFは作成済みです${report.createdAt?`（${formatDateTime(report.createdAt)}）`:''}。${packChangeReportCopyNote(report)}`};
   if(report.reason==='outdated')return {...hidden,show:true,canCreate:true,createLabel:'変更点PDFを作り直す',status:'前に作った変更点PDFは、今の比べた結果と合いません。作り直してください。'};
   return {...hidden,show:true,canCreate:true,status:'この変更点を、紙やメールで渡せる確認用のPDFにします（提出物ではありません）。'};
 }
@@ -7553,7 +7670,10 @@ async function createPackChangeReport(){
       if(stale())return;
     }
     if(String(job.status||'')==='completed'&&packChangeState.changes){
-      packChangeState.changes={...packChangeState.changes,report:job.report||{...(packChangeState.changes.report||{}),exists:true}};
+      // ジョブの report は作成済みかどうかだけ。同梱できる組み合わせか（attachable）は開いたときの応答のまま。
+      // 同梱できる組み合わせで作り終えたものは、コピーのときにサーバーが同じ条件で確かめ直す。
+      const attachable=!!packChangeState.changes.report?.attachable;
+      packChangeState.changes={...packChangeState.changes,report:{...(job.report||{...(packChangeState.changes.report||{}),exists:true}),attachable,publishable:attachable}};
     }else if(!String(job.status||'')){
       job={status:'failed',message:'変更点PDFの作成を始められませんでした。もう一度押してください。'};
     }
