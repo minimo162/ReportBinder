@@ -330,7 +330,7 @@ function normalizeStatePayload(payload){return payload;}
 function targetVolume(id){return String(id||'');} function activeTargetVolumes(){return ['ja-main'];} function log(){} function renderAll(){}
 let draggingRow=null, pagesRendered=0; function renderPages(){pagesRendered++;}
 let paneRefreshes=0; function schedulePdfImagePaneRefresh(){paneRefreshes++;}
-function showMessage(){} const snapshotHistoryResponseCache=new Map(); let historyPanelsInitialized=false;
+function showMessage(){} const snapshotHistoryResponseCache=new Map(); const diffDetailResponseCache=new Map(); let historyPanelsInitialized=false;
 function api(url){
   if(url==='/api/state')return Promise.resolve({structure:{pages:[]},packProgress:{},finalReadiness:{}});
   return Promise.resolve({volumes:{'ja-main':{status:'needs-rebuild',displayState:'needs-rebuild',pageCount:2}}});

@@ -191,6 +191,66 @@ Assert-HistoryTest (-not (New-ContentPdfPin $workspace $sourceId $missingVersion
 Assert-HistoryTest ([string]::IsNullOrWhiteSpace((New-ContentPdfLease $workspace $sourceId $missingVersionId 'compare' 'missing-job'))) 'A lease was created for a missing content PDF generation.'
 Assert-HistoryTest (-not (Test-Path -LiteralPath (Get-ContentPdfVersionDir $workspace $sourceId $missingVersionId))) 'Content PDF protection created a ghost generation directory.'
 
+# 「この版を保護」は snapshot だけでなく、その版の全 render version の content PDF も守る。
+# 守らないと保持世代の整理で content PDF が消え、保護中の版が比較できなくなる。
+$manualSnapshotId = 'manual-generation'
+$manualVersionIds = @('manual-version-1','manual-version-2')
+$manualSnapshotDir = Get-SnapshotDir 'ja' $sourceId $manualSnapshotId
+New-Item -ItemType Directory -Path $manualSnapshotDir -Force | Out-Null
+Write-JsonFile (Join-Path $manualSnapshotDir 'manifest.json') ([ordered]@{ schemaVersion=1; snapshotId=$manualSnapshotId; workbookId=$sourceId; relativePath='history-source.pdf'; sourceHash=$sourceHash; capturedAt=(New-NowIso); status='complete' })
+foreach ($manualVersionId in $manualVersionIds) {
+    Write-RenderRecord 'ja' $sourceId $manualSnapshotId $manualVersionId 'normal' $true ([pscustomobject][ordered]@{
+        analyzerVersion=1; javaVersion='test'; javaVendor='test'
+        sheets=@([ordered]@{ sheetName='Summary'; visualHash='manual-hash'; status='ok' })
+    })
+    $manualContentDir = Get-ContentPdfVersionDir $workspace $sourceId $manualVersionId
+    New-Item -ItemType Directory -Path $manualContentDir -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $manualContentDir ((Get-WorksheetStorageStem 'Summary') + '.pdf')), 'test pdf placeholder', (New-Object Text.UTF8Encoding($false)))
+    Assert-HistoryTest (-not (Test-ContentPdfProtected $workspace $sourceId $manualVersionId)) 'Manual pin fixture content PDF was already protected.'
+}
+Assert-HistoryTest ([bool](Set-ManualSnapshotPin 'ja' $sourceId $manualSnapshotId $true)) 'Manual snapshot pin could not be set.'
+Assert-HistoryTest (@(Get-SnapshotPins 'ja' $sourceId $manualSnapshotId) -contains 'manual') 'Manual snapshot pin was not written.'
+foreach ($manualVersionId in $manualVersionIds) {
+    Assert-HistoryTest (Test-ContentPdfProtected $workspace $sourceId $manualVersionId) ("Manual snapshot pin did not protect content PDF version $manualVersionId.")
+}
+Assert-HistoryTest ([bool](Set-ManualSnapshotPin 'ja' $sourceId $manualSnapshotId $false)) 'Manual snapshot pin could not be cleared.'
+Assert-HistoryTest (@(Get-SnapshotPins 'ja' $sourceId $manualSnapshotId) -notcontains 'manual') 'Manual snapshot pin survived unpinning.'
+foreach ($manualVersionId in $manualVersionIds) {
+    Assert-HistoryTest (-not (Test-ContentPdfProtected $workspace $sourceId $manualVersionId)) ("Manual content PDF pin survived unpinning for $manualVersionId.")
+}
+
+# 登録画面の比較要約は、今の変換PDF（lastRendered*）の比較のときだけ書き直す。
+# complete の後に unavailable の比較が来たら、前回の「見た目変更 N」を残さない。
+[void](Update-StructureLocked 'ja' {
+    param($structure)
+    $target = @($structure.workbooks | Where-Object { [string]$_.workbookId -eq $sourceId } | Select-Object -First 1)[0]
+    Set-NoteProperty $target 'lastRenderedSnapshotId' $manualSnapshotId
+    Set-NoteProperty $target 'lastRenderedVersionId' 'manual-version-2'
+    return $null
+})
+function Get-TestComparisonSummary {
+    $current = @((Get-Structure 'ja').workbooks | Where-Object { [string]$_.workbookId -eq $sourceId } | Select-Object -First 1)[0]
+    return (Get-DataProperty $current 'latestComparisonSummary' $null)
+}
+[void](Publish-LatestComparisonSummary 'ja' $sourceId ([pscustomobject][ordered]@{
+    status='complete'; method='stored-hash'; currentSnapshotId=$manualSnapshotId; currentVersionId='manual-version-2'
+    changedSheets=@('Summary'); unchangedSheets=@(); unknownSheets=@(); addedSheets=@(); removedSheets=@(); message=''; comparedAt=(New-NowIso)
+}))
+$publishedSummary = Get-TestComparisonSummary
+Assert-HistoryTest ($null -ne $publishedSummary -and [string]$publishedSummary.status -eq 'complete' -and [string]$publishedSummary.currentVersionId -eq 'manual-version-2') 'Complete comparison summary was not published with its version identity.'
+[void](Publish-LatestComparisonSummary 'ja' $sourceId ([pscustomobject][ordered]@{
+    status='unavailable'; method=''; currentSnapshotId=$manualSnapshotId; currentVersionId='manual-version-2'
+    changedSheets=@(); unchangedSheets=@(); unknownSheets=@(); addedSheets=@(); removedSheets=@(); message='前回の比較基準がありません。'; comparedAt=(New-NowIso)
+}))
+$unavailableSummary = Get-TestComparisonSummary
+Assert-HistoryTest ([string]$unavailableSummary.status -eq 'unavailable' -and @($unavailableSummary.changedSheets).Count -eq 0) 'Unavailable comparison did not replace the previous complete summary.'
+[void](Publish-LatestComparisonSummary 'ja' $sourceId ([pscustomobject][ordered]@{
+    status='complete'; method='stored-hash'; currentSnapshotId=$manualSnapshotId; currentVersionId='manual-version-1'
+    changedSheets=@('Summary'); unchangedSheets=@(); unknownSheets=@(); addedSheets=@(); removedSheets=@(); message=''; comparedAt=(New-NowIso)
+}))
+$staleSummary = Get-TestComparisonSummary
+Assert-HistoryTest ([string]$staleSummary.status -eq 'unavailable' -and [string]$staleSummary.currentVersionId -eq 'manual-version-2') 'A comparison for another render version overwrote the current summary.'
+
 Write-Output 'history logic selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

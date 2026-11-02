@@ -1,5 +1,17 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 変更履歴・比較で古い要約・古い応答が残る問題を直した（2026-11-02）
+
+- 目的: 変更履歴・比較ロジックのレビューで挙がった高優先度の指摘（H1〜H3）と M3、CI の構文検査漏れを最小限の修正で直す。
+- H1: 登録画面の「見た目変更 N」が前回の比較のまま残り、履歴画面と食い違っていた。要約は比較が complete のときしか書かれず、原稿を変えずにPDFを作り直しただけ（同じ snapshot に新しい version）でも古い要約が出続けた。サーバーは要約の書き込みを `Publish-LatestComparisonSummary` にまとめ、要約に `currentSnapshotId`／`currentVersionId` を持たせた。`Invoke-PostRenderAnalysis` は比較が complete 以外（unavailable など）でも要約を書き直す。書き込みは `Update-StructureLocked` の中で structure の `lastRenderedSnapshotId`／`lastRenderedVersionId` と照合し、一致しなければ書かない（後から別の版が作られた場合に古い比較で上書きしない）。画面は `changeSummaryFor` で要約の ID が今の変換PDFと一致しなければ null 扱いにする（ID の無い旧形式の要約も出さない。次のPDF作成で書き直される）。
+- H2: 「この版を保護」しても snapshot にしか pin を作らず、content PDF は保持世代の整理で消えて、保護中の版が比較できなくなっていた。`Set-ManualSnapshotPin` で、content PDF の整理ロックの中でその版の全 render version に `manual` の content PDF pin を作り、解除時は対で消す。整理済みでフォルダーが無い version は作れないが、保護自体は失敗にしない。
+- H3: 同じ原稿で比較ペアを切り替えると、前のペアの応答が後から届いて差分画面を上書きし、「確認済みにする」が別ペアの ID を混ぜて送っていた。`openDiffDetail` に通し番号（`diffDetailOpenSerial`）を付け、成功・失敗のどちらでも番号と `diffDetailRequestPath()` が開いたときと同じ場合だけ描く。`toggleDiffSheetReviewed` は開始時の detail と今の detail が同じときだけ確認状態を反映する。
+- M3: 差分詳細のクライアントキャッシュが「比較できない」応答も持ち続け、開き直しても同じ失敗が出ていた。`status==='ready'` の応答だけを残し、`refresh()` でもキャッシュを捨てる。
+- CI: `ci-selfcheck.ps1` の Fast／Full の両方で `node --check app/web/app.js` と `app/web/diff-worker.js` を見る。
+- `tests/history-compare-review-regression.mjs` を追加した（ID 不一致の要約を出さないこと、ペア切り替え後の古い成功・失敗応答で描かないこと、確認済みの応答を別の比較へ書かないこと、unavailable をキャッシュせず取り直すこと、`refresh()` のキャッシュ破棄）。`selfcheck.py` から実行し、サーバー側の静的検査も足した。`history-logic-selfcheck.ps1` に、手動保護で全 render version の content PDF が守られ解除で外れること、complete の後の unavailable で要約が置き換わること、別 version の比較で要約を上書きしないことを足した。
+- 見開きの `buildSpreadLayout` と頁・左右をサーバー値で決める契約には手を入れていない。three.js／WebGL は使っていない。PowerShell 5.1 で使えない構文は使っていない。
+- RuntimeVersion `2026.10.30.21`、`app.js` `v20261030_v209` へ更新した。
+
 ## 提出用PDFの出力前チェックが一瞬「確認が必要」「出力できません」になるのを直した（2026-11-02）
 
 - 目的: 出力前チェックが一瞬だけ「出力前に確認が必要です／1項目」や赤い表示になり、すぐ「準備完了」に戻っていた。届く前の確認中や一時的な確認失敗を、確定した問題と同じに見せない。本当の問題は今までどおり出す。
