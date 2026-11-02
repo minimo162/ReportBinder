@@ -1485,7 +1485,8 @@ function renderStepBar() {
   const workbooks=workbooksForActivePreset(); const pages=pagesForActivePreset();
   const needs=workbooks.filter(w=>!isLatestPdfWorkbook(w)).length;
   const currentMap={excel:'step-excel-state',pages:'step-pages-state',final:'step-final-state'};
-  setStepState('step-excel-state', configured()&&workbooks.length&&needs===0?'complete':'attention','1');
+  // 原稿0件は「まだ始めていない」だけで要対応ではない。初回起動で「!」を出すと壊れたように見える。
+  setStepState('step-excel-state', configured()&&workbooks.length?(needs===0?'complete':'attention'):'','1');
   setStepState('step-pages-state', pages.some(p=>p.enabled!==false && String(p.volume||'none')!=='none')?'complete':(pages.length?'attention':''),'2');
   // activeReadinessItems() counts targets that HAVE pages, not problems, so this
   // used to show "!" next to "出力準備が整っています". Warn only on real blockers.
@@ -3053,10 +3054,32 @@ async function registerSelected(btn) {
     // 互換viewを持つ正規stateを取り直し、登録直後に0件へ見える状態ずれを防ぐ。
     selectedFiles.clear();lastFileRangeAnchor='';await refresh();
     selectedWorkbooks=new Set(registered.map(x=>String(x.workbookId||'')).filter(Boolean));lastWorkbookRangeAnchor='';renderAll();await loadFiles(null);
+    // 失敗したファイルは選んだまま残す。やり直すたびに選び直させない。
+    const failedRels=new Set(errors.map(e=>String(e?.relativePath||'')).filter(r=>rels.includes(r)));
+    if(failedRels.size){selectedFiles=new Set([...failedRels].filter(r=>visibleFileSelectionValues().includes(r)));syncFileSelectionUi();}
+    const reasons=registerErrorSummary(errors);
     if(registered.length&&errors.length===0)showMessage('ok',`${registered.length}件を登録しました`,`登録した${registered.length}件が選択されています。`,null,[{label:`登録した${registered.length}件をPDF作成`,primary:true,view:'excel',handler:()=>renderSelectedWorkbooks($('render-selected-btn'))}],0);
-    else if(registered.length)showMessage('warn',`${registered.length}件を登録しました`,`${errors.length}件は登録できませんでした。`,errors,[{label:'登録分をPDF作成',view:'excel',handler:()=>renderSelectedWorkbooks($('render-selected-btn'))}],0);
-    else showMessage('warn','登録できませんでした','詳細を確認してください。',errors.length?errors:result,[],0);
+    else if(registered.length)showMessage('warn',`${registered.length}件を登録しました`,`${errors.length}件は登録できませんでした。\n${reasons}`,errors,[{label:'登録分をPDF作成',view:'excel',handler:()=>renderSelectedWorkbooks($('render-selected-btn'))}],0);
+    else showMessage('warn','登録できませんでした',reasons||'原稿フォルダーの中にファイルが残っているか確認してから、もう一度登録してください。',errors.length?errors:result,[],0);
   });
+  // runBusy は終わりにボタンを無条件で有効へ戻す。選択0件なら押せない状態へ揃え直す。
+  syncFileSelectionUi();syncWorkbookSelectionUi();
+}
+// 登録の失敗理由を画面に出す形へまとめる。以前は「詳細を確認」と促すだけで、
+// 詳細は非表示のログ(#log)にしか書いていなかったため、利用者には理由を知る手段が無かった。
+// 同じ理由はまとめ（Java未導入なら全件同じ）、違う理由はファイル名つきで3件まで。
+function registerErrorSummary(errors){
+  const byReason=new Map();
+  for(const e of asArray(errors)){
+    const reason=userFriendlyError(String(e?.userError||e?.error||e?.message||e?.detail||'').trim()||'登録できませんでした。');
+    const name=String(e?.relativePath||e?.fileName||'').split(/[\\/]/).pop();
+    if(!byReason.has(reason))byReason.set(reason,[]);
+    if(name)byReason.get(reason).push(name);
+  }
+  if(!byReason.size)return '';
+  if(byReason.size===1){const [reason,names]=[...byReason][0];return names.length>1?`${names.length}件とも同じ理由です。\n${reason}`:(names.length?`${names[0]}：${reason}`:reason);}
+  const lines=[...byReason].flatMap(([reason,names])=>(names.length?names:['']).map(n=>n?`${n}：${reason}`:reason));
+  return lines.slice(0,3).join('\n')+(lines.length>3?`\nほか${lines.length-3}件`:'');
 }
 
 
@@ -7999,7 +8022,7 @@ async function loadSnapshotHistory(options={}){
   if(!state?.inputHistoryEnabled){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">変更履歴の記録がオフになっているため、更新前後の比較は利用できません。比較を使うには、情報システム担当者に変更履歴の有効化を依頼してください。</div>';if(diffBox)diffBox.innerHTML='';return;}
   populateSnapshotHistoryWorkbooks();
   const wbId=String(snapshotHistoryState.workbookId||'');
-  if(!wbId){snapshotHistoryState.snapshots=[];box.innerHTML='<div class="caption">対象原稿を選ぶと、版の一覧・差分・保護を表示します。</div>';if(diffBox)diffBox.innerHTML='';return;}
+  if(!wbId){snapshotHistoryState.snapshots=[];box.innerHTML=workbooksForActivePreset().length?'<div class="caption">対象原稿を選ぶと、版の一覧・差分・保護を表示します。</div>':'<div class="caption">まだ原稿が登録されていません。「原稿を登録・PDF化」で原稿を登録すると、ここで版を比べられます。</div>';if(diffBox)diffBox.innerHTML='';return;}
   const cached=!force?snapshotHistoryCachedRecord(wbId):null;
   if(!cached)box.innerHTML='<div class="caption">版の一覧を読み込んでいます。</div>';
   try{
