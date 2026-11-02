@@ -380,13 +380,169 @@ Assert-ChangeTest ((Get-TextCount $manyHtml '<section class="sheet') -eq $expect
 $noneHtml = New-PackChangeReportHtml (New-TestReportSummary @((New-TestReportRow 1 1 @('unchanged'))) $true @{ unchanged = 1 }) '一式' '本体'
 Assert-ChangeTest ((Get-TextCount $noneHtml '<section class="sheet') -eq 1 -and $noneHtml.Contains('変更点 1 / 1') -and $noneHtml.Contains('前回コピーしたときから、変わったページはありません。')) 'A report without changes must be a single "no changes" page.'
 
+# ==== ページごとの詳細（PR-B2） =====================================================
+function New-TestDetailRow([string]$RowKey, [int]$ToPage, [int]$FromPage, [string[]]$Kinds, [int]$ToSourcePage = 2, [int]$FromSourcePage = 2) {
+    $row = New-TestReportRow $ToPage $FromPage $Kinds
+    $row.rowKey = $RowKey
+    $row.sourceId = 'wb_a'; $row.fromSourceId = $(if ($FromPage -gt 0) { 'wb_a' } else { '' })
+    $row.fromSheetName = $(if ($FromPage -gt 0) { '売上' } else { '' })
+    $row.fromSnapshotId = $(if ($FromPage -gt 0) { 's1' } else { '' }); $row.fromVersionId = $(if ($FromPage -gt 0) { 'v1' } else { '' })
+    $row.toSnapshotId = $(if ($ToPage -gt 0) { 's2' } else { '' }); $row.toVersionId = $(if ($ToPage -gt 0) { 'v2' } else { '' })
+    $row.toSourcePageNumber = $(if ($ToPage -gt 0) { $ToSourcePage } else { $null })
+    $row.fromSourcePageNumber = $(if ($FromPage -gt 0) { $FromSourcePage } else { $null })
+    $row.pagePartIndex = 2; $row.toPartCount = 3; $row.fromPartCount = 3
+    $row.detailAvailable = ($ToPage -gt 0 -and $FromPage -gt 0)
+    return $row
+}
+
+# 「アプリの『くわしく見る』で確認できます」は、アプリを持たない受け取り手には実行できないので書かない。
+$plainContent = New-TestDetailRow 'item:A#2' 12 10 @('content')
+Assert-ChangeTest ((Get-PackChangeReportVisualText $plainContent) -eq '変更箇所を特定できませんでした（ページ全体を確認してください）') 'A changed row without a detail page must ask to check the whole page.'
+Assert-ChangeTest ((Get-PackChangeReportVisualText $plainContent $null 0 $true) -like '*最初の200ページ分*') 'A row beyond the detail limit must say the details were left out.'
+
+# ---- details の検証（中身は信用しない） ----
+$detailSummary = [ordered]@{ pages = @(
+    (New-TestDetailRow 'item:A#2' 12 10 @('content')),
+    (New-TestDetailRow 'item:B#1' 13 0 @('added') 1 0),
+    (New-TestDetailRow 'item:C#1' 14 11 @('moved'))
+) }
+$longText = ('長' * 5000)
+$manyRegions = @(for ($n = 0; $n -lt 40; $n++) { [ordered]@{ kind = 'modified'; before = [ordered]@{ x = 0.01; y = 0.01; width = 0.01; height = 0.01 }; after = [ordered]@{ x = 0.01; y = 0.01; width = 0.01; height = 0.01 }; beforeText = ''; afterText = '' } })
+$rawDetails = @(
+    [ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 2; afterPageNumber = 2; regionCount = 6; regions = @(
+        [ordered]@{ kind = 'modified'; before = [ordered]@{ x = 0.1; y = 0.1; width = 0.2; height = 0.1 }; after = [ordered]@{ x = 0.1; y = 0.1; width = 0.2; height = 0.1 }; beforeText = '1,234'; afterText = '1,240' },
+        [ordered]@{ kind = 'added'; before = [ordered]@{ x = -0.5; y = 0.5; width = 5; height = 0.1 }; after = [ordered]@{ x = 0.3; y = 0.3; width = 0.9; height = 0.1 }; beforeText = ''; afterText = ('<script>alert(2)</script>' + $longText) },
+        [ordered]@{ kind = 'MODIFIED'; before = [ordered]@{ x = 0.1; y = 0.1; width = 0.1; height = 0.1 }; after = $null; beforeText = 'x'; afterText = 'y' },
+        [ordered]@{ kind = 'evil'; before = [ordered]@{ x = 0.1; y = 0.1; width = 0.1; height = 0.1 }; after = $null; beforeText = 'x'; afterText = 'y' },
+        [ordered]@{ kind = 'removed'; before = [ordered]@{ x = '0.1'; y = 0.1; width = 0.1; height = 0.1 }; after = [ordered]@{ x = 1.5; y = 0.1; width = 0.1; height = 0.1 }; beforeText = 'z'; afterText = '' }
+    ) },
+    # 同じ rowKey の2件目・実在しない rowKey・内容の変わっていない行・増えた行・版やページ番号の違うものは捨てる。
+    [ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 2; afterPageNumber = 2; regions = @() },
+    [ordered]@{ rowKey = 'item:Z#9'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 2; afterPageNumber = 2; regions = @() },
+    [ordered]@{ rowKey = 'item:C#1'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 2; afterPageNumber = 2; regions = @() },
+    [ordered]@{ rowKey = 'item:B#1'; fromVersionId = ''; toVersionId = 'v2'; beforePageNumber = 0; afterPageNumber = 1; regions = @() },
+    'not an object', 42
+)
+# 画面から届くのと同じく、JSON を通した形で渡す。
+$parsedDetails = (ConvertTo-Json -InputObject $rawDetails -Depth 10) | ConvertFrom-Json
+$validated = ConvertTo-PackChangeReportDetails $parsedDetails $detailSummary  # ps51-count-ok（Hashtable を返す）
+Assert-ChangeTest ($validated.Count -eq 1 -and $validated.ContainsKey('item:A#2')) "details were not filtered to existing changed rows: $(@($validated.Keys) -join ',')"
+$validA = $validated['item:A#2']
+# 種類が4つ以外（大文字違いも）・使える枠が無い（文字列の座標・ページの外）の枠は捨てる。regionCount は送られた数。
+Assert-ChangeTest (@($validA.regions).Count -eq 2 -and [int]$validA.regionCount -eq 6) "Regions with an unknown kind or without a usable box were not dropped: $(@($validA.regions).Count)"
+$addedRegion = @($validA.regions)[1]
+Assert-ChangeTest ([double]$addedRegion.before.x -eq 0 -and [double]$addedRegion.before.width -eq 1 -and [double]$addedRegion.after.x -eq 0.3 -and [Math]::Abs([double]$addedRegion.after.width - 0.7) -lt 0.00001) 'Out-of-range coordinates were not clamped to the page.'
+Assert-ChangeTest (([string]$addedRegion.afterText).Length -eq 200 -and ([string]$addedRegion.afterText).StartsWith('<script>alert(2)</script>')) 'Region text was not cut to 200 characters.'
+$wrongVersion = ConvertTo-PackChangeReportDetails ((ConvertTo-Json -InputObject @([ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v1'; toVersionId = 'v9'; beforePageNumber = 2; afterPageNumber = 2; regions = @() }) -Depth 6) | ConvertFrom-Json) $detailSummary  # ps51-count-ok（Hashtable を返す）
+$wrongPage = ConvertTo-PackChangeReportDetails ((ConvertTo-Json -InputObject @([ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 3; afterPageNumber = 2; regions = @() }) -Depth 6) | ConvertFrom-Json) $detailSummary  # ps51-count-ok（Hashtable を返す）
+$wrongCase = ConvertTo-PackChangeReportDetails ((ConvertTo-Json -InputObject @([ordered]@{ rowKey = 'ITEM:A#2'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 2; afterPageNumber = 2; regions = @() }) -Depth 6) | ConvertFrom-Json) $detailSummary  # ps51-count-ok（Hashtable を返す）
+Assert-ChangeTest ($wrongVersion.Count -eq 0 -and $wrongPage.Count -eq 0 -and $wrongCase.Count -eq 0) 'details of another version, another page, or a differently cased row key were accepted.'
+$tooMany = ConvertTo-PackChangeReportDetails ((ConvertTo-Json -InputObject @([ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v1'; toVersionId = 'v2'; beforePageNumber = 2; afterPageNumber = 2; regions = @($manyRegions) }) -Depth 8) | ConvertFrom-Json) $detailSummary  # ps51-count-ok（Hashtable を返す）
+Assert-ChangeTest (@($tooMany['item:A#2'].regions).Count -eq 30 -and [int]$tooMany['item:A#2'].regionCount -eq 30) 'More than 30 regions were kept for one row.'
+Assert-ChangeTest ((ConvertTo-PackChangeReportDetails 'x' $detailSummary).Count -eq 0 -and (ConvertTo-PackChangeReportDetails $null $detailSummary).Count -eq 0) 'Malformed details were not ignored.'  # ps51-count-ok（Hashtable を返す）
+# 全体の大きさの上限を超える分は捨てる。
+$savedMax = $Script:PackChangeReportDetailsMaxBytes
+$Script:PackChangeReportDetailsMaxBytes = 100
+Assert-ChangeTest ((ConvertTo-PackChangeReportDetails $parsedDetails $detailSummary).Count -eq 0) 'details over the size limit were accepted.'  # ps51-count-ok（Hashtable を返す）
+$Script:PackChangeReportDetailsMaxBytes = $savedMax
+
+# ---- 座標の換算（前後でページの大きさが違う） ----
+# ブラウザ・サーバーの枠は前後のうち大きい方の寸法に左上を合わせた割合。半分の大きさの画像では倍の割合になる。
+$halfBox = ConvertTo-PackChangeReportImageBox ([pscustomobject]@{ x = 0.1; y = 0.1; width = 0.2; height = 0.1 }) 1000 1400 500 700
+Assert-ChangeTest ([double]$halfBox.x -eq 0.2 -and [double]$halfBox.y -eq 0.2 -and [double]$halfBox.width -eq 0.4 -and [double]$halfBox.height -eq 0.2) "A region was not converted to the smaller page: $($halfBox | ConvertTo-Json -Compress)"
+Assert-ChangeTest ($null -eq (ConvertTo-PackChangeReportImageBox ([pscustomobject]@{ x = 0.6; y = 0.1; width = 0.2; height = 0.1 }) 1000 1400 500 700)) 'A region outside the smaller page was drawn on it.'
+$sameBox = ConvertTo-PackChangeReportImageBox ([pscustomobject]@{ x = 0.1; y = 0.1; width = 0.2; height = 0.1 }) 1000 1400 1000 1400
+Assert-ChangeTest ([double]$sameBox.x -eq 0.1 -and [double]$sameBox.width -eq 0.2) 'A region on a page of the full size was moved.'
+
+# ---- 詳細ページの中身 ----
+$imgBefore = [pscustomobject]@{ src = 'img/i0000/0002-b.png'; width = 1000; height = 1400 }
+$imgAfterHalf = [pscustomobject]@{ src = 'img/i0000/0002-a.png'; width = 500; height = 700 }
+$targetA = [pscustomobject]@{ rowKey = 'item:A#2'; mode = 'diff'; row = $detailSummary.pages[0] }
+$pageA = New-PackChangeReportDetailPage $targetA $validA $null $imgBefore $imgAfterHalf
+Assert-ChangeTest ([string]$pageA.source -eq 'browser' -and @($pageA.regions).Count -eq 2 -and [int]$pageA.regionCount -eq 6) "The browser detail page is wrong: $($pageA.source) $(@($pageA.regions).Count)"
+# 追加の枠は今回の画像だけ、変更の枠は両方（アプリの差分画面と同じ）。
+Assert-ChangeTest (@($pageA.before.boxes).Count -eq 1 -and [string]@($pageA.before.boxes)[0].kind -eq 'modified' -and @($pageA.after.boxes).Count -eq 2) 'Added regions must be drawn on the current page only.'
+Assert-ChangeTest ([double]@($pageA.after.boxes)[0].x -eq 0.2 -and [double]@($pageA.after.boxes)[0].width -eq 0.4) 'The detail page did not convert regions to the smaller current page.'
+Assert-ChangeTest (@($pageA.notes | Where-Object { $_ -like '*最初の2か所だけ*全部で 6 か所*' }).Count -eq 1) 'The detail page did not say that only some regions are shown.'
+$fallbackPage = [pscustomobject]@{ width = 1000; height = 1400; regions = @([pscustomobject]@{ kind = 'modified'; x = 0.1; y = 0.2; width = 0.3; height = 0.05 }) }
+$pageServer = New-PackChangeReportDetailPage $targetA $null $fallbackPage $imgBefore $imgBefore
+Assert-ChangeTest ([string]$pageServer.source -eq 'server' -and @($pageServer.notes | Where-Object { $_ -like '*自動で検出した範囲*' }).Count -eq 1 -and @($pageServer.before.boxes).Count -eq 1) 'The server fallback page was not marked as automatically detected.'
+$pageNone = New-PackChangeReportDetailPage $targetA $null $null $imgBefore $imgBefore
+Assert-ChangeTest (@($pageNone.regions).Count -eq 0 -and @($pageNone.notes | Where-Object { $_ -like '*特定できませんでした*' }).Count -eq 1) 'A detail page without regions did not ask to check the whole page.'
+Assert-ChangeTest ($null -eq (New-PackChangeReportDetailPage $targetA $validA $null $null $null)) 'A detail page was made without any picture.'
+$targetB = [pscustomobject]@{ rowKey = 'item:B#1'; mode = 'added'; row = $detailSummary.pages[1] }
+$pageB = New-PackChangeReportDetailPage $targetB $null $null $null $imgBefore
+Assert-ChangeTest ([string]$pageB.source -eq 'page' -and $null -eq $pageB.before -and @($pageB.after.boxes).Count -eq 1 -and [string]@($pageB.after.boxes)[0].kind -eq 'added' -and [double]@($pageB.after.boxes)[0].width -gt 0.9) 'An added page did not get one picture with a whole-page frame.'
+Assert-ChangeTest ($null -eq (New-PackChangeReportDetailPage $targetB $null $null $imgBefore $null)) 'An added page was shown without its current picture.'
+Assert-ChangeTest ((Get-PackChangeReportDetailSource @($pageA)) -eq 'browser' -and (Get-PackChangeReportDetailSource @($pageA, $pageServer, $pageB)) -eq 'mixed' -and (Get-PackChangeReportDetailSource @($pageServer, $pageB)) -eq 'server' -and (Get-PackChangeReportDetailSource @($pageB)) -eq 'none') 'detailSource is wrong.'
+
+# ---- 詳細ページの HTML（枠の座標・番号・文字・エスケープ・詳細ページの番号・総ページ数） ----
+$detailRows = @(
+    (New-TestDetailRow 'item:A#2' 12 10 @('content')),
+    (New-TestDetailRow 'item:B#1' 13 0 @('added') 1 0),
+    (New-TestDetailRow 'item:D#1' 15 13 @('content'))
+)
+$detailHtml = New-PackChangeReportHtml (New-TestReportSummary $detailRows $true @{ changed = 3; content = 2; added = 1 }) '一式' '本体' '' @($pageA, $pageB)
+Assert-ChangeTest ((Get-TextCount $detailHtml '<section class="sheet') -eq 4 -and $detailHtml.Contains('変更点 4 / 4') -and (Get-TextCount $detailHtml 'class="mark-badge">確認用') -eq 4) 'The detail pages were not counted in the page total.'
+Assert-ChangeTest ($detailHtml.Contains('変更 1か所・追加 1か所・ほか 4か所（詳細 p.3）') -and $detailHtml.Contains('今回だけにあるページ（詳細 p.4）')) 'The list does not point to the detail page numbers.'
+Assert-ChangeTest ($detailHtml.Contains('<td>変更箇所を特定できませんでした（ページ全体を確認してください）</td>') -and $detailHtml.Contains('1 ページは画像を用意できなかったため')) 'A changed row without a detail page is not explained.'
+Assert-ChangeTest ($detailHtml.Contains('今回 p.12（右） ← 前回 p.10（右）／売上.xlsx / 売上（シート内 2/3 ページ）')) 'The detail heading is wrong.'
+Assert-ChangeTest ($detailHtml.Contains('<img src="img/i0000/0002-b.png"') -and $detailHtml.Contains('<img src="img/i0000/0002-a.png"')) 'The detail pictures are missing.'
+Assert-ChangeTest ($detailHtml.Contains('class="box modified" style="left:10%;top:10%;width:20%;height:10%"><span class="tag">①変更</span>') -and $detailHtml.Contains('class="box modified" style="left:20%;top:20%;width:40%;height:20%"><span class="tag">①変更</span>')) 'The numbered frames are not placed at the converted coordinates.'
+Assert-ChangeTest ($detailHtml.Contains('<span class="tag">②追加</span>') -and $detailHtml.Contains('<li class="item">① 変更: 1,234 → 1,240</li>')) 'The numbered list of changed text is missing.'
+Assert-ChangeTest (-not $detailHtml.Contains('<script>alert(2)') -and $detailHtml.Contains('② 追加: &lt;script&gt;alert(2)&lt;/script&gt;')) 'Changed text was not escaped in the report HTML.'
+Assert-ChangeTest (-not $detailHtml.Contains('くわしく見る') -and -not $detailHtml.Contains('line-clamp') -and -not $detailHtml.Contains('class="clip"')) 'The report still refers to the app or clips list cells.'
+Assert-ChangeTest ($detailHtml.Contains('p.3 から 2 ページ分')) 'The cover does not point to the detail pages.'
+
+# 一覧のセルは3行で切らない。長い名前の行は高さを見積もってページを分け、名前はそのまま載せる。
+$longName = ('とても長い原稿名' * 25)
+$tallRows = @(for ($p = 1; $p -le 12; $p++) { New-TestReportRow $p $p @('content') $false 'right' 'right' $(if ($p -eq 1) { $longName } else { '売上.xlsx' }) })
+$tallHtml = New-PackChangeReportHtml (New-TestReportSummary $tallRows) '一式' '本体'
+Assert-ChangeTest ((Get-TextCount $tallHtml '<section class="sheet') -eq 3 -and $tallHtml.Contains('変更点 3 / 3') -and $tallHtml.Contains($longName)) 'A tall row was clipped or did not push the list onto another page.'
+$hugeName = ('長' * 3000)
+$hugeHtml = New-PackChangeReportHtml (New-TestReportSummary @((New-TestReportRow 1 1 @('content') $false 'right' 'right' $hugeName))) '一式' '本体'
+Assert-ChangeTest ($hugeHtml.Contains('…（長いため省略しました）') -and -not $hugeHtml.Contains($hugeName)) 'A cell taller than a page was not shortened visibly.'
+Assert-ChangeTest ([Math]::Abs((Get-PackChangeReportTextUnits 'ab全') - 2.2) -lt 0.0001) 'Half-width characters must count as narrower than full-width ones.'
+$split = Split-PackChangeReportPages @(10, 10, 10, 30) 15 25 0
+Assert-ChangeTest ($split.pages.Count -eq 3 -and @($split.pages[0]).Count -eq 1 -and @($split.pages[1]).Count -eq 2 -and @($split.pages[2])[0] -eq 3) 'The height-based page split is wrong.'
+$splitFirst = Split-PackChangeReportPages @(20) 15 25 0
+Assert-ChangeTest ($splitFirst.pages.Count -eq 2 -and @($splitFirst.pages[0]).Count -eq 0) 'An item too tall for the first page must move to the next page.'
+
+# 文字の一覧が1ページに入りきらない詳細は「続き」のページへ回し、総ページ数も合わせる。
+$wordy = [pscustomobject]@{ rowKey = 'item:A#2'; beforePageNumber = 2; afterPageNumber = 2; regionCount = 30; regions = @(for ($n = 0; $n -lt 30; $n++) { [pscustomobject]@{ kind = 'modified'; before = [pscustomobject]@{ x = 0.1; y = 0.1; width = 0.1; height = 0.1 }; after = [pscustomobject]@{ x = 0.1; y = 0.1; width = 0.1; height = 0.1 }; beforeText = ('前' * 200); afterText = ('後' * 200) } }) }
+$wordyPage = New-PackChangeReportDetailPage $targetA $wordy $null $imgBefore $imgBefore
+$wordyHtml = New-PackChangeReportHtml (New-TestReportSummary @($detailRows[0])) '一式' '本体' '' @($wordyPage)
+$wordySheets = Get-TextCount $wordyHtml '<section class="sheet'
+Assert-ChangeTest ($wordySheets -gt 3 -and $wordyHtml.Contains(('変更点 {0} / {0}' -f $wordySheets)) -and $wordyHtml.Contains('（続き）') -and (Get-TextCount $wordyHtml '<li class="item">') -eq 30) "A long list of changed text was not continued on extra pages: $wordySheets sheets"
+Assert-ChangeTest ($wordyHtml.Contains('㉚変更') -and $wordyHtml.Contains('⑳変更')) 'Frames beyond 20 must keep readable numbers.'
+
+# 200件の上限: 201件目からは詳細を載せず、表紙と一覧でそう伝える。
+$limitRows = @(for ($p = 1; $p -le 205; $p++) { New-TestDetailRow ('item:L' + $p + '#1') $p $p @('content') })
+$limitSelection = Get-PackChangeReportDetailTargets @(Get-PackChangeReportEntries $limitRows)
+Assert-ChangeTest (@($limitSelection.targets).Count -eq 200 -and @($limitSelection.omitted).Count -eq 5 -and [string]@($limitSelection.omitted)[0] -eq 'item:L201#1') 'The detail pages were not limited to the first 200 rows.'
+$limitHtml = New-PackChangeReportHtml (New-TestReportSummary $limitRows) '一式' '本体'
+Assert-ChangeTest ($limitHtml.Contains('ページごとの詳細は最初の200ページ分だけ載せています（ほかの 5 ページは一覧だけです）') -and (Get-TextCount $limitHtml '詳細は省略しました') -eq 5) 'The 200-page limit is not explained.'
+# ずれただけ・左右の入れ替わりだけの行には詳細ページを作らない。増えた・なくなった行は作る。
+$kindSelection = Get-PackChangeReportDetailTargets @(Get-PackChangeReportEntries @((New-TestDetailRow 'item:M#1' 3 3 @('moved','side')), (New-TestDetailRow 'item:R#1' 0 4 @('removed') 0 1), (New-TestDetailRow 'item:N#1' 5 0 @('added') 1 0)))
+Assert-ChangeTest ((@($kindSelection.targets | ForEach-Object { [string]$_.mode }) -join ',') -eq 'removed,added') 'Detail targets must be changed content, added and removed pages only.'
+# 前回の画像は前回の原稿・シートで引く（原稿の差し替え・シート名の変更）。古い summary.json は同じ原稿と分かるときだけ。
+$renamedRow = New-TestDetailRow 'item:A#2' 12 10 @('content')
+$renamedRow.fromSheetName = '旧売上'; $renamedRow.fromSourceId = 'wb_old'
+$renamedSides = Get-PackChangeReportImageSides $renamedRow 'diff'
+Assert-ChangeTest ([string]$renamedSides.before.sheetName -eq '旧売上' -and [string]$renamedSides.before.workbookId -eq 'wb_old' -and [string]$renamedSides.after.sheetName -eq '売上' -and [int]$renamedSides.after.pageNumber -eq 2 -and [string]$renamedSides.before.versionId -eq 'v1') 'The previous picture must come from the previous source and sheet.'
+$legacyRow = New-TestDetailRow 'item:A#2' 12 10 @('content')
+$legacyRow.Remove('fromSourceId'); $legacyRow.Remove('fromSheetName'); $legacyRow.detailAvailable = $false
+Assert-ChangeTest ($null -eq (Get-PackChangeReportImageSides $legacyRow 'diff').before) 'An old summary row of another source must not guess the previous source.'
+Assert-ChangeTest ($null -eq (Get-PackChangeReportImageSides (New-TestDetailRow 'item:N#1' 5 0 @('added') 1 0) 'added').before) 'An added page has no previous picture.'
+
 # ---- Edge のヘッドレス印刷 ---------------------------------------------------------
 # 専用の --user-data-dir を必ず渡す（起動中の Edge にのっとられると PDF ができない）。
 $edgeArgs = @(Get-EdgePrintToPdfArguments 'C:\t\profile' 'C:\t\report.pdf' 'file:///C:/t/report.html')
 Assert-ChangeTest ($edgeArgs -contains '--headless' -and $edgeArgs -contains '--user-data-dir=C:\t\profile' -and $edgeArgs -contains '--no-pdf-header-footer' -and $edgeArgs -contains '--print-to-pdf=C:\t\report.pdf' -and $edgeArgs[-1] -eq 'file:///C:/t/report.html') "The Edge print arguments are wrong: $($edgeArgs -join ' ')"
 Assert-Throws { Get-EdgePrintToPdfArguments '' 'C:\t\report.pdf' 'file:///x' } 'プロファイル' 'Edge was allowed to print with the default profile.'
-# 待ち時間の上限は件数に比例させ、最大10分。
+# 待ち時間の上限は件数と詳細ページの画像の枚数に比例させ、最大10分。
 Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 0) -eq 60 -and (Get-PackChangeReportTimeoutSeconds 100) -eq 110 -and (Get-PackChangeReportTimeoutSeconds 2000) -eq 600) 'The report timeout is not proportional to the item count.'
+Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 100 40) -eq 170 -and (Get-PackChangeReportTimeoutSeconds 100 400) -eq 600) 'The report timeout does not count the detail pictures.'
 
 # Edge の代わりに、印刷を真似る偽物を使う（PDF を書く／時間切れ／PDF を書かずに正常終了）。
 $Script:EdgeCalls = New-Object System.Collections.ArrayList
@@ -501,6 +657,122 @@ foreach ($case in @(@('timeout','時間内'), @('blocked','ヘッドレス印刷
 }
 Assert-ChangeTest ([string](Read-JsonFile $reportStatusPath $null).code -eq 'no-pdf') 'The failure code of the Edge print was not kept on the job.'
 $Script:EdgeMode = 'ok'
+
+# ---- ページごとの詳細を載せる作成ジョブ（偽の画像化・lease で、実際に呼ばれる経路を通す） -------------
+# 新しい2つの版: シートA の2ページ目だけ内容が変わり、シートN が1ページ増えた。
+foreach ($snapshotId in @('s7','s8')) { New-Item -ItemType Directory -Path (Get-SnapshotDir 'ja' 'wb_a' $snapshotId) -Force | Out-Null }
+Write-TestVisualHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') }
+Write-TestVisualHashes 's8' 'v8' @{ 'シートA' = @('K1','K2X'); 'シートN' = @('N1') }
+$build7 = Set-ArchivedOutput 'ja-main' '%PDF-change-7' (New-TestManifest @((New-TestItem 'A' 2))) (New-TestMetadata @{ wb_a = 's7|v7' })
+$build8 = Set-ArchivedOutput 'ja-main' '%PDF-change-8' (New-TestManifest @((New-TestItem 'A' 2), (New-TestItem 'N'))) (New-TestMetadata @{ wb_a = 's8|v8' })
+$detailJobSummary = Get-PackChangeSummary 'ja' $packId 'main' $build7 $build8
+$changedRow = @($detailJobSummary.pages | Where-Object { [string]$_.rowKey -eq 'item:A#2' })[0]
+Assert-ChangeTest ((Get-Kinds $changedRow) -eq 'content' -and [string]$changedRow.fromSourceId -eq 'wb_a' -and [string]$changedRow.fromSheetName -eq 'シートA') "The detail job fixture is wrong: $(Get-Kinds $changedRow)"
+
+function Write-FakePng([string]$Path, [int]$Width, [int]$Height) {
+    $bytes = New-Object byte[] 33
+    $head = @(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52)
+    for ($i = 0; $i -lt $head.Count; $i++) { $bytes[$i] = [byte]$head[$i] }
+    $bytes[18] = [byte][Math]::Floor($Width / 256); $bytes[19] = [byte]($Width % 256)
+    $bytes[22] = [byte][Math]::Floor($Height / 256); $bytes[23] = [byte]($Height % 256)
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
+$Script:FakeLeaseVersions = New-Object System.Collections.ArrayList
+$Script:FakeLeaseReleased = 0
+$Script:FakePdfCalls = New-Object System.Collections.ArrayList
+$Script:FakeBatchDpi = 0
+$Script:FakeBatchMode = 'ok'
+function New-PackChangeReportLeases([string]$Language, $Versions, [string]$JobId) {
+    $out = @()
+    foreach ($v in @($Versions)) {
+        [void]$Script:FakeLeaseVersions.Add(([string]$v.snapshotId + '|' + [string]$v.versionId))
+        $out += [pscustomobject]@{ workbookId = [string]$v.workbookId; snapshotId = [string]$v.snapshotId; versionId = [string]$v.versionId; snapshotLeaseName = 'fake'; contentLeaseName = 'fake' }
+    }
+    return $out
+}
+function Remove-PackChangeReportLeases([string]$Language, $Leases) { $Script:FakeLeaseReleased += @($Leases).Count }
+function Resolve-DiffContentPdfPath([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$VersionId, [string]$SheetName) {
+    [void]$Script:FakePdfCalls.Add(($WorkbookId + '|' + $SnapshotId + '|' + $VersionId + '|' + $SheetName))
+    return ('C:\fake\' + $VersionId + '-' + $SheetName + '.pdf')
+}
+# PdfBatchRasterizer の代わり。シートA は2ページ（2ページ目の今回は半分の大きさ＝用紙サイズ違い）、シートN は1ページ。
+function Invoke-DiffImageBatchGeneration($Items, [int]$Dpi = 0) {
+    $Script:FakeBatchDpi = $Dpi
+    if ($Script:FakeBatchMode -eq 'throw') { throw '差分画像の一括生成に失敗しました。' }
+    $results = @()
+    foreach ($item in @($Items)) {
+        $dir = [string]$item.outputDirectory
+        $pages = @()
+        if ([string]$item.kind -eq 'modified') {
+            Write-FakePng (Join-Path $dir '0001-b.png') 1000 1400; Write-FakePng (Join-Path $dir '0001-a.png') 1000 1400
+            Write-FakePng (Join-Path $dir '0002-b.png') 1000 1400; Write-FakePng (Join-Path $dir '0002-a.png') 500 700
+            $pages += [pscustomobject]@{ pageNumber = 1; width = 1000; height = 1400; beforePageNumber = 1; afterPageNumber = 1; beforeFile = '0001-b.png'; afterFile = '0001-a.png'; status = 'ready'; regions = @() }
+            $pages += [pscustomobject]@{ pageNumber = 2; width = 1000; height = 1400; beforePageNumber = 2; afterPageNumber = 2; beforeFile = '0002-b.png'; afterFile = '0002-a.png'; status = 'ready'; regions = @([pscustomobject]@{ kind = 'modified'; x = 0.1; y = 0.2; width = 0.3; height = 0.05 }) }
+        } else {
+            Write-FakePng (Join-Path $dir '0001-a.png') 1000 1400
+            $pages += [pscustomobject]@{ pageNumber = 1; width = 1000; height = 1400; beforePageNumber = 0; afterPageNumber = 1; beforeFile = '0001-b.png'; afterFile = '0001-a.png'; status = 'ready'; regions = @() }
+        }
+        $results += [pscustomobject]@{ id = [string]$item.id; ok = $true; pages = @($pages) }
+    }
+    return [pscustomobject]@{ ok = $true; items = @($results) }
+}
+$detailReportDir = Get-PackChangeReportDir 'ja' $packId 'main' $build7 $build8
+function Invoke-DetailReportJob($Details) {
+    $job = [pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build7; toBuildId = $build8; statusPath = $reportStatusPath; details = $Details }
+    Invoke-PackChangeReportJobCore $job
+    $state = Read-JsonFile $reportStatusPath $null
+    Assert-ChangeTest ([string]$state.status -eq 'completed') "The detail report job failed: $($state.status) $($state.message) $(@($state.errors | ForEach-Object { [string]$_.detail }) -join ' | ')"
+    return [pscustomobject]@{
+        status = $state
+        meta = (Read-JsonFile (Join-Path $detailReportDir 'meta.json') $null)
+        html = [IO.File]::ReadAllText((Join-Path $detailReportDir 'report.html'), [Text.Encoding]::UTF8)
+    }
+}
+
+# 1) 画面の計算（details）がある行は、その枠と文字をそのまま使う（ジョブの入力は JSON を通った形）。
+$jobDetails = (ConvertTo-Json -InputObject @(
+    [ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v7'; toVersionId = 'v8'; beforePageNumber = 2; afterPageNumber = 2; regionCount = 1; regions = @(
+        [ordered]@{ kind = 'modified'; before = [ordered]@{ x = 0.1; y = 0.1; width = 0.2; height = 0.1 }; after = [ordered]@{ x = 0.1; y = 0.1; width = 0.2; height = 0.1 }; beforeText = '1,234'; afterText = '<b>1,240</b>' }) },
+    [ordered]@{ rowKey = 'item:N#1'; fromVersionId = ''; toVersionId = 'v8'; beforePageNumber = 0; afterPageNumber = 1; regions = @() }
+) -Depth 10) | ConvertFrom-Json
+$browserRun = Invoke-DetailReportJob $jobDetails
+Assert-ChangeTest ([int]$browserRun.meta.reportVersion -eq 2 -and [string]$browserRun.meta.detailSource -eq 'browser' -and [int]$browserRun.meta.detailPageCount -eq 2) "meta.json does not describe the detail pages: $($browserRun.meta | ConvertTo-Json -Compress)"
+Assert-ChangeTest ([string]$browserRun.status.report.detailSource -eq 'browser') 'The made report does not report where its frames came from.'
+Assert-ChangeTest ($browserRun.html.Contains('<li class="item">① 変更: 1,234 → &lt;b&gt;1,240&lt;/b&gt;</li>') -and -not $browserRun.html.Contains('<b>1,240</b>')) 'The detail page does not list the changed text (escaped).'
+Assert-ChangeTest ($browserRun.html.Contains('style="left:10%;top:10%;width:20%;height:10%"') -and $browserRun.html.Contains('style="left:20%;top:20%;width:40%;height:20%"')) 'Browser regions were not converted to the picture of each side (paper size changed).'
+Assert-ChangeTest ($browserRun.html.Contains('<img src="img/i0000/0002-b.png"') -and $browserRun.html.Contains('<img src="img/i0000/0002-a.png"') -and $browserRun.html.Contains('今回だけにあるページ（詳細 p.4）') -and $browserRun.html.Contains('（詳細 p.3）')) 'The detail pages or their page numbers are missing.'
+Assert-ChangeTest (-not $browserRun.html.Contains('自動で検出した範囲')) 'Browser regions were labelled as automatically detected.'
+# 画像は詳細ページ用の解像度で、記録された版（v7・v8）の変換PDFから作り、lease は作り終えたら外す。
+Assert-ChangeTest ([int]$Script:FakeBatchDpi -eq [int]$Script:PackChangeReportImageDpi) 'The detail pictures were not rendered at the report resolution.'
+Assert-ChangeTest ($Script:FakePdfCalls -contains 'wb_a|s7|v7|シートA' -and $Script:FakePdfCalls -contains 'wb_a|s8|v8|シートA' -and $Script:FakePdfCalls -contains 'wb_a|s8|v8|シートN') "The pictures were not made from the archived versions: $(@($Script:FakePdfCalls) -join ', ')"
+Assert-ChangeTest ((@($Script:FakeLeaseVersions | Sort-Object -Unique) -join ',') -eq 's7|v7,s8|v8' -and [int]$Script:FakeLeaseReleased -eq 2) "The versions were not leased while the pictures were made: $(@($Script:FakeLeaseVersions) -join ',') released=$($Script:FakeLeaseReleased)"
+# 待ち時間の上限に画像の枚数（前回・今回の2枚＋増えたページの1枚）を数える。
+Assert-ChangeTest ([int]$Script:EdgeCalls[$Script:EdgeCalls.Count - 1].timeout -eq (Get-PackChangeReportTimeoutSeconds @($detailJobSummary.pages).Count 3)) 'The report timeout does not count the detail pictures.'
+
+# 2) details が無い（画面で計算できなかった）行は、サーバーの画素比較の枠で埋めて印を付ける。
+$serverRun = Invoke-DetailReportJob @()
+Assert-ChangeTest ([string]$serverRun.meta.detailSource -eq 'server' -and $serverRun.html.Contains('枠は、前回と今回のページの画像の違いから自動で検出した範囲です。')) 'Rows without browser details were not filled with the server frames.'
+Assert-ChangeTest ($serverRun.html.Contains('style="left:10%;top:20%;width:30%;height:5%"') -and $serverRun.html.Contains('style="left:20%;top:40%;width:60%;height:10%"')) 'The server frames were not converted to the picture of each side.'
+# 不正な details（版の違う結果）は捨てて、予備の枠を使う。
+$forged = (ConvertTo-Json -InputObject @([ordered]@{ rowKey = 'item:A#2'; fromVersionId = 'v1'; toVersionId = 'v8'; beforePageNumber = 2; afterPageNumber = 2; regions = @([ordered]@{ kind = 'modified'; before = [ordered]@{ x = 0.5; y = 0.5; width = 0.1; height = 0.1 }; after = [ordered]@{ x = 0.5; y = 0.5; width = 0.1; height = 0.1 }; beforeText = 'X'; afterText = 'Y' }) }) -Depth 10) | ConvertFrom-Json
+$forgedRun = Invoke-DetailReportJob $forged
+Assert-ChangeTest ([string]$forgedRun.meta.detailSource -eq 'server' -and -not $forgedRun.html.Contains('X → Y')) 'details of another version were used for the report.'
+
+# 3) 画像を作れなくても変更点PDFは作り、詳細の無いことを伝える（作成は失敗にしない）。
+$Script:FakeBatchMode = 'throw'
+$failedImages = Invoke-DetailReportJob $jobDetails
+Assert-ChangeTest ([int]$failedImages.meta.detailPageCount -eq 0 -and [string]$failedImages.meta.detailSource -eq 'none' -and $failedImages.html.Contains('2 ページは画像を用意できなかったため')) 'A report without pictures did not explain the missing details.'
+Assert-ChangeTest (@($failedImages.status.warnings).Count -eq 1 -and [int]$Script:FakeLeaseReleased -eq 8) "The picture failure was not kept as a warning or the leases were not released: released=$($Script:FakeLeaseReleased)"
+$Script:FakeBatchMode = 'ok'
+
+# 版 1 の作成済みPDF（ページごとの詳細の無いもの）は、作り直すまで作成済みにしない。
+$detailMetaPath = Join-Path $detailReportDir 'meta.json'
+$detailMeta = Read-JsonFile $detailMetaPath $null
+$detailStateArgs = @('ja', $packId, 'main', $build7, $build8, [string]$detailJobSummary.from.outputPdfSha256, [string]$detailJobSummary.to.outputPdfSha256)
+Assert-ChangeTest ([bool](Get-PackChangeReportState @detailStateArgs $true).exists) 'A report of the current version was not offered.'
+$detailMeta.reportVersion = 1
+Write-JsonFile $detailMetaPath $detailMeta
+Assert-ChangeTest (-not [bool](Get-PackChangeReportState @detailStateArgs $true).exists -and [string](Get-PackChangeReportState @detailStateArgs $true).reason -eq 'outdated') 'A report made before the detail pages (version 1) was still offered.'
 
 Write-Output 'pack-change selfcheck ok'
 '@

@@ -233,7 +233,7 @@ function renderPackChangeError(message){errors.push(message);}
 }
 
 // ---- 変更点PDF（確認用） -------------------------------------------------------------
-const reportHelpers = ['packChangeReportBody', 'packChangeReportView', 'packChangeReportCopyNote'].map(extractFunction).join('\n') + '\n'
+const reportHelpers = ['packChangeReportBody', 'packChangeReportView', 'packChangeReportCopyNote', 'packChangeReportDetailNote'].map(extractFunction).join('\n') + '\n'
   + source.slice(source.indexOf('const PACK_CHANGE_REPORT_TERMINAL='), source.indexOf('];', source.indexOf('const PACK_CHANGE_REPORT_TERMINAL=')) + 2);
 const readyChanges = (extra = {}) => ({ status: 'ready', from: { buildId: 'b1' }, to: { buildId: 'b3' }, report: { exists: false, reason: 'not-created' }, ...extra });
 {
@@ -263,6 +263,19 @@ const readyChanges = (extra = {}) => ({ status: 'ready', from: { buildId: 'b1' }
   assert.equal(view.canOpen, true); assert.equal(view.canCreate, false);
   view = ctx.packChangeReportView(readyChanges({ report: { exists: false, reason: 'outdated' } }), null);
   assert.equal(view.canOpen, false); assert.equal(view.createLabel, '変更点PDFを作り直す');
+  // PR-B2: 詳細ページの枠の一部・全部がサーバーの予備（画像の違いから自動で検出した範囲）なら、そう伝える。
+  // アプリと同じ計算（browser）・詳細なし（none）・古い記録（無し）では何も足さない。
+  view = ctx.packChangeReportView(readyChanges({ report: { exists: true, detailSource: 'mixed' } }), null);
+  assert.match(view.status, /一部のページの詳細の枠は、画像の違いから自動で検出した範囲です/);
+  view = ctx.packChangeReportView(readyChanges({ report: { exists: true, detailSource: 'server' } }), null);
+  assert.match(view.status, /ページごとの詳細の枠は、画像の違いから自動で検出した範囲です/);
+  for (const detailSource of ['browser', 'none', '']) {
+    view = ctx.packChangeReportView(readyChanges({ report: { exists: true, detailSource } }), null);
+    assert.doesNotMatch(view.status, /自動で検出/);
+  }
+  // 作り終えたジョブの report（作成直後の状態）でも同じ。
+  view = ctx.packChangeReportView(readyChanges(), { status: 'completed', report: { exists: true, detailSource: 'server' } });
+  assert.match(view.status, /変更点PDFを作りました。.*自動で検出した範囲です/);
 }
 
 function makeReportContext() {
