@@ -8129,9 +8129,14 @@ function Test-FinalSnapshotContentUnchanged([string]$Language, $Snapshot) {
         $rel = [string](Get-DataProperty $fp 'contentPdf' '')
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
         $size = 0L; $ticks = 0L
+        # Get-FinalBuildInputSnapshot と同じ規則で見る。作業フォルダーの外と隠しファイルは「見つからない」
+        # （サイズ・更新時刻0）として記録しているので、ここで実物の値を読むと毎回外れて作り直しになる。
         try {
-            $info = New-Object IO.FileInfo (Join-Path $workspace $rel)
-            if ($info.Exists) { $size = [int64]$info.Length; $ticks = [int64]$info.LastWriteTimeUtc.Ticks }
+            $full = [IO.Path]::GetFullPath((Join-Path $workspace $rel))
+            $root = [IO.Path]::GetFullPath($workspace)
+            if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+            $info = New-Object IO.FileInfo $full
+            if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $info.Exists -and -not ($info.Attributes -band [IO.FileAttributes]::Hidden)) { $size = [int64]$info.Length; $ticks = [int64]$info.LastWriteTimeUtc.Ticks }
         } catch { return $false }
         if ([int64](Get-DataProperty $fp 'contentPdfSize' 0) -ne $size -or [int64](Get-DataProperty $fp 'contentPdfLastWriteUtcTicks' 0) -ne $ticks) { return $false }
     }
