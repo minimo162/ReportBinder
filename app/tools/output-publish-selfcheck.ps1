@@ -557,6 +557,99 @@ Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|'
 $Script:FailClearOnPublishedFolder = $false
 Set-Item Function:\Clear-PublishHiddenAttribute $realClearHidden
 
+# ---- 変更点の下準備: コピーした版（buildId）の記録とアーカイブの読み込み ---------------
+# 比べる元の「前回コピーした版」は発行の記録から引く。Write-HistoryEvent は何も書かないので、
+# 記録が残っていなければ、この節の Get-LastPublishedBuildId はすべて '' になって落ちる。
+$recordPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='版の記録の一式' })
+$recordId = [string]$recordPack.packId
+Add-TestPages $recordId @('ja-main')
+# 出力ジョブ（Build-DocumentPackPdf）が確定したときと同じく、buildId を記録してアーカイブを作る。
+function Set-ArchivedOutput([string]$Content, [bool]$WithPageMap = $true) {
+    $path = Set-BuiltOutput $recordId 'ja-main' $Content
+    $buildId = New-RbId
+    [void](Update-StructureLocked 'ja' { param($st) Set-NoteProperty (Get-PackOutputState $st 'ja' $recordId 'ja-main' $true) 'buildId' $buildId; return $null })
+    $pageMap = @(if ($WithPageMap) { [ordered]@{ outputPageNumber=1; side='right'; spreadIndex=0; itemId='item-1'; pagePartIndex=0; pagePartCount=1 } })
+    $manifest = [ordered]@{ schemaVersion=3; packId=$recordId; targetId='main'; volume='ja-main'; physicalPages=$pageMap; pages=@() }
+    [void](New-FinalArchive 'ja' $recordId 'ja-main' $buildId $path $manifest ([ordered]@{ sourceWorkbooks=@(); pages=@(1) }))
+    return $buildId
+}
+function Get-ArchiveRow([string]$BuildId) {
+    $rows = @(Get-FinalArchives 'ja' $recordId | Where-Object { [string]$_.buildId -eq $BuildId })
+    Assert-OutputTest ($rows.Count -eq 1) "The archive list did not contain exactly one row for $BuildId (rows=$($rows.Count))."
+    return $rows[0]
+}
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $recordId 'main') -eq '') 'A target that was never copied reported a last published build.'
+$firstBuild = Set-ArchivedOutput '%PDF-record-1'
+$firstRow = Get-ArchiveRow $firstBuild
+Assert-OutputTest ([bool]$firstRow.isCurrent -and -not [bool]$firstRow.isLastPublished -and [string]$firstRow.publishedAt -eq '') 'An archive that was never copied was not listed as current-and-unpublished.'
+Assert-OutputTest ([bool]$firstRow.hasPageMap) 'An archive with physicalPages was listed without a page map.'
+
+$firstPublish = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $recordId
+Assert-OutputTest ([string]$firstPublish.publishRecordError -eq '') "Recording the publish failed: $($firstPublish.publishRecordError)"
+Assert-OutputTest ([string]@($firstPublish.files)[0].buildId -eq $firstBuild) 'The publish result did not carry the buildId of the copied output.'
+Assert-OutputTest ([string]@($firstPublish.files)[0].sha256 -eq (New-Sha256 ([string]@($firstPublish.files)[0].sharedPath))) 'The publish result did not carry the hash of the copied PDF.'
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $recordId 'main') -eq $firstBuild) 'Publishing did not record the buildId of the copied output.'
+$publishRecord = @(Get-PublishRecords 'ja' $recordId 'ja-main')[0]
+Assert-OutputTest ([string]$publishRecord.sha256 -eq (New-Sha256 ([string]@($firstPublish.files)[0].sharedPath)) -and [string]$publishRecord.folderName -eq [string]$firstPublish.folderName) 'The publish record does not hold the hash and folder of the copy.'
+# 発行の記録はアーカイブの木に混ぜない（出力先フォルダーの中に余計なフォルダーを作らない）。
+$archiveVolumeDir = Join-Path (Join-Path (Get-ArchiveRoot 'ja') $recordId) 'ja-main'
+Assert-OutputTest (@(Get-ChildItem -LiteralPath $archiveVolumeDir -Directory | Where-Object { $_.Name -ne $firstBuild }).Count -eq 0) 'The publish record was written inside the archive tree.'
+$firstRow = Get-ArchiveRow $firstBuild
+Assert-OutputTest ([bool]$firstRow.isLastPublished -and [string]$firstRow.publishedAt -eq [string]$firstPublish.publishedAt -and [string]$firstRow.folderName -eq [string]$firstPublish.folderName) 'The copied archive was not marked as the last published one.'
+
+# 出力し直しただけでは「前回コピーした版」は変わらない。今の版は新しい出力。
+$secondBuild = Set-ArchivedOutput '%PDF-record-2' $false
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $recordId 'main') -eq $firstBuild) 'Rebuilding without copying changed the last published build.'
+$firstRow = Get-ArchiveRow $firstBuild
+$secondRow = Get-ArchiveRow $secondBuild
+Assert-OutputTest ([bool]$firstRow.isLastPublished -and -not [bool]$firstRow.isCurrent) 'After a rebuild the copied archive lost its mark or stayed current.'
+Assert-OutputTest ([bool]$secondRow.isCurrent -and -not [bool]$secondRow.isLastPublished -and [string]$secondRow.publishedAt -eq '') 'The rebuilt archive was not listed as current-and-unpublished.'
+Assert-OutputTest (-not [bool]$secondRow.hasPageMap) 'An archive without physicalPages was listed with a page map.'
+# 出力フォルダーのPDFが出力の後に変わっていたら、どのアーカイブも今の提出用PDFとは呼ばない。
+$currentPdf = Get-PlannedOutputPath $recordId 'ja-main'
+[IO.File]::AppendAllText($currentPdf, 'edited')
+Assert-OutputTest (-not [bool](Get-ArchiveRow $secondBuild).isCurrent) 'An archive was still current after the output PDF was edited.'
+[void](Set-BuiltOutput $recordId 'ja-main' '%PDF-record-2')
+
+# 次のコピーで記録が更新され、前の版にはコピーした日時だけが残る。
+$secondPublish = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $recordId
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $recordId 'main') -eq $secondBuild) 'The next publish did not update the last published build.'
+$firstRow = Get-ArchiveRow $firstBuild
+$secondRow = Get-ArchiveRow $secondBuild
+Assert-OutputTest (-not [bool]$firstRow.isLastPublished -and [string]$firstRow.publishedAt -eq [string]$firstPublish.publishedAt) 'The older copy lost its publish date or kept the last-published mark.'
+Assert-OutputTest ([bool]$secondRow.isLastPublished -and [bool]$secondRow.isCurrent -and [string]$secondRow.folderName -eq [string]$secondPublish.folderName) 'The newest copy was not marked as last published.'
+# 別の出力先の記録とは混ざらない。
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $recordId 'appendix') -eq '') 'A target that was never copied picked up another target''s publish record.'
+# 最後のコピーが buildId を持たない（組み込み一式など）ときは、古い記録へさかのぼらない。
+# 記録の名前はミリ秒までの時刻なので、直前の発行と同じ名前の時刻にならないよう少し待つ。
+Start-Sleep -Milliseconds 20
+Write-PublishRecord 'ja' $recordId 'ja-main' ([ordered]@{ packId=$recordId; targetId='main'; volume='ja-main'; buildId=''; sha256='X'; publishedAt=(New-NowIso) })
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $recordId 'main') -eq '') 'A last copy without a buildId fell back to an older copy.'
+
+# Get-FinalArchiveRecord: 記録どおりなら読み、アーカイブのPDFがすり替えられていたら読まない。
+$record = Get-FinalArchiveRecord 'ja' $recordId 'ja-main' $firstBuild
+Assert-OutputTest ($null -ne $record -and [string]$record.buildId -eq $firstBuild -and [bool]$record.hasPageMap -and @(Get-Array $record.manifest.physicalPages).Count -eq 1) 'An intact archive was not read.'
+Assert-OutputTest ([string]$record.outputPdfSha256 -eq [string](Get-ArchiveRow $firstBuild).outputPdfSha256.ToUpperInvariant()) 'The archive record returned a different hash from the archive list.'
+$archivedPdf = [string]$record.pdfPath
+$archivedStamp = (Get-Item -LiteralPath $archivedPdf).LastWriteTimeUtc
+$archivedOriginal = [IO.File]::ReadAllText($archivedPdf)
+# サイズも更新日時も同じまま中身だけを差し替える。
+[IO.File]::WriteAllText($archivedPdf, $archivedOriginal.ToLowerInvariant())
+(Get-Item -LiteralPath $archivedPdf).LastWriteTimeUtc = $archivedStamp
+Assert-OutputTest ($null -eq (Get-FinalArchiveRecord 'ja' $recordId 'ja-main' $firstBuild)) 'An archive whose PDF was swapped (same size and time) was still read.'
+[IO.File]::WriteAllText($archivedPdf, $archivedOriginal)
+Assert-OutputTest ($null -ne (Get-FinalArchiveRecord 'ja' $recordId 'ja-main' $firstBuild)) 'Restoring the archived PDF did not make the archive readable again.'
+# sha256.txt と metadata の記録が食い違うものも読まない。
+$shaFile = Join-Path ([string]$record.path) 'sha256.txt'
+$shaOriginal = [IO.File]::ReadAllText($shaFile)
+[IO.File]::WriteAllText($shaFile, ('0' * 64))
+Assert-OutputTest ($null -eq (Get-FinalArchiveRecord 'ja' $recordId 'ja-main' $firstBuild)) 'An archive whose sha256.txt disagrees with metadata was still read.'
+[IO.File]::WriteAllText($shaFile, $shaOriginal)
+# 無い版は $null、パスを抜ける識別子は受け付けない。
+Assert-OutputTest ($null -eq (Get-FinalArchiveRecord 'ja' $recordId 'ja-main' 'missing-build')) 'A missing archive was not reported as absent.'
+Assert-Throws { Get-FinalArchiveRecord 'ja' $recordId 'ja-main' '..\other' } '不正' 'A buildId with a path separator was accepted.'
+Assert-Throws { Get-FinalArchiveRecord 'ja' $recordId '..' $firstBuild } '不正' 'A volume with dot traversal was accepted.'
+
 Write-Output 'output-publish selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

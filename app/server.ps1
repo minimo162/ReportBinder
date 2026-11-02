@@ -88,6 +88,7 @@ $Script:VisualHashCache = @{}
 $Script:SnapshotIdCache = @{}
 $Script:SnapshotSummaryCache = @{}
 $Script:DiffDetailResponseCache = @{}
+$Script:FinalArchivePageMapCache = @{}
 $Script:LocalRuntimeCacheRoot = Join-Path $Script:LocalConfigRoot 'runtime-cache'
 if (-not (Test-Path -LiteralPath $Script:LocalRuntimeCacheRoot)) { New-Item -ItemType Directory -Path $Script:LocalRuntimeCacheRoot -Force | Out-Null }
 # 最小化コンソールで起動されたとき、何のウィンドウか分かるようにタイトルを付ける。
@@ -9681,7 +9682,9 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
             throw ("「{0}」と「{1}」の提出用PDFが同じファイル（{2}）です。一式の設定で出力ファイル名に {{targetName}} を含めて出力し直してから、共有用フォルダーにコピーしてください。" -f [string]$usedFileNames[$fileName.ToLowerInvariant()], $targetName, $fileName)
         }
         $usedFileNames[$fileName.ToLowerInvariant()] = $targetName
-        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName; sha256 = $expectedHash }
+        # どの出力（アーカイブの buildId）をコピーしたかを残す。組み込み一式は buildId を持たない。
+        $buildId = [string](Get-DataProperty $outputState 'buildId' '')
+        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName; sha256 = $expectedHash; buildId = $buildId }
     }
 
     $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -9742,13 +9745,16 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
     }
     $publishedAt = New-NowIso
     $files = @()
+    $publishRecordErrors = @()
     foreach ($entry in $entries) {
         $destination = Join-Path $publishDir ([string]$entry.fileName)
-        Write-HistoryEvent $Language 'final.published' ([ordered]@{
+        $publishedEvent = [ordered]@{
             packId = $packId
             category = $cat
             targetId = [string]$entry.targetId
             volume = [string]$entry.volume
+            buildId = [string]$entry.buildId
+            sha256 = [string]$entry.sha256
             source = [string]$entry.sourceFull
             destination = $destination
             sharedFolder = $publishDir
@@ -9757,8 +9763,14 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
             userName = $userName
             packName = $packName
             publishedAt = $publishedAt
-        })
-        $files += [ordered]@{ volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourcePdf = [string]$entry.sourceFull; sharedPath = $destination; fileName = [string]$entry.fileName }
+        }
+        Write-HistoryEvent $Language 'final.published' $publishedEvent
+        # Write-HistoryEvent は何も書かない（履歴タイムラインは廃止）。「前回コピーした版」を
+        # 後から引けるよう、出力先ごとの発行記録を別に残す。コピーはもう終わっているので、
+        # 記録に失敗してもコピーを失敗にはしない（次の比較が「1つ前の出力」になるだけ）。
+        try { Write-PublishRecord $Language $packId ([string]$entry.volume) $publishedEvent }
+        catch { $publishRecordErrors += ("{0}: {1}" -f [string]$entry.targetName, $_.Exception.Message) }
+        $files += [ordered]@{ volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourcePdf = [string]$entry.sourceFull; sharedPath = $destination; fileName = [string]$entry.fileName; buildId = [string]$entry.buildId; sha256 = [string]$entry.sha256 }
     }
     # 1冊だけの呼び出し元は volume/sharedPath/fileName を読む。先頭の1冊で従来の形を保つ。
     $first = $files[0]
@@ -9776,6 +9788,7 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
         publishedBy = $userName
         packName = $packName
         publishedAt = $publishedAt
+        publishRecordError = ($publishRecordErrors -join ' / ')
     }
 }
 
@@ -13399,27 +13412,163 @@ function Get-FinalArchives([string]$Language, [string]$Category) {
     if (-not (Test-Path -LiteralPath $root)) { return @() }
     $out = @()
     foreach ($volDir in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
-        foreach ($b in @(Get-ChildItem -LiteralPath $volDir.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 50)) {
+        # 出力先ごとに、今の出力（buildId とハッシュ）と発行の記録を1回だけ引く。
+        $volumeName = [string]$volDir.Name
+        $currentBuildId = ''
+        $currentSha = ''
+        try {
+            $outputState = Get-PackOutputState $structure $Language $packId $volumeName $false
+            # 出力した後に出力フォルダーのPDFが変更・上書きされていたら、どのアーカイブも
+            # 「今の提出用PDF」ではない（サイズ・更新日時だけを見る。ハッシュは発行の時に見る）。
+            $integrityProblem = Get-OutputPdfIntegrityProblem $outputState ([string](Get-DataProperty $outputState 'outputPdf' '')) $false
+            if ($integrityProblem -eq '') {
+                $currentBuildId = [string](Get-DataProperty $outputState 'buildId' '')
+                $currentSha = Normalize-FileHash ([string](Get-DataProperty (Get-DataProperty $outputState 'outputIntegrity' $null) 'sha256' ''))
+            }
+        } catch { }
+        $publishRecords = @()
+        try { $publishRecords = @(Get-PublishRecords $Language $packId $volumeName) } catch { }
+        $lastPublishedBuildId = if ($publishRecords.Count -gt 0) { [string](Get-DataProperty $publishRecords[0] 'buildId' '') } else { '' }
+        # 作りかけ（.staging）はアーカイブではない。
+        foreach ($b in @(Get-ChildItem -LiteralPath $volDir.FullName -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.staging' } | Sort-Object Name -Descending | Select-Object -First 50)) {
             try {
                 $meta = Read-JsonFile (Join-Path $b.FullName 'metadata.json') $null
                 if ($null -eq $meta) { continue }
+                $rowBuildId = [string](Get-DataProperty $meta 'buildId' $b.Name)
+                $rowSha = Normalize-FileHash ([string](Get-DataProperty $meta 'outputPdfSha256' ''))
+                # 同じ版を何度コピーしても、いちばん新しいコピーを出す（記録は新しい順）。
+                $published = @($publishRecords | Where-Object { -not [string]::IsNullOrWhiteSpace($rowBuildId) -and [string](Get-DataProperty $_ 'buildId' '') -eq $rowBuildId } | Select-Object -First 1)
                 $out += [ordered]@{
-                    buildId = [string](Get-DataProperty $meta 'buildId' $b.Name)
+                    buildId = $rowBuildId
                     packId = [string](Get-DataProperty $meta 'packId' $packId)
                     category = [string](Get-DataProperty $meta 'category' ([string]$scope.category))
-                    targetId = [string](Get-DataProperty $meta 'targetId' (Get-TargetIdFromLegacyVolume ([string]$volDir.Name)))
-                    volume = [string]$volDir.Name
+                    targetId = [string](Get-DataProperty $meta 'targetId' (Get-TargetIdFromLegacyVolume $volumeName))
+                    volume = $volumeName
                     builtAt = [string](Get-DataProperty $meta 'builtAt' '')
                     pageCount = [int](Get-DataProperty $meta 'pageCount' 0)
                     outputFileName = [string](Get-DataProperty $meta 'outputFileName' '')
                     outputPdfSha256 = [string](Get-DataProperty $meta 'outputPdfSha256' '')
                     builtBy = (Get-DataProperty $meta 'builtBy' $null)
                     path = [string]$b.FullName
+                    publishedAt = $(if ($published.Count -gt 0) { [string](Get-DataProperty $published[0] 'publishedAt' '') } else { '' })
+                    folderName = $(if ($published.Count -gt 0) { [string](Get-DataProperty $published[0] 'folderName' '') } else { '' })
+                    isLastPublished = (-not [string]::IsNullOrWhiteSpace($lastPublishedBuildId) -and $rowBuildId -eq $lastPublishedBuildId)
+                    # 出力後にPDFが手で差し替えられていたら「今の提出用PDF」とは呼ばない。
+                    isCurrent = (-not [string]::IsNullOrWhiteSpace($currentBuildId) -and $rowBuildId -eq $currentBuildId -and -not [string]::IsNullOrWhiteSpace($rowSha) -and $rowSha -eq $currentSha)
+                    hasPageMap = (Test-FinalArchiveHasPageMap ([string]$b.FullName))
                 }
             } catch { }
         }
     }
     return @($out | Sort-Object { [string]$_.builtAt } -Descending)
+}
+
+# アーカイブの保存先の1段目。組み込み一式は category、カスタム一式は packId（New-FinalArchive と同じ）。
+function Get-FinalArchiveStorageId([string]$PackIdOrCategory) {
+    $category = Normalize-WorkbookCategory $PackIdOrCategory ''
+    if ([string]::IsNullOrWhiteSpace($category)) { $category = Get-CategoryFromBuiltinPackId $PackIdOrCategory }
+    if (-not [string]::IsNullOrWhiteSpace($category)) { return $category }
+    return (Assert-SafeStorageSegment $PackIdOrCategory 'packId')
+}
+
+# manifest.json に頁・左右の記録（physicalPages）があるか。古い形式の版には無い。
+# アーカイブは書き換わらないので、パスごとに覚える。一覧のたびに大きな manifest を
+# JSON として読まないよう、文字列で先頭の要素の有無だけを見る。
+function Test-FinalArchiveHasPageMap([string]$ArchivePath) {
+    $key = ([string]$ArchivePath).ToLowerInvariant()
+    if ($Script:FinalArchivePageMapCache.ContainsKey($key)) { return [bool]$Script:FinalArchivePageMapCache[$key] }
+    $result = $false
+    try {
+        $manifestPath = Join-Path $ArchivePath 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $false }
+        $text = Read-TextFileShared $manifestPath
+        $result = [regex]::IsMatch([string]$text, '"physicalPages"\s*:\s*(\[\s*\{|\{)')
+    } catch { return $false }
+    $Script:FinalArchivePageMapCache[$key] = $result
+    return $result
+}
+
+# 1件のアーカイブを読む。記録（sha256.txt・metadata.outputPdfSha256）と final.pdf の中身が
+# 一致しなければ読まない（$null）。アーカイブのPDFがすり替えられていたら、比べる元にも先にもしない。
+function Get-FinalArchiveRecord([string]$Language, [string]$PackId, [string]$Volume, [string]$BuildId) {
+    $storageId = Get-FinalArchiveStorageId $PackId
+    $safeVolume = Assert-SafeStorageSegment $Volume 'volume'
+    $safeBuildId = Assert-SafeStorageSegment $BuildId 'buildId'
+    $dir = Join-Path (Join-Path (Join-Path (Get-ArchiveRoot $Language) $storageId) $safeVolume) $safeBuildId
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    $meta = Read-JsonFile (Join-Path $dir 'metadata.json') $null
+    if ($null -eq $meta) { return $null }
+    if ([string](Get-DataProperty $meta 'buildId' '') -ne $safeBuildId) { return $null }
+    $pdfPath = Join-Path $dir 'final.pdf'
+    $shaPath = Join-Path $dir 'sha256.txt'
+    if (-not (Test-Path -LiteralPath $pdfPath -PathType Leaf) -or -not (Test-Path -LiteralPath $shaPath -PathType Leaf)) { return $null }
+    $expected = Normalize-FileHash ([string](Get-DataProperty $meta 'outputPdfSha256' ''))
+    $recorded = Normalize-FileHash ([string](Read-TextFileShared $shaPath))
+    if ([string]::IsNullOrWhiteSpace($expected) -or $expected -ne $recorded) { return $null }
+    # サイズ・更新日時を揃えたすり替えもあるので、覚えたハッシュは使わず毎回読む。
+    if ((Normalize-FileHash (New-Sha256 $pdfPath)) -ne $expected) { return $null }
+    $manifest = Read-JsonFile (Join-Path $dir 'manifest.json') $null
+    if ($null -eq $manifest) { return $null }
+    return [ordered]@{
+        buildId = $safeBuildId
+        packId = [string](Get-DataProperty $meta 'packId' $PackId)
+        category = [string](Get-DataProperty $meta 'category' '')
+        targetId = [string](Get-DataProperty $meta 'targetId' (Get-TargetIdFromLegacyVolume $safeVolume))
+        volume = $safeVolume
+        builtAt = [string](Get-DataProperty $meta 'builtAt' '')
+        pageCount = [int](Get-DataProperty $meta 'pageCount' 0)
+        outputFileName = [string](Get-DataProperty $meta 'outputFileName' '')
+        outputPdfSha256 = $expected
+        path = [string]$dir
+        pdfPath = [string]$pdfPath
+        hasPageMap = (@(Get-Array (Get-DataProperty $manifest 'physicalPages' @())).Count -gt 0)
+        manifest = $manifest
+        metadata = $meta
+    }
+}
+
+# ---- 共有用フォルダーへの発行の記録 ------------------------------------
+# 「前回コピーした版」を引くための、出力先ごとの記録。1回の発行・1出力先で1ファイル
+# （名前は New-RbId なので名前順＝時刻順）。exports\archive の下に置くと出力先フォルダーの
+# 中に混ざり、アーカイブの一覧（Get-FinalArchives）の50件の枠を食うので、別の木に置く。
+function Get-PublishRecordDir([string]$Language, [string]$PackId, [string]$Volume) {
+    $storageId = Get-FinalArchiveStorageId $PackId
+    $safeVolume = Assert-SafeStorageSegment $Volume 'volume'
+    return (Join-Path (Join-Path (Join-Path (Get-WorkspacePath $Language) 'exports\publish-records') $storageId) $safeVolume)
+}
+
+function Write-PublishRecord([string]$Language, [string]$PackId, [string]$Volume, $PublishedEvent) {
+    $dir = Get-PublishRecordDir $Language $PackId $Volume
+    $record = [ordered]@{ schemaVersion = 1 }
+    foreach ($key in @($PublishedEvent.Keys)) { $record[$key] = $PublishedEvent[$key] }
+    Write-JsonFile (Join-Path $dir ((New-RbId) + '.json')) $record
+}
+
+# 新しい順に返す。読めない記録・別の出力先の記録は飛ばす。
+function Get-PublishRecords([string]$Language, [string]$PackId, [string]$Volume, [int]$Limit = 200) {
+    $dir = Get-PublishRecordDir $Language $PackId $Volume
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
+    $targetId = Get-TargetIdFromLegacyVolume $Volume
+    $out = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First $Limit)) {
+        try {
+            $record = Read-JsonFile $f.FullName $null
+            if ($null -eq $record) { continue }
+            if ([string](Get-DataProperty $record 'targetId' '') -ne $targetId) { continue }
+            $out += $record
+        } catch { }
+    }
+    return @($out)
+}
+
+# その出力先で最後に共有用フォルダーへコピーした版の buildId。コピーしたことが無い、または
+# 最後のコピーが buildId を持たない（組み込み一式など）ときは ''。古い記録へはさかのぼらない
+# （それは「前回コピーした版」ではない）。
+function Get-LastPublishedBuildId([string]$Language, [string]$PackId, [string]$TargetId) {
+    $volume = Get-LegacyVolumeFromTargetId $Language $TargetId
+    $records = @(Get-PublishRecords $Language $PackId $volume 1)
+    if ($records.Count -eq 0) { return '' }
+    return [string](Get-DataProperty $records[0] 'buildId' '')
 }
 
 

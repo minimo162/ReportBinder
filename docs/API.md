@@ -61,8 +61,8 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない
 - `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する。出力を確定したときにPDFのサイズ・更新日時・SHA-256を`outputIntegrity`として記録し、発行の前にハッシュを、共有側へコピーした後にもハッシュを照合する。出力後に変更・上書きされたPDF、記録の無い（以前の版で出力した）PDFは発行せず、再出力を求める。readinessはサイズと更新日時が記録と違えば`needs-rebuild`（`staleReasons[].type`=`output-changed`）を返す。提出用PDFの出力ジョブの実行中は拒否し、出力と同じロックを持ってコピーする（`publish-all`も同じ）
-- `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`を返す
-- `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す
+- `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`・`buildId`（コピーした出力のアーカイブ。組み込み一式は空）・`sha256`を返す
+- `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す。各行に`publishedAt`・`folderName`（その版を最後に共有用フォルダーへコピーした日時と発行フォルダー名。コピーしていなければ空）、`isLastPublished`（その出力先で最後にコピーした版）、`isCurrent`（今の提出用PDF。出力状態の`buildId`と`outputIntegrity.sha256`がアーカイブと一致し、出力フォルダーのPDFが出力後に変わっていないときだけ true）、`hasPageMap`（manifest に頁・左右の記録`physicalPages`がある）を含む
 
 `PATCH`の例：
 
@@ -756,6 +756,10 @@ GET   /api/v2/outputs/archives?packId=pack_...
 最新状態の最終PDFだけを共有発行できます。提出フォルダー直下の一時フォルダーへコピーし、サイズ検証後に日時・言語・利用者名付きフォルダーへ切り替えます。
 
 最終PDFの作成時には、PDF、manifest、SHA-256、使用した原稿版と変換環境を`exports/archive/<packId>/...`へ保存します。`GET /api/v2/outputs/archives`は新しい順にアーカイブ情報を返します。
+
+共有発行のたびに、出力先ごとの発行記録を`exports/publish-records/<packId>/<volume>/<時刻ID>.json`へ1件ずつ書きます（組み込み一式は`<packId>`の代わりに`ecm`など）。中身は`final.published`と同じ項目（`packId`・`targetId`・`volume`・`buildId`・`sha256`・`fileName`・`folderName`・`sharedFolder`・`destination`・`publishedAt`・`userName`ほか）です。「前回コピーした版」（`Get-LastPublishedBuildId`）は、その出力先のいちばん新しい記録の`buildId`で、古い記録へはさかのぼりません。履歴イベントの書き込み（`Write-HistoryEvent`）は廃止済みで何も書かないため、この記録が唯一の手がかりです。記録を書けなかったときもコピー自体は成功として返し、`publishRecordError`に理由を入れます。
+
+サーバー内部の`Get-FinalArchiveRecord`はアーカイブ1件を読み、`sha256.txt`・`metadata.json`の`outputPdfSha256`・`final.pdf`の実際のハッシュが一致しないもの（すり替えられた版）は読みません。`buildId`・`volume`は`Assert-SafeStorageSegment`で確かめます。
 
 ## 自動PDF作成
 

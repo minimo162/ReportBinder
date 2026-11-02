@@ -1,5 +1,17 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 提出用PDF一式の変更点の下準備: どの版を共有用フォルダーへコピーしたかを残すようにした（2026-11-02）
+
+- 目的: 出力先ごとに「前回共有用フォルダーへコピーした提出用PDF」と「今の提出用PDF」を比べる機能（変更点表示・変更点PDF）の土台を作る。この回はサーバーだけで、画面は変えていない。組み込み一式（ecm/bod/dmm）のアーカイブの再開は将来に回した（今回は入れていない）。
+- 設計では `final.published` の履歴イベントに `buildId` を足す想定だったが、`Write-HistoryEvent` は履歴タイムラインの廃止で何も書かないため、イベントに足すだけでは残らない。そこで発行ごと・出力先ごとに発行記録を `exports\publish-records\<packId>\<volume>\<New-RbId>.json` へ1件ずつ書くようにした（`Write-PublishRecord`）。`exports\archive` の下には置かない（出力先フォルダーに混ざり、`Get-FinalArchives` の50件の枠を食うため）。
+- `Publish-DocumentPackPdfToSharedLocked`: 出力状態の `buildId` を発行の項目に持たせ、`final.published` の内容と発行記録に `buildId`・`sha256` を足した。応答の `files[]` にも `buildId`・`sha256` を返す。コピーが終わった後に記録だけ書けなかったときは、コピーを失敗にせず `publishRecordError` に理由を返す（次の比較が「1つ前の出力」になるだけのため）。
+- 新規 `Get-PublishRecords`（新しい順）・`Get-LastPublishedBuildId`。最後のコピーが `buildId` を持たない（組み込み一式など）ときは '' を返し、古い記録へはさかのぼらない（それは「前回コピーした版」ではない）。
+- 新規 `Get-FinalArchiveRecord`: アーカイブ1件を読む。`buildId`・`volume` は `Assert-SafeStorageSegment` で確かめる。`sha256.txt` と `metadata.outputPdfSha256` が食い違うもの、`final.pdf` の中身がそれと違うもの（サイズ・更新日時を揃えたすり替えも見るため、覚えたハッシュは使わず毎回読む）は読まない（`$null`）。保存先の1段目は `Get-FinalArchiveStorageId` で `New-FinalArchive` と同じに決める。
+- `Get-FinalArchives`: 各行に `publishedAt`・`folderName`・`isLastPublished`・`isCurrent`・`hasPageMap` を足した。`isCurrent` は出力状態の `buildId` と `outputIntegrity.sha256` がアーカイブと一致し、出力フォルダーのPDFが出力後に変わっていない（`Get-OutputPdfIntegrityProblem` のサイズ・更新日時）ときだけ true。`hasPageMap` は manifest の `physicalPages` の有無を文字列で見て、パスごとに覚える（`Test-FinalArchiveHasPageMap`、大きな manifest を一覧のたびに JSON として読まない）。作りかけの `*.staging` フォルダーは一覧に出さないようにした。
+- `app/tools/output-publish-selfcheck.ps1` に、発行したら `buildId`・`sha256`・発行フォルダー名が記録されること、出力し直しただけでは「前回コピーした版」が変わらず次の発行で更新されること、別の出力先の記録と混ざらないこと、`buildId` の無い最後の記録で古い記録へさかのぼらないこと、一覧の `isCurrent`／`isLastPublished`／`publishedAt`／`hasPageMap`、出力PDFを書き換えたら `isCurrent` にならないこと、アーカイブのPDFを（サイズ・更新日時を揃えて）すり替えたり `sha256.txt` を食い違わせたりしたら `Get-FinalArchiveRecord` が読まないこと、パスを抜ける識別子を拒むことを足した。`app/tools/selfcheck.py` に、発行が記録を書くこと、`Get-LastPublishedBuildId` が履歴タイムラインを読まないこと、`Get-FinalArchiveRecord` が毎回ハッシュを読むことなどの静的検査を足した。
+- 見開きの `buildSpreadLayout` と頁・左右をサーバー値で決める契約には手を入れていない。three.js／WebGL は使っていない。PowerShell 5.1 で使えない構文は使っていない。
+- RuntimeVersion `2026.10.30.22`、`app.js` `v20261030_v210` へ更新した。
+
 ## 変更履歴・比較で古い要約・古い応答が残る問題を直した（2026-11-02）
 
 - 目的: 変更履歴・比較ロジックのレビューで挙がった高優先度の指摘（H1〜H3）と M3、CI の構文検査漏れを最小限の修正で直す。
