@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ReportBinder</title>
-  <link rel="stylesheet" href="style.css?v=20261030_v131">
+  <link rel="stylesheet" href="style.css?v=20261030_v132">
 </head>
 <body class="app-initializing">
   <a class="skip-link" href="#main-content">本文へ移動</a>
@@ -67,7 +67,7 @@
               <span id="active-pack-name">未作成</span><svg class="icon"><use href="#i-chevron-down"/></svg>
             </button>
             <div id="pack-menu" class="pack-menu hidden" role="dialog" aria-label="一式の選択と管理">
-              <div class="pack-menu-head"><div><strong>一式</strong><span>使用するパックを選択します</span></div><div class="pack-menu-head-actions"><button id="create-pack-btn" class="btn primary compact" type="button">新規作成</button></div></div>
+              <div class="pack-menu-head"><div><strong>一式</strong><span>使用する一式を選びます</span></div><div class="pack-menu-head-actions"><button id="create-pack-btn" class="btn primary compact" type="button">新規作成</button></div></div>
               <div id="pack-menu-list" class="pack-menu-list"></div>
               <button id="toggle-archived-packs" class="pack-archive-toggle hidden" type="button" aria-expanded="false"></button>
               <div id="archived-pack-list" class="pack-menu-list archived hidden"></div>
@@ -278,8 +278,8 @@
     <div class="modal-card spread-move-dialog"><div class="modal-head"><div><span class="eyebrow">位置を指定して移動</span><h2 id="spread-move-title">移動前と移動後の見開きを確かめる</h2><p id="spread-move-subtitle"></p></div></div><div class="spread-move-controls"><label class="field"><span>移動先</span><select id="spread-move-target"></select></label><label class="field"><span>位置</span><select id="spread-move-position"></select></label><label class="check-inline"><input type="checkbox" id="spread-move-changed-only" checked> 変化のある見開きだけ表示</label><div class="segmented spread-move-pane-switch" role="group" aria-label="表示する側"><button type="button" data-spread-move-pane="before" aria-pressed="false">移動前</button><button type="button" data-spread-move-pane="after" aria-pressed="true">移動後</button></div></div><div id="spread-move-summary" class="spread-move-summary" role="status" aria-live="polite"></div><ul class="spread-move-legend" aria-label="色と記号の意味"><li class="spread-diff-moved">◆ 移動したページ</li><li class="spread-diff-side">⇄ 左右が反転</li><li class="spread-diff-shift">↓ 頁だけずれた</li><li class="spread-diff-volume">⇢ 出力先が変わった</li><li class="spread-diff-uncertain">？ 頁未確定</li><li class="spread-diff-same">変化なし</li></ul><div id="spread-move-compare" class="spread-move-compare show-after"></div><div class="confirm-actions"><button id="spread-move-cancel" class="btn secondary" type="button">取消</button><button id="spread-move-accept" class="btn primary" type="button" disabled>この並びで確定</button></div></div>
   </div>
   <div id="preview-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="preview-title">
-    <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" role="group" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" role="group" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button><button id="preview-move-position" class="btn ghost compact" type="button">位置を指定…</button></div></div><iframe id="pdf-frame" title="PDF preview" class="pdf-frame"></iframe></div>
+    <div class="modal-card preview-dialog"><div class="modal-head"><div><h2 id="preview-title">PDF確認</h2><p id="preview-subtitle"></p></div><div class="toolbar"><a id="preview-open-new" class="btn secondary" target="_blank" rel="noopener"><svg class="icon"><use href="#i-external"/></svg>別タブで開く</a><button id="preview-close" class="btn ghost" type="button">閉じる</button></div></div><div id="preview-page-tools" class="preview-page-tools hidden"><div class="preview-page-nav" role="group" aria-label="ページを順番に確認"><button id="preview-prev-page" class="btn ghost compact" type="button">前のページ</button><strong id="preview-page-position" aria-live="polite"></strong><button id="preview-next-page" class="btn ghost compact" type="button">次のページ</button></div><div class="preview-page-assign" role="group" aria-label="表示中ページの移動先"><span>このページを</span><span id="preview-target-buttons"></span><button id="preview-move-none" class="btn secondary compact" type="button">未振り分けへ</button><button id="preview-move-position" class="btn ghost compact" type="button">位置を指定…</button></div></div><iframe id="pdf-frame" title="PDFプレビュー" class="pdf-frame"></iframe></div>
   </div>
-  <script src="app.js?v=20261030_v220"></script>
+  <script src="app.js?v=20261030_v221"></script>
 </body>
 </html>

@@ -1148,6 +1148,13 @@ if 'missingCount' not in _hint:
 for _stale in ['資料パック', '監査履歴', '静止待ち', '判定不能', 'PDF処理エンジン']:
     if _stale in html or _stale in appjs:
         raise SystemExit(f'this wording was replaced with plain Japanese; it must not come back: {_stale}')
+# 一式メニューに「使用するパックを選択します」が残っていた。画面の文言では「一式」だけを使う。
+if 'パック' in html:
+    raise SystemExit('the screen calls it 一式; パック must not appear in index.html')
+# 登録の失敗は理由を画面に出す。以前は「詳細を確認してください」とだけ出し、詳細は非表示のログにしかなかった。
+_register = appjs.split('async function registerSelected(', 1)[1].split(chr(10) + 'function registerErrorSummary(', 1)[0]
+if '詳細を確認してください' in _register or _register.count('registerErrorSummary(errors)') != 1 or '${reasons}' not in _register:
+    raise SystemExit('a failed registration must show why on screen, not only in the hidden log')
 # 2) 13px以下の日本語は読ませない（この方針は style.css 自身に書いてある）。
 _small = re.findall(r'font-size:(\d+)px', css) + re.findall(r'font:[^;{}]*?(\d+)px', css)
 _too_small = sorted({int(v) for v in _small if int(v) < 14})
@@ -1670,7 +1677,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v220', 'style.css?v=20261030_v131']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v221', 'style.css?v=20261030_v132']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1731,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v220' not in html:
+if 'app.js?v=20261030_v221' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1757,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v220' not in html:
+if 'app.js?v=20261030_v221' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
