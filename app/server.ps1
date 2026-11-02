@@ -805,6 +805,14 @@ function New-UniqueDirectory([string]$Parent, [scriptblock]$IdFactory) {
     throw "一意なフォルダ名を生成できませんでした: $Parent"
 }
 
+# ハッシュ・コピーで原稿や変換PDFを読むときの読み込みバッファ。既定の 4KB のままだと、共有フォルダー
+# 上の大きなファイルでは読み込みの往復が増える。読む中身・ハッシュの値・共有モードは変わらない。
+$Script:FileReadBufferSize = 1MB
+
+function Open-FileSharedRead([string]$Path) {
+    return [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete), $Script:FileReadBufferSize, [IO.FileOptions]::SequentialScan)
+}
+
 function New-Sha256([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     # Get-FileHash は FileShare.Read で開くため、誰かがExcelで(書き込みアクセス付きで)開いていると
@@ -812,7 +820,7 @@ function New-Sha256([string]$Path) {
     $fs = $null
     $sha = $null
     try {
-        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $fs = Open-FileSharedRead $Path
         $sha = [Security.Cryptography.SHA256]::Create()
         $hashBytes = $sha.ComputeHash($fs)
         $hex = (-join ($hashBytes | ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
@@ -830,9 +838,9 @@ function Copy-FileSharedRead([string]$Source, [string]$Destination) {
     $inStream = $null
     $outStream = $null
     try {
-        $inStream = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        $outStream = [IO.File]::Open($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $inStream.CopyTo($outStream)
+        $inStream = Open-FileSharedRead $Source
+        $outStream = [IO.FileStream]::new($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None, $Script:FileReadBufferSize)
+        $inStream.CopyTo($outStream, $Script:FileReadBufferSize)
     } finally {
         if ($outStream) { try { $outStream.Dispose() } catch { } }
         if ($inStream) { try { $inStream.Dispose() } catch { } }
@@ -6523,11 +6531,18 @@ function Render-Workbook([string]$Language, [string]$WorkbookId, $SharedExcel = 
     return $renderResult
 }
 
-function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null, [bool]$ForceHash = $false) {
+# $PackId を渡すと、その一式の原稿だけを確かめる（独自一式の出力前の確認）。各原稿への判定と
+# 保存の規則は全件のときと同じで、ほかの一式の原稿には触れない。
+function Scan-Updates([string]$Language, [scriptblock]$ProgressCallback = $null, [bool]$ForceHash = $false, [string]$PackId = '') {
     $paths = Get-Paths
     $snapshot = Get-Structure $Language
     $scanned = 0; $hashed = 0; $metadataOnly = 0
     $list = @(Get-Array $snapshot.workbooks)
+    if (-not [string]::IsNullOrWhiteSpace($PackId)) {
+        $packWorkbooks = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($wb in $list) { if (Test-WorkbookPack $wb $PackId) { $packWorkbooks.Add($wb) } }
+        $list = $packWorkbooks.ToArray()
+    }
     $index = 0
     # ファイル確認とハッシュ計算はロックの外で全原稿ぶん先に済ませる。
     # 原稿ごとにロックを取って書き込むと、変更が無くても原稿数だけ structure.json を書き直してしまう。
@@ -8016,8 +8031,13 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
     $effectiveTemplate=Get-PackEffectiveTemplate $Language $packObject
     $naming=Get-PackTargetOutputNaming $Structure $Language $scope $Volume;$settings=$naming.settings;$targetName=[string]$naming.targetName;$projectId=[string]$naming.projectId;$outputFileName=[string]$naming.outputFileName
     $document=[ordered]@{title=[string]$settings.documentTitle;subtitle=[string]$settings.documentSubtitle;targetName=$targetName;outputFileNamePattern=[string]$settings.outputFileNamePattern;outputFileName=$outputFileName}
-    $pages=@(Get-Array $Structure.pages|Where-Object{$_.enabled -eq $true -and [string]$_.volume -eq $Volume -and $wbMap.ContainsKey([string]$_.workbookId)}|Sort-Object {[double]$_.order},{Resolve-PageId $_})
-    $blockers=@();$manifest=@();$fpPages=@()
+    # 対象ページの絞り込みは素のループで（Where-Object の固定費を避ける）。並べ替えは今までと同じ
+    # Sort-Object に、今までと同じ順のまま渡す（同じ order のページの順序も変えないため）。
+    $candidatePages=New-Object 'System.Collections.Generic.List[object]'
+    foreach($candidate in @(Get-Array $Structure.pages)){if($candidate.enabled -eq $true -and [string]$candidate.volume -eq $Volume -and $wbMap.ContainsKey([string]$candidate.workbookId)){$candidatePages.Add($candidate)}}
+    $pages=@($candidatePages|Sort-Object {[double]$_.order},{Resolve-PageId $_})
+    # 配列への += はページ数の2乗で遅くなる。List に積み、返すときに配列へ戻す（要素・順序は同じ）。
+    $blockers=New-Object 'System.Collections.Generic.List[object]';$manifest=New-Object 'System.Collections.Generic.List[object]';$fpPages=New-Object 'System.Collections.Generic.List[object]'
     $requiredRequirementIds=@{}
     foreach($requirement in @(Get-Array (Get-DataProperty $effectiveTemplate 'sourceRequirements' @()))){
         if(-not [bool](Get-DataProperty $requirement 'required' $true)){continue}
@@ -8026,7 +8046,7 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
         $requiredRequirementIds[$requirementId]=$true
         $assigned=@($targets|Where-Object{[string](Get-DataProperty $_ 'requirementId' '') -eq $requirementId})
         if($assigned.Count -eq 0){
-            $blockers+=[ordered]@{code='required-source-unregistered';requirementId=$requirementId;sourceId='';pageTitle='';workbookName=[string](Get-DataProperty $requirement 'displayName' '');ownerDepartment=[string](Get-DataProperty $requirement 'ownerDepartment' '');dueDate=[string](Get-DataProperty $requirement 'dueDate' '');message='必須原稿がまだ登録されていません。必要原稿リストから原稿を割り当ててください。'}
+            $blockers.Add([ordered]@{code='required-source-unregistered';requirementId=$requirementId;sourceId='';pageTitle='';workbookName=[string](Get-DataProperty $requirement 'displayName' '');ownerDepartment=[string](Get-DataProperty $requirement 'ownerDepartment' '');dueDate=[string](Get-DataProperty $requirement 'dueDate' '');message='必須原稿がまだ登録されていません。必要原稿リストから原稿を割り当ててください。'})
         }
     }
     # A source marked "required" is a safety contract, independent of template
@@ -8041,46 +8061,50 @@ function Get-FinalBuildInputSnapshot($Structure,[string]$Language,[string]$Volum
                 try{$sourceExists=Test-Path -LiteralPath (Join-Safe $submissionRoot $relativePath) -PathType Leaf}catch{$sourceExists=$false}
             }
             if(-not $sourceExists){
-                $blockers+=[ordered]@{code='required-source-missing';sourceId=[string](Get-DataProperty $requiredSource 'workbookId' '');pageTitle='';workbookName=$requiredName;message='必須原稿のファイルが見つかりません。提出フォルダを確認してください。'}
+                $blockers.Add([ordered]@{code='required-source-missing';sourceId=[string](Get-DataProperty $requiredSource 'workbookId' '');pageTitle='';workbookName=$requiredName;message='必須原稿のファイルが見つかりません。提出フォルダを確認してください。'})
                 continue
             }
             $lastError=[string](Get-DataProperty $requiredSource 'lastError' '')
             $sourceStatus=([string](Get-DataProperty $requiredSource 'status' '')).ToLowerInvariant()
             if(-not [string]::IsNullOrWhiteSpace($lastError) -or $sourceStatus -match 'fail|error'){
-                $blockers+=[ordered]@{code='required-source-failed';sourceId=[string](Get-DataProperty $requiredSource 'workbookId' '');pageTitle='';workbookName=$requiredName;message='必須原稿のPDF変換に失敗しています。エラーを解消して再作成してください。'}
+                $blockers.Add([ordered]@{code='required-source-failed';sourceId=[string](Get-DataProperty $requiredSource 'workbookId' '');pageTitle='';workbookName=$requiredName;message='必須原稿のPDF変換に失敗しています。エラーを解消して再作成してください。'})
                 continue
             }
             if(-not (Test-WorkbookRenderIsCurrent $requiredSource)){
                 $hasRendered=-not [string]::IsNullOrWhiteSpace([string](Get-DataProperty $requiredSource 'lastRenderedVersionId' ''))
-                $blockers+=[ordered]@{code=$(if($hasRendered){'required-source-stale'}else{'required-source-not-rendered'});sourceId=[string](Get-DataProperty $requiredSource 'workbookId' '');pageTitle='';workbookName=$requiredName;message=$(if($hasRendered){'必須原稿が更新されています。先に変換PDFを再作成してください。'}else{'必須原稿の変換PDFが未作成です。先にPDFを作成してください。'})}
+                $blockers.Add([ordered]@{code=$(if($hasRendered){'required-source-stale'}else{'required-source-not-rendered'});sourceId=[string](Get-DataProperty $requiredSource 'workbookId' '');pageTitle='';workbookName=$requiredName;message=$(if($hasRendered){'必須原稿が更新されています。先に変換PDFを再作成してください。'}else{'必須原稿の変換PDFが未作成です。先にPDFを作成してください。'})})
             }
     }
     # 変換PDFが見つからないページは manifest に入れない（$full を空に戻す）。入れると頁数を1と
     # 仮定した物理ページができ、試算の unknownPageIds から漏れて、後ろの頁・左右がずれる。
-    if($pages.Count -eq 0){$blockers+= [ordered]@{code='no-pages';pageTitle='';workbookName='';message='対象ページがありません。ページ構成を確認してください。'}}
+    if($pages.Count -eq 0){$blockers.Add([ordered]@{code='no-pages';pageTitle='';workbookName='';message='対象ページがありません。ページ構成を確認してください。'})}
     foreach($p in $pages){$pageId=Resolve-PageId $p;$wb=$wbMap[[string]$p.workbookId];$title=[string]$p.title;if([string]::IsNullOrWhiteSpace($title)){$title=[string]$p.sheetName};$wbName=[string]$wb.fileName;$rel=[string]$p.contentPdf;$full='';$size=0L;$ticks=0L;$sourcePageCount=1
         # 記録済みの頁数（artifact.pageCount／unit.physicalPageCount）があれば変換PDFを開いて数えない。
         # 出力・readiness のたびに全ページの変換PDFを丸ごと読み込むと、それだけで数秒かかる。
+        # 変換PDFは FileInfo 1回で見る。以前の Get-Item（-Force なし）は隠しファイルを返さず「見つからない」に
+        # なっていたので、指紋・ブロッカーを変えないよう隠しファイルは今までどおり見つからない扱いにする。
         $item=if($itemMap.ContainsKey($pageId)){$itemMap[$pageId]}else{$null};$unitId=[string](Get-DataProperty $item 'unitId' (New-WorksheetUnitId ([string]$p.workbookId) ([string]$p.sheetName)));$unit=if($unitMap.ContainsKey($unitId)){$unitMap[$unitId]}else{$null};$artifactId=[string](Get-DataProperty $item 'artifactId' '');$artifact=if($artifactMap.ContainsKey($artifactId)){$artifactMap[$artifactId]}else{$null};$source=if($sourceMap.ContainsKey([string]$p.workbookId)){$sourceMap[[string]$p.workbookId]}else{$null};$recordedPageCount=Get-IntDataProperty $artifact 'pageCount' (Get-IntDataProperty $unit 'physicalPageCount' 0);if($recordedPageCount -gt 0){$sourcePageCount=$recordedPageCount}
-        if(-not $rel){$blockers+=[ordered]@{code='content-missing';pageTitle=$title;workbookName=$wbName;message='PDF未作成のページがあります。先にPDF作成してください。'}}
-        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};if(-not(Test-Path -LiteralPath $full)){throw 'missing'};$it=Get-Item -LiteralPath $full;$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;if($recordedPageCount -le 0){$sourcePageCount=Get-PdfPageCount $full}}catch{$full='';$blockers+=[ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'}}}
-        if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers+=[ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='元原稿が更新されています。先に変換PDFを作成してください。'}}
-        elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers+=[ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='原稿のページ構成が変わっています。先に変換PDFを作成してください。'}}
-        elseif(-not(Test-PageContentMatchesWorkbookVersion $p $wb)){$blockers+=[ordered]@{code='old-content';pageTitle=$title;workbookName=$wbName;message='古いPDF参照が残っています。先にPDF作成してください。'}}
-        $rangeValue=Get-DataProperty $p 'pageRange' (Get-DataProperty $item 'pageRange' $null);$range=$null;try{$range=ConvertTo-NormalizedPageRange $rangeValue}catch{$blockers+=[ordered]@{code='invalid-page-range';pageTitle=$title;workbookName=$wbName;message=$_.Exception.Message}}
+        if(-not $rel){$blockers.Add([ordered]@{code='content-missing';pageTitle=$title;workbookName=$wbName;message='PDF未作成のページがあります。先にPDF作成してください。'})}
+        else{try{$full=[IO.Path]::GetFullPath((Join-Path $workspace $rel));$root=[IO.Path]::GetFullPath($workspace);if(-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)){$root+=[IO.Path]::DirectorySeparatorChar};if(-not $full.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){throw 'outside'};$it=New-Object IO.FileInfo $full;if(-not $it.Exists -or ($it.Attributes -band [IO.FileAttributes]::Hidden)){throw 'missing'};$size=$it.Length;$ticks=$it.LastWriteTimeUtc.Ticks;if($recordedPageCount -le 0){$sourcePageCount=Get-PdfPageCount $full}}catch{$full='';$blockers.Add([ordered]@{code='content-file-missing';pageTitle=$title;workbookName=$wbName;message='レンダリング済みPDFが見つかりません。先にPDF作成してください。'})}}
+        if(-not(Test-WorkbookRenderIsCurrent $wb)){$blockers.Add([ordered]@{code='stale-content';pageTitle=$title;workbookName=$wbName;message='元原稿が更新されています。先に変換PDFを作成してください。'})}
+        elseif(-not(Test-WorkbookRenderedSheetContains $wb ([string]$p.sheetName))){$blockers.Add([ordered]@{code='sheet-changed';pageTitle=$title;workbookName=$wbName;message='原稿のページ構成が変わっています。先に変換PDFを作成してください。'})}
+        elseif(-not(Test-PageContentMatchesWorkbookVersion $p $wb)){$blockers.Add([ordered]@{code='old-content';pageTitle=$title;workbookName=$wbName;message='古いPDF参照が残っています。先にPDF作成してください。'})}
+        $rangeValue=Get-DataProperty $p 'pageRange' (Get-DataProperty $item 'pageRange' $null);$range=$null;try{$range=ConvertTo-NormalizedPageRange $rangeValue}catch{$blockers.Add([ordered]@{code='invalid-page-range';pageTitle=$title;workbookName=$wbName;message=$_.Exception.Message})}
         $rangeStart=if($null -ne $range){[int]$range.start}else{1};$rangeEnd=if($null -ne $range){[int]$range.end}else{$sourcePageCount}
-        if($rangeStart -gt $sourcePageCount -or $rangeEnd -gt $sourcePageCount){$blockers+=[ordered]@{code='page-range-out-of-bounds';pageTitle=$title;workbookName=$wbName;message="ページ範囲 $rangeStart-$rangeEnd は変換PDF（$sourcePageCount ページ）の範囲外です。"}}
+        if($rangeStart -gt $sourcePageCount -or $rangeEnd -gt $sourcePageCount){$blockers.Add([ordered]@{code='page-range-out-of-bounds';pageTitle=$title;workbookName=$wbName;message="ページ範囲 $rangeStart-$rangeEnd は変換PDF（$sourcePageCount ページ）の範囲外です。"})}
         $sourceType=[string](Get-DataProperty $source 'sourceType' (Get-DataProperty $wb 'sourceType' 'excel'));$sourceKey=[string](Get-DataProperty $unit 'sourceKey' ([string]$p.sheetName));$sectionId="source:$([string]$p.workbookId)";$sectionTitle=[string](Get-DataProperty $source 'displayName' (Get-DataProperty $wb 'displayName' $wbName));$bookmarkTitle=if([string]::IsNullOrWhiteSpace($sectionTitle)){$title}else{"$sectionTitle / $title"}
-        $normalized=($rel -replace '\\','/').ToLowerInvariant();$fpPages+=[ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);order=[double]$p.order;enabled=[bool]$p.enabled;volume=[string]$p.volume;title=$title;pageRange=$range;numberingMode=[string]$p.numberingMode;contentPdf=$normalized;contentPdfSize=$size;contentPdfLastWriteUtcTicks=$ticks;lastRenderedVersionId=[string]$wb.lastRenderedVersionId}
-        if($full){$manifest+=[ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);sourceId=[string]$p.workbookId;unitId=$unitId;artifactId=[string](Get-DataProperty $artifact 'artifactId' $artifactId);sourceType=$sourceType;sourceKey=$sourceKey;title=$title;bookmarkTitle=$bookmarkTitle;sectionId=$sectionId;sectionTitle=$sectionTitle;sourcePdf=$full;sourcePageStart=$rangeStart;sourcePageEnd=$rangeEnd;sourcePageCount=$sourcePageCount;numberingMode=[string]$p.numberingMode;punchShiftPt=(Convert-CmToPt 0.2)}}
+        $normalized=($rel -replace '\\','/').ToLowerInvariant();$fpPages.Add([ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);order=[double]$p.order;enabled=[bool]$p.enabled;volume=[string]$p.volume;title=$title;pageRange=$range;numberingMode=[string]$p.numberingMode;contentPdf=$normalized;contentPdfSize=$size;contentPdfLastWriteUtcTicks=$ticks;lastRenderedVersionId=[string]$wb.lastRenderedVersionId})
+        if($full){$manifest.Add([ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);sourceId=[string]$p.workbookId;unitId=$unitId;artifactId=[string](Get-DataProperty $artifact 'artifactId' $artifactId);sourceType=$sourceType;sourceKey=$sourceKey;title=$title;bookmarkTitle=$bookmarkTitle;sectionId=$sectionId;sectionTitle=$sectionTitle;sourcePdf=$full;sourcePageStart=$rangeStart;sourcePageEnd=$rangeEnd;sourcePageCount=$sourcePageCount;numberingMode=[string]$p.numberingMode;punchShiftPt=(Convert-CmToPt 0.2)})}
     }
     # 左右は出力先ごとの物理ページ番号の奇偶で決める（奇数＝右）。ReportPdfComposer.java の
     # パンチ穴シフトと同じ規則。1頁は台紙0の右、2・3頁は台紙1。指紋（fpPages）には入れない。
-    $physicalPages=@();$outputPageNumber=0
+    $manifest=$manifest.ToArray();$fpPages=$fpPages.ToArray();$blockers=$blockers.ToArray()
+    $physicalPages=New-Object 'System.Collections.Generic.List[object]';$outputPageNumber=0
     foreach($entry in $manifest){
         $pagePartCount=[Math]::Max(0,[int]$entry.sourcePageEnd-[int]$entry.sourcePageStart+1)
-        for($sourcePage=[int]$entry.sourcePageStart;$sourcePage -le [int]$entry.sourcePageEnd;$sourcePage++){$outputPageNumber++;$physicalPages+=[ordered]@{outputPageNumber=$outputPageNumber;side=$(if($outputPageNumber%2 -eq 1){'right'}else{'left'});spreadIndex=[int][Math]::Floor($outputPageNumber/2);pagePartIndex=$sourcePage-[int]$entry.sourcePageStart+1;pagePartCount=$pagePartCount;kind='content';itemId=[string]$entry.itemId;pageId=[string]$entry.pageId;sourceId=[string]$entry.sourceId;unitId=[string]$entry.unitId;artifactId=[string]$entry.artifactId;sourceType=[string]$entry.sourceType;sourceKey=[string]$entry.sourceKey;sourcePdfPageNumber=$sourcePage;title=[string]$entry.title;sectionId=[string]$entry.sectionId;numberingMode=[string]$entry.numberingMode}}
+        for($sourcePage=[int]$entry.sourcePageStart;$sourcePage -le [int]$entry.sourcePageEnd;$sourcePage++){$outputPageNumber++;$physicalPages.Add([ordered]@{outputPageNumber=$outputPageNumber;side=$(if($outputPageNumber%2 -eq 1){'right'}else{'left'});spreadIndex=[int][Math]::Floor($outputPageNumber/2);pagePartIndex=$sourcePage-[int]$entry.sourcePageStart+1;pagePartCount=$pagePartCount;kind='content';itemId=[string]$entry.itemId;pageId=[string]$entry.pageId;sourceId=[string]$entry.sourceId;unitId=[string]$entry.unitId;artifactId=[string]$entry.artifactId;sourceType=[string]$entry.sourceType;sourceKey=[string]$entry.sourceKey;sourcePdfPageNumber=$sourcePage;title=[string]$entry.title;sectionId=[string]$entry.sectionId;numberingMode=[string]$entry.numberingMode})}
     }
+    $physicalPages=$physicalPages.ToArray()
     $fpDocument=[ordered]@{};foreach($fpKey in @($document.Keys)){$fpDocument[$fpKey]=$document[$fpKey]};$fpDocument.outputFileName=[string]$naming.outputFileNameKey;$input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;language=$Language;packId=$packId;category=$cat;volume=$Volume;document=$fpDocument;pages=$fpPages};$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json
     return [ordered]@{language=$Language;packId=$packId;category=$cat;volume=$Volume;pages=$pages;manifestPages=$manifest;physicalPages=$physicalPages;document=$document;blockers=@($blockers);itemCount=$pages.Count;pageCount=$outputPageNumber;projectId=$projectId;outputFileName=$outputFileName;fingerprint=$fingerprint;fingerprintInput=$input}
 }
@@ -8105,9 +8129,14 @@ function Test-FinalSnapshotContentUnchanged([string]$Language, $Snapshot) {
         $rel = [string](Get-DataProperty $fp 'contentPdf' '')
         if ([string]::IsNullOrWhiteSpace($rel)) { continue }
         $size = 0L; $ticks = 0L
+        # Get-FinalBuildInputSnapshot と同じ規則で見る。作業フォルダーの外と隠しファイルは「見つからない」
+        # （サイズ・更新時刻0）として記録しているので、ここで実物の値を読むと毎回外れて作り直しになる。
         try {
-            $info = New-Object IO.FileInfo (Join-Path $workspace $rel)
-            if ($info.Exists) { $size = [int64]$info.Length; $ticks = [int64]$info.LastWriteTimeUtc.Ticks }
+            $full = [IO.Path]::GetFullPath((Join-Path $workspace $rel))
+            $root = [IO.Path]::GetFullPath($workspace)
+            if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+            $info = New-Object IO.FileInfo $full
+            if ($full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -and $info.Exists -and -not ($info.Attributes -band [IO.FileAttributes]::Hidden)) { $size = [int64]$info.Length; $ticks = [int64]$info.LastWriteTimeUtc.Ticks }
         } catch { return $false }
         if ([int64](Get-DataProperty $fp 'contentPdfSize' 0) -ne $size -or [int64](Get-DataProperty $fp 'contentPdfLastWriteUtcTicks' 0) -ne $ticks) { return $false }
     }
@@ -8455,6 +8484,27 @@ function Get-FinalBuildReadiness($Structure,[string]$Language,[string]$Volume,[s
     return [ordered]@{packId=$packId;targetId=(Get-TargetIdFromLegacyVolume $Volume);canBuild=($snap.blockers.Count -eq 0 -and $snap.pageCount -gt 0);pageCount=$snap.pageCount;status=$status;displayState=$display;builtFingerprint=$built;currentFingerprint=$current;outputPdf=$out;outputPdfExists=[bool]$exists;lastBuiltAt=(Get-DataProperty $v 'lastBuiltAt' $null);blockers=@($snap.blockers);staleReasons=@($reasons);snapshot=$snap}
 }
 
+# 画面へ返す readiness の写し。snapshot（入力スナップショット）は、画面が読む itemCount・
+# outputFileName・physicalPages だけに絞る。pages（structure のページの実体）・manifestPages・
+# fingerprintInput・document はページ数に比例して大きく、応答のたびの JSON 化（Depth 50）が重かった。
+# サーバー内部（出力・確認・変更点）は Get-FinalBuildReadiness の返り値をそのまま使う。これは
+# 応答・ジョブの状態ファイルを作るときだけ通す。元の readiness・スナップショットは書き換えない。
+function ConvertTo-FinalReadinessResponse($Readiness) {
+    if ($null -eq $Readiness -or $Readiness -isnot [System.Collections.IDictionary]) { return $Readiness }
+    $view = [ordered]@{}
+    foreach ($key in @($Readiness.Keys)) { $view[$key] = $Readiness[$key] }
+    $snap = Get-DataProperty $Readiness 'snapshot' $null
+    if ($null -ne $snap) {
+        $slim = [ordered]@{
+            itemCount = Get-DataProperty $snap 'itemCount' 0
+            outputFileName = [string](Get-DataProperty $snap 'outputFileName' '')
+            physicalPages = @(Get-Array (Get-DataProperty $snap 'physicalPages' @()))
+        }
+        $view['snapshot'] = $slim
+    }
+    return $view
+}
+
 function Render-PowerPointSnapshotForComparison([string]$Language, [string]$SourceId, [string]$SnapshotId) {
     $state = Get-SnapshotSourceState $Language $SourceId $SnapshotId
     if (-not [bool]$state.sourceRetained) { return [ordered]@{ ok=$false; reason='source-missing' } }
@@ -8683,8 +8733,9 @@ function Register-PowerPointSource([string]$Language, [string]$RelativePath, [st
     }
 }
 
+# /api/state の finalReadiness 用。応答に載せるので、出力先ごとの readiness は応答用に絞って返す。
 function Get-AllFinalReadiness($Structure,[string]$Language,[bool]$CheckOutputExists = $true,[string]$StructureStamp = '') {
-    $result=[ordered]@{};foreach($cat in @('ecm','bod','dmm')){$vols=[ordered]@{};foreach($volume in @(Get-VolumeList $Language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $Structure $Language $volume $cat $CheckOutputExists $StructureStamp};$result[$cat]=[ordered]@{volumes=$vols}};return $result
+    $result=[ordered]@{};foreach($cat in @('ecm','bod','dmm')){$vols=[ordered]@{};foreach($volume in @(Get-VolumeList $Language|Where-Object{$_ -ne 'none'})){$vols[$volume]=ConvertTo-FinalReadinessResponse (Get-FinalBuildReadiness $Structure $Language $volume $cat $CheckOutputExists $StructureStamp)};$result[$cat]=[ordered]@{volumes=$vols}};return $result
 }
 
 function Get-PackProgressDashboard($Structure, [string]$Language, [string]$StructureStamp = '') {
@@ -8796,17 +8847,28 @@ function Build-FinalPdf([string]$Language,[string]$Volume,[string]$Category='') 
     return $built[0]
 }
 
+# workbookId → ブック（同じ ID が複数あれば先にあるもの。Where-Object | Select-Object -First 1 と同じ）。
+function Get-WorkbookByIdMap($Structure) {
+    $map = @{}
+    foreach ($wb in @(Get-Array (Get-DataProperty $Structure 'workbooks' @()))) {
+        $id = [string](Get-DataProperty $wb 'workbookId' '')
+        if (-not $map.ContainsKey($id)) { $map[$id] = $wb }
+    }
+    return $map
+}
+
 function Add-FinalSnapshotSourceWorkbooks($Structure, $Snapshot) {
     $seen = @{}
-    $sourceWorkbooks = @()
+    $sourceWorkbooks = New-Object 'System.Collections.Generic.List[object]'
+    # 原稿ごとに全ブックを Where-Object で探さない。
+    $workbooksById = Get-WorkbookByIdMap $Structure
     foreach ($page in @(Get-Array (Get-DataProperty $Snapshot 'pages' @()))) {
         $workbookId = [string](Get-DataProperty $page 'workbookId' '')
         if ([string]::IsNullOrWhiteSpace($workbookId) -or $seen.ContainsKey($workbookId)) { continue }
         $seen[$workbookId] = $true
-        $workbook = @(Get-Array $Structure.workbooks | Where-Object { [string]$_.workbookId -eq $workbookId } | Select-Object -First 1)
-        if ($workbook.Count -eq 0) { continue }
-        $w = $workbook[0]
-        $sourceWorkbooks += [ordered]@{
+        if (-not $workbooksById.ContainsKey($workbookId)) { continue }
+        $w = $workbooksById[$workbookId]
+        $sourceWorkbooks.Add([ordered]@{
             workbookId = $workbookId
             fileName = [string](Get-DataProperty $w 'fileName' '')
             relativePath = [string](Get-DataProperty $w 'relativePath' '')
@@ -8818,9 +8880,11 @@ function Add-FinalSnapshotSourceWorkbooks($Structure, $Snapshot) {
             sourceHash = Normalize-FileHash ([string](Get-DataProperty $w 'lastRenderedExcelHash' ''))
             renderEnvironmentFingerprint = [string](Get-DataProperty $w 'renderEnvironmentFingerprint' '')
             renderEnvironment = Get-DataProperty $w 'renderEnvironment' $null
-        }
+        })
     }
-    Set-NoteProperty $Snapshot 'sourceWorkbooks' @($sourceWorkbooks)
+    # New-Object の List は PSObject に包まれており、Windows PowerShell 5.1 では @($list) が
+    # 'Argument types do not match' で落ちる。ToArray() で以前と同じ object[] にして渡す。
+    Set-NoteProperty $Snapshot 'sourceWorkbooks' $sourceWorkbooks.ToArray()
     return $Snapshot
 }
 
@@ -8894,15 +8958,16 @@ function Copy-FinalBuildInputPdfs([string]$Language, $Snapshot, [string]$CopyDir
         if ($null -eq $safeSourceId) { & $copyGroup }
         else { Invoke-WithLock (Get-ContentPdfMaintenanceLockPath $workspace $sourceId) $copyGroup | Out-Null }
     }
-    $pages = @()
+    $pages = New-Object 'System.Collections.Generic.List[object]'
     foreach ($entry in $entries) {
         $page = [ordered]@{}
         if ($entry -is [System.Collections.IDictionary]) { foreach ($k in @($entry.Keys)) { $page[$k] = $entry[$k] } }
         else { foreach ($p in @($entry.PSObject.Properties)) { $page[$p.Name] = $p.Value } }
         $page['sourcePdf'] = $copies[([string](Get-DataProperty $entry 'sourcePdf' '')).ToLowerInvariant()]
-        $pages += $page
+        $pages.Add($page)
     }
-    return @($pages)
+    # List を @() で包むと PS5.1 で落ちる（Add-FinalSnapshotSourceWorkbooks 参照）。
+    return $pages.ToArray()
 }
 
 function Test-StaleReasonSince($Reason, [DateTimeOffset]$Since) {
@@ -8937,7 +9002,9 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
     $paths = Get-Paths
     $workspace = Get-WorkspacePath $Language
     Report-FinalBuildPhase '元原稿の更新を確認しています'
-    try { [void](Scan-Updates $Language $null $false) } catch { }
+    # この出力の入力（スナップショット）になるのはこの一式の原稿だけ。出力先ごとに全一式の
+    # 全原稿を確かめていたのを、この一式の原稿に絞る（判定の規則は Scan-Updates のまま）。
+    try { [void](Scan-Updates $Language $null $false ([string]$scope.packId)) } catch { }
     $lockPath = Join-Path $workspace ("locks\pack-output_{0}_{1}.lock" -f ([string]$scope.packId), $TargetId)
     # 合成する変換PDFの写し（Copy-FinalBuildInputPdfs）。成否にかかわらず最後に消す。
     $inputCopyDir = New-FinalBuildInputCopyDir $Language
@@ -9044,14 +9111,17 @@ function Build-DocumentPackPdf([string]$Language, [string]$PackId, [string]$Targ
             Write-HistoryEvent $Language 'final.archive.failed' ([ordered]@{ packId=[string]$scope.packId; targetId=$TargetId; volume=$volume; buildId=$buildId; message=$archiveError })
         }
         Write-HistoryEvent $Language 'final.built' ([ordered]@{ packId=[string]$scope.packId; category=''; targetId=$TargetId; volume=$volume; buildId=$buildId; outputPdf=$outputPath; archivePath=$archivePath; archiveError=$archiveError; inputChangedDuringBuild=$changedDuringBuild })
-        return [ordered]@{ packId=[string]$scope.packId; targetId=$TargetId; volume=$volume; outputPdf=$outputPath; inputFingerprint=$fingerprint; buildId=$buildId; archivePath=$archivePath; archiveError=$archiveError; message=[string]$run.text; readiness=$commit.readiness; inputChangedDuringBuild=$changedDuringBuild }
+        return [ordered]@{ packId=[string]$scope.packId; targetId=$TargetId; volume=$volume; outputPdf=$outputPath; inputFingerprint=$fingerprint; buildId=$buildId; archivePath=$archivePath; archiveError=$archiveError; message=[string]$run.text; readiness=(ConvertTo-FinalReadinessResponse $commit.readiness); inputChangedDuringBuild=$changedDuringBuild }
     }
     } finally {
         Remove-FinalBuildInputCopyDir $inputCopyDir
     }
 }
 
-function Get-StatePayload([string]$Language) {
+# $StructureViewSink（ハッシュテーブル）を渡すと、読んだ structure とその版を 'view' に入れて返す。
+# /api/v2/state はそれを使い回し、同じ要求の中で structure を読み直さない（読み直すと版が変わった
+# ときに要求内のスナップショットのキャッシュが外れ、全出力先を作り直していた）。
+function Get-StatePayload([string]$Language, $StructureViewSink = $null) {
     $paths = Get-Paths
     $configured = $false
     if ($paths -and [string]$paths.submissionDir -and [string]$paths.dataDir -and [string]$paths.outputDir) { $configured = $true }
@@ -9063,6 +9133,7 @@ function Get-StatePayload([string]$Language) {
             $structureView = Get-StructureWithStamp $Language
             $structure = $structureView.structure
             $structureStamp = [string]$structureView.stamp
+            if ($StructureViewSink -is [System.Collections.IDictionary]) { $StructureViewSink['view'] = $structureView }
         } catch {
             $structureLoadError = $_.Exception.Message
             $structure = New-EmptyStructure $Language
@@ -9149,12 +9220,14 @@ function Get-StatePayload([string]$Language) {
 }
 
 function Get-V2StatePayload([string]$Language) {
-    $legacy = Get-StatePayload $Language
+    $legacyView = @{}
+    $legacy = Get-StatePayload $Language $legacyView
     $configured = [bool](Get-DataProperty $legacy 'configured' $false)
     $structureLoadError = [string](Get-DataProperty $legacy 'structureLoadError' '')
     $structureStamp = ''
     if ($configured -and [string]::IsNullOrWhiteSpace($structureLoadError)) {
-        $structureView = Get-StructureWithStamp $Language
+        # 旧形式の state と同じ structure・版で組む（一式進捗で作ったスナップショットを引ける）。
+        $structureView = if ($legacyView.ContainsKey('view')) { $legacyView['view'] } else { Get-StructureWithStamp $Language }
         $structure = $structureView.structure
         $structureStamp = [string]$structureView.stamp
     } else { $structure = New-EmptyStructure $Language }
@@ -9170,7 +9243,7 @@ function Get-V2StatePayload([string]$Language) {
             $volumes = [ordered]@{}
             foreach ($targetId in @(Get-PackTargetIds $Language $pack)) {
                 $volume = Get-LegacyVolumeFromTargetId $Language $targetId
-                try { $volumes[$volume] = Get-FinalBuildReadiness $structure $Language $volume $packId $true $structureStamp }
+                try { $volumes[$volume] = ConvertTo-FinalReadinessResponse (Get-FinalBuildReadiness $structure $Language $volume $packId $true $structureStamp) }
                 catch { }
             }
             Set-NoteProperty $finalReadiness $packId ([ordered]@{ volumes = $volumes })
@@ -10095,7 +10168,7 @@ function Handle-Api($Context) {
                 # readinessError を付けて「出力できません」として見せる。
                 try {
                     $volume = Get-LegacyVolumeFromTargetId $language $targetId
-                    $targets[$targetId] = Get-FinalBuildReadiness $structure $language $volume ([string]$scope.packId) $true ([string]$structureView.stamp)
+                    $targets[$targetId] = ConvertTo-FinalReadinessResponse (Get-FinalBuildReadiness $structure $language $volume ([string]$scope.packId) $true ([string]$structureView.stamp))
                 } catch {
                     $targets[$targetId] = [ordered]@{ packId=[string]$scope.packId; targetId=[string]$targetId; readinessError=$true; canBuild=$false; pageCount=0; status='not-built'; displayState='blocked'; outputPdf=''; outputPdfExists=$false; blockers=@([ordered]@{ code='readiness-failed'; message=('出力先の状態を確認できませんでした: ' + $_.Exception.Message) }); staleReasons=@() }
                 }
@@ -10218,7 +10291,7 @@ function Handle-Api($Context) {
         if ($method -eq 'GET' -and $path -eq '/api/final/readiness') {
             $cat=Require-WorkbookCategory ([string]$Context.Request.QueryString['category'])
             $structure=Get-Structure $language;$vols=[ordered]@{}
-            foreach($volume in @(Get-VolumeList $language|Where-Object{$_ -ne 'none'})){$vols[$volume]=Get-FinalBuildReadiness $structure $language $volume $cat}
+            foreach($volume in @(Get-VolumeList $language|Where-Object{$_ -ne 'none'})){$vols[$volume]=ConvertTo-FinalReadinessResponse (Get-FinalBuildReadiness $structure $language $volume $cat)}
             Write-JsonResponse $Context 200 ([ordered]@{ok=$true;category=$cat;volumes=$vols});return
         }
         if ($method -eq 'GET' -and $path -eq '/api/submission-files') {
@@ -15981,6 +16054,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             # スナップショットは版をキーに要求（ジョブ）スコープのキャッシュから引く。
             $lockedStamp = if ($numberingChanged) { '' } else { Get-StructureFileStamp $Language }
             $all = [ordered]@{}
+            $workbooksById = Get-WorkbookByIdMap $st
             foreach ($v in $requested) {
                 $sn = Get-CachedFinalBuildInputSnapshot $st $Language $v $cat $lockedStamp
                 # V5-P0: アーカイブ用の情報はこの時点で固定する(後で structure を読み直さない)。
@@ -15990,8 +16064,8 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                     $wid = [string]$pg.workbookId
                     if ([string]::IsNullOrWhiteSpace($wid) -or $seen.ContainsKey($wid)) { continue }
                     $seen[$wid] = $true
-                    $w = @(Get-Array $st.workbooks | Where-Object { [string]$_.workbookId -eq $wid } | Select-Object -First 1)
-                    if ($w.Count -eq 0) { continue }
+                    if (-not $workbooksById.ContainsKey($wid)) { continue }
+                    $w = @($workbooksById[$wid])
                     $sw += [ordered]@{
                         workbookId = $wid
                         fileName = [string]$w[0].fileName
@@ -16049,6 +16123,10 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
         Write-FinalJournal $Language $journal
 
         $backupDir = Join-Path $workspace ("state\final-backups\" + $txId)
+        # exports\manifest_*.json に書く manifest は、ジャーナルではなくここに持つ。ジャーナルは
+        # 1回の出力で何度も書き直すため、全ページぶんの manifest を入れると書くたびに重かった。
+        # 復旧（Restore-FinalTransaction・Recover-FinalTransactions）は manifest を読まない。
+        $manifests = @{}
         try {
             # 5. 出力先PDFが開かれていないかを、対象すべてまとめて確認
             foreach ($v in $targets) {
@@ -16092,14 +16170,14 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
                 }
                 if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -le 0) { throw '提出用PDFを作成できませんでした。' }
                 Set-NoteProperty $t 'newPdfHash' (Normalize-FileHash (New-Sha256 $tmp))
-                Set-NoteProperty $t 'manifest' $manifest
+                $manifests[$v] = $manifest
             }
-            Write-FinalJournal $Language $journal
 
             # 9. 作成中に入力が変わっていても、ここでは止めない（開始時の入力で組み上がっている）。
             #    変わったかどうかは 12. の structure ロック内で確かめ、出力先を needs-rebuild にする。
 
             # 10. バックアップ
+            # 組版で決まった newPdfHash は、この phase の書き込みでいっしょに残す（間に副作用は無い）。
             Set-JournalPhase $Language $journal 'backups-created'
             if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
             foreach ($v in $targets) {
@@ -16179,7 +16257,7 @@ function Invoke-FinalBuildTransaction([string]$Language, [string]$Category, [str
             $built = @()
             foreach ($v in $targets) {
                 $t = Get-JournalTarget $journal $v
-                $savedManifest = Get-DataProperty $t 'manifest' $null
+                $savedManifest = $manifests[$v]
                 $savedManifestPath = Join-Path $workspace ("exports\manifest_{0}_{1}.json" -f $v, $cat)
                 if ($null -ne $savedManifest) {
                     Set-NoteProperty $savedManifest 'outputPdf' ([string]$t.finalPath)

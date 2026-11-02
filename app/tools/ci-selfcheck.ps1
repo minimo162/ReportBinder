@@ -315,6 +315,9 @@ try {
         Invoke-Checked 'Pack change regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-change-selfcheck.ps1'))
         # シートの振り分け（外したシート・改名の旧名が未振り分けに残らないこと）も毎回見る。
         Invoke-Checked 'Sheet assignment regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\sheet-assignment-regression.ps1'))
+        # 高速化（提出用PDFの指紋が変わらないこと・readiness の応答・ハッシュとコピー・一式だけの更新確認）。
+        # 指紋が1文字でも変わると全出力が「再出力が必要」になるので毎回見る。
+        Invoke-Checked 'Speed regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\speed-regression.ps1'))
         Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
         # 画面本体は抜き出し型のテストだけでは全体の構文を見ない。読み込めないと画面が丸ごと動かない。
         Invoke-Checked 'Web app JavaScript syntax' $node @('--check',(Join-Path $appRoot 'web\app.js'))
@@ -343,6 +346,7 @@ try {
     Invoke-Checked 'Output and shared-copy regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'output-publish-selfcheck.ps1'))
     Invoke-Checked 'Pack change regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-change-selfcheck.ps1'))
     Invoke-Checked 'Sheet assignment regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\sheet-assignment-regression.ps1'))
+    Invoke-Checked 'Speed regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\speed-regression.ps1'))
     Invoke-Checked 'History logic regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'history-logic-selfcheck.ps1'))
     Invoke-Checked 'Custom pack workflow regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'custom-pack-workflow-selfcheck.ps1'))
     # この3本は書かれていたのに、どのCI経路からも呼ばれていなかった。原稿アダプタは
