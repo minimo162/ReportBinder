@@ -261,7 +261,7 @@ $sincePublish = Get-PackChangeSummary 'ja' $packId 'main'
 Assert-ChangeTest ([string]$sincePublish.from.buildId -eq $build2 -and [string]$sincePublish.to.buildId -eq $build4 -and [string]$sincePublish.fromReason -eq 'published' -and [bool]$sincePublish.defaultPair) "The default pair did not compare with the last copied version: from=$($sincePublish.from.buildId)"
 Assert-ChangeTest ([int]$sincePublish.counts.added -eq 1 -and [int]$sincePublish.counts.side -eq 2 -and [int]$sincePublish.counts.content -eq 0) "The changes since the last copy are wrong: $($sincePublish.counts | ConvertTo-Json -Compress)"
 Assert-ChangeTest ([string]$sincePublish.from.publishedAt -eq [string]$publish.publishedAt -and -not [bool]$sincePublish.from.isCurrent -and [bool]$sincePublish.to.isCurrent) 'The from/to bands do not say which was copied and which is current.'
-Assert-ChangeTest ([string]$sincePublish.report.reason -eq 'not-available' -and -not [bool]$sincePublish.report.publishable) 'The change report was offered before it can be made.'
+Assert-ChangeTest ([string]$sincePublish.report.reason -eq 'not-created' -and -not [bool]$sincePublish.report.exists -and -not [bool]$sincePublish.report.publishable) 'A change report was reported as made (or copyable) before it was made.'
 
 # 好きな2回: 新しい→古いの順に選んでも、古い→新しいに入れ替えて比べる。
 $picked = Get-PackChangeSummary 'ja' $packId 'main' $build4 $build1
@@ -307,6 +307,157 @@ Assert-ChangeTest ([string]$builtin.status -eq 'unsupported') "A built-in pack w
 # 応答は JSON にしても形が崩れない（kinds が1件でも配列のまま）。
 $json = ConvertTo-Json -InputObject ([ordered]@{ ok=$true; changes=$sincePublish }) -Depth 50 | ConvertFrom-Json
 Assert-ChangeTest (@($json.changes.pages).Count -eq 3 -and @($json.changes.pages)[0].kinds -is [array]) 'The changes response lost its arrays when serialized.'
+
+# ==== 変更点PDF（表紙・変更一覧。Edge のヘッドレス印刷） ===================================
+function New-TestReportSummary([object[]]$Pages, [bool]$HasSides = $true, [hashtable]$Counts = @{}) {
+    $c = New-PackChangeCounts
+    foreach ($k in @($Counts.Keys)) { $c[$k] = $Counts[$k] }
+    return [ordered]@{
+        status = 'ready'; hasSides = $HasSides; complete = $true; counts = $c; notes = @(); pages = @($Pages)
+        from = [ordered]@{ buildId = 'b1'; builtAt = '2026-10-28T14:05:00+09:00'; pageCount = 32; outputFileName = 'old.pdf'; publishedAt = '2026-10-28T15:00:00+09:00'; folderName = '20261028_1500_user'; isLastPublished = $true; isCurrent = $false }
+        to = [ordered]@{ buildId = 'b2'; builtAt = '2026-11-02T09:40:00+09:00'; pageCount = 34; outputFileName = '一式_本体.pdf'; isCurrent = $true; isLatest = $true }
+    }
+}
+function New-TestReportRow([int]$ToPage, [int]$FromPage, [string[]]$Kinds, [bool]$ShiftOnly = $false, [string]$ToSide = 'right', [string]$FromSide = 'right', [string]$SourceName = '売上.xlsx', [string]$SheetName = '売上') {
+    return [ordered]@{ toPage = $(if ($ToPage -gt 0) { $ToPage } else { $null }); toSide = $ToSide; fromPage = $(if ($FromPage -gt 0) { $FromPage } else { $null }); fromSide = $FromSide; sourceName = $SourceName; sheetName = $SheetName; title = $SheetName; fromTitle = $SheetName; kinds = @($Kinds); shiftOnly = $ShiftOnly; changedRatio = $null; regionCount = $null; message = '' }
+}
+function Get-TextCount([string]$Text, [string]$Needle) {
+    return ([regex]::Matches($Text, [regex]::Escape($Needle))).Count
+}
+
+# 利用者が付けた原稿名・シート名はエスケープする（<script> を含む名前で試す）。
+# ずれただけのページの連続は1行にまとめ、左右が入れ替わったページは別の行に残す。変わっていないページは載せない。
+$reportRows = New-Object System.Collections.ArrayList
+[void]$reportRows.Add((New-TestReportRow 12 10 @('content') $false 'right' 'right' '<script>alert(1)</script>' 'S&1'))
+for ($p = 15; $p -le 34; $p++) { [void]$reportRows.Add((New-TestReportRow $p ($p - 2) @('moved') $true ($(if ($p % 2 -eq 1) { 'right' } else { 'left' })) ($(if ($p % 2 -eq 1) { 'right' } else { 'left' })))) }
+[void]$reportRows.Add((New-TestReportRow 35 34 @('moved','side') $true 'right' 'left'))
+[void]$reportRows.Add((New-TestReportRow 36 36 @('unchanged')))
+[void]$reportRows.Add((New-TestReportRow 37 37 @('same-look')))
+# 左右の記録が無い古い版の行。頁番号だけを書き、左右を補わない（見開きの契約）。
+[void]$reportRows.Add((New-TestReportRow 40 39 @('moved') $false '' ''))
+$entries = @(Get-PackChangeReportEntries @($reportRows))
+Assert-ChangeTest ($entries.Count -eq 4) "The report list did not fold shifted pages into one line or did not drop unchanged pages: $($entries.Count) entries"
+Assert-ChangeTest ([string]$entries[1].type -eq 'shift' -and [int]$entries[1].startPage -eq 15 -and [int]$entries[1].endPage -eq 34 -and [int]$entries[1].count -eq 20) 'The shifted run is wrong.'
+$html = New-PackChangeReportHtml (New-TestReportSummary @($reportRows) $true @{ changed = 23; content = 1; moved = 22; shifted = 21; side = 1 }) '<b>一式</b>' '本体' '2026-11-02T10:00:00+09:00'
+Assert-ChangeTest (-not $html.Contains('<script>alert') -and $html.Contains('&lt;script&gt;alert(1)&lt;/script&gt;') -and $html.Contains('S&amp;1')) 'Source and sheet names were not escaped in the report HTML.'
+Assert-ChangeTest (-not $html.Contains('<b>一式</b>') -and $html.Contains('&lt;b&gt;一式&lt;/b&gt;')) 'The pack name was not escaped in the report HTML.'
+Assert-ChangeTest ((Get-TextCount $html 'p.15〜p.34 は前のページが増えたため2ページ後ろにずれました') -eq 1) 'The shifted pages were not summarised in one line.'
+Assert-ChangeTest ((Get-TextCount $html '<tr class="r') -eq 4 -and -not $html.Contains('>p.16（')) 'Folded or unchanged pages were listed one by one.'
+Assert-ChangeTest ($html.Contains('p.35（右）') -and $html.Contains('p.34（左）') -and $html.Contains('左右が入れ替わった')) 'A page whose side changed after a shift was hidden.'
+Assert-ChangeTest ($html.Contains('<td>p.40</td>') -and $html.Contains('<td>p.39</td>') -and -not $html.Contains('p.40（')) 'A side was filled in for a page without a recorded side.'
+# 全ページの上に「確認用」、下に「変更点 n / N」。総ページ数はサーバーで決める。
+Assert-ChangeTest ((Get-TextCount $html '<section class="sheet') -eq 2 -and (Get-TextCount $html 'class="mark-badge">確認用') -eq 2) 'Every report page must carry the 確認用 mark.'
+Assert-ChangeTest ($html.Contains('変更点 1 / 2') -and $html.Contains('変更点 2 / 2') -and (Get-TextCount $html '提出物ではありません') -ge 3) 'The page footer or the "not a submission" notice is missing.'
+Assert-ChangeTest ($html.Contains('前回（共有用フォルダーにコピーした版）') -and $html.Contains('今回（今の提出用PDF）') -and $html.Contains('20261028_1500_user') -and $html.Contains('左右が入れ替わったページ')) 'The cover does not describe both versions and the side count.'
+Assert-ChangeTest ($html.Contains('@page{size:A4 landscape') -and $html.Contains('<meta charset="utf-8">')) 'The report HTML is not an A4 landscape UTF-8 page.'
+# 左右の記録が無い版との比較では、左右の数を 0 と書かない。
+$noSides = New-PackChangeReportHtml (New-TestReportSummary @($reportRows) $false) '一式' '本体'
+Assert-ChangeTest (-not $noSides.Contains('左右が入れ替わったページ') -and $noSides.Contains('左右までは比べていません')) 'The side count was printed for archives without recorded sides.'
+# 1ページに載せる行数を超えたらページを分け、総ページ数も合わせる。
+$many = @(for ($p = 1; $p -le 30; $p++) { New-TestReportRow $p $p @('content') })
+$manyHtml = New-PackChangeReportHtml (New-TestReportSummary $many) '一式' '本体'
+$expectedSheets = 1 + [int][Math]::Ceiling(30 / [double]$Script:PackChangeReportRowsPerPage)
+Assert-ChangeTest ((Get-TextCount $manyHtml '<section class="sheet') -eq $expectedSheets -and $manyHtml.Contains(('変更点 {0} / {0}' -f $expectedSheets)) -and (Get-TextCount $manyHtml '<tr class="r') -eq 30) 'Long lists were not split across pages with a matching total.'
+# 変更が1つも無いときは、「変更なし」と書いた1枚だけ。
+$noneHtml = New-PackChangeReportHtml (New-TestReportSummary @((New-TestReportRow 1 1 @('unchanged'))) $true @{ unchanged = 1 }) '一式' '本体'
+Assert-ChangeTest ((Get-TextCount $noneHtml '<section class="sheet') -eq 1 -and $noneHtml.Contains('変更点 1 / 1') -and $noneHtml.Contains('前回コピーしたときから、変わったページはありません。')) 'A report without changes must be a single "no changes" page.'
+
+# ---- Edge のヘッドレス印刷 ---------------------------------------------------------
+# 専用の --user-data-dir を必ず渡す（起動中の Edge にのっとられると PDF ができない）。
+$edgeArgs = @(Get-EdgePrintToPdfArguments 'C:\t\profile' 'C:\t\report.pdf' 'file:///C:/t/report.html')
+Assert-ChangeTest ($edgeArgs -contains '--headless' -and $edgeArgs -contains '--user-data-dir=C:\t\profile' -and $edgeArgs -contains '--no-pdf-header-footer' -and $edgeArgs -contains '--print-to-pdf=C:\t\report.pdf' -and $edgeArgs[-1] -eq 'file:///C:/t/report.html') "The Edge print arguments are wrong: $($edgeArgs -join ' ')"
+Assert-Throws { Get-EdgePrintToPdfArguments '' 'C:\t\report.pdf' 'file:///x' } 'プロファイル' 'Edge was allowed to print with the default profile.'
+# 待ち時間の上限は件数に比例させ、最大10分。
+Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 0) -eq 60 -and (Get-PackChangeReportTimeoutSeconds 100) -eq 110 -and (Get-PackChangeReportTimeoutSeconds 2000) -eq 600) 'The report timeout is not proportional to the item count.'
+
+# Edge の代わりに、印刷を真似る偽物を使う（PDF を書く／時間切れ／PDF を書かずに正常終了）。
+$Script:EdgeCalls = New-Object System.Collections.ArrayList
+$Script:EdgeMode = 'ok'
+function Get-EdgeExecutablePath { return 'C:\fake\Edge\msedge.exe' }
+function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSeconds = 120) {
+    $profileArg = @($ArgumentList | Where-Object { $_ -like '--user-data-dir=*' } | Select-Object -First 1)
+    $pdfArg = @($ArgumentList | Where-Object { $_ -like '--print-to-pdf=*' } | Select-Object -First 1)
+    $edgeProfileDir = $(if ($profileArg.Count -gt 0) { $profileArg[0].Substring('--user-data-dir='.Length) } else { '' })
+    $edgeProfileExisted = (-not [string]::IsNullOrWhiteSpace($edgeProfileDir) -and (Test-Path -LiteralPath $edgeProfileDir))
+    [void]$Script:EdgeCalls.Add([pscustomobject]@{ file = $FilePath; args = @($ArgumentList); timeout = $TimeoutSeconds; profile = $edgeProfileDir; profileExisted = $edgeProfileExisted })
+    if ($Script:EdgeMode -eq 'timeout') { return [ordered]@{ exitCode = -1; output = @(); text = 'NATIVE_TIMEOUT: fake'; timedOut = $true; cancelled = $false } }
+    if ($Script:EdgeMode -eq 'blocked') { return [ordered]@{ exitCode = 0; output = @('HeadlessModeEnabled=false'); text = 'HeadlessModeEnabled=false'; timedOut = $false; cancelled = $false } }
+    [IO.File]::WriteAllText($pdfArg[0].Substring('--print-to-pdf='.Length), '%PDF-1.7 fake change report')
+    return [ordered]@{ exitCode = 0; output = @(); text = ''; timedOut = $false; cancelled = $false }
+}
+$printDir = Join-Path $Script:LocalConfigRoot 'print-test'
+New-Item -ItemType Directory -Path $printDir -Force | Out-Null
+$printHtml = Join-Path $printDir 'report.html'
+[IO.File]::WriteAllText($printHtml, '<!DOCTYPE html><p>x</p>')
+$printed = Invoke-EdgePrintToPdf $printHtml (Join-Path $printDir 'report.pdf') 90
+Assert-ChangeTest ([bool]$printed.ok -and (Test-PdfMagic (Join-Path $printDir 'report.pdf'))) 'A successful Edge print was not accepted.'
+$firstCall = $Script:EdgeCalls[$Script:EdgeCalls.Count - 1]
+Assert-ChangeTest ([bool]$firstCall.profileExisted -and ([IO.Path]::GetFileName($firstCall.profile)) -like 'rb-chg-edge-*' -and -not (Test-Path -LiteralPath $firstCall.profile) -and [int]$firstCall.timeout -eq 90) 'Edge was not given its own temporary profile (or it was not cleaned up).'
+[void](Invoke-EdgePrintToPdf $printHtml (Join-Path $printDir 'report.pdf') 90)
+Assert-ChangeTest ([string]$Script:EdgeCalls[$Script:EdgeCalls.Count - 1].profile -ne [string]$firstCall.profile) 'Two prints shared the same Edge profile.'
+# timedOut を読まずに「PDF が無い」と言うと、何をすればよいか分からない（DEVELOPMENT_RULES §1）。
+$Script:EdgeMode = 'timeout'
+$timedOut = Invoke-EdgePrintToPdf $printHtml (Join-Path $printDir 'report.pdf') 90
+Assert-ChangeTest (-not [bool]$timedOut.ok -and [string]$timedOut.code -eq 'timeout' -and [bool]$timedOut.timedOut -and [string]$timedOut.message -like '*時間内*') "A timed-out Edge print was not reported as a timeout: $($timedOut.code)"
+Assert-ChangeTest (-not (Test-Path -LiteralPath (Join-Path $printDir 'report.pdf'))) 'An old PDF survived a failed print and could be mistaken for the new one.'
+# 管理ポリシーで止められていると、Edge は正常終了しても PDF を書かない。
+$Script:EdgeMode = 'blocked'
+$blocked = Invoke-EdgePrintToPdf $printHtml (Join-Path $printDir 'report.pdf') 90
+Assert-ChangeTest (-not [bool]$blocked.ok -and [string]$blocked.code -eq 'no-pdf' -and [string]$blocked.message -like '*ヘッドレス印刷*' -and [string]$blocked.log -like '*HeadlessModeEnabled*') 'A print that wrote no PDF was accepted or not explained.'
+
+# ---- 作成ジョブの本体・作成済みの判定・開く ------------------------------------------
+$Script:EdgeMode = 'ok'
+$reportJobId = 'job_20261102_000000_aaaaaaaa'
+$reportStatusPath = Join-Path (Get-RenderJobDir 'ja') "$reportJobId.status.json"
+Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build3; toBuildId = $build4; statusPath = $reportStatusPath })
+$doneJob = Read-JsonFile $reportStatusPath $null
+Assert-ChangeTest ([string]$doneJob.status -eq 'completed' -and [string]$doneJob.jobType -eq 'change-report' -and [bool]$doneJob.report.exists) "The report job did not complete: $($doneJob.status) $($doneJob.message)"
+$reportDir = Get-PackChangeReportDir 'ja' $packId 'main' $build3 $build4
+foreach ($name in @('report.pdf','report.html','meta.json','summary.json')) { Assert-ChangeTest (Test-Path -LiteralPath (Join-Path $reportDir $name) -PathType Leaf) "The report folder is missing $name." }
+Assert-ChangeTest ($reportDir.StartsWith((Join-Path (Get-WorkspacePath 'ja') 'exports\change-reports'))) 'The report was not kept under exports\change-reports.'
+Assert-ChangeTest (@(Get-ChildItem -LiteralPath $outputDir -Filter '*変更点*' -ErrorAction SilentlyContinue).Count -eq 0) 'The change report was copied into the local output folder.'
+$reportSummary = Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4
+Assert-ChangeTest ([int]$Script:EdgeCalls[$Script:EdgeCalls.Count - 1].timeout -eq (Get-PackChangeReportTimeoutSeconds @($reportSummary.pages).Count)) 'The report job did not use the proportional timeout.'
+Assert-ChangeTest ([bool]$reportSummary.report.exists -and [string]$reportSummary.report.reason -eq 'copy-not-available' -and -not [bool]$reportSummary.report.publishable -and [string]$reportSummary.report.reportId -eq ($build3 + '__' + $build4)) "The changes response does not describe the made report: $($reportSummary.report | ConvertTo-Json -Compress)"
+Assert-ChangeTest ([string]$reportSummary.report.fileName -eq ([IO.Path]::GetFileNameWithoutExtension([string]$reportSummary.to.outputFileName) + '_変更点.pdf')) 'The report file name does not follow the submission PDF.'
+# 作成済みなら作り直さない（子プロセスを起動しない）。2つの版の指定は必須。
+$again = Start-PackChangeReportJob 'ja' $packId 'main' $build3 $build4
+Assert-ChangeTest ([string]$again.status -eq 'completed' -and [string]$again.jobId -eq '' -and [bool]$again.reportReady) 'A made report was made again.'
+Assert-Throws { Start-PackChangeReportJob 'ja' $packId 'main' '' $build4 } 'fromBuildId' 'A report was started without the versions shown on screen.'
+Assert-Throws { Start-PackChangeReportJob 'ja' 'ecm' 'main' 'b1' 'b2' } '組み込み' 'A report was started for a built-in pack.'
+Assert-ChangeTest ((Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4) -eq (Join-Path $reportDir 'report.pdf')) 'The made report cannot be opened.'
+Assert-Throws { Resolve-PackChangeReportFile 'ja' $packId 'main' '..\x' $build4 } '不正' 'A report path outside exports\change-reports was accepted.'
+# 見た目のハッシュがそろう前に作ったものは、そろった後には古い（一覧の中身が変わる）。
+$metaPath = Join-Path $reportDir 'meta.json'
+$meta = Read-JsonFile $metaPath $null
+$meta.complete = $false
+Write-JsonFile $metaPath $meta
+$stateArgs = @('ja', $packId, 'main', $build3, $build4, [string]$reportSummary.from.outputPdfSha256, [string]$reportSummary.to.outputPdfSha256)
+Assert-ChangeTest (-not [bool](Get-PackChangeReportState @stateArgs $true).exists -and [string](Get-PackChangeReportState @stateArgs $true).reason -eq 'outdated') 'A report made before the hashes were complete was still offered.'
+Assert-ChangeTest ([bool](Get-PackChangeReportState @stateArgs $false).exists) 'A report made from the same incomplete comparison was not offered.'
+$meta.complete = $true
+Write-JsonFile $metaPath $meta
+# 別の提出用PDFについての記録なら作成済みにしない。
+Assert-ChangeTest (-not [bool](Get-PackChangeReportState 'ja' $packId 'main' $build3 $build4 ([string]$reportSummary.from.outputPdfSha256) ('0' * 64) $true).exists) 'A report about another submission PDF was offered.'
+# 中身が作ったときから変わっていたら、作成済みにしないし開かない。
+[IO.File]::WriteAllText((Join-Path $reportDir 'report.pdf'), '%PDF-tampered')
+$tamperedReport = Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4
+Assert-ChangeTest (-not [bool]$tamperedReport.report.exists -and [string]$tamperedReport.report.reason -eq 'outdated') 'A tampered change report was still offered.'
+Assert-Throws { Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4 } '変わっています' 'A tampered change report was opened.'
+# 作り直すと、置き換えた report.pdf と meta.json がそろう。
+Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build3; toBuildId = $build4; statusPath = $reportStatusPath })
+Assert-ChangeTest ([bool](Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4).report.exists) 'Re-making a tampered report did not replace it.'
+
+# Edge が時間切れ・PDF を書かないときは、ジョブを失敗にして理由を残す。作成済みの記録は書かない。
+foreach ($case in @(@('timeout','時間内'), @('blocked','ヘッドレス印刷'))) {
+    $Script:EdgeMode = $case[0]
+    Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build1; toBuildId = $build4; statusPath = $reportStatusPath })
+    $failedJob = Read-JsonFile $reportStatusPath $null
+    Assert-ChangeTest ([string]$failedJob.status -eq 'failed' -and [string]$failedJob.message -like ('*' + $case[1] + '*') -and @($failedJob.errors).Count -eq 1) "A failed Edge print ($($case[0])) was not reported: $($failedJob.status) $($failedJob.message)"
+    Assert-ChangeTest (-not (Test-Path -LiteralPath (Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build1 $build4) 'meta.json'))) 'A failed print left a "made" record behind.'
+}
+Assert-ChangeTest ([string](Read-JsonFile $reportStatusPath $null).code -eq 'no-pdf') 'The failure code of the Edge print was not kept on the job.'
+$Script:EdgeMode = 'ok'
 
 Write-Output 'pack-change selfcheck ok'
 '@

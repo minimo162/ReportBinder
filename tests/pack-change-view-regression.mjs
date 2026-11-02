@@ -229,4 +229,132 @@ function renderPackChangeError(message){errors.push(message);}
   assert.equal(seen.length, 1);
 }
 
+// ---- 変更点PDF（確認用） -------------------------------------------------------------
+const reportHelpers = ['packChangeReportBody', 'packChangeReportView'].map(extractFunction).join('\n') + '\n'
+  + source.slice(source.indexOf('const PACK_CHANGE_REPORT_TERMINAL='), source.indexOf('];', source.indexOf('const PACK_CHANGE_REPORT_TERMINAL=')) + 2);
+const readyChanges = (extra = {}) => ({ status: 'ready', from: { buildId: 'b1' }, to: { buildId: 'b3' }, report: { exists: false, reason: 'not-created' }, ...extra });
+{
+  const ctx = browserContext();
+  vm.runInContext(stubs + reportHelpers, ctx);
+  // 作るのは画面に出ている2つの版。既定の組み合わせでも buildId を両方送る（作成までに出力・コピーがあっても組み合わせが変わらない）。
+  assert.deepEqual({ ...ctx.packChangeReportBody(readyChanges(), 'pack_1', 'main') }, { packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b3' });
+  assert.equal(ctx.packChangeReportBody({ status: 'no-baseline', to: { buildId: 'b3' } }, 'pack_1', 'main'), null);
+  assert.equal(ctx.packChangeReportBody(readyChanges({ from: null }), 'pack_1', 'main'), null);
+
+  // 比べられないときは欄ごと出さない。
+  assert.equal(ctx.packChangeReportView({ status: 'unsupported' }, null).show, false);
+  let view = ctx.packChangeReportView(readyChanges(), null);
+  assert.equal(view.show, true); assert.equal(view.canCreate, true); assert.equal(view.canOpen, false);
+  assert.equal(view.createLabel, '変更点をPDFにする');
+  // 作成中は押せない。進み具合を出す。
+  view = ctx.packChangeReportView(readyChanges(), { status: 'running', percent: 40, message: '印刷しています。' });
+  assert.equal(view.busy, true); assert.equal(view.percent, 40); assert.match(view.status, /40%/);
+  // 終わったら「開く」「フォルダーを開く」。
+  view = ctx.packChangeReportView(readyChanges(), { status: 'completed' });
+  assert.equal(view.canOpen, true); assert.equal(view.canCreate, false); assert.match(view.status, /変更点PDFを作りました/);
+  // Edge で作れなかったときは、サーバーの説明をそのまま出し、もう一度押せる。
+  view = ctx.packChangeReportView(readyChanges(), { status: 'failed', message: '管理者に『Edge のヘッドレス印刷』が使えるか確認してください。' });
+  assert.equal(view.canCreate, true); assert.equal(view.canOpen, false); assert.match(view.status, /ヘッドレス印刷/);
+  // 作成済み・古くなったもの。
+  view = ctx.packChangeReportView(readyChanges({ report: { exists: true, createdAt: '2026-11-02' } }), null);
+  assert.equal(view.canOpen, true); assert.equal(view.canCreate, false);
+  view = ctx.packChangeReportView(readyChanges({ report: { exists: false, reason: 'outdated' } }), null);
+  assert.equal(view.canOpen, false); assert.equal(view.createLabel, '変更点PDFを作り直す');
+}
+
+function makeReportContext() {
+  const elements = new Map();
+  const el = id => {
+    if (!elements.has(id)) {
+      const classes = new Set();
+      elements.set(id, { id, innerHTML: '', textContent: '', value: '', disabled: false, checked: false, open: false,
+        classList: { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c), toggle: (c, on) => { if (on === undefined ? !classes.has(c) : on) classes.add(c); else classes.delete(c); } } });
+    }
+    return elements.get(id);
+  };
+  const ctx = browserContext({ calls: [], pending: [], renders: [] });
+  vm.runInContext(stubs + helpers + reportHelpers + `
+var activePackId='pack_1';
+var finalArchivesState={packId:'pack_1',loaded:true,list:[]};
+var packChangeState={volume:'v-main',targetId:'main',fromBuildId:'',toBuildId:'',requestPath:'',changes:null,archives:[],filter:'all',showAll:false};
+var packChangeOpenSerial=0;
+var packChangeReturnFocus=null;
+var packChangeReportJob=null;
+function $(id){return __el(id);}
+function api(path,options){const d=__deferred();pending.push({path,options,d});return d.promise;}
+function sleep(){return Promise.resolve();}
+function renderPackChanges(changes){packChangeState.changes=changes;}
+function renderPackChangeError(){}
+function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChangeReportJob}:null);}
+` + ['isPackChangeOpen', 'loadPackChangeArchives', 'loadPackChanges', 'closePackChanges', 'createPackChangeReport'].map(extractFunction).join('\n'), Object.assign(ctx, { __el: el, __deferred: deferred }));
+  return ctx;
+}
+{
+  const ctx = makeReportContext();
+  // 既定の組み合わせを開いた状態（b1 → b3）。
+  const load = ctx.loadPackChanges({});
+  ctx.pending.shift().d.resolve({ changes: readyChanges() });
+  await load;
+  assert.equal(ctx.packChangeState.changes.to.buildId, 'b3');
+
+  // 作成 → 状態を見る → 完了。送るのは画面の2つの版。
+  const creating = ctx.createPackChangeReport();
+  const start = ctx.pending.shift();
+  assert.equal(start.path, '/api/v2/outputs/changes/report');
+  assert.deepEqual({ ...start.options.body }, { packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b3' });
+  // 作成中にもう一度押しても、2本目は始めない。
+  await ctx.createPackChangeReport();
+  assert.equal(ctx.pending.length, 0);
+  start.d.resolve({ job: { jobId: 'job_1', status: 'launching', percent: 2 } });
+  await flush(); await flush();
+  const poll = ctx.pending.shift();
+  assert.equal(poll.path, '/api/v2/outputs/changes/report/status?jobId=job_1');
+  poll.d.resolve({ job: { jobId: 'job_1', status: 'completed', percent: 100, report: { exists: true, reportId: 'b1__b3' } } });
+  await creating;
+  assert.equal(ctx.packChangeReportJob.status, 'completed');
+  assert.equal(ctx.packChangeState.changes.report.exists, true, 'a finished report must be offered for opening');
+}
+{
+  // 作成中に別の組み合わせへ切り替えたら、前の組み合わせのジョブの結果で画面を書き換えない。
+  const ctx = makeReportContext();
+  const load = ctx.loadPackChanges({});
+  ctx.pending.shift().d.resolve({ changes: readyChanges() });
+  await load;
+  const creating = ctx.createPackChangeReport();
+  ctx.pending.shift().d.resolve({ job: { jobId: 'job_1', status: 'running', percent: 30 } });
+  await flush(); await flush();
+  const poll = ctx.pending.shift();
+  const switched = ctx.loadPackChanges({ fromBuildId: 'b2', toBuildId: 'b3' });
+  assert.equal(ctx.packChangeReportJob, null, 'switching the pair must drop the previous report job');
+  ctx.pending.shift().d.resolve({ changes: readyChanges({ from: { buildId: 'b2' } }) });
+  await switched;
+  const rendersBefore = ctx.renders.length;
+  poll.d.resolve({ job: { jobId: 'job_1', status: 'completed', report: { exists: true } } });
+  await creating;
+  assert.equal(ctx.renders.length, rendersBefore, 'a stale report job must not repaint the new comparison');
+  assert.equal(ctx.packChangeReportJob, null);
+  assert.equal(ctx.packChangeState.changes.report.exists, false, 'a report for the old pair must not be offered for the new pair');
+  assert.equal(ctx.pending.length, 0, 'polling must stop after the pair changed');
+}
+{
+  // 閉じた後の失敗も描かない。開いているときの失敗はサーバーの説明を出す。
+  const ctx = makeReportContext();
+  const load = ctx.loadPackChanges({});
+  ctx.pending.shift().d.resolve({ changes: readyChanges() });
+  await load;
+  let creating = ctx.createPackChangeReport();
+  ctx.pending.shift().d.resolve({ job: { jobId: 'job_2', status: 'running' } });
+  await flush(); await flush();
+  ctx.pending.shift().d.resolve({ job: { jobId: 'job_2', status: 'failed', message: 'この PC では変更点PDFを作れませんでした。' } });
+  await creating;
+  assert.equal(ctx.packChangeReportJob.status, 'failed');
+  assert.match(ctx.packChangeReportJob.message, /作れませんでした/);
+  creating = ctx.createPackChangeReport();
+  ctx.closePackChanges();
+  const rendersBefore = ctx.renders.length;
+  ctx.pending.shift().d.reject(new Error('boom'));
+  await creating;
+  assert.equal(ctx.renders.length, rendersBefore, 'a failure after closing must not repaint');
+}
+
 console.log('pack change view regression ok');

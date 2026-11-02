@@ -1314,7 +1314,8 @@ if 'ExcelWatchdogLogPaths' not in _stop_watchdog:
 # (2000ページの分割、共有フォルダー宛ての組版)に流用できるものではない。呼び出しごとに
 # 用途の上限を明示させる。
 _timeout_vars = ['$Script:JavaProbeTimeoutSeconds', '$Script:PdfSplitTimeoutSeconds',
-                 '$Script:FinalComposeTimeoutSeconds', '$Script:PdfAnalyzeTimeoutSeconds']
+                 '$Script:FinalComposeTimeoutSeconds', '$Script:PdfAnalyzeTimeoutSeconds',
+                 '$Script:EdgePrintMaxTimeoutSeconds']
 for needed in _timeout_vars:
     if needed + ' = ' not in server:
         raise SystemExit(f'missing native command timeout constant: {needed}')
@@ -1670,7 +1671,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v212', 'style.css?v=20261030_v128']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v213', 'style.css?v=20261030_v129']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1725,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v212' not in html:
+if 'app.js?v=20261030_v213' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1751,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v212' not in html:
+if 'app.js?v=20261030_v213' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3346,5 +3347,64 @@ if '%2' in _pack_page_label or 'spreadIndex' in _pack_page_label:
 _escape = _pack_js.split("if(e.key==='Escape'){\n", 1)[1].split('return;\n  }', 1)[0]
 if _escape.find('closeDiffDetail()') < 0 or _escape.find('closePackChanges()') < _escape.find('closeDiffDetail()'):
     raise SystemExit('Escape must close the diff detail before the pack change modal')
+
+# 提出用PDF一式の変更点PDF（PR4）--------------------------------------------------
+# 振る舞い（エスケープ・行のまとめ方・ページ割り・Edge の時間切れ・作成済みの判定）は
+# pack-change-selfcheck.ps1 と pack-change-view-regression.mjs が見る。ここでは経路と、
+# 作成を要求の中でしないこと、Edge に専用プロファイルを渡すこと、左右を推定しないことを見る。
+for needed in ["$path -eq '/api/v2/outputs/changes/report')", "$path -eq '/api/v2/outputs/changes/report/status')",
+               "$path -eq '/api/v2/outputs/changes/report/file')", 'Start-PackChangeReportJob $language',
+               'Resolve-PackChangeReportFile $language', '[string]$ChangeReportJobPath',
+               'Invoke-PackChangeReportJobFromFile $ChangeReportJobPath']:
+    if needed not in server:
+        raise SystemExit(f'change report plumbing missing: {needed}')
+_report_route = server.split("$path -eq '/api/v2/outputs/changes/report') {", 1)[1].split('if ($method', 1)[0]
+if 'Start-PackChangeReportJob' not in _report_route or 'Invoke-EdgePrintToPdf' in _report_route or 'New-PackChangeReportHtml' in _report_route:
+    raise SystemExit('POST /api/v2/outputs/changes/report must hand off to a background job, not print inline')
+_status_route = server.split("$path -eq '/api/v2/outputs/changes/report/status') {", 1)[1].split('if ($method', 1)[0]
+if 'Read-RenderJobStatus' not in _status_route:
+    raise SystemExit('the change report status must be read with Read-RenderJobStatus')
+_edge_args = _publish_server_function('Get-EdgePrintToPdfArguments')
+for needed in ["'--headless'", "'--user-data-dir='", "'--no-pdf-header-footer'", "'--print-to-pdf='", 'throw']:
+    if needed not in _edge_args:
+        raise SystemExit(f'Edge must print headless with its own profile: {needed}')
+_edge_print = _publish_server_function('Invoke-EdgePrintToPdf')
+for needed in ['Get-EdgeExecutablePath', 'Invoke-NativeCapture', '$capture.timedOut', "'timeout'", "'no-pdf'", "'edge-missing'", 'Test-PdfMagic', 'Get-EdgePrintToPdfArguments', "'rb-chg-edge-'", 'GetTempPath()']:
+    if needed not in _edge_print:
+        raise SystemExit(f'the Edge print must read timedOut and check the PDF itself: {needed}')
+_report_html = _publish_server_function('New-PackChangeReportHtml')
+for needed in ['ConvertTo-PackChangeHtmlText', 'Get-PackChangeReportEntries', '確認用', '提出物ではありません', '変更点 {0} / {1}', '@page{size:A4 landscape', '<meta charset="utf-8">', 'PackChangeReportRowsPerPage']:
+    if needed not in _report_html:
+        raise SystemExit(f'the change report HTML is missing a part: {needed}')
+for forbidden in ['Read-JsonFile', 'Write-JsonFile', 'Write-Utf8NoBomFile', 'Test-Path', 'spreadIndex', '% 2', '%2']:
+    if forbidden in _report_html or forbidden in _publish_server_function('Get-PackChangeReportPageLabel'):
+        raise SystemExit(f'the change report HTML must be a pure function that never decides sides itself: {forbidden}')
+if 'HtmlEncode' not in _publish_server_function('ConvertTo-PackChangeHtmlText'):
+    raise SystemExit('names in the change report must be HTML-escaped')
+_report_core = _publish_server_function('Invoke-PackChangeReportJobCore')
+for needed in ['Get-PackChangeReportTimeoutSeconds', 'Invoke-EdgePrintToPdf', 'Write-Utf8NoBomFile $workHtml', 'reportSha256', 'GetTempPath()', "'rb-chg-'", 'Move-FileAtomicCompat $tmpPdf']:
+    if needed not in _report_core:
+        raise SystemExit(f'the change report job is missing a safeguard: {needed}')
+if _report_core.find('Move-FileAtomicCompat $tmpPdf') > _report_core.find('Write-JsonFile $metaPath'):
+    raise SystemExit('meta.json must be written after report.pdf is in place')
+if 'outputDir' in _report_core or 'Get-Paths' in _report_core:
+    raise SystemExit('the change report must not be copied into the local output folder')
+_report_state = _publish_server_function('Get-PackChangeReportState')
+for needed in ['reportSha256', 'New-Sha256', "'fromOutputPdfSha256'", "'toOutputPdfSha256'", 'PackChangeReportVersion', "'complete'", 'publishable = $false']:
+    if needed not in _report_state:
+        raise SystemExit(f'a made change report must match its record and both versions: {needed}')
+if 'Get-PackChangeReportState' not in _publish_server_function('Get-PackChangeSummary'):
+    raise SystemExit('the changes response must report whether the change report was made')
+if "'\\s-changereportjobpath\\b'" not in launch:
+    raise SystemExit('relaunching the UI must not stop a change report child process')
+for needed in ['id="pack-change-report"', 'id="pack-change-report-create"', 'id="pack-change-report-open"', 'id="pack-change-report-reveal"', 'id="pack-change-report-status"', 'id="pack-change-report-progress"']:
+    if needed not in html:
+        raise SystemExit(f'change report markup is missing: {needed}')
+_report_create = _pack_js.split('async function createPackChangeReport(', 1)[1].split('\nasync function ', 1)[0]
+for needed in ["'/api/v2/outputs/changes/report'", '/api/v2/outputs/changes/report/status?jobId=', 'packChangeReportBody(packChangeState.changes', 'serial!==packChangeOpenSerial', 'packChangeState.requestPath!==requestPath']:
+    if needed not in _report_create:
+        raise SystemExit(f'the change report button must follow the shown pair and ignore stale jobs: {needed}')
+if "path === '/api/v2/outputs/changes/report/file'" not in _pack_js:
+    raise SystemExit('the change report must be opened with a POST like the submission PDF')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))
