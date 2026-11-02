@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v216', 'style.css?v=20261030_v131']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v217', 'style.css?v=20261030_v131']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v216' not in html:
+if 'app.js?v=20261030_v217' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v216' not in html:
+if 'app.js?v=20261030_v217' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3548,5 +3548,70 @@ for needed in ["rowKey = ([string]$k + '#' + [string]($i + 1))", 'rowKey = [stri
         raise SystemExit(f'pack change rows must carry a stable key and source page numbers: {needed}')
 if '$Script:PackChangeAlgorithmVersion = 2' not in server:
     raise SystemExit('PackChangeAlgorithmVersion must be raised so cached summaries without row keys are rebuilt')
+
+# 変更点PDFに「ページごとの詳細」を載せる（PR-B2）-------------------------------------------
+# 振る舞い（details の検証・座標の換算・枠の番号と文字・エスケープ・200件の上限・詳細ページの番号・続きのページ・
+# 予備の枠・lease・待ち時間・作成済みの判定）は pack-change-selfcheck.ps1、画面の表示は pack-change-view-regression.mjs が見る。
+# ここでは、受け取り手が実行できない案内を書かないこと、HTML が純粋なままであること、要求の中で画像化しないこと、
+# 画像の版を別の版に代えないことを見る。
+if 'アプリの「くわしく見る」で確認できます' in server:
+    raise SystemExit('the change report must not tell recipients (who do not have the app) to use 「くわしく見る」')
+if '$Script:PackChangeReportVersion = 2' not in server:
+    raise SystemExit('PackChangeReportVersion must be raised so reports without detail pages are made again')
+if 'line-clamp' in _report_html or 'class="clip"' in _report_html:
+    raise SystemExit('the change report list must not silently clip cells')
+for needed in ['Get-PackChangeReportDetailTargets', 'Split-PackChangeReportPages', 'Get-PackChangeReportDetailLines', 'Get-PackChangeReportVisualText $row $cells.detail $detailNumber',
+               '$DetailPages', '(& $h ([string]$line.text))', '(& $h ([string]$image.src))', '(& $h $tag)', 'Format-PackChangeReportPercent']:
+    if needed not in _report_html:
+        raise SystemExit(f'the change report detail pages are missing a part: {needed}')
+for forbidden in ['Get-PngImageSize', 'Invoke-DiffImageBatchGeneration', 'Resolve-DiffContentPdfPath', 'Get-Content', '[IO.File]']:
+    if forbidden in _report_html:
+        raise SystemExit(f'the change report HTML must stay a pure function (pictures are prepared by the job): {forbidden}')
+_detail_text = _publish_server_function('ConvertTo-PackChangeReportDetailText')
+if 'PackChangeReportTextLimit' not in _detail_text or '$Script:PackChangeReportTextLimit = 200' not in server:
+    raise SystemExit('changed text in the change report must be cut to 200 characters')
+_details_check = _publish_server_function('ConvertTo-PackChangeReportDetails')
+for needed in ["'rowKey'", "'fromVersionId'", "'toVersionId'", "'toSourcePageNumber'", "'fromSourcePageNumber'", '-cnotcontains $kind',
+               'ConvertTo-PackChangeReportBox', 'ConvertTo-PackChangeReportDetailText', 'PackChangeReportRegionLimit', 'PackChangeReportDetailsMaxBytes', '[StringComparer]::Ordinal']:
+    if needed not in _details_check:
+        raise SystemExit(f'details from the browser must be checked against the recompared rows: {needed}')
+if 'ConvertTo-PackChangeReportUnit' not in _publish_server_function('ConvertTo-PackChangeReportBox'):
+    raise SystemExit('detail coordinates must be clamped to 0..1')
+if 'ConvertTo-PackChangeReportDetails $Details $summary' not in _publish_server_function('Start-PackChangeReportJob') or 'details = @($validDetails.Values)' not in _publish_server_function('Start-PackChangeReportJob'):
+    raise SystemExit('the change report job must only receive details checked against the summary')
+for forbidden in ['Invoke-PackChangeReportImages', 'Invoke-DiffImageBatchGeneration', 'New-PackChangeReportHtml', 'New-PackChangeReportLeases']:
+    if forbidden in _report_route or forbidden in _publish_server_function('Start-PackChangeReportJob'):
+        raise SystemExit(f'details must not be turned into pictures inside the request: {forbidden}')
+if "(Get-DataProperty $body 'details' $null)" not in _report_route:
+    raise SystemExit('POST /api/v2/outputs/changes/report must pass the details to the job')
+for needed in ["ConvertTo-PackChangeReportDetails (Get-DataProperty $Job 'details' $null) $summary", 'Invoke-PackChangeReportImages $language',
+               'New-PackChangeReportDetailPage', 'Get-PackChangeReportDetailSource', 'detailSource = $detailSource',
+               'Get-PackChangeReportTimeoutSeconds (@(Get-Array $summary.pages).Count) $imageCount']:
+    if needed not in _report_core:
+        raise SystemExit(f'the change report job must build the detail pages from checked details: {needed}')
+_report_images = _publish_server_function('Invoke-PackChangeReportImages')
+for needed in ['New-PackChangeReportLeases', 'Remove-PackChangeReportLeases', 'Resolve-DiffContentPdfPath', 'Invoke-DiffImageBatchGeneration @($items) ([int]$Script:PackChangeReportImageDpi)',
+               "beforeRasterDirectory = ''", "'beforePageNumber'", "'afterPageNumber'", 'finally']:
+    if needed not in _report_images:
+        raise SystemExit(f'the detail pictures must come from the archived versions under a lease: {needed}')
+if 'Get-PreferredHistoryRenderVersion' in _report_images or 'Get-PreferredHistoryRenderVersion' in _publish_server_function('Get-PackChangeReportImageSides'):
+    raise SystemExit('the detail pictures must not fall back to the newest render version')
+if _report_images.find('Remove-PackChangeReportLeases') < _report_images.find('finally'):
+    raise SystemExit('the detail picture leases must be released in finally')
+_report_leases = _publish_server_function('New-PackChangeReportLeases')
+for needed in ['history-cleanup.lock', 'Get-ContentPdfMaintenanceLockPath', 'Get-HistoryRenderVersionAvailability', 'New-SnapshotLease', 'New-ContentPdfLease']:
+    if needed not in _report_leases:
+        raise SystemExit(f'the detail pictures must lease their versions like the diff job: {needed}')
+if "'^[0-9]{4}-[ab]\\.png$'" not in _publish_server_function('Get-PackChangeReportImageFile'):
+    raise SystemExit('only the copied comparison PNGs may be referenced from the report HTML')
+_image_box = _publish_server_function('ConvertTo-PackChangeReportImageBox')
+for needed in ['$CanvasWidth / $ImageWidth', '$CanvasHeight / $ImageHeight']:
+    if needed not in _image_box:
+        raise SystemExit(f'detail frames must be converted to the size of each picture: {needed}')
+if 'detailSource' not in _report_state or 'packChangeReportDetailNote(report)' not in _js_function('packChangeReportView'):
+    raise SystemExit('the screen must say when the detail frames were detected by the server')
+for name in ['fromSourceId = ', 'fromSheetName = ']:
+    if name not in _page_maps:
+        raise SystemExit(f'pack change rows must carry the previous source and sheet for the previous picture: {name}')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

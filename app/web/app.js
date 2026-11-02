@@ -7811,6 +7811,14 @@ function packChangeReportCopyNote(report){
   if(report?.attachable)return '変更点PDFは、今の提出用PDFに合わせて作り直すとコピーできます。';
   return 'この組み合わせの変更点PDFは、共有用フォルダーにはコピーしません（コピーできるのは、前回コピーした版と今の提出用PDFの組み合わせだけです）。';
 }
+// 変更点PDFの詳細ページの枠の出どころ（サーバーの meta.json の detailSource）。アプリと同じ計算で作れなかった
+// ページがあれば、そのページの枠は画像の違いから自動で検出した範囲だと伝える（もう一度作るときは画面で計算し直す）。
+function packChangeReportDetailNote(report){
+  const source=String(report?.detailSource||'');
+  if(source==='server')return 'ページごとの詳細の枠は、画像の違いから自動で検出した範囲です。';
+  if(source==='mixed')return '一部のページの詳細の枠は、画像の違いから自動で検出した範囲です。';
+  return '';
+}
 // 変更点PDFの欄の見え方。job は作成中・作成後のジョブ（無ければ null）。
 function packChangeReportView(changes,job){
   const hidden={show:false,busy:false,canCreate:false,canOpen:false,createLabel:'変更点をPDFにする',status:'',percent:0};
@@ -7821,9 +7829,9 @@ function packChangeReportView(changes,job){
     const percent=Math.max(0,Math.min(100,Number(job.percent||0)));
     return {...hidden,show:true,busy:true,createLabel:'変更点PDFを作っています',status:`${String(job.message||'変更点PDFを作っています。')}（${percent}%）`,percent};
   }
-  if(job&&status==='completed')return {...hidden,show:true,canOpen:true,status:`変更点PDFを作りました。「開く」で確かめられます。${packChangeReportCopyNote(report)}`};
+  if(job&&status==='completed')return {...hidden,show:true,canOpen:true,status:`変更点PDFを作りました。「開く」で確かめられます。${packChangeReportDetailNote(job.report||report)}${packChangeReportCopyNote(report)}`};
   if(job&&status)return {...hidden,show:true,canCreate:true,createLabel:'もう一度PDFにする',status:String(job.message||'変更点PDFを作れませんでした。')};
-  if(report.exists)return {...hidden,show:true,canOpen:true,status:`変更点PDFは作成済みです${report.createdAt?`（${formatDateTime(report.createdAt)}）`:''}。${packChangeReportCopyNote(report)}`};
+  if(report.exists)return {...hidden,show:true,canOpen:true,status:`変更点PDFは作成済みです${report.createdAt?`（${formatDateTime(report.createdAt)}）`:''}。${packChangeReportDetailNote(report)}${packChangeReportCopyNote(report)}`};
   if(report.reason==='outdated')return {...hidden,show:true,canCreate:true,createLabel:'変更点PDFを作り直す',status:'前に作った変更点PDFは、今の比べた結果と合いません。作り直してください。'};
   return {...hidden,show:true,canCreate:true,status:'この変更点を、紙やメールで渡せる確認用のPDFにします（提出物ではありません）。'};
 }

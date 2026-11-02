@@ -10191,9 +10191,10 @@ function Handle-Api($Context) {
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/changes/report') {
             # 変更点PDF（確認用）の作成は Edge の印刷で時間がかかるので、子プロセスのジョブにする。
-            # 本文の details（画面が集めた「くわしく見る」の結果）は、まだ読まない（ページごとの詳細は未実装）。
+            # 本文の details（画面が集めた「くわしく見る」の結果）は Start-PackChangeReportJob が比べ直した結果と
+            # 突き合わせて整え、ジョブの入力に入れる。画像化・印刷はジョブ（子プロセス）で行い、ここではしない。
             $body = Read-BodyJson $Context.Request
-            $reportJob = Start-PackChangeReportJob $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' '')) ([string](Get-DataProperty $body 'fromBuildId' '')) ([string](Get-DataProperty $body 'toBuildId' ''))
+            $reportJob = Start-PackChangeReportJob $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' '')) ([string](Get-DataProperty $body 'fromBuildId' '')) ([string](Get-DataProperty $body 'toBuildId' '')) (Get-DataProperty $body 'details' $null)
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=$reportJob }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/changes/report/status') {
@@ -13946,7 +13947,11 @@ function Compare-PackArchivePageMaps($FromManifest, $FromMetadata, $ToManifest, 
             # 原稿の変換PDFの中で何ページ目か（「くわしく見る」の pages[].afterPageNumber／beforePageNumber と同じ数え方）。
             toSourcePageNumber = $(if ($null -ne $t) { [int]$t.sourcePdfPageNumber } else { $null })
             fromSourcePageNumber = $(if ($null -ne $f) { [int]$f.sourcePdfPageNumber } else { $null })
-            fromPage = $(if ($null -ne $f) { [int]$f.outputPageNumber } else { $null })
+            # 前回のページの原稿とシート（変更点PDFの「ページごとの詳細」で前回の画像を作るのに使う）。
+            # sourceId・sheetName は今回のページ（無ければ前回）のもので、原稿の差し替え・シート名の変更があると前回と違う。
+            fromSourceId = $(if ($null -ne $f) { [string]$f.sourceId } else { '' })
+            fromSheetName = $(if ($null -ne $f) { Get-PackChangeHashSheetName ([string]$f.sourceKey) } else { '' })
+            fromPage =$(if ($null -ne $f) { [int]$f.outputPageNumber } else { $null })
             fromSide = $(if ($null -ne $f -and [bool]$fromMap.hasSides) { [string]$f.side } else { '' })
             fromSpreadIndex = $(if ($null -ne $f -and [bool]$fromMap.hasSides) { $f.spreadIndex } else { $null })
             itemId = [string]$page.itemId
@@ -14214,7 +14219,7 @@ function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$Targ
         # 変更点PDF。比べられた（status=ready）ときだけ Get-PackChangeReportState で埋める。
         # attachable = この組み合わせが「前回コピーした版 → 今の提出用PDF」（共有コピーへ同梱できる組み合わせ）、
         # publishable = 作成済みで、今コピーすれば同梱される（Resolve-PublishableChangeReport の条件を満たす）。
-        report = [ordered]@{ exists = $false; reportId = ''; fileName = ''; createdAt = ''; attachable = $false; publishable = $false; reason = 'not-available' }
+        report = [ordered]@{ exists = $false; reportId = ''; fileName = ''; createdAt = ''; attachable = $false; publishable = $false; reason = 'not-available'; detailSource = '' }
     }
     if ([bool]$scope.builtIn) {
         $result.status = 'unsupported'
@@ -14335,15 +14340,26 @@ function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$Targ
 }
 
 # ---- 変更点PDF（確認用。提出物ではない） ------------------------------------
-# 中身は表紙と変更一覧だけ（ページごとの画像は後の版）。サーバーが report.html を作り、
-# Edge のヘッドレス印刷で report.pdf にする。日本語を PDFBox で書くにはフォントの埋め込みと
-# jar の作り直しが要るため、このアプリの前提として入っている Edge を使う。
+# 中身は表紙・変更一覧・ページごとの詳細（前回・今回のページの画像と番号つきの枠、文字の変化）。
+# サーバーが report.html を作り、Edge のヘッドレス印刷で report.pdf にする。日本語を PDFBox で書くには
+# フォントの埋め込みと jar の作り直しが要るため、このアプリの前提として入っている Edge を使う。
 # 保存先は Get-PackChangeReportDir（exports\change-reports\<packId>\<targetId>\<from>__<to>）。
 # ローカルの出力フォルダーにはコピーしない（提出用PDFと取り違えないため）。
-$Script:PackChangeReportVersion = 1
-# 1ページに載せる一覧の行数。行の高さを固定し、ページ割りをサーバーで決める
-# （「変更点 1 / 8」の総ページ数を HTML を作る時点で決めるため。Edge の余白欄の機能には頼らない）。
+# 2: ページごとの詳細を足した（作成済みの版 1 のPDFは作り直すまで作成済みにしない・同梱しない）。
+$Script:PackChangeReportVersion = 2
+# 1ページに載せる一覧の行数の上限。行の高さは中身の長さから見積もり（3行で切らない）、
+# ページ割りは見積もった高さの合計で決める。短い行だけなら今までどおり12行（12 × 最小の高さ）。
+# 「変更点 1 / 8」の総ページ数を HTML を作る時点で決めるため（Edge の余白欄の機能には頼らない）。
 $Script:PackChangeReportRowsPerPage = 12
+$Script:PackChangeReportRowMinMm = 12.4
+# ページごとの詳細を載せる行数の上限（画面が「くわしく見る」の結果を集める上限と同じ）。
+$Script:PackChangeReportDetailLimit = 200
+# 画面から受け取る details の上限（1行の枠の数・文字の長さ・全体の見積もりの大きさ）。
+$Script:PackChangeReportRegionLimit = 30
+$Script:PackChangeReportTextLimit = 200
+$Script:PackChangeReportDetailsMaxBytes = 2097152
+# 詳細ページの画像の解像度。差分画面用（DiffDetailDpi）より落とし、200ページ分でも印刷できる大きさにする。
+$Script:PackChangeReportImageDpi = 96
 # Edge の印刷の待ち時間の上限（件数に比例させた値もこれを超えない）。
 $Script:EdgePrintMaxTimeoutSeconds = 600
 
@@ -14411,19 +14427,40 @@ function Get-PackChangeReportKindLabels($Row) {
     return @($labels)
 }
 
-# 見た目の変化の欄。画像の比較（枠・変化の割合）は後の版で埋まる。無いときは分かることだけを書く。
-function Get-PackChangeReportVisualText($Row) {
-    $kinds = @(Get-PackChangeReportRowKinds $Row)
-    $ratio = Get-DataProperty $Row 'changedRatio' $null
-    $regions = Get-DataProperty $Row 'regionCount' $null
-    if ($null -ne $ratio -and $kinds -contains 'content') {
-        $percent = [double]$ratio * 100.0
-        $percentText = $(if ($percent -lt 1.0) { '1% 未満' } else { ('約 {0}%' -f [int][Math]::Round($percent)) })
-        if ($null -ne $regions -and [int]$regions -gt 0) { return ('ページの{0}が変わっています（{1}か所）' -f $percentText, [int]$regions) }
-        return ('ページの{0}が変わっています' -f $percentText)
+function Get-PackChangeReportRegionKindLabel([string]$Kind) {
+    switch ($Kind) {
+        'modified' { return '変更' }
+        'added' { return '追加' }
+        'removed' { return '削除' }
     }
-    if ($kinds -contains 'content') { return '見た目が変わっています（アプリの「くわしく見る」で確認できます）' }
-    if ($kinds -contains 'maybe-content') { return 'まだ確かめられていません' }
+    return '不明'
+}
+
+# 見た目の変化の欄。ページごとの詳細があれば枠の数と詳細ページの番号を書く（受け取った人はアプリを
+# 持っていないので、アプリでの確かめ方は書かない）。$DetailPage は New-PackChangeReportDetailPage の結果。
+function Get-PackChangeReportVisualText($Row, $DetailPage = $null, [int]$DetailPageNumber = 0, [bool]$Omitted = $false) {
+    $kinds = @(Get-PackChangeReportRowKinds $Row)
+    if ($null -ne $DetailPage -and $DetailPageNumber -gt 0) {
+        $where = ('詳細 p.{0}' -f $DetailPageNumber)
+        $mode = [string](Get-DataProperty $DetailPage 'mode' '')
+        if ($mode -eq 'added') { return ('今回だけにあるページ（{0}）' -f $where) }
+        if ($mode -eq 'removed') { return ('前回だけにあったページ（{0}）' -f $where) }
+        $regions = @(Get-Array (Get-DataProperty $DetailPage 'regions' @()))
+        if ($regions.Count -eq 0) { return ('変更箇所を特定できませんでした（{0} でページ全体を確認してください）' -f $where) }
+        $parts = New-Object System.Collections.ArrayList
+        foreach ($kind in @('modified','added','removed','unknown')) {
+            $n = @($regions | Where-Object { [string]$_.kind -eq $kind }).Count
+            if ($n -gt 0) { [void]$parts.Add(('{0} {1}か所' -f (Get-PackChangeReportRegionKindLabel $kind), $n)) }
+        }
+        $total = [int](Get-DataProperty $DetailPage 'regionCount' $regions.Count)
+        if ($total -gt $regions.Count) { [void]$parts.Add(('ほか {0}か所' -f ($total - $regions.Count))) }
+        return ('{0}（{1}）' -f (@($parts) -join '・'), $where)
+    }
+    if ($kinds -contains 'content' -or $kinds -contains 'maybe-content') {
+        if ($Omitted) { return ('詳細は省略しました（ページごとの詳細は最初の{0}ページ分だけ載せています）' -f [int]$Script:PackChangeReportDetailLimit) }
+        if ($kinds -contains 'content') { return '変更箇所を特定できませんでした（ページ全体を確認してください）' }
+        return 'まだ確かめられていません（ページ全体を確認してください）'
+    }
     if ($kinds -contains 'added') { return '今回だけにあるページ' }
     if ($kinds -contains 'removed') { return '前回だけにあったページ' }
     return '—'
@@ -14472,17 +14509,486 @@ function Format-PackChangeReportDate([string]$Value) {
     } catch { return $Value }
 }
 
-# 変更点PDFの HTML（§6.1 の 表紙・変更一覧・全ページの「確認用」と「変更点 n / N」）。副作用なし。
-# $Summary は Get-PackChangeSummary の結果（status=ready）。文字はすべてエスケープする。
-function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetName, [string]$GeneratedAt = '') {
+# ---- ページごとの詳細（変更点PDF） ----------------------------------------------
+# 詳細ページを載せる行を、一覧の並び順で決める。内容が変わった（かもしれない）行（diff）は前回・今回の
+# 画像と枠、増えた（added）・なくなった（removed）行は片側の画像とページ全体の枠。最初の
+# PackChangeReportDetailLimit 件だけで、残りは omitted（一覧だけ）。rowKey の無い行は載せない。副作用なし。
+function Get-PackChangeReportDetailTargets($Entries) {
+    $targets = New-Object System.Collections.ArrayList
+    $omitted = New-Object System.Collections.ArrayList
+    $seen = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    $limit = [Math]::Max(0, [int]$Script:PackChangeReportDetailLimit)
+    foreach ($entry in @(Get-Array $Entries)) {
+        if ([string](Get-DataProperty $entry 'type' '') -ne 'row') { continue }
+        $row = Get-DataProperty $entry 'row' $null
+        if ($null -eq $row) { continue }
+        $rowKey = [string](Get-DataProperty $row 'rowKey' '')
+        if ([string]::IsNullOrWhiteSpace($rowKey) -or $seen.ContainsKey($rowKey)) { continue }
+        $kinds = @(Get-PackChangeReportRowKinds $row)
+        $mode = ''
+        if ($kinds -contains 'added') { $mode = 'added' }
+        elseif ($kinds -contains 'removed') { $mode = 'removed' }
+        elseif ($kinds -contains 'content' -or $kinds -contains 'maybe-content') { $mode = 'diff' }
+        if (-not $mode) { continue }
+        $seen[$rowKey] = $true
+        if ($targets.Count -ge $limit) { [void]$omitted.Add($rowKey); continue }
+        [void]$targets.Add([pscustomobject][ordered]@{ rowKey = $rowKey; mode = $mode; row = $row })
+    }
+    return [pscustomobject][ordered]@{ targets = @($targets); omitted = @($omitted) }
+}
+
+# 0〜1 の割合。数値（JSON の数）だけを受け、範囲外は丸める。文字列・真偽値・NaN は捨てる（$null）。
+function ConvertTo-PackChangeReportUnit($Value) {
+    if ($null -eq $Value -or $Value -is [bool] -or $Value -is [string]) { return $null }
+    if (-not ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single])) { return $null }
+    $number = [double]$Value
+    if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return $null }
+    return [Math]::Max(0.0, [Math]::Min(1.0, $number))
+}
+
+# 枠1つ（x・y・width・height が 0〜1）。ページからはみ出す分は削り、面積が無ければ捨てる。
+function ConvertTo-PackChangeReportBox($Box) {
+    if ($null -eq $Box -or $Box -is [string] -or $Box -is [ValueType] -or $Box -is [System.Array]) { return $null }
+    $x = ConvertTo-PackChangeReportUnit (Get-DataProperty $Box 'x' $null)
+    $y = ConvertTo-PackChangeReportUnit (Get-DataProperty $Box 'y' $null)
+    $width = ConvertTo-PackChangeReportUnit (Get-DataProperty $Box 'width' $null)
+    $height = ConvertTo-PackChangeReportUnit (Get-DataProperty $Box 'height' $null)
+    if ($null -eq $x -or $null -eq $y -or $null -eq $width -or $null -eq $height) { return $null }
+    $width = [Math]::Min([double]$width, 1.0 - [double]$x)
+    $height = [Math]::Min([double]$height, 1.0 - [double]$y)
+    if ($width -le 0.0 -or $height -le 0.0) { return $null }
+    return [pscustomobject][ordered]@{ x = [Math]::Round([double]$x, 5); y = [Math]::Round([double]$y, 5); width = [Math]::Round($width, 5); height = [Math]::Round($height, 5) }
+}
+
+# 枠に添える変更前後の文字。原稿の中身そのもの（個人情報・金額を含みうる）なので、制御文字を除き、
+# 空白をまとめ、PackChangeReportTextLimit 字で切る。HTML に書くときは必ず ConvertTo-PackChangeHtmlText を通す。
+function ConvertTo-PackChangeReportDetailText($Value) {
+    if ($null -eq $Value -or -not ($Value -is [string])) { return '' }
+    $clean = [regex]::Replace([string]$Value, '[\x00-\x1F\x7F]', ' ')
+    $clean = [regex]::Replace($clean, '\s+', ' ').Trim()
+    $limit = [Math]::Max(1, [int]$Script:PackChangeReportTextLimit)
+    if ($clean.Length -gt $limit) {
+        $cut = $limit
+        if ([char]::IsHighSurrogate($clean[$cut - 1])) { $cut-- }
+        $clean = $clean.Substring(0, $cut)
+    }
+    return $clean
+}
+
+# 画面が送った details（「くわしく見る」の結果）を、比べ直した結果（$Summary.pages）と突き合わせ、表示用の
+# 座標と文字だけにする。中身は信用しない: 実在する rowKey で、内容が変わった（かもしれない）行の版
+# （fromVersionId・toVersionId）と原稿内のページ番号（beforePageNumber＝fromSourcePageNumber・
+# afterPageNumber＝toSourcePageNumber）が同じものだけ使う。座標は 0〜1 に丸め、種類は4つだけ、
+# 枠は1行 PackChangeReportRegionLimit 件まで、文字は PackChangeReportTextLimit 字まで、全体の見積もりの
+# 大きさは PackChangeReportDetailsMaxBytes まで。返すのは rowKey → 整えた1件 の表。副作用なし。
+function ConvertTo-PackChangeReportDetails($Details, $Summary) {
+    $result = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    if ($null -eq $Details -or $Details -is [string] -or $Details -is [ValueType] -or $Details -is [System.Collections.IDictionary]) { return $result }
+    $rows = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    foreach ($row in @(Get-Array (Get-DataProperty $Summary 'pages' @()))) {
+        $key = [string](Get-DataProperty $row 'rowKey' '')
+        if ([string]::IsNullOrWhiteSpace($key) -or $rows.ContainsKey($key)) { continue }
+        $kinds = @(Get-PackChangeReportRowKinds $row)
+        if ($kinds -notcontains 'content' -and $kinds -notcontains 'maybe-content') { continue }
+        $rows[$key] = $row
+    }
+    $allowedKinds = @('modified','added','removed','unknown')
+    $limit = [Math]::Max(0, [int]$Script:PackChangeReportDetailLimit)
+    $regionLimit = [Math]::Max(0, [int]$Script:PackChangeReportRegionLimit)
+    $budget = [int64]$Script:PackChangeReportDetailsMaxBytes
+    $used = [int64]0
+    $examined = 0
+    foreach ($entry in @(Get-Array $Details)) {
+        $examined++
+        if ($examined -gt ($limit * 5) -or $result.Count -ge $limit) { break }
+        if ($null -eq $entry -or $entry -is [string] -or $entry -is [ValueType] -or $entry -is [System.Array]) { continue }
+        $rowKey = Get-DataProperty $entry 'rowKey' $null
+        if (-not ($rowKey -is [string]) -or -not $rows.ContainsKey($rowKey) -or $result.ContainsKey($rowKey)) { continue }
+        $row = $rows[$rowKey]
+        $fromVersionId = Get-DataProperty $entry 'fromVersionId' $null
+        $toVersionId = Get-DataProperty $entry 'toVersionId' $null
+        if (-not ($fromVersionId -is [string]) -or -not ($toVersionId -is [string])) { continue }
+        if ([string]::IsNullOrWhiteSpace($toVersionId) -or $fromVersionId -cne [string](Get-DataProperty $row 'fromVersionId' '') -or $toVersionId -cne [string](Get-DataProperty $row 'toVersionId' '')) { continue }
+        $afterPage = Get-IntDataProperty $entry 'afterPageNumber' 0
+        $beforePage = Get-IntDataProperty $entry 'beforePageNumber' 0
+        if ($afterPage -le 0 -or $afterPage -ne (Get-IntDataProperty $row 'toSourcePageNumber' 0)) { continue }
+        if ($beforePage -le 0 -or $beforePage -ne (Get-IntDataProperty $row 'fromSourcePageNumber' 0)) { continue }
+        $rawRegions = Get-DataProperty $entry 'regions' @()
+        if ($null -eq $rawRegions -or $rawRegions -is [string] -or $rawRegions -is [ValueType] -or $rawRegions -is [System.Collections.IDictionary]) { $rawRegions = @() }
+        $regions = New-Object System.Collections.ArrayList
+        $size = [int64]200
+        foreach ($region in @(Get-Array $rawRegions | Select-Object -First $regionLimit)) {
+            if ($null -eq $region -or $region -is [string] -or $region -is [ValueType] -or $region -is [System.Array]) { continue }
+            $kind = Get-DataProperty $region 'kind' $null
+            if (-not ($kind -is [string]) -or $allowedKinds -cnotcontains $kind) { continue }
+            $before = ConvertTo-PackChangeReportBox (Get-DataProperty $region 'before' $null)
+            $after = ConvertTo-PackChangeReportBox (Get-DataProperty $region 'after' $null)
+            if ($null -eq $before -and $null -eq $after) { continue }
+            $beforeText = ConvertTo-PackChangeReportDetailText (Get-DataProperty $region 'beforeText' $null)
+            $afterText = ConvertTo-PackChangeReportDetailText (Get-DataProperty $region 'afterText' $null)
+            [void]$regions.Add([pscustomobject][ordered]@{ kind = $kind; before = $before; after = $after; beforeText = $beforeText; afterText = $afterText })
+            $size += [int64](160 + 3 * ($beforeText.Length + $afterText.Length))
+        }
+        $count = $regions.Count
+        $claimed = Get-DataProperty $entry 'regionCount' $null
+        if ($claimed -is [int] -or $claimed -is [long] -or $claimed -is [double] -or $claimed -is [decimal]) {
+            $claimedNumber = [double]$claimed
+            if (-not [double]::IsNaN($claimedNumber) -and $claimedNumber -gt $count) { $count = [int][Math]::Min(100000.0, [Math]::Floor($claimedNumber)) }
+        }
+        if ($used + $size -gt $budget) { continue }
+        $used += $size
+        $result[$rowKey] = [pscustomobject][ordered]@{
+            rowKey = $rowKey; beforePageNumber = $beforePage; afterPageNumber = $afterPage
+            regionCount = $count; regions = @($regions)
+        }
+    }
+    return $result
+}
+
+# 前後のうち大きい方の寸法（左上を合わせる）に対する 0〜1 の枠を、その側の画像の寸法に対する割合に
+# 換算する（ページの大きさが前後で違うと、小さい方の画像では同じ割合が別の位置になる）。
+# 画像の外に出た分は削り、画像に入らない枠は捨てる。副作用なし。
+function ConvertTo-PackChangeReportImageBox($Box, [double]$CanvasWidth, [double]$CanvasHeight, [double]$ImageWidth, [double]$ImageHeight) {
+    if ($null -eq $Box -or $CanvasWidth -le 0 -or $CanvasHeight -le 0 -or $ImageWidth -le 0 -or $ImageHeight -le 0) { return $null }
+    $scaleX = $CanvasWidth / $ImageWidth
+    $scaleY = $CanvasHeight / $ImageHeight
+    $x = [double](Get-DataProperty $Box 'x' 0) * $scaleX
+    $y = [double](Get-DataProperty $Box 'y' 0) * $scaleY
+    $width = [double](Get-DataProperty $Box 'width' 0) * $scaleX
+    $height = [double](Get-DataProperty $Box 'height' 0) * $scaleY
+    if ($x -ge 1.0 -or $y -ge 1.0) { return $null }
+    $width = [Math]::Min($width, 1.0 - $x)
+    $height = [Math]::Min($height, 1.0 - $y)
+    if ($width -le 0.0 -or $height -le 0.0) { return $null }
+    return [pscustomobject][ordered]@{ x = [Math]::Round($x, 5); y = [Math]::Round($y, 5); width = [Math]::Round($width, 5); height = [Math]::Round($height, 5) }
+}
+
+function Get-PackChangeReportCircledNumber([int]$Number) {
+    if ($Number -ge 1 -and $Number -le 20) { return [string][char](0x2460 + $Number - 1) }
+    if ($Number -ge 21 -and $Number -le 35) { return [string][char](0x3251 + $Number - 21) }
+    if ($Number -ge 36 -and $Number -le 50) { return [string][char](0x32B1 + $Number - 36) }
+    return ('(' + [string]$Number + ')')
+}
+
+# 詳細ページ1件の中身（画像・番号つきの枠・番号つきの文字の一覧・注記）を決める。副作用なし。
+# $Target は Get-PackChangeReportDetailTargets の1件、$Detail は ConvertTo-PackChangeReportDetails の1件
+# （画面の計算。無ければ $null）、$Fallback は予備（サーバーの画素比較）の1ページ（regions・width・height。
+# 無ければ $null）、$BeforeImage・$AfterImage は { src, width, height }（作れなかった側は $null）。
+# 画像が1枚も無ければ $null（詳細ページを作らない）。枠は、アプリの差分画面と同じく、追加は今回の画像だけ、
+# 削除は前回の画像だけ、変更・不明は両方に描く。
+function New-PackChangeReportDetailPage($Target, $Detail, $Fallback, $BeforeImage, $AfterImage) {
+    if ($null -eq $BeforeImage -and $null -eq $AfterImage) { return $null }
+    $mode = [string](Get-DataProperty $Target 'mode' 'diff')
+    $page = [pscustomobject][ordered]@{
+        rowKey = [string](Get-DataProperty $Target 'rowKey' ''); mode = $mode; row = (Get-DataProperty $Target 'row' $null)
+        source = 'none'; before = $null; after = $null; regions = @(); regionCount = 0; notes = @()
+    }
+    $notes = New-Object System.Collections.ArrayList
+    $beforeBoxes = New-Object System.Collections.ArrayList
+    $afterBoxes = New-Object System.Collections.ArrayList
+    $listed = New-Object System.Collections.ArrayList
+    if ($mode -eq 'added' -or $mode -eq 'removed') {
+        $page.source = 'page'
+        $whole = [pscustomobject][ordered]@{ number = 1; kind = $mode; x = 0.01; y = 0.01; width = 0.98; height = 0.98 }
+        if ($mode -eq 'added') {
+            if ($null -eq $AfterImage) { return $null }
+            [void]$afterBoxes.Add($whole)
+            [void]$notes.Add('今回だけにあるページです（前回にはありません）。')
+        } else {
+            if ($null -eq $BeforeImage) { return $null }
+            [void]$beforeBoxes.Add($whole)
+            [void]$notes.Add('前回だけにあったページです（今回はなくなりました）。')
+        }
+        [void]$listed.Add([pscustomobject][ordered]@{ number = 1; kind = $mode; beforeText = ''; afterText = '' })
+        $page.regionCount = 1
+    } else {
+        $rawRegions = @()
+        if ($null -ne $Detail) {
+            $page.source = 'browser'
+            $rawRegions = @(Get-Array (Get-DataProperty $Detail 'regions' @()))
+            $page.regionCount = [int](Get-DataProperty $Detail 'regionCount' $rawRegions.Count)
+        } elseif ($null -ne $Fallback) {
+            $page.source = 'server'
+            # サーバーの画素比較の枠は前後で同じ位置（前後のうち大きい方の寸法に対する割合）。
+            $serverRegions = New-Object System.Collections.ArrayList
+            foreach ($region in @(Get-Array (Get-DataProperty $Fallback 'regions' @()))) {
+                $kind = [string](Get-DataProperty $region 'kind' '')
+                if (@('modified','added','removed','unknown') -cnotcontains $kind) { $kind = 'unknown' }
+                $box = ConvertTo-PackChangeReportBox $region
+                if ($null -eq $box) { continue }
+                [void]$serverRegions.Add([pscustomobject][ordered]@{ kind = $kind; before = $box; after = $box; beforeText = ''; afterText = '' })
+            }
+            $page.regionCount = $serverRegions.Count
+            $rawRegions = @($serverRegions | Select-Object -First ([int]$Script:PackChangeReportRegionLimit))
+            [void]$notes.Add('枠は、前回と今回のページの画像の違いから自動で検出した範囲です。')
+        }
+        if ($page.regionCount -lt $rawRegions.Count) { $page.regionCount = $rawRegions.Count }
+        # 換算の基準（前後のうち大きい方の寸法）。片側の画像しか無いときは予備のページの寸法も使う（同じ解像度の画素）。
+        $canvasWidth = 0.0; $canvasHeight = 0.0
+        foreach ($image in @($BeforeImage, $AfterImage)) {
+            if ($null -eq $image) { continue }
+            $canvasWidth = [Math]::Max($canvasWidth, [double](Get-DataProperty $image 'width' 0))
+            $canvasHeight = [Math]::Max($canvasHeight, [double](Get-DataProperty $image 'height' 0))
+        }
+        if ($null -ne $Fallback -and ($null -eq $BeforeImage -or $null -eq $AfterImage)) {
+            $canvasWidth = [Math]::Max($canvasWidth, [double](Get-DataProperty $Fallback 'width' 0))
+            $canvasHeight = [Math]::Max($canvasHeight, [double](Get-DataProperty $Fallback 'height' 0))
+        }
+        $number = 0
+        foreach ($region in $rawRegions) {
+            $kind = [string](Get-DataProperty $region 'kind' 'unknown')
+            $beforeBox = $null; $afterBox = $null
+            if ($null -ne $BeforeImage -and $kind -ne 'added') { $beforeBox = ConvertTo-PackChangeReportImageBox (Get-DataProperty $region 'before' $null) $canvasWidth $canvasHeight ([double]$BeforeImage.width) ([double]$BeforeImage.height) }
+            if ($null -ne $AfterImage -and $kind -ne 'removed') { $afterBox = ConvertTo-PackChangeReportImageBox (Get-DataProperty $region 'after' $null) $canvasWidth $canvasHeight ([double]$AfterImage.width) ([double]$AfterImage.height) }
+            $beforeText = [string](Get-DataProperty $region 'beforeText' '')
+            $afterText = [string](Get-DataProperty $region 'afterText' '')
+            if ($null -eq $beforeBox -and $null -eq $afterBox -and -not $beforeText -and -not $afterText) { continue }
+            $number++
+            if ($null -ne $beforeBox) { [void]$beforeBoxes.Add([pscustomobject][ordered]@{ number = $number; kind = $kind; x = $beforeBox.x; y = $beforeBox.y; width = $beforeBox.width; height = $beforeBox.height }) }
+            if ($null -ne $afterBox) { [void]$afterBoxes.Add([pscustomobject][ordered]@{ number = $number; kind = $kind; x = $afterBox.x; y = $afterBox.y; width = $afterBox.width; height = $afterBox.height }) }
+            [void]$listed.Add([pscustomobject][ordered]@{ number = $number; kind = $kind; beforeText = $beforeText; afterText = $afterText })
+        }
+        if ($listed.Count -eq 0) {
+            [void]$notes.Add('変更箇所を特定できませんでした。前回と今回のページ全体を見比べて確認してください。')
+        } elseif ($page.regionCount -gt $listed.Count) {
+            [void]$notes.Add(('枠は最初の{0}か所だけ表示しています（全部で {1} か所）。' -f $listed.Count, $page.regionCount))
+        }
+        if ($null -eq $BeforeImage) { [void]$notes.Add('前回のページの画像を用意できませんでした。') }
+        if ($null -eq $AfterImage) { [void]$notes.Add('今回のページの画像を用意できませんでした。') }
+    }
+    if ($null -ne $BeforeImage) { $page.before = [pscustomobject][ordered]@{ src = [string]$BeforeImage.src; boxes = @($beforeBoxes) } }
+    if ($null -ne $AfterImage) { $page.after = [pscustomobject][ordered]@{ src = [string]$AfterImage.src; boxes = @($afterBoxes) } }
+    $page.regions = @($listed)
+    $page.notes = @($notes)
+    return $page
+}
+
+# 作った詳細ページの枠の出どころ（meta.json の detailSource）。browser＝すべてアプリと同じ計算、
+# server＝すべてサーバーの予備（または特定できなかった）、mixed＝両方、none＝内容の変わった行の詳細が無い。
+function Get-PackChangeReportDetailSource($DetailPages) {
+    $browser = 0; $other = 0
+    foreach ($page in @(Get-Array $DetailPages)) {
+        if ($null -eq $page -or [string](Get-DataProperty $page 'mode' '') -ne 'diff') { continue }
+        if ([string](Get-DataProperty $page 'source' '') -eq 'browser') { $browser++ } else { $other++ }
+    }
+    if ($browser -eq 0 -and $other -eq 0) { return 'none' }
+    if ($other -eq 0) { return 'browser' }
+    if ($browser -eq 0) { return 'server' }
+    return 'mixed'
+}
+
+# ---- 高さの見積もり（ページ割りを HTML を作る時点でサーバーが決めるため） ----
+# 全角の文字を 1、半角を 0.6 として数える。
+function Get-PackChangeReportTextUnits([string]$Text) {
+    $units = 0.0
+    if ([string]::IsNullOrEmpty($Text)) { return $units }
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        if ($code -lt 0x80 -or ($code -ge 0xFF61 -and $code -le 0xFF9F)) { $units += 0.6 } else { $units += 1.0 }
+    }
+    return $units
+}
+
+function Get-PackChangeReportLineCount([string]$Text, [double]$UnitsPerLine) {
+    if ([string]::IsNullOrEmpty($Text)) { return 1 }
+    return [Math]::Max(1, [int][Math]::Ceiling((Get-PackChangeReportTextUnits $Text) / [Math]::Max(1.0, $UnitsPerLine)))
+}
+
+# 1つの欄が1ページに収まらないほど長いときだけ、省いたことが分かる形で短くする（黙って切らない）。
+function Limit-PackChangeReportText([string]$Text, [double]$UnitsPerLine, [int]$MaxLines) {
+    $budget = [Math]::Max(1.0, $UnitsPerLine * [Math]::Max(1, $MaxLines - 1))
+    if ((Get-PackChangeReportTextUnits $Text) -le $budget) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $used = 0.0
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        $width = $(if ($code -lt 0x80 -or ($code -ge 0xFF61 -and $code -le 0xFF9F)) { 0.6 } else { 1.0 })
+        if ($used + $width -gt $budget) { break }
+        [void]$sb.Append($ch)
+        $used += $width
+    }
+    return ($sb.ToString() + '…（長いため省略しました）')
+}
+
+# 高さ（mm）の列を、1ページ目は $FirstBudget、2ページ目からは $Budget に収まるように分ける。
+# $MaxPerPage が 0 より大きければ1ページの件数もそれまで。結果の pages は各ページの添字の配列。
+# 1ページ目に最初の1件も入らないときは、1ページ目を空にして次のページから載せる。
+function Split-PackChangeReportPages($Heights, [double]$FirstBudget, [double]$Budget, [int]$MaxPerPage = 0) {
+    $pages = New-Object System.Collections.ArrayList
+    $current = New-Object System.Collections.ArrayList
+    $used = 0.0
+    $limit = $FirstBudget
+    $list = @($Heights)
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $height = [double]$list[$i]
+        if ($current.Count -eq 0 -and $pages.Count -eq 0 -and $height -gt $limit -and $limit -lt $Budget) {
+            [void]$pages.Add(@())
+            $limit = $Budget
+            $used = 0.0
+        }
+        $full = ($current.Count -gt 0 -and (($used + $height) -gt $limit -or ($MaxPerPage -gt 0 -and $current.Count -ge $MaxPerPage)))
+        if ($full) {
+            [void]$pages.Add(@($current.ToArray()))
+            $current = New-Object System.Collections.ArrayList
+            $used = 0.0
+            $limit = $Budget
+        }
+        [void]$current.Add($i)
+        $used += $height
+    }
+    if ($current.Count -gt 0) { [void]$pages.Add(@($current.ToArray())) }
+    return [pscustomobject]@{ pages = $pages }
+}
+
+# 一覧の「原稿名 / シート名」。
+function Get-PackChangeReportRowName($Row) {
+    $sheetLabel = [string](Get-DataProperty $Row 'sheetName' '')
+    if ([string]::IsNullOrWhiteSpace($sheetLabel)) { $sheetLabel = [string](Get-DataProperty $Row 'title' '') }
+    $name = (@([string](Get-DataProperty $Row 'sourceName' ''), $sheetLabel) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' / '
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = [string](Get-DataProperty $Row 'title' '') }
+    return $name
+}
+
+# 詳細ページの見出し。頁・左右は pages[] の値のまま（Get-PackChangeReportPageLabel。左右を推定しない）。
+function Get-PackChangeReportDetailHeading($Row) {
+    $toLabel = Get-PackChangeReportPageLabel (Get-DataProperty $Row 'toPage' $null) ([string](Get-DataProperty $Row 'toSide' ''))
+    $fromLabel = Get-PackChangeReportPageLabel (Get-DataProperty $Row 'fromPage' $null) ([string](Get-DataProperty $Row 'fromSide' ''))
+    $hasTo = ($null -ne (Get-DataProperty $Row 'toPage' $null))
+    $partCount = $(if ($hasTo) { Get-IntDataProperty $Row 'toPartCount' 0 } else { Get-IntDataProperty $Row 'fromPartCount' 0 })
+    $partIndex = Get-IntDataProperty $Row 'pagePartIndex' 0
+    $part = ''
+    if ($partCount -gt 1 -and $partIndex -gt 0) { $part = ('（シート内 {0}/{1} ページ）' -f $partIndex, $partCount) }
+    return ('今回 {0} ← 前回 {1}／{2}{3}' -f $toLabel, $fromLabel, (Get-PackChangeReportRowName $Row), $part)
+}
+
+# 詳細ページの文字の一覧（注記のあとに「① 変更: 1,234 → 1,240」のような番号つきの行）。
+# 文字が取れた枠だけを行にし、取れなかった枠は番号をまとめて1行にする。
+function Get-PackChangeReportDetailLines($DetailPage) {
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($note in @(Get-Array (Get-DataProperty $DetailPage 'notes' @()))) { [void]$lines.Add([pscustomobject]@{ cls = 'note'; text = [string]$note }) }
+    if ([string](Get-DataProperty $DetailPage 'mode' '') -ne 'diff') { return @($lines) }
+    $withoutText = New-Object System.Collections.ArrayList
+    $withText = 0
+    foreach ($region in @(Get-Array (Get-DataProperty $DetailPage 'regions' @()))) {
+        $mark = Get-PackChangeReportCircledNumber ([int]$region.number)
+        $label = Get-PackChangeReportRegionKindLabel ([string]$region.kind)
+        $beforeText = [string]$region.beforeText
+        $afterText = [string]$region.afterText
+        $text = ''
+        if ($beforeText -and $afterText) {
+            if ([string]$region.kind -eq 'added') { $text = $afterText }
+            elseif ([string]$region.kind -eq 'removed') { $text = $beforeText }
+            else { $text = $beforeText + ' → ' + $afterText }
+        } elseif ($beforeText) {
+            if ([string]$region.kind -eq 'removed') { $text = $beforeText } else { $text = '変更前「' + $beforeText + '」' }
+        } elseif ($afterText) {
+            if ([string]$region.kind -eq 'added') { $text = $afterText } else { $text = '変更後「' + $afterText + '」' }
+        }
+        if ($text) {
+            $withText++
+            [void]$lines.Add([pscustomobject]@{ cls = 'item'; text = ('{0} {1}: {2}' -f $mark, $label, $text) })
+        } else {
+            [void]$withoutText.Add($mark)
+        }
+    }
+    if ($withoutText.Count -gt 0) {
+        $format = 'このほか、文字の変化を取り出せなかった枠: {0}'
+        if ($withText -eq 0) { $format = '文字の変化は取り出せませんでした。画像の枠（{0}）で確認してください。' }
+        [void]$lines.Add([pscustomobject]@{ cls = 'note'; text = ($format -f (@($withoutText) -join '、')) })
+    }
+    return @($lines)
+}
+
+function Format-PackChangeReportPercent([double]$Value) {
+    return (([double]$Value * 100.0).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture) + '%')
+}
+
+# 変更点PDFの HTML（§6.1 の 表紙・変更一覧・ページごとの詳細・全ページの「確認用」と「変更点 n / N」）。
+# 副作用なし（ファイルを読まない。画像の場所は $DetailPages の src のまま書く）。
+# $Summary は Get-PackChangeSummary の結果（status=ready）。$DetailPages は New-PackChangeReportDetailPage の結果の
+# 配列（無ければ空）。文字（原稿名・シート名・変更前後の文字など）はすべてエスケープする。
+function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetName, [string]$GeneratedAt = '', $DetailPages = @()) {
     $h = { param($Value) ConvertTo-PackChangeHtmlText $Value }
     $from = Get-DataProperty $Summary 'from' $null
     $to = Get-DataProperty $Summary 'to' $null
     $counts = Get-DataProperty $Summary 'counts' $null
     $entries = @(Get-PackChangeReportEntries (Get-DataProperty $Summary 'pages' @()))
+    $selection = Get-PackChangeReportDetailTargets $entries
+    $omittedKeys = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    foreach ($key in @($selection.omitted)) { $omittedKeys[[string]$key] = $true }
+    # 詳細ページは一覧の並び順（対象の順）で、作れたものだけ。
+    $pageByKey = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    foreach ($detailPage in @(Get-Array $DetailPages)) {
+        if ($null -eq $detailPage) { continue }
+        $key = [string](Get-DataProperty $detailPage 'rowKey' '')
+        if ($key -and -not $pageByKey.ContainsKey($key)) { $pageByKey[$key] = $detailPage }
+    }
+    $details = New-Object System.Collections.ArrayList
+    $detailKeys = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    $missingDetails = 0
+    foreach ($target in @($selection.targets)) {
+        $key = [string]$target.rowKey
+        if ($pageByKey.ContainsKey($key)) { [void]$details.Add($pageByKey[$key]); $detailKeys[$key] = $true } else { $missingDetails++ }
+    }
+
+    # ---- 一覧のページ割り（行の高さを中身から見積もる。3行で切らない） ----
+    # 欄の幅は A4 横の本文 273mm の 12/12/24/27/25%。9pt の全角1文字を 3.3mm、1行を 4.3mm と見積もる。
+    # 1ページの高さは「PackChangeReportRowsPerPage 行 × 最小の行の高さ」で、行数もそれを超えない。
     $perPage = [Math]::Max(1, [int]$Script:PackChangeReportRowsPerPage)
-    $listPageCount = [int][Math]::Ceiling($entries.Count / [double]$perPage)
-    $totalPages = 1 + $listPageCount
+    $rowMin = [double]$Script:PackChangeReportRowMinMm
+    # 足し算の丸め誤差で12行目がはみ出したことにならないよう、わずかに余裕を持たせる。
+    $listBudget = $perPage * $rowMin + 0.01
+    $nameUnits = 18.0; $kindsUnits = 21.0; $visualUnits = 19.0; $shiftUnits = 81.0
+    $maxCellLines = [Math]::Max(2, [int][Math]::Floor(($listBudget - 2.4) / 4.3))
+    $rowCells = New-Object System.Collections.ArrayList
+    $rowHeights = New-Object System.Collections.ArrayList
+    foreach ($entry in $entries) {
+        if ([string]$entry.type -eq 'shift') {
+            $shiftText = Get-PackChangeReportShiftText $entry
+            [void]$rowCells.Add([pscustomobject]@{ shift = $shiftText })
+            [void]$rowHeights.Add([Math]::Max($rowMin, (Get-PackChangeReportLineCount $shiftText $shiftUnits) * 4.3 + 2.4))
+            continue
+        }
+        $row = $entry.row
+        $rowKey = [string](Get-DataProperty $row 'rowKey' '')
+        $halfLines = [int][Math]::Floor($maxCellLines / 2)
+        $name = Limit-PackChangeReportText (Get-PackChangeReportRowName $row) $nameUnits $maxCellLines
+        $kindsText = Limit-PackChangeReportText ((@(Get-PackChangeReportKindLabels $row)) -join '、') $kindsUnits $halfLines
+        $rowMessage = Limit-PackChangeReportText ([string](Get-DataProperty $row 'message' '')) $kindsUnits $halfLines
+        $detailPageForRow = $null
+        if ($rowKey -and $detailKeys.ContainsKey($rowKey)) { $detailPageForRow = $pageByKey[$rowKey] }
+        $isOmitted = [bool]($rowKey -and $omittedKeys.ContainsKey($rowKey))
+        # 詳細ページの番号はまだ決まらないので、桁の多い仮の番号で高さを見積もる。
+        $visualEstimate = Get-PackChangeReportVisualText $row $detailPageForRow 9999 $isOmitted
+        $kindsLines = Get-PackChangeReportLineCount $kindsText $kindsUnits
+        if ($rowMessage) { $kindsLines = Get-PackChangeReportLineCount ($kindsText + ' ' + $rowMessage) $kindsUnits }
+        $lines = [Math]::Max((Get-PackChangeReportLineCount $name $nameUnits), [Math]::Max($kindsLines, (Get-PackChangeReportLineCount $visualEstimate $visualUnits)))
+        [void]$rowCells.Add([pscustomobject]@{ shift = $null; row = $row; rowKey = $rowKey; name = $name; kinds = $kindsText; message = $rowMessage; detail = $detailPageForRow; omitted = $isOmitted })
+        [void]$rowHeights.Add([Math]::Max($rowMin, $lines * 4.3 + 2.4))
+    }
+    $listSplit = Split-PackChangeReportPages @($rowHeights) $listBudget $listBudget $perPage
+    $listPageCount = [int]$listSplit.pages.Count
+
+    # ---- 詳細ページの割り付け（1件1ページ。文字の一覧が入りきらなければ「続き」のページを足す） ----
+    # 本文 186mm から、上の印 11mm・見出し・凡例 5mm・左右の画像 104mm を引いた残りに一覧を入れる。
+    $detailLayouts = New-Object System.Collections.ArrayList
+    $nextPage = 2 + $listPageCount
+    foreach ($detailPage in $details) {
+        $heading = Get-PackChangeReportDetailHeading $detailPage.row
+        $headingHeight = (Get-PackChangeReportLineCount $heading 64.0) * 5.3 + 2.0
+        $detailLines = @(Get-PackChangeReportDetailLines $detailPage)
+        $lineHeights = @($detailLines | ForEach-Object { (Get-PackChangeReportLineCount ([string]$_.text) 78.0) * 4.7 + 0.6 })
+        $firstBudget = [Math]::Max(10.0, 186.0 - 11.0 - $headingHeight - 5.0 - 104.0 - 2.0)
+        $moreBudget = 186.0 - 11.0 - $headingHeight - 2.0
+        $split = Split-PackChangeReportPages $lineHeights $firstBudget $moreBudget 0
+        $sheetCount = [Math]::Max(1, [int]$split.pages.Count)
+        [void]$detailLayouts.Add([pscustomobject]@{ page = $detailPage; heading = $heading; lines = $detailLines; split = $split.pages; sheets = $sheetCount; number = $nextPage })
+        $nextPage += $sheetCount
+    }
+    $detailNumberByKey = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    foreach ($layout in $detailLayouts) { $detailNumberByKey[[string]$layout.page.rowKey] = [int]$layout.number }
+    $totalPages = $nextPage - 1
+
     $title = '提出用PDF 変更点のお知らせ'
     $subject = (@($PackName, $TargetName) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join ' ／ '
     $mark = '<div class="mark"><span class="mark-badge">確認用</span><span class="mark-title">' + (& $h ($title + $(if ($subject) { ' ／ ' + $subject } else { '' }))) + '</span></div>'
@@ -14504,8 +15010,17 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
     [void]$sb.Append('.versions{display:flex;gap:5mm;margin-bottom:5mm}.version{flex:1;border:0.3mm solid #d0d7de;padding:3mm 4mm}.version h3{margin:0 0 2mm;font-size:11.5pt}.version p{margin:0.8mm 0}.arrow{align-self:center;font-size:16pt;color:#57606a}')
     [void]$sb.Append('.counts{border-collapse:collapse;margin-bottom:4mm}.counts td{border:0.3mm solid #d0d7de;padding:1.2mm 4mm}.counts td.n{text-align:right;font-weight:700;min-width:16mm}')
     [void]$sb.Append('.notes p{margin:1mm 0}.none{font-size:14pt;font-weight:700;margin:6mm 0}.notice{font-weight:700;margin-top:4mm}')
-    [void]$sb.Append('table.list{width:100%;border-collapse:collapse;table-layout:fixed}.list th,.list td{border:0.3mm solid #d0d7de;padding:1mm 2mm;text-align:left;vertical-align:top;overflow:hidden}.list th{background:#f6f8fa;font-size:9.5pt}')
-    [void]$sb.Append('.list tr.r td{height:12.4mm;font-size:9pt;line-height:1.35}.clip{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.list small{color:#57606a}.list tr.shift td{color:#57606a}')
+    # 一覧の欄は行の高さを中身に合わせる（行数で切らない。ページ割りは見積もった高さでサーバーが決める）。
+    [void]$sb.Append('table.list{width:100%;border-collapse:collapse;table-layout:fixed}.list th,.list td{border:0.3mm solid #d0d7de;padding:1mm 2mm;text-align:left;vertical-align:top;overflow-wrap:anywhere}.list th{background:#f6f8fa;font-size:9.5pt}')
+    [void]$sb.Append('.list tr.r td{height:12.4mm;font-size:9pt;line-height:1.35}.list small{color:#57606a}.list tr.shift td{color:#57606a}')
+    # 詳細ページ。枠の色はアプリの凡例（変更＝琥珀・追加＝青・削除＝赤の破線・不明＝灰の点線）と合わせ、色だけに頼らず番号と文字を付ける。
+    [void]$sb.Append('.dh{font-size:11.5pt;line-height:1.3;margin:0 0 2mm;overflow-wrap:anywhere}.legend{display:flex;flex-wrap:wrap;gap:4mm;font-size:8.5pt;color:#57606a;height:5mm;margin:0}.legend i{display:inline-block;width:4mm;height:2.6mm;border:0.5mm solid rgb(var(--c));margin-right:1mm;vertical-align:-0.2mm}')
+    [void]$sb.Append('.pair{display:flex;gap:5mm;margin-bottom:3mm}.side{flex:1;min-width:0}.side-h{font-size:9pt;font-weight:700;height:5mm;line-height:5mm;overflow:hidden;white-space:nowrap}')
+    [void]$sb.Append('.pic{box-sizing:border-box;height:96mm;border:0.3mm solid #d0d7de;background:#f6f8fa;display:flex;align-items:flex-start;justify-content:center;overflow:hidden}.pic.empty{align-items:center;color:#57606a;font-size:9.5pt}')
+    [void]$sb.Append('.frame{position:relative;display:inline-block;line-height:0}.frame img{display:block;max-width:133mm;max-height:95mm;width:auto;height:auto}')
+    [void]$sb.Append('.box{position:absolute;box-sizing:border-box;border:0.6mm solid rgb(var(--c));background:rgba(var(--c),.12)}.tag{position:absolute;left:-0.6mm;top:-4.4mm;background:rgb(var(--c));color:#fff;font-size:8pt;font-weight:700;line-height:4.2mm;padding:0 1mm;white-space:nowrap;border-radius:0.6mm}.box.in .tag{top:0}')
+    [void]$sb.Append('.modified{--c:155,95,0}.added{--c:28,103,190}.removed{--c:200,48,55}.unknown{--c:105,113,124}.box.removed,.legend .removed i{border-style:dashed}.box.unknown,.legend .unknown i{border-style:dotted}')
+    [void]$sb.Append('.lines{margin:0;padding:0;list-style:none;font-size:9.5pt;line-height:1.4}.lines li{margin:0 0 0.6mm;overflow-wrap:anywhere}.lines li.note{color:#57606a}')
     [void]$sb.Append('</style></head><body>')
 
     # ---- 表紙 ----
@@ -14553,7 +15068,17 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
         $noneText = $(if ([bool](Get-DataProperty $from 'isLastPublished' $false) -and $fromPublished) { '前回コピーしたときから、変わったページはありません。' } else { '比べた2つの版のあいだで、変わったページはありません。' })
         [void]$sb.Append('<p class="none">' + (& $h $noneText) + '</p>')
     }
-    $noteTexts = @(Get-Array (Get-DataProperty $Summary 'notes' @()) | ForEach-Object { [string](Get-DataProperty $_ 'message' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notlike '*変わったページはありません*' })
+    $noteTexts = New-Object System.Collections.ArrayList
+    foreach ($noteText in @(Get-Array (Get-DataProperty $Summary 'notes' @()) | ForEach-Object { [string](Get-DataProperty $_ 'message' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notlike '*変わったページはありません*' })) { [void]$noteTexts.Add($noteText) }
+    if ($detailLayouts.Count -gt 0) {
+        [void]$noteTexts.Add(('ページごとの詳細（前回・今回のページの画像と、変わった箇所の番号つきの枠）は p.{0} から {1} ページ分を載せています。' -f [int]$detailLayouts[0].number, $detailLayouts.Count))
+    }
+    if (@($selection.omitted).Count -gt 0) {
+        [void]$noteTexts.Add(('ページごとの詳細は最初の{0}ページ分だけ載せています（ほかの {1} ページは一覧だけです）。' -f [int]$Script:PackChangeReportDetailLimit, @($selection.omitted).Count))
+    }
+    if ($missingDetails -gt 0) {
+        [void]$noteTexts.Add(('{0} ページは画像を用意できなかったため、ページごとの詳細を載せていません（一覧の「見た目の変化」を見てください）。' -f $missingDetails))
+    }
     if ($noteTexts.Count -gt 0) {
         [void]$sb.Append('<div class="notes">')
         foreach ($noteText in $noteTexts) { [void]$sb.Append('<p>' + (& $h $noteText) + '</p>') }
@@ -14569,42 +15094,101 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
         [void]$sb.Append('<section class="sheet list-page">')
         [void]$sb.Append($mark)
         [void]$sb.Append('<h2>変更一覧</h2>')
-        [void]$sb.Append('<table class="list"><colgroup><col style="width:13%"><col style="width:13%"><col style="width:25%"><col style="width:30%"><col style="width:19%"></colgroup>')
+        [void]$sb.Append('<table class="list"><colgroup><col style="width:12%"><col style="width:12%"><col style="width:24%"><col style="width:27%"><col style="width:25%"></colgroup>')
         [void]$sb.Append('<thead><tr><th>今回 p.／左右</th><th>前回 p.／左右</th><th>原稿名 / シート名</th><th>変わったこと</th><th>見た目の変化</th></tr></thead><tbody>')
-        $startIndex = $pageIndex * $perPage
-        $endIndex = [Math]::Min($entries.Count, $startIndex + $perPage) - 1
-        for ($i = $startIndex; $i -le $endIndex; $i++) {
-            $entry = $entries[$i]
-            if ([string]$entry.type -eq 'shift') {
-                [void]$sb.Append('<tr class="r shift"><td colspan="5"><div class="clip">' + (& $h (Get-PackChangeReportShiftText $entry)) + '</div></td></tr>')
+        foreach ($i in @($listSplit.pages[$pageIndex])) {
+            $cells = $rowCells[[int]$i]
+            if ($null -ne $cells.shift) {
+                [void]$sb.Append('<tr class="r shift"><td colspan="5">' + (& $h $cells.shift) + '</td></tr>')
                 continue
             }
-            $row = $entry.row
-            $sheetLabel = [string](Get-DataProperty $row 'sheetName' '')
-            if ([string]::IsNullOrWhiteSpace($sheetLabel)) { $sheetLabel = [string](Get-DataProperty $row 'title' '') }
-            $name = (@([string](Get-DataProperty $row 'sourceName' ''), $sheetLabel) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' / '
-            if ([string]::IsNullOrWhiteSpace($name)) { $name = [string](Get-DataProperty $row 'title' '') }
-            $kindsText = (@(Get-PackChangeReportKindLabels $row)) -join '、'
-            $rowMessage = [string](Get-DataProperty $row 'message' '')
+            $row = $cells.row
+            $detailNumber = 0
+            if ($null -ne $cells.detail -and $detailNumberByKey.ContainsKey([string]$cells.rowKey)) { $detailNumber = [int]$detailNumberByKey[[string]$cells.rowKey] }
+            $visualText = Get-PackChangeReportVisualText $row $cells.detail $detailNumber ([bool]$cells.omitted)
             [void]$sb.Append('<tr class="r">')
             [void]$sb.Append('<td>' + (& $h (Get-PackChangeReportPageLabel (Get-DataProperty $row 'toPage' $null) ([string](Get-DataProperty $row 'toSide' '')))) + '</td>')
             [void]$sb.Append('<td>' + (& $h (Get-PackChangeReportPageLabel (Get-DataProperty $row 'fromPage' $null) ([string](Get-DataProperty $row 'fromSide' '')))) + '</td>')
-            [void]$sb.Append('<td><div class="clip">' + (& $h $name) + '</div></td>')
-            [void]$sb.Append('<td><div class="clip">' + (& $h $kindsText) + $(if ($rowMessage) { ' <small>' + (& $h $rowMessage) + '</small>' } else { '' }) + '</div></td>')
-            [void]$sb.Append('<td><div class="clip">' + (& $h (Get-PackChangeReportVisualText $row)) + '</div></td>')
+            [void]$sb.Append('<td>' + (& $h $cells.name) + '</td>')
+            [void]$sb.Append('<td>' + (& $h $cells.kinds) + $(if ($cells.message) { ' <small>' + (& $h $cells.message) + '</small>' } else { '' }) + '</td>')
+            [void]$sb.Append('<td>' + (& $h $visualText) + '</td>')
             [void]$sb.Append('</tr>')
         }
         [void]$sb.Append('</tbody></table>')
         [void]$sb.Append((& $footer ($pageIndex + 2)))
         [void]$sb.Append('</section>')
     }
+
+    # ---- ページごとの詳細 ----
+    $legend = '<p class="legend"><span class="modified"><i></i>変更</span><span class="added"><i></i>追加</span><span class="removed"><i></i>削除</span><span class="unknown"><i></i>不明</span></p>'
+    foreach ($layout in $detailLayouts) {
+        $detailPage = $layout.page
+        $row = $detailPage.row
+        for ($sheetIndex = 0; $sheetIndex -lt [int]$layout.sheets; $sheetIndex++) {
+            if ($sheetIndex -eq 0) { [void]$sb.Append('<section class="sheet detail">') } else { [void]$sb.Append('<section class="sheet detail-more">') }
+            [void]$sb.Append($mark)
+            $headingText = [string]$layout.heading
+            if ($sheetIndex -gt 0) { $headingText += '（続き）' }
+            [void]$sb.Append('<h2 class="dh">' + (& $h $headingText) + '</h2>')
+            if ($sheetIndex -eq 0) {
+                [void]$sb.Append($legend)
+                [void]$sb.Append('<div class="pair">')
+                foreach ($sideName in @('before','after')) {
+                    if ($sideName -eq 'before') {
+                        $image = $detailPage.before
+                        $sideTitle = '前回 ' + (Get-PackChangeReportPageLabel (Get-DataProperty $row 'fromPage' $null) ([string](Get-DataProperty $row 'fromSide' '')))
+                    } else {
+                        $image = $detailPage.after
+                        $sideTitle = '今回 ' + (Get-PackChangeReportPageLabel (Get-DataProperty $row 'toPage' $null) ([string](Get-DataProperty $row 'toSide' '')))
+                    }
+                    [void]$sb.Append('<div class="side"><div class="side-h">' + (& $h $sideTitle) + '</div>')
+                    if ($null -eq $image) {
+                        $emptyText = '画像を用意できませんでした'
+                        if ([string]$detailPage.mode -eq 'added' -and $sideName -eq 'before') { $emptyText = '前回にはこのページがありません' }
+                        if ([string]$detailPage.mode -eq 'removed' -and $sideName -eq 'after') { $emptyText = '今回はこのページがありません' }
+                        [void]$sb.Append('<div class="pic empty">' + (& $h $emptyText) + '</div></div>')
+                        continue
+                    }
+                    $boxes = @(Get-Array $image.boxes)
+                    [void]$sb.Append('<div class="pic"><div class="frame"><img src="' + (& $h ([string]$image.src)) + '" alt="">')
+                    foreach ($box in $boxes) {
+                        $kind = [string]$box.kind
+                        if (@('modified','added','removed','unknown') -cnotcontains $kind) { $kind = 'unknown' }
+                        $inside = ([double]$box.y -lt 0.05 -or $boxes.Count -gt 12)
+                        $style = ('left:{0};top:{1};width:{2};height:{3}' -f (Format-PackChangeReportPercent ([double]$box.x)), (Format-PackChangeReportPercent ([double]$box.y)), (Format-PackChangeReportPercent ([double]$box.width)), (Format-PackChangeReportPercent ([double]$box.height)))
+                        $tag = (Get-PackChangeReportCircledNumber ([int]$box.number)) + (Get-PackChangeReportRegionKindLabel $kind)
+                        $boxClass = 'box ' + $kind
+                        if ($inside) { $boxClass += ' in' }
+                        [void]$sb.Append('<div class="' + $boxClass + '" style="' + $style + '"><span class="tag">' + (& $h $tag) + '</span></div>')
+                    }
+                    [void]$sb.Append('</div></div></div>')
+                }
+                [void]$sb.Append('</div>')
+            }
+            $indexes = @()
+            if ($sheetIndex -lt $layout.split.Count) { $indexes = @($layout.split[$sheetIndex]) }
+            if ($indexes.Count -gt 0) {
+                [void]$sb.Append('<ul class="lines">')
+                foreach ($lineIndex in $indexes) {
+                    $line = $layout.lines[[int]$lineIndex]
+                    $lineClass = 'item'
+                    if ([string]$line.cls -eq 'note') { $lineClass = 'note' }
+                    [void]$sb.Append('<li class="' + $lineClass + '">' + (& $h ([string]$line.text)) + '</li>')
+                }
+                [void]$sb.Append('</ul>')
+            }
+            [void]$sb.Append((& $footer ([int]$layout.number + $sheetIndex)))
+            [void]$sb.Append('</section>')
+        }
+    }
     [void]$sb.Append('</body></html>')
     return $sb.ToString()
 }
 
-# 変更点PDFを作る待ち時間の上限。件数に比例させる（60秒＋1件あたり0.5秒、最大10分）。
-function Get-PackChangeReportTimeoutSeconds([int]$ItemCount) {
-    $seconds = 60 + [int][Math]::Ceiling([Math]::Max(0, $ItemCount) * 0.5)
+# 変更点PDFを作る待ち時間の上限。件数と詳細ページの画像の枚数に比例させる
+# （60秒＋一覧の1件あたり0.5秒＋画像1枚あたり1.5秒、最大10分）。
+function Get-PackChangeReportTimeoutSeconds([int]$ItemCount, [int]$ImageCount = 0) {
+    $seconds = 60 + [int][Math]::Ceiling([Math]::Max(0, $ItemCount) * 0.5 + [Math]::Max(0, $ImageCount) * 1.5)
     return [int][Math]::Min([int]$Script:EdgePrintMaxTimeoutSeconds, $seconds)
 }
 
@@ -14680,7 +15264,7 @@ function Get-PackChangeReportFileName([string]$OutputFileName) {
 # Resolve-PublishableChangeReport で決める。ここでは作成済みかどうかだけ。
 function Get-PackChangeReportState([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId, [string]$FromOutputPdfSha256, [string]$ToOutputPdfSha256, [bool]$Complete, [string]$OutputFileName = '') {
     $reportId = ([string]$FromBuildId + '__' + [string]$ToBuildId)
-    $state = [ordered]@{ exists = $false; reportId = $reportId; fileName = (Get-PackChangeReportFileName $OutputFileName); createdAt = ''; attachable = $false; publishable = $false; reason = 'not-created' }
+    $state = [ordered]@{ exists = $false; reportId = $reportId; fileName = (Get-PackChangeReportFileName $OutputFileName); createdAt = ''; attachable = $false; publishable = $false; reason = 'not-created'; detailSource = '' }
     $dir = Get-PackChangeReportDir $Language $PackId $TargetId $FromBuildId $ToBuildId
     $metaPath = Join-Path $dir 'meta.json'
     $pdfPath = Join-Path $dir 'report.pdf'
@@ -14700,6 +15284,9 @@ function Get-PackChangeReportState([string]$Language, [string]$PackId, [string]$
     if (-not $valid) { $state.reason = 'outdated'; return $state }
     $state.exists = $true
     $state.createdAt = [string](Get-DataProperty $meta 'createdAt' '')
+    # 詳細ページの枠の出どころ（browser／server／mixed／none）。server・mixed は画面で
+    # 「一部は画像の違いから自動で検出した範囲」と伝える。
+    $state.detailSource = [string](Get-DataProperty $meta 'detailSource' '')
     $state.reason = 'created'
     return $state
 }
@@ -14774,7 +15361,9 @@ function Get-PackChangeReportLockPath([string]$Language, [string]$Kind, [string]
 # 変更点PDFの作成を始める（POST /api/v2/outputs/changes/report）。比べる2つの版は画面に出ている
 # 組み合わせ（fromBuildId・toBuildId の両方）で受け取る。作成済みなら作り直さない。同じ組み合わせの
 # 作成中のジョブがあれば、それに合流する（起動ロックで1本にまとめる）。
-function Start-PackChangeReportJob([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId) {
+# $Details は画面が集めた「くわしく見る」の結果。ConvertTo-PackChangeReportDetails で比べ直した結果と
+# 突き合わせ、表示用の座標と文字だけをジョブの入力に入れる（中身は信用しない。ここでは画像を作らない）。
+function Start-PackChangeReportJob([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId, $Details = $null) {
     if ([string]::IsNullOrWhiteSpace($FromBuildId) -or [string]::IsNullOrWhiteSpace($ToBuildId)) {
         throw [ArgumentException]::new('変更点PDFを作る2つの版（fromBuildId・toBuildId）を指定してください。')
     }
@@ -14790,6 +15379,7 @@ function Start-PackChangeReportJob([string]$Language, [string]$PackId, [string]$
     $fromBuildId = [string]$summary.from.buildId
     $toBuildId = [string]$summary.to.buildId
     $reportDir = Get-PackChangeReportDir $Language $packId $targetId $fromBuildId $toBuildId
+    $validDetails = ConvertTo-PackChangeReportDetails $Details $summary
     $launchLock = Get-PackChangeReportLockPath $Language 'launch' $packId $targetId $fromBuildId $toBuildId
     return Invoke-WithLock $launchLock {
         if ([bool](Get-DataProperty $summary.report 'exists' $false)) {
@@ -14832,6 +15422,7 @@ function Start-PackChangeReportJob([string]$Language, [string]$PackId, [string]$
             Write-JsonFile $inputPath ([ordered]@{
                 jobId = $jobId; mode = $Language; packId = $packId; targetId = $targetId
                 fromBuildId = $fromBuildId; toBuildId = $toBuildId
+                details = @($validDetails.Values)
                 reportDir = $reportDir; statusPath = $statusPath
                 stdoutPath = $stdoutPath; stderrPath = $stderrPath
                 generationLockPath = (Get-PackChangeReportLockPath $Language 'generate' $packId $targetId $fromBuildId $toBuildId)
@@ -14856,8 +15447,215 @@ function Start-PackChangeReportJob([string]$Language, [string]$PackId, [string]$
     }
 }
 
-# 子プロセスの本体。比べ直し → HTML → Edge で PDF → ハッシュを記録。report.pdf は一時名で書いてから
-# 名前を変え、meta.json を最後に書く（meta.json と report.pdf のハッシュが合わないものは作成済みにしない）。
+# PNG の幅・高さ（IHDR）。読めなければ $null。詳細ページの枠を画像ごとの寸法に換算するのに使う。
+function Get-PngImageSize([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $stream = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $bytes = New-Object byte[] 24
+        if ($stream.Read($bytes, 0, 24) -lt 24) { return $null }
+        $signature = @(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        for ($i = 0; $i -lt 8; $i++) { if ([int]$bytes[$i] -ne $signature[$i]) { return $null } }
+        if ([Text.Encoding]::ASCII.GetString($bytes, 12, 4) -ne 'IHDR') { return $null }
+        $width = ([int]$bytes[16] * 16777216) + ([int]$bytes[17] * 65536) + ([int]$bytes[18] * 256) + [int]$bytes[19]
+        $height = ([int]$bytes[20] * 16777216) + ([int]$bytes[21] * 65536) + ([int]$bytes[22] * 256) + [int]$bytes[23]
+        if ($width -le 0 -or $height -le 0) { return $null }
+        return [pscustomobject]@{ width = [int]$width; height = [int]$height }
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+# 詳細ページの前回・今回の画像を作る元（原稿・版・シート・原稿内のページ番号）。版はアーカイブに記録された
+# 版（提出用PDFに入った版）だけを使い、別の版に代えない。分からない側は $null。副作用なし。
+# fromSourceId・fromSheetName の無い古い summary.json では、同じ原稿と分かるとき（くわしく見られる行・
+# なくなった行）だけ今回の原稿・シート名で前回を引く。
+function Get-PackChangeReportImageSides($Row, [string]$Mode) {
+    $sourceId = [string](Get-DataProperty $Row 'sourceId' '')
+    $sheetName = [string](Get-DataProperty $Row 'sheetName' '')
+    $before = $null
+    $after = $null
+    if ($Mode -ne 'added') {
+        $fromSourceId = Get-DataProperty $Row 'fromSourceId' $null
+        if ($null -eq $fromSourceId) {
+            $fromSourceId = ''
+            if ($Mode -eq 'removed' -or [bool](Get-DataProperty $Row 'detailAvailable' $false)) { $fromSourceId = $sourceId }
+        }
+        $fromSheetName = [string](Get-DataProperty $Row 'fromSheetName' '')
+        if ([string]::IsNullOrWhiteSpace($fromSheetName)) { $fromSheetName = $sheetName }
+        $side = [pscustomobject][ordered]@{
+            workbookId = [string]$fromSourceId; snapshotId = [string](Get-DataProperty $Row 'fromSnapshotId' '')
+            versionId = [string](Get-DataProperty $Row 'fromVersionId' ''); sheetName = $fromSheetName
+            pageNumber = (Get-IntDataProperty $Row 'fromSourcePageNumber' 0)
+        }
+        if ($side.workbookId -and $side.snapshotId -and $side.versionId -and $side.sheetName -and $side.pageNumber -gt 0) { $before = $side }
+    }
+    if ($Mode -ne 'removed') {
+        $side = [pscustomobject][ordered]@{
+            workbookId = $sourceId; snapshotId = [string](Get-DataProperty $Row 'toSnapshotId' '')
+            versionId = [string](Get-DataProperty $Row 'toVersionId' ''); sheetName = $sheetName
+            pageNumber = (Get-IntDataProperty $Row 'toSourcePageNumber' 0)
+        }
+        if ($side.workbookId -and $side.snapshotId -and $side.versionId -and $side.sheetName -and $side.pageNumber -gt 0) { $after = $side }
+    }
+    return [pscustomobject][ordered]@{ before = $before; after = $after }
+}
+
+# 詳細ページの画像を作るあいだ、使う版（スナップショットと変換PDF）が整理されないよう lease を取る
+# （New-DiffJobLeases と同じ順にロックを持つ）。版ごとに取り、取れなかった版は使わない（返さない）。
+function New-PackChangeReportLeases([string]$Language, $Versions, [string]$JobId) {
+    $workspace = Get-WorkspacePath $Language
+    $historyLock = Join-Path $workspace 'locks\history-cleanup.lock'
+    $leases = New-Object System.Collections.ArrayList
+    $index = 0
+    foreach ($version in @(Get-Array $Versions)) {
+        $index++
+        $purpose = 'change-report-' + [string]$index
+        try {
+            $contentLock = Get-ContentPdfMaintenanceLockPath $workspace ([string]$version.workbookId)
+            $lease = Invoke-WithLock $historyLock {
+                Invoke-WithLock $contentLock {
+                    if ($null -eq (Get-SnapshotManifest $Language ([string]$version.workbookId) ([string]$version.snapshotId))) { throw '版の記録が整理されています。' }
+                    $availability = Get-HistoryRenderVersionAvailability $Language ([string]$version.workbookId) ([string]$version.snapshotId) ([string]$version.versionId)
+                    if (-not [bool]$availability.ready) { throw [string]$availability.reason }
+                    $snapshotLease = New-SnapshotLease $Language ([string]$version.workbookId) ([string]$version.snapshotId) $purpose $JobId 120 ([string]$version.versionId)
+                    if ([string]::IsNullOrWhiteSpace($snapshotLease)) { throw '履歴版の保護leaseを作成できませんでした。' }
+                    $contentLease = New-ContentPdfLease $workspace ([string]$version.workbookId) ([string]$version.versionId) $purpose $JobId 120
+                    if ([string]::IsNullOrWhiteSpace($contentLease)) {
+                        Remove-SnapshotLease $Language ([string]$version.workbookId) ([string]$version.snapshotId) $snapshotLease
+                        throw 'content PDFの保護leaseを作成できませんでした。'
+                    }
+                    return [pscustomobject][ordered]@{
+                        workbookId = [string]$version.workbookId; snapshotId = [string]$version.snapshotId; versionId = [string]$version.versionId
+                        snapshotLeaseName = $snapshotLease; contentLeaseName = $contentLease
+                    }
+                }
+            }
+            if ($null -ne $lease) { [void]$leases.Add($lease) }
+        } catch { }
+    }
+    return @($leases)
+}
+
+function Remove-PackChangeReportLeases([string]$Language, $Leases) {
+    $workspace = ''
+    try { $workspace = Get-WorkspacePath $Language } catch { return }
+    foreach ($lease in @(Get-Array $Leases)) {
+        try {
+            Remove-SnapshotLease $Language ([string]$lease.workbookId) ([string]$lease.snapshotId) ([string]$lease.snapshotLeaseName)
+            Remove-ContentPdfLease $workspace ([string]$lease.workbookId) ([string]$lease.versionId) ([string]$lease.contentLeaseName)
+        } catch { }
+    }
+}
+
+# バッチが作業フォルダーに書いた1枚の画像（{0000}-b.png／{0000}-a.png だけ。永続の画像フォルダーの
+# render.png や、名前の形が違うものは使わない）。{ src（report.html からの相対パス）, width, height }。
+function Get-PackChangeReportImageFile([string]$Directory, [string]$ItemId, [string]$FileName) {
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -notmatch '^[0-9]{4}-[ab]\.png$' -or $ItemId -notmatch '^i[0-9]{4}$') { return $null }
+    $size = Get-PngImageSize (Join-Path $Directory $FileName)
+    if ($null -eq $size) { return $null }
+    return [pscustomobject][ordered]@{ src = ('img/' + $ItemId + '/' + $FileName); width = [int]$size.width; height = [int]$size.height }
+}
+
+# 詳細ページの前回・今回の画像を、差分画面のサーバー側の画像化（Invoke-DiffImageBatchGeneration・
+# PdfBatchRasterizer）で作業フォルダーの img\ に作る。原稿の変換PDFは Resolve-DiffContentPdfPath で
+# アーカイブに記録された版を厳密に引く（別の版に代えない）。同じ原稿・シートの組み合わせは1件にまとめる。
+# あわせて、前後が両方あるページの画素比較の枠（予備。画面の結果が無い行に使う）も返す。
+# 返すのは rowKey → { before, after, fallback }（作れなかったものは $null）。失敗しても例外にしない
+# （画像の無い行は一覧だけになる）。lease は画像を作るあいだだけ持ち、作り終えたら外す（画像は複製済み）。
+function Invoke-PackChangeReportImages([string]$Language, $Targets, [string]$WorkDir, [string]$JobId) {
+    $result = [pscustomobject][ordered]@{ images = (New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)); error = '' }
+    $plans = New-Object System.Collections.ArrayList
+    $versions = [ordered]@{}
+    foreach ($target in @(Get-Array $Targets)) {
+        $sides = Get-PackChangeReportImageSides $target.row ([string]$target.mode)
+        if ($null -eq $sides.before -and $null -eq $sides.after) { continue }
+        foreach ($side in @($sides.before, $sides.after)) {
+            if ($null -eq $side) { continue }
+            $versionKey = Get-PackChangeVersionKey ([string]$side.workbookId) ([string]$side.snapshotId) ([string]$side.versionId)
+            if (-not $versions.Contains($versionKey)) { $versions[$versionKey] = $side }
+        }
+        [void]$plans.Add([pscustomobject][ordered]@{ target = $target; before = $sides.before; after = $sides.after; item = $null; beforePdf = ''; afterPdf = '' })
+    }
+    if ($plans.Count -eq 0) { return $result }
+    $leases = @()
+    try {
+        $leases = @(New-PackChangeReportLeases $Language @($versions.Values) $JobId)
+        $leased = @{}
+        foreach ($lease in $leases) { $leased[(Get-PackChangeVersionKey ([string]$lease.workbookId) ([string]$lease.snapshotId) ([string]$lease.versionId))] = $true }
+        $resolvePdf = {
+            param($Side)
+            if ($null -eq $Side) { return '' }
+            if (-not $leased.ContainsKey((Get-PackChangeVersionKey ([string]$Side.workbookId) ([string]$Side.snapshotId) ([string]$Side.versionId)))) { return '' }
+            try { return [string](Resolve-DiffContentPdfPath $Language ([string]$Side.workbookId) ([string]$Side.snapshotId) ([string]$Side.versionId) ([string]$Side.sheetName)) } catch { return '' }
+        }
+        $items = New-Object System.Collections.ArrayList
+        $itemByKey = @{}
+        $imageRoot = Join-Path $WorkDir 'img'
+        foreach ($plan in $plans) {
+            $plan.beforePdf = & $resolvePdf $plan.before
+            $plan.afterPdf = & $resolvePdf $plan.after
+            if (-not $plan.beforePdf -and -not $plan.afterPdf) { continue }
+            $itemKey = ([string]$plan.beforePdf + '|' + [string]$plan.afterPdf).ToLowerInvariant()
+            if (-not $itemByKey.ContainsKey($itemKey)) {
+                $itemId = 'i' + $items.Count.ToString('0000')
+                $itemDir = Join-Path $imageRoot $itemId
+                New-Item -ItemType Directory -Path $itemDir -Force | Out-Null
+                $kind = 'modified'
+                if (-not $plan.beforePdf) { $kind = 'added' } elseif (-not $plan.afterPdf) { $kind = 'removed' }
+                [void]$items.Add([ordered]@{
+                    id = $itemId; beforePdf = [string]$plan.beforePdf; afterPdf = [string]$plan.afterPdf
+                    # 永続の画像フォルダーは渡さない（画像を作業フォルダーへ複製させ、report.html から相対パスで読む）。
+                    beforeRasterDirectory = ''; afterRasterDirectory = ''; beforePageCount = 0; afterPageCount = 0
+                    unchangedPageNumbers = @(); outputDirectory = $itemDir; kind = $kind
+                })
+                $itemByKey[$itemKey] = [pscustomobject]@{ id = $itemId; dir = $itemDir }
+            }
+            $plan.item = $itemByKey[$itemKey]
+        }
+        if ($items.Count -eq 0) { return $result }
+        $batch = Invoke-DiffImageBatchGeneration @($items) ([int]$Script:PackChangeReportImageDpi)
+        $batchById = @{}
+        foreach ($batchItem in @(Get-Array (Get-DataProperty $batch 'items' @()))) { $batchById[[string](Get-DataProperty $batchItem 'id' '')] = $batchItem }
+        foreach ($plan in $plans) {
+            if ($null -eq $plan.item) { continue }
+            $batchItem = $batchById[[string]$plan.item.id]
+            if ($null -eq $batchItem -or -not [bool](Get-DataProperty $batchItem 'ok' $false)) { continue }
+            $pages = @(Get-Array (Get-DataProperty $batchItem 'pages' @()))
+            $beforeImage = $null; $afterImage = $null; $fallback = $null
+            if ($plan.beforePdf -and $null -ne $plan.before) {
+                $found = @($pages | Where-Object { (Get-IntDataProperty $_ 'beforePageNumber' 0) -eq [int]$plan.before.pageNumber } | Select-Object -First 1)
+                if ($found.Count -gt 0) { $beforeImage = Get-PackChangeReportImageFile ([string]$plan.item.dir) ([string]$plan.item.id) ([string](Get-DataProperty $found[0] 'beforeFile' '')) }
+            }
+            if ($plan.afterPdf -and $null -ne $plan.after) {
+                $found = @($pages | Where-Object { (Get-IntDataProperty $_ 'afterPageNumber' 0) -eq [int]$plan.after.pageNumber } | Select-Object -First 1)
+                if ($found.Count -gt 0) { $afterImage = Get-PackChangeReportImageFile ([string]$plan.item.dir) ([string]$plan.item.id) ([string](Get-DataProperty $found[0] 'afterFile' '')) }
+            }
+            if ([string]$plan.target.mode -eq 'diff' -and $null -ne $beforeImage -and $null -ne $afterImage) {
+                # 予備の枠は、行と同じ前後のページどうしを比べた結果のときだけ使う。
+                $pair = @($pages | Where-Object { (Get-IntDataProperty $_ 'beforePageNumber' 0) -eq [int]$plan.before.pageNumber -and (Get-IntDataProperty $_ 'afterPageNumber' 0) -eq [int]$plan.after.pageNumber } | Select-Object -First 1)
+                if ($pair.Count -gt 0) { $fallback = $pair[0] }
+            }
+            if ($null -ne $beforeImage -or $null -ne $afterImage) {
+                $result.images[[string]$plan.target.rowKey] = [pscustomobject][ordered]@{ before = $beforeImage; after = $afterImage; fallback = $fallback }
+            }
+        }
+    } catch {
+        $result.error = [string]$_.Exception.Message
+    } finally {
+        Remove-PackChangeReportLeases $Language $leases
+    }
+    return $result
+}
+
+# 子プロセスの本体。比べ直し → ページごとの詳細の画像（Invoke-PackChangeReportImages）→ HTML → Edge で PDF →
+# ハッシュを記録。画面が送った details は比べ直した結果と突き合わせ直してから使い（入力ファイルも信用しない）、
+# 無い行・使えない行はサーバーの画素比較の枠（予備）で埋めて「自動で検出した範囲」と書く。
+# report.pdf は一時名で書いてから名前を変え、meta.json を最後に書く（meta.json と report.pdf のハッシュが
+# 合わないものは作成済みにしない）。
 function Invoke-PackChangeReportJobCore($Job) {
     $language = [string](Get-DataProperty $Job 'mode' $Mode)
     $statusPath = [string](Get-DataProperty $Job 'statusPath' '')
@@ -14887,16 +15685,37 @@ function Invoke-PackChangeReportJobCore($Job) {
         $targetName = ''
         try { $targetName = Get-PackTargetDisplayName $language $scope.pack $targetId } catch { $targetName = $targetId }
         $createdAt = New-NowIso
-        $html = New-PackChangeReportHtml $summary $packName $targetName $createdAt
+        # file:// のパスに日本語・空白・長いパスが入らないよう、TEMP の短い作業フォルダーで画像を作り、印刷する。
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        $selection = Get-PackChangeReportDetailTargets @(Get-PackChangeReportEntries (Get-DataProperty $summary 'pages' @()))
+        $details = ConvertTo-PackChangeReportDetails (Get-DataProperty $Job 'details' $null) $summary
+        $detailPages = New-Object System.Collections.ArrayList
+        $imageCount = 0
+        if (@($selection.targets).Count -gt 0) {
+            $status.percent = 10; $status.message = ('ページごとの詳細の画像を作っています（{0} ページ）。' -f @($selection.targets).Count)
+            Write-RenderJobStatus $statusPath $status
+            $imageSet = Invoke-PackChangeReportImages $language @($selection.targets) $workDir $jobId
+            if ([string]$imageSet.error) { Set-NoteProperty $status 'warnings' @([ordered]@{ code = 'detail-images'; message = [string]$imageSet.error }) }
+            foreach ($target in @($selection.targets)) {
+                $images = $imageSet.images[[string]$target.rowKey]
+                if ($null -eq $images) { continue }
+                $detail = $(if ($details.ContainsKey([string]$target.rowKey)) { $details[[string]$target.rowKey] } else { $null })
+                $detailPage = New-PackChangeReportDetailPage $target $detail $images.fallback $images.before $images.after
+                if ($null -eq $detailPage) { continue }
+                [void]$detailPages.Add($detailPage)
+                if ($null -ne $detailPage.before) { $imageCount++ }
+                if ($null -ne $detailPage.after) { $imageCount++ }
+            }
+        }
+        $detailSource = Get-PackChangeReportDetailSource @($detailPages)
+        $html = New-PackChangeReportHtml $summary $packName $targetName $createdAt @($detailPages)
         $status.percent = 30; $status.message = '変更点PDFを作っています（Microsoft Edge で印刷しています）。'
         Write-RenderJobStatus $statusPath $status
 
-        # file:// のパスに日本語・空白・長いパスが入らないよう、TEMP の短い作業フォルダーで印刷する。
-        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
         $workHtml = Join-Path $workDir 'report.html'
         $workPdf = Join-Path $workDir 'report.pdf'
         Write-Utf8NoBomFile $workHtml $html
-        $timeout = Get-PackChangeReportTimeoutSeconds (@(Get-Array $summary.pages).Count)
+        $timeout = Get-PackChangeReportTimeoutSeconds (@(Get-Array $summary.pages).Count) $imageCount
         $print = Invoke-EdgePrintToPdf $workHtml $workPdf $timeout
         if (-not [bool]$print.ok) {
             $status.code = [string]$print.code
@@ -14929,6 +15748,7 @@ function Invoke-PackChangeReportJobCore($Job) {
         } finally {
             if (Test-Path -LiteralPath $tmpPdf) { Remove-Item -LiteralPath $tmpPdf -Force -ErrorAction SilentlyContinue }
         }
+        # 控え（詳細ページの画像は作業フォルダーにだけあり、ここには置かない。PDF には入っている）。
         Write-Utf8NoBomFile (Join-Path $reportDir 'report.html') $html
         Write-JsonFile $metaPath ([ordered]@{
             schemaVersion = 1
@@ -14940,6 +15760,9 @@ function Invoke-PackChangeReportJobCore($Job) {
             reportSha256 = $reportSha
             complete = [bool]$summary.complete
             changedCount = [int](Get-DataProperty $summary.counts 'changed' 0)
+            # 詳細ページの数と枠の出どころ（browser＝アプリと同じ計算／server＝サーバーの予備／mixed／none）。
+            detailPageCount = $detailPages.Count
+            detailSource = $detailSource
             fileName = (Get-PackChangeReportFileName ([string]$summary.to.outputFileName))
             createdAt = $createdAt
         })
@@ -16527,13 +17350,15 @@ function Invoke-DiffImagePageGeneration([string]$BeforePdf, [string]$AfterPdf, [
     return ($text | ConvertFrom-Json)
 }
 
-function Invoke-DiffImageBatchGeneration($Items) {
+# $Dpi を省くと差分画面用の解像度（DiffDetailDpi）。変更点PDFの詳細ページは PackChangeReportImageDpi で呼ぶ。
+function Invoke-DiffImageBatchGeneration($Items, [int]$Dpi = 0) {
     $scriptPath = Join-Path $Script:AppRoot 'tools\diff-image-batch.ps1'
+    if ($Dpi -le 0) { $Dpi = [int]$Script:DiffDetailDpi }
     if (-not (Test-Path -LiteralPath $scriptPath)) { throw '差分画像一括生成ツールが見つかりません。' }
     $requestPath = Join-Path ([IO.Path]::GetTempPath()) ('rb-diff-request-' + [Guid]::NewGuid().ToString('N') + '.json')
     try {
         Write-JsonFile $requestPath ([ordered]@{ schemaVersion = 1; items = @($Items) })
-        $raw = @(& $scriptPath -RequestPath $requestPath -Dpi $Script:DiffDetailDpi `
+        $raw = @(& $scriptPath -RequestPath $requestPath -Dpi $Dpi `
             -Threshold $Script:DiffDetailThreshold -MinimumRegionPixels $Script:DiffDetailMinimumRegionPixels `
             -Padding $Script:DiffDetailPadding | ForEach-Object { [string]$_ })
         $text = ($raw -join '')
