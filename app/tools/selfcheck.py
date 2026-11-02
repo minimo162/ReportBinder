@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/history-compare-review-regression.mjs','tests/pack-change-view-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/history-compare-review-regression.mjs','tests/pack-change-view-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','tests/speed-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v219', 'style.css?v=20261030_v131']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v220', 'style.css?v=20261030_v131']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v219' not in html:
+if 'app.js?v=20261030_v220' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v219' not in html:
+if 'app.js?v=20261030_v220' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2890,7 +2890,7 @@ if 'return ,@($affected)' in _ps_function(server, 'Set-PageReorderPlacement', 's
     raise SystemExit('Set-PageReorderPlacement must stream the affected volumes, not wrap them with ,@()')
 # 変換PDFが見つからないページを manifest に入れると、頁数1の物理ページとして数えられ、
 # 試算の unknownPageIds から漏れる。catch で $full を空に戻す。
-if "catch{$full='';$blockers+=[ordered]@{code='content-file-missing'" not in _ps_function(server, 'Get-FinalBuildInputSnapshot', 'server.ps1'):
+if "catch{$full='';$blockers.Add([ordered]@{code='content-file-missing'" not in _ps_function(server, 'Get-FinalBuildInputSnapshot', 'server.ps1'):
     raise SystemExit('Get-FinalBuildInputSnapshot must not add pages whose content PDF is missing to the manifest')
 _spread_route = server.split("$path -eq '/api/v2/outputs/spread-preview'", 1)[1].split('\n        if ($method', 1)[0]
 for needed in ('ConvertTo-PageReorderVolumes', "Test-ConfigHasKey $body 'baseLayout'", 'Get-SpreadPreview $language $request'):
@@ -3657,5 +3657,102 @@ if "width = [int](Get-DataProperty $BeforeImage 'width' 0)" not in _publish_serv
     raise SystemExit('the detail page must carry the picture size so the HTML can fit it without reading files')
 if '* 2.5)' not in _publish_server_function('Get-PackChangeReportTimeoutSeconds') or '$Script:EdgePrintMaxTimeoutSeconds = 900' not in server:
     raise SystemExit('the change report timeout must account for the 120dpi pictures')
+
+# ---- 高速化: readiness の応答・入力スナップショットの固定費・出力ジャーナル・一式だけの更新確認・読み込みバッファ ----
+# 振る舞い（指紋が変更前の実装と1文字も違わないこと、応答の形、ハッシュの値、一式だけの更新確認）は
+# tests/speed-regression.ps1、ジャーナルと出力結果は output-publish-selfcheck.ps1 が実物の関数で見る。
+# ここでは経路と形を見る。
+_speed_bytes = (root/'tests/speed-regression.ps1').read_bytes()
+if not _speed_bytes.startswith(b'\xef\xbb\xbf'):
+    raise SystemExit('tests/speed-regression.ps1 must be UTF-8 BOM (PowerShell 5.1 reads it as ANSI otherwise)')
+if 'tests\\speed-regression.ps1' not in _fast:
+    raise SystemExit('the fast gate must run the speed regression (a changed fingerprint makes every output "needs rebuild")')
+_speed_text = _speed_bytes.decode('utf-8-sig')
+# 指紋は形を変えない。指紋を作る行と指紋のページの形が、今の server.ps1 と回帰テストの基準（変更前の写し）で同じ。
+_fp_line = ("$fpDocument=[ordered]@{};foreach($fpKey in @($document.Keys)){$fpDocument[$fpKey]=$document[$fpKey]};"
+            "$fpDocument.outputFileName=[string]$naming.outputFileNameKey;$input=[ordered]@{composerProfileVersion=$Script:FinalPdfComposerProfileVersion;"
+            "language=$Language;packId=$packId;category=$cat;volume=$Volume;document=$fpDocument;pages=$fpPages};"
+            "$json=ConvertTo-Json $input -Depth 20 -Compress;$fingerprint=Get-Sha256Text $json")
+_fp_page = ("[ordered]@{pageId=$pageId;itemId=[string](Get-DataProperty $item 'itemId' $pageId);order=[double]$p.order;enabled=[bool]$p.enabled;"
+            "volume=[string]$p.volume;title=$title;pageRange=$range;numberingMode=[string]$p.numberingMode;contentPdf=$normalized;"
+            "contentPdfSize=$size;contentPdfLastWriteUtcTicks=$ticks;lastRenderedVersionId=[string]$wb.lastRenderedVersionId}")
+_snapshot_now = _ps_function(server, 'Get-FinalBuildInputSnapshot', 'server.ps1')
+_snapshot_base = _ps_function(_speed_text, 'Get-FinalBuildInputSnapshotBaseline', 'tests/speed-regression.ps1')
+if _fp_line not in _snapshot_now or '$fpPages.Add(' + _fp_page + ')' not in _snapshot_now:
+    raise SystemExit('the final build fingerprint must keep its exact shape (existing builtFingerprint values would all go stale)')
+if _fp_line not in _snapshot_base or '$fpPages+=' + _fp_page not in _snapshot_base:
+    raise SystemExit('tests/speed-regression.ps1 must keep the pre-change snapshot as its fingerprint baseline')
+if 'Get-FinalBuildInputSnapshotBaseline $structure' not in _speed_text or 'Assert-SnapshotSame' not in _speed_text:
+    raise SystemExit('tests/speed-regression.ps1 must compare the current snapshot with the baseline')
+# 固定費: 配列への += をしない。変換PDFは FileInfo 1回で見る。返すときは配列に戻してから指紋を作る。
+if re.search(r'\$(blockers|manifest|fpPages|physicalPages)\s*\+=', _snapshot_now):
+    raise SystemExit('Get-FinalBuildInputSnapshot must not grow arrays with += (quadratic in the page count)')
+if '$it=New-Object IO.FileInfo $full;if(-not $it.Exists -or ($it.Attributes -band [IO.FileAttributes]::Hidden)){throw' not in _snapshot_now or 'Get-Item -LiteralPath $full' in _snapshot_now or 'Test-Path -LiteralPath $full' in _snapshot_now:
+    raise SystemExit('Get-FinalBuildInputSnapshot must read each converted PDF with one FileInfo and keep treating hidden files as missing (as Get-Item without -Force did)')
+_to_array = '$manifest=$manifest.ToArray();$fpPages=$fpPages.ToArray();$blockers=$blockers.ToArray()'
+if _to_array not in _snapshot_now or '$physicalPages=$physicalPages.ToArray()' not in _snapshot_now or _snapshot_now.find(_to_array) > _snapshot_now.find(_fp_line):
+    raise SystemExit('Get-FinalBuildInputSnapshot must turn its lists back into arrays before fingerprinting and returning')
+# 応答: snapshot は画面が読む3つだけ。元の readiness は書き換えない。
+_readiness_response = _ps_function(server, 'ConvertTo-FinalReadinessResponse', 'server.ps1')
+for needed in ['$view = [ordered]@{}', 'itemCount = ', 'outputFileName = ', 'physicalPages = ', "$view['snapshot'] = $slim"]:
+    if needed not in _readiness_response:
+        raise SystemExit(f'ConvertTo-FinalReadinessResponse must copy the readiness and keep only the fields the screen reads: {needed}')
+for forbidden in ['manifestPages', 'fingerprintInput', 'Set-NoteProperty $Readiness', "$Readiness['snapshot'] ="]:
+    if forbidden in _readiness_response:
+        raise SystemExit(f'ConvertTo-FinalReadinessResponse must not return or modify the full snapshot: {forbidden}')
+_wrapped = 'ConvertTo-FinalReadinessResponse (Get-FinalBuildReadiness '
+for _fn in ('Get-AllFinalReadiness', 'Get-V2StatePayload'):
+    if _wrapped not in _ps_function(server, _fn, 'server.ps1'):
+        raise SystemExit(f'{_fn} must return the slim readiness')
+_handle_api = _ps_function(server, 'Handle-Api', 'server.ps1')
+if _handle_api.count('Get-FinalBuildReadiness ') != _handle_api.count(_wrapped) or _handle_api.count(_wrapped) < 2:
+    raise SystemExit('every readiness written by an API route must go through ConvertTo-FinalReadinessResponse')
+if 'readiness=(ConvertTo-FinalReadinessResponse $commit.readiness)' not in _pack_build:
+    raise SystemExit('the build result (job status file) must carry the slim readiness')
+# 画面は snapshot の itemCount・outputFileName・physicalPages だけを読む。ほかを読むなら応答を広げること。
+_ui_snapshot_fields = {m.group(2) for m in re.finditer(r'(\w*\.)?snapshot\??\.([A-Za-z]+)', appjs) if (m.group(1) or '') != 'input.'}
+if not _ui_snapshot_fields or not _ui_snapshot_fields <= {'itemCount', 'outputFileName', 'physicalPages'}:
+    raise SystemExit(f'the screen reads readiness snapshot fields the response no longer carries: {sorted(_ui_snapshot_fields)}')
+# /api/v2/state は旧形式の state と同じ structure・版を使い回す（要求の中で読み直さない）。
+if "$StructureViewSink['view'] = $structureView" not in _ps_function(server, 'Get-StatePayload', 'server.ps1'):
+    raise SystemExit('Get-StatePayload must hand its structure version to /api/v2/state')
+_v2_state = _ps_function(server, 'Get-V2StatePayload', 'server.ps1')
+if '$legacy = Get-StatePayload $Language $legacyView' not in _v2_state or "$legacyView['view']" not in _v2_state:
+    raise SystemExit('/api/v2/state must reuse the structure version read for the legacy state')
+# まとめて出力のジャーナルは manifest を持たない（書き直しのたびに全ページを JSON にしない）。復旧も読まない。
+if "Set-NoteProperty $t 'manifest'" in _tx_build or '$manifests[$v] = $manifest' not in _tx_build or '$savedManifest = $manifests[$v]' not in _tx_build:
+    raise SystemExit('the final build transaction must keep manifests outside its journal')
+for _fn in ('Restore-FinalTransaction', 'Recover-FinalTransactions'):
+    if "'manifest'" in _ps_function(server, _fn, 'server.ps1'):
+        raise SystemExit(f'{_fn} must not depend on a manifest in the journal')
+_tx_ws = _tx_build.split('Set-NoteProperty $t \'newPdfHash\'', 1)[1].split("Set-JournalPhase $Language $journal 'backups-created'", 1)[0]
+if 'Write-FinalJournal' in _tx_ws:
+    raise SystemExit('the journal write right before backups-created is redundant (the phase write records the same state)')
+# 独自一式の出力前の更新確認は、その一式の原稿だけ。判定の規則は Scan-Updates のまま。
+_scan_now = _ps_function(server, 'Scan-Updates', 'server.ps1')
+if "[string]$PackId = ''" not in _scan_now or 'Test-WorkbookPack $wb $PackId' not in _scan_now:
+    raise SystemExit('Scan-Updates must be able to check only the sources of one pack')
+if 'Scan-Updates $Language $null $false ([string]$scope.packId)' not in _pack_build or 'Scan-Updates $Language $null $false)' in _pack_build:
+    raise SystemExit('Build-DocumentPackPdf must check only the sources of the pack it builds')
+# 原稿ごとに全ブックを Where-Object で探さない。配列への += をしない。
+if 'Get-WorkbookByIdMap' not in _ps_function(server, 'Add-FinalSnapshotSourceWorkbooks', 'server.ps1') or '| Where-Object' in _ps_function(server, 'Add-FinalSnapshotSourceWorkbooks', 'server.ps1'):
+    raise SystemExit('Add-FinalSnapshotSourceWorkbooks must look workbooks up by id')
+if 'Get-WorkbookByIdMap $st' not in _tx_prepare or 'Where-Object { [string]$_.workbookId -eq $wid }' in _tx_prepare:
+    raise SystemExit('the final build transaction must look workbooks up by id')
+if '$pages += $page' in _copy_inputs:
+    raise SystemExit('Copy-FinalBuildInputPdfs must not grow arrays with +=')
+# ハッシュとコピーは大きな読み込みバッファで、共有モード（Excel で開いていても読める）は変えない。
+_buffer_at = server.find('$Script:FileReadBufferSize = 1MB')
+if _buffer_at < 0 or _buffer_at > server.find('function New-Sha256('):
+    raise SystemExit('the file read buffer must be defined before New-Sha256')
+_open_shared = _ps_function(server, 'Open-FileSharedRead', 'server.ps1')
+for needed in ['[IO.FileAccess]::Read', '([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)', '$Script:FileReadBufferSize', '[IO.FileOptions]::SequentialScan']:
+    if needed not in _open_shared:
+        raise SystemExit(f'Open-FileSharedRead must keep shared read access with a large buffer: {needed}')
+if '$fs = Open-FileSharedRead $Path' not in _ps_function(server, 'New-Sha256', 'server.ps1'):
+    raise SystemExit('New-Sha256 must read through the large shared-read buffer')
+_copy_shared = _ps_function(server, 'Copy-FileSharedRead', 'server.ps1')
+if '$inStream = Open-FileSharedRead $Source' not in _copy_shared or '$inStream.CopyTo($outStream, $Script:FileReadBufferSize)' not in _copy_shared:
+    raise SystemExit('Copy-FileSharedRead must copy through the large shared-read buffer')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

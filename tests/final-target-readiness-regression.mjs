@@ -182,6 +182,28 @@ assert.ok(!targetReadinessPending({ pageCount: 0, snapshot: { itemCount: 0 } }),
   assert.equal(result.hardProblemCount, 1, '確認できなかった出力先は出力を止める');
 }
 
+// ---- サーバーが返す形（応答用に絞った snapshot）のまま読める ----
+// /api/state・/api/v2/state・/api/v2/outputs/readiness・/api/final/readiness の snapshot は
+// itemCount・outputFileName・physicalPages だけ（ConvertTo-FinalReadinessResponse）。
+// pages・manifestPages・fingerprintInput・document は返さないので、画面はそれに頼らない。
+{
+  const physicalPages = [
+    { outputPageNumber: 1, side: 'right', spreadIndex: 0, pagePartIndex: 1, pagePartCount: 1, kind: 'content', pageId: 'p1', itemId: 'p1', sourcePdfPageNumber: 1, title: '表紙' },
+    { outputPageNumber: 2, side: 'left', spreadIndex: 1, pagePartIndex: 1, pagePartCount: 2, kind: 'content', pageId: 'p2', itemId: 'p2', sourcePdfPageNumber: 1, title: '損益' },
+  ];
+  const slim = { packId: 'pack1', targetId: 'main', canBuild: true, pageCount: 3, status: 'built', displayState: 'built', blockers: [], staleReasons: [],
+    snapshot: { itemCount: 2, outputFileName: '本体.pdf', physicalPages } };
+  assert.deepEqual(Object.keys(slim.snapshot), ['itemCount', 'outputFileName', 'physicalPages']);
+  assert.equal(targetItemCount(slim), 2, '絞った snapshot の itemCount を使う');
+  assert.ok(!targetReadinessPending(slim));
+  const check = targetCheck(renderFinalPreflight([entry('ja-main', slim)]));
+  assert.equal(check.state, 'ok', `絞った readiness でも出力先は問題なし: ${check.detail}`);
+  // 画面が snapshot から読む項目は、応答に残した3つだけ（増やすならサーバーの応答も広げる）。
+  const read = new Set([...source.matchAll(/(\w*\.)?snapshot\??\.([A-Za-z]+)/g)].filter(m => (m[1] || '') !== 'input.').map(m => m[2]));
+  assert.ok(read.size > 0);
+  for (const field of read) assert.ok(Object.keys(slim.snapshot).includes(field), `app.js reads snapshot.${field}, which the server no longer returns`);
+}
+
 // ---- 出力先カードとまとめて出力も pageCount ではなく itemCount で見る ----
 const renderFinalBody = source.slice(source.indexOf('const renderFreshness=(ready,card)=>{'), source.indexOf('function renderFinalPreflight('));
 assert.ok(renderFinalBody.includes('targetItemCount(ready)===0'), 'card empty state must use itemCount');

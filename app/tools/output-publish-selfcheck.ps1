@@ -345,6 +345,9 @@ try {
     Assert-OutputTest (-not [bool](Get-DataProperty $steady 'inputChangedDuringBuild' $true)) 'An unchanged build reported changed inputs.'
     $steadyReady = Get-FinalBuildReadiness (Get-Structure 'ja') 'ja' 'ja-main' $midId
     Assert-OutputTest ([string]$steadyReady.displayState -eq 'built' -and @($steadyReady.staleReasons).Count -eq 0) "An unchanged build is not shown as built (displayState=$($steadyReady.displayState))."
+    # 出力の結果（ジョブの状態ファイルに載る）の readiness は、画面が読む snapshot の3項目だけ持つ。
+    $steadySnapshot = Get-DataProperty (Get-DataProperty $steady 'readiness' $null) 'snapshot' $null
+    Assert-OutputTest ($null -ne $steadySnapshot -and -not $steadySnapshot.Contains('manifestPages') -and -not $steadySnapshot.Contains('fingerprintInput') -and $steadySnapshot.Contains('physicalPages') -and [string]$steadySnapshot.outputFileName -eq $Script:MidOutputName) 'The build result still carries the full input snapshot.'
 
     # 2. 組み込み一式の一括出力（Invoke-FinalBuildTransaction）でも同じ。
     $Script:MidOutputName = 'mid-build-ecm.pdf'
@@ -355,6 +358,14 @@ try {
     Assert-OutputTest (@($txResult.built).Count -eq 1) 'The final build transaction did not complete when the inputs changed during the build.'
     Assert-BuiltFromStartSnapshot @($txResult.built)[0] (Get-BuiltinPackId 'ecm') '%PDF-start-of-transaction' 'A built-in pack build'
     Assert-OutputTest (@(Get-InputCopyDirs).Count -eq 0) 'The start-of-build copy folder of the transaction was left behind.'
+    # ジャーナルは何度も書き直すので manifest を持たない。exports\manifest_*.json には今までどおり書く。
+    $txJournalPath = Join-Path (Get-FinalTransactionDir 'ja') ("{0}.json" -f [string]$txResult.transactionId)
+    Assert-OutputTest (Test-Path -LiteralPath $txJournalPath) 'The final build journal was not written.'
+    Assert-OutputTest (-not ([IO.File]::ReadAllText($txJournalPath)).Contains('"manifest"')) 'The final build journal still carries the manifest.'
+    Assert-OutputTest ([string](Read-JsonFile $txJournalPath $null).phase -eq 'completed') 'The final build journal did not reach completed.'
+    $txBuilt = @($txResult.built)[0]
+    $txManifest = Read-JsonFile ([string]$txBuilt.manifestPath) $null
+    Assert-OutputTest ($null -ne $txManifest -and [string]$txManifest.outputPdf -eq [string]$txBuilt.outputPdf -and @($txManifest.pages).Count -eq 1 -and [string]@($txManifest.pages)[0].sourcePdf -eq $midPdf) 'The final build did not write its manifest to exports.'
 
     # 3. 合成する変換PDFそのものが開始時点で消えた・差し替わったときだけ失敗する。
     $Script:MidOutputName = 'mid-build.pdf'

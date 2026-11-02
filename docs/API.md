@@ -58,7 +58,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `GET /api/v2/outputs/readiness?packId={packId}`: 本体・補足の出力可否と再出力理由を返す
 - `POST /api/v2/outputs/spread-preview`: 並べ替えの案を保存せずに試算し、出力先ごとの物理ページ（頁・左右・見開き）を before/after で返す。ページ構成の「位置を指定して移動」が確定前の見比べに使う。要求と検証は`POST /api/v2/items/reorder`と同じ
 - `POST /api/v2/outputs/build`: 資料パックの提出用PDFを出力するジョブを開始し、`job`（`jobId`・`status`・`total`）を返す。HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると進捗ポーリングも中止も受け付けられない。実処理は子プロセスで走る
-- `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
+- `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す。`built[].readiness.snapshot`は`itemCount`・`outputFileName`・`physicalPages`だけ（「readiness の`snapshot`」参照）。独自一式の出力では、出力先ごとの「元原稿の更新を確認しています」で、その一式の原稿だけを確かめる（以前は全一式の全原稿を確かめていた。ほかの一式の原稿の更新は、次の更新確認で検出する）
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない
 - `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する。出力を確定したときにPDFのサイズ・更新日時・SHA-256を`outputIntegrity`として記録し、発行の前にハッシュを、共有側へコピーした後にもハッシュを照合する。出力後に変更・上書きされたPDF、記録の無い（以前の版で出力した）PDFは発行せず、再出力を求める。readinessはサイズと更新日時が記録と違えば`needs-rebuild`（`staleReasons[].type`=`output-changed`）を返す。提出用PDFの出力ジョブの実行中は拒否し、出力と同じロックを持ってコピーする（`publish-all`も同じ）。本文に`includeChangeReports: true`を付けると、前回コピーした版から今の提出用PDFまでの変更点PDFを同じ発行フォルダーへ入れる（省略時は false で、今までどおり提出用PDFだけ）。詳しくは「変更点PDFの共有コピーへの同梱」
 - `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`・`buildId`（コピーした出力のアーカイブ。組み込み一式は空）・`sha256`・`changeReport`（同梱した変更点PDF。無ければ null）を返す。本文の`includeChangeReports`は`publish`と同じ
@@ -543,6 +543,20 @@ categoryは必須です。省略・不正値はHTTP 400です。
 
 `displayState`は`blocked`、`needs-rebuild`、`output-missing`、`not-built`、`built`です。
 
+### readiness の`snapshot`（応答では3項目だけ）
+
+readiness を返す応答（`GET /api/state`・`GET /api/v2/state`の`finalReadiness`、ページ構成の変更などが返す`state.finalReadiness`、`GET /api/v2/outputs/readiness`の`targets`、`GET /api/final/readiness`の`volumes`、提出用PDFの出力ジョブの状態の`built[].readiness`）の`snapshot`は、次の3項目だけです（RuntimeVersion `2026.10.30.32`から）。
+
+```jsonc
+"snapshot": {
+  "itemCount": 3,                 // 出力先に振り分けたページ（項目）の数
+  "outputFileName": "本体.pdf",    // 出力ファイル名
+  "physicalPages": [ /* 下の表の形。変換PDFの無いページは含まない */ ]
+}
+```
+
+以前は入力スナップショットをそのまま返しており、`pages`（ページ構成の実体）・`manifestPages`（変換PDFの絶対パス付き）・`fingerprintInput`・`document`・`language`・`packId`・`category`・`volume`・`blockers`・`pageCount`・`projectId`・`fingerprint`も入っていました。これらはページ数に比例して大きく、応答のたびの JSON 化が重かったため返さなくしました。同じ値が要るときは readiness の直下の`pageCount`・`blockers`・`currentFingerprint`を使ってください。readiness の直下の項目と、出力可否・最新かどうかの判定（指紋）は変わっていません。
+
 各出力先の`snapshot.physicalPages`（`GET /api/v2/outputs/readiness`、`/api/state`の`finalReadiness`も同じ）は、提出用PDFの1物理ページを1要素で返します。頁は出力先ごとに1から数えます。変換PDFの無いページは含みません。
 
 | 項目 | 値 |
@@ -923,3 +937,5 @@ POST  /api/v2/outputs/changes/report/file
 `POST /api/pages/update`の`pageRange`に`"2"`または`"2-5"`を指定すると、項目が参照する変換PDFの一部だけを最終PDFへ含めます。全ページへ戻す場合は`clearPageRange: true`を送信します。
 
 最終PDFのmanifestはschema 3です。`pages`には論理項目と元PDF内の開始・終了ページ、`physicalPages`には出力後の物理ページ番号を記録します。表紙・目次・区切りページも通常の原稿として登録し、ページ構成で配置します。成功時のmanifestは`exports/manifest_<volume>_<category>.json`に保存されます。
+
+組み込み一式のまとめて出力のジャーナル（`state\final-transactions\<transactionId>.json`）は、出力先ごとの`targets[].manifest`を持ちません（RuntimeVersion `2026.10.30.32`から）。manifest は出力の処理中だけ保持して`exports/manifest_*.json`へ書きます。ジャーナルは出力中に何度も書き直すため、全ページぶんの manifest を入れると書くたびに重かったためです。障害からの復旧（巻き戻し）はもともと manifest を使っていません。以前の版で書かれたジャーナルに`manifest`が残っていても、そのまま読めます。
