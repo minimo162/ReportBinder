@@ -99,7 +99,7 @@ const pdfImagePaperRatios = new Map();
 const PDF_IMAGE_PAPER_RATIO_LIMIT = 2000;
 // 横パネル「PDFイメージを横に表示」（サムネイル・詳細で、操作しながら物理ページの並びを見る）。
 // 並びは盤面のDOM（collectBoardVolumes）から読むので、保存を待たずに追従する。
-let pdfImagePaneEnabled = (() => { try { return sessionStorage.getItem('ReportBinderPdfImagePane') === '1'; } catch { return false; } })();
+let pdfImagePaneEnabled = readPdfImagePaneEnabled();
 let pdfImagePaneFrame = 0;
 let pdfImagePaneVolumes = null;
 let pdfImagePaneSignature = '';
@@ -4984,6 +4984,9 @@ function syncPdfImagePaneControls(){
   $('page-board-layout')?.classList.toggle('with-pdf-pane',visible);
   if(visible)schedulePdfImagePaneRefresh();else releasePdfImagePane();
 }
+// 既定は表示する。利用者が閉じた（'0' を保存した）ときだけ、そのセッションでは閉じたままにする。
+// 未設定・'1'・sessionStorage が読めないときは表示する（狭い画面で出さないのは pdfImagePaneWideEnough 側）。
+function readPdfImagePaneEnabled(){try{return sessionStorage.getItem('ReportBinderPdfImagePane')!=='0';}catch{return true;}}
 function setPdfImagePaneEnabled(enabled){
   pdfImagePaneEnabled=!!enabled;
   try{sessionStorage.setItem('ReportBinderPdfImagePane',pdfImagePaneEnabled?'1':'0');}catch{}

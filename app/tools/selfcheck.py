@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v206', 'style.css?v=20261030_v127']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v207', 'style.css?v=20261030_v127']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v206' not in html:
+if 'app.js?v=20261030_v207' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v206' not in html:
+if 'app.js?v=20261030_v207' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3078,6 +3078,10 @@ if 'id="page-pdf-pane-toggle"' in html.split('class="toolbar page-filter-tools"'
     raise SystemExit('the side pane toggle must stay visible while pages are selected')
 if "sessionStorage.getItem('ReportBinderPdfImagePane')" not in appjs or 'PDF_IMAGE_PANE_MIN_WIDTH = 1100' not in appjs:
     raise SystemExit('the side pane toggle must persist per session and stay off on narrow screens')
+# 2026-10-30 既定で表示する。'0'（利用者が閉じた）ときだけ閉じたまま、読めなければ表示する。
+_pane_default = appjs.split('function readPdfImagePaneEnabled(', 1)[1].split('\nfunction ', 1)[0] if 'function readPdfImagePaneEnabled(' in appjs else ''
+if "!=='0'" not in _pane_default or 'catch{return true;}' not in _pane_default or 'let pdfImagePaneEnabled = readPdfImagePaneEnabled();' not in appjs:
+    raise SystemExit("the side pane must be on by default and off only when '0' is saved")
 for needed in ['.page-board-layout.with-pdf-pane{', '.page-pdf-image-pane{', '#page-pdf-image-pane[hidden]{display:none}', '@media(max-width:1099px){.page-pdf-image-pane{display:none}']:
     if needed not in css:
         raise SystemExit(f'the side pane needs its two-column style: {needed}')
