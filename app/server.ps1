@@ -14834,7 +14834,10 @@ function Limit-PackChangeReportText([string]$Text, [double]$UnitsPerLine, [int]$
 # 高さ（mm）の列を、1ページ目は $FirstBudget、2ページ目からは $Budget に収まるように分ける。
 # $MaxPerPage が 0 より大きければ1ページの件数もそれまで。結果の pages は各ページの添字の配列。
 # 1ページ目に最初の1件も入らないときは、1ページ目を空にして次のページから載せる。
+# 高さの比較は 0.001mm の余裕を持たせる（引き算・足し算の丸め誤差で、ちょうど入る高さが
+# 25.299999… < 25.3 のようにはみ出したことになり、余計な「続き」のページができないように）。
 function Split-PackChangeReportPages($Heights, [double]$FirstBudget, [double]$Budget, [int]$MaxPerPage = 0) {
+    $tolerance = 0.001
     $pages = New-Object System.Collections.ArrayList
     $current = New-Object System.Collections.ArrayList
     $used = 0.0
@@ -14842,12 +14845,12 @@ function Split-PackChangeReportPages($Heights, [double]$FirstBudget, [double]$Bu
     $list = @($Heights)
     for ($i = 0; $i -lt $list.Count; $i++) {
         $height = [double]$list[$i]
-        if ($current.Count -eq 0 -and $pages.Count -eq 0 -and $height -gt $limit -and $limit -lt $Budget) {
+        if ($current.Count -eq 0 -and $pages.Count -eq 0 -and $height -gt ($limit + $tolerance) -and $limit -lt $Budget) {
             [void]$pages.Add(@())
             $limit = $Budget
             $used = 0.0
         }
-        $full = ($current.Count -gt 0 -and (($used + $height) -gt $limit -or ($MaxPerPage -gt 0 -and $current.Count -ge $MaxPerPage)))
+        $full = ($current.Count -gt 0 -and (($used + $height) -gt ($limit + $tolerance) -or ($MaxPerPage -gt 0 -and $current.Count -ge $MaxPerPage)))
         if ($full) {
             [void]$pages.Add(@($current.ToArray()))
             $current = New-Object System.Collections.ArrayList

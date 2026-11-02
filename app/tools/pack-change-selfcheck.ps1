@@ -502,7 +502,7 @@ function Get-TestDetailTotal($Size) {
     return [double]$Script:PackChangeReportMarkMm + [double]$Size.headingHeight + [double]$Script:PackChangeReportSideHeadMm + [double]$Size.picHeight + [double]$Script:PackChangeReportPairMarginMm + [double]$Size.firstBudget + [double]$Script:PackChangeReportDetailSlackMm
 }
 $sizeShort = Get-PackChangeReportDetailLayout 'x' @(10)
-Assert-ChangeTest ([Math]::Abs([double]$sizeShort.picHeight - 147.7) -lt 0.001 -and [Math]::Abs([double]$sizeShort.firstBudget - 10) -lt 0.001)"A short list must leave the rest of the page to the pictures: $($sizeShort | ConvertTo-Json -Compress)"
+Assert-ChangeTest ([Math]::Abs([double]$sizeShort.picHeight - 147.7) -lt 0.001 -and [Math]::Abs([double]$sizeShort.firstBudget - 10) -lt 0.001) "A short list must leave the rest of the page to the pictures: $($sizeShort | ConvertTo-Json -Compress)"
 $sizeEmpty = Get-PackChangeReportDetailLayout 'x' @()
 Assert-ChangeTest ([double]$sizeEmpty.picHeight -le [double]$Script:PackChangeReportPicMaxMm -and [double]$sizeEmpty.picHeight -gt 150) "Without a list the pictures must be as tall as the page allows: $($sizeEmpty.picHeight)"
 $sizeLong = Get-PackChangeReportDetailLayout ('長' * 400) @(1..40 | ForEach-Object { 5.3 })
@@ -633,7 +633,8 @@ $again = Start-PackChangeReportJob 'ja' $packId 'main' $build3 $build4
 Assert-ChangeTest ([string]$again.status -eq 'completed' -and [string]$again.jobId -eq '' -and [bool]$again.reportReady) 'A made report was made again.'
 Assert-Throws { Start-PackChangeReportJob 'ja' $packId 'main' '' $build4 } 'fromBuildId' 'A report was started without the versions shown on screen.'
 Assert-Throws { Start-PackChangeReportJob 'ja' 'ecm' 'main' 'b1' 'b2' } '組み込み' 'A report was started for a built-in pack.'
-Assert-ChangeTest ((Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4) -eq (Join-Path $reportDir 'report.pdf')) 'The made report cannot be opened.'
+# 実装は GetFullPath で返すので、比べる側もそろえる（一時フォルダーの 8.3 形式 RUNNER~1 などの違いを比べない）。
+Assert-ChangeTest ((Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4) -eq [IO.Path]::GetFullPath((Join-Path $reportDir 'report.pdf'))) 'The made report cannot be opened.'
 Assert-Throws { Resolve-PackChangeReportFile 'ja' $packId 'main' '..\x' $build4 } '不正' 'A report path outside exports\change-reports was accepted.'
 # 見た目のハッシュがそろう前に作ったものは、そろった後には古い（一覧の中身が変わる）。
 $metaPath = Join-Path $reportDir 'meta.json'
@@ -668,7 +669,7 @@ $attachSummary = Get-PackChangeSummary 'ja' $packId 'main'
 Assert-ChangeTest ([string]$attachSummary.from.buildId -eq $build2 -and [string]$attachSummary.to.buildId -eq $build6 -and [bool]$attachSummary.report.exists) "The default pair report was not made: $($attachSummary.report | ConvertTo-Json -Compress)"
 Assert-ChangeTest ([bool]$attachSummary.report.attachable -and [bool]$attachSummary.report.publishable -and [string]$attachSummary.report.reason -eq 'publishable') "A made last-copy → current report was not offered for the shared copy: $($attachSummary.report | ConvertTo-Json -Compress)"
 $attachCheck = Resolve-PublishableChangeReport 'ja' $packId 'main' $build6 ([string]$attachSummary.to.outputPdfSha256) ([string]$attachSummary.to.outputFileName)
-Assert-ChangeTest ([bool]$attachCheck.ok -and [string]$attachCheck.fromBuildId -eq $build2 -and [string]$attachCheck.sourceFull -eq (Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build2 $build6) 'report.pdf')) 'The publish check disagrees with the changes response.'
+Assert-ChangeTest ([bool]$attachCheck.ok -and [string]$attachCheck.fromBuildId -eq $build2 -and [string]$attachCheck.sourceFull -eq [IO.Path]::GetFullPath((Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build2 $build6) 'report.pdf'))) 'The publish check disagrees with the changes response.'
 # 今の提出用PDFが出力の後に変わったら、同じ組み合わせでも同梱できると言わない。
 $currentOutput = Get-PlannedOutputPath 'ja-main'
 $currentOriginal = [IO.File]::ReadAllText($currentOutput)
@@ -794,7 +795,8 @@ Assert-ChangeTest ([string]$forgedRun.meta.detailSource -eq 'server' -and -not $
 $Script:FakeBatchMode = 'throw'
 $failedImages = Invoke-DetailReportJob $jobDetails
 Assert-ChangeTest ([int]$failedImages.meta.detailPageCount -eq 0 -and [string]$failedImages.meta.detailSource -eq 'none' -and $failedImages.html.Contains('2 ページは画像を用意できなかったため')) 'A report without pictures did not explain the missing details.'
-Assert-ChangeTest (@($failedImages.status.warnings).Count -eq 1 -and [int]$Script:FakeLeaseReleased -eq 8) "The picture failure was not kept as a warning or the leases were not released: released=$($Script:FakeLeaseReleased)"
+# @($null).Count も 1 なので、件数だけでなく中身（code）も見る。
+Assert-ChangeTest (@($failedImages.status.warnings).Count -eq 1 -and [string]@($failedImages.status.warnings)[0].code -eq 'detail-images' -and [int]$Script:FakeLeaseReleased -eq 8) "The picture failure was not kept as a warning or the leases were not released: released=$($Script:FakeLeaseReleased)"
 $Script:FakeBatchMode = 'ok'
 
 # 版 1 の作成済みPDF（ページごとの詳細の無いもの）は、作り直すまで作成済みにしない。
