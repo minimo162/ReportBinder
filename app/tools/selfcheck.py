@@ -3741,6 +3741,16 @@ if 'Get-WorkbookByIdMap $st' not in _tx_prepare or 'Where-Object { [string]$_.wo
     raise SystemExit('the final build transaction must look workbooks up by id')
 if '$pages += $page' in _copy_inputs:
     raise SystemExit('Copy-FinalBuildInputPdfs must not grow arrays with +=')
+# New-Object で作った List は PSObject に包まれ、Windows PowerShell 5.1 では @($list) が
+# 'Argument types do not match' で落ちる（@() の List<object> 用の近道が包みを外さない）。
+# 同じ関数内では ToArray() で配列へ戻す。
+for _ps_name, _ps_text in (('server.ps1', server),):
+    for _chunk in re.split(r'(?m)^function ', _ps_text):
+        for _list_var in set(re.findall(r'\$([A-Za-z_]\w*)\s*=\s*New-Object\s+\'?System\.Collections\.Generic\.List\[', _chunk)):
+            if re.search(r'\$' + _list_var + r'\s*=\s*\$' + _list_var + r'\.ToArray\(\)', _chunk):
+                continue
+            if re.search(r'@\(\s*\$' + _list_var + r'\s*\)', _chunk):
+                raise SystemExit(f'{_ps_name}: @(${_list_var}) on a New-Object generic collection fails on Windows PowerShell 5.1; use ToArray()')
 # ハッシュとコピーは大きな読み込みバッファで、共有モード（Excel で開いていても読める）は変えない。
 _buffer_at = server.find('$Script:FileReadBufferSize = 1MB')
 if _buffer_at < 0 or _buffer_at > server.find('function New-Sha256('):

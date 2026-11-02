@@ -8877,7 +8877,9 @@ function Add-FinalSnapshotSourceWorkbooks($Structure, $Snapshot) {
             renderEnvironment = Get-DataProperty $w 'renderEnvironment' $null
         })
     }
-    Set-NoteProperty $Snapshot 'sourceWorkbooks' @($sourceWorkbooks)
+    # New-Object の List は PSObject に包まれており、Windows PowerShell 5.1 では @($list) が
+    # 'Argument types do not match' で落ちる。ToArray() で以前と同じ object[] にして渡す。
+    Set-NoteProperty $Snapshot 'sourceWorkbooks' $sourceWorkbooks.ToArray()
     return $Snapshot
 }
 
@@ -8959,7 +8961,8 @@ function Copy-FinalBuildInputPdfs([string]$Language, $Snapshot, [string]$CopyDir
         $page['sourcePdf'] = $copies[([string](Get-DataProperty $entry 'sourcePdf' '')).ToLowerInvariant()]
         $pages.Add($page)
     }
-    return @($pages)
+    # List を @() で包むと PS5.1 で落ちる（Add-FinalSnapshotSourceWorkbooks 参照）。
+    return $pages.ToArray()
 }
 
 function Test-StaleReasonSince($Reason, [DateTimeOffset]$Since) {
