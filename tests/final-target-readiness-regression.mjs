@@ -26,6 +26,8 @@ function extractFunction(name) {
   throw new Error(`unterminated function ${name}`);
 }
 
+// 必須原稿・変換PDFの問題を一時的に起こすための切り替え。
+const overrides = { conversionPending: false };
 const fakeElement = () => ({ className: '', innerHTML: '', textContent: '', dataset: {}, querySelectorAll: () => [] });
 const elements = { 'final-preflight-summary': fakeElement(), 'final-preflight-list': fakeElement(), 'final-preflight-announce': fakeElement() };
 const env = {
@@ -40,7 +42,7 @@ const env = {
   // 必須原稿・変換PDF・ページ構成・出力ファイル名は問題なしにしておく。
   workbooksForActivePreset: () => [{ workbookId: 'w1', status: 'ready' }],
   activeSourceRequirements: () => [],
-  isLatestPdfWorkbook: () => true,
+  isLatestPdfWorkbook: () => !overrides.conversionPending,
   unresolvedPageCount: () => 0,
   packForPreset: () => ({ settings: { outputFileNamePattern: '{packName}_{targetName}.pdf' } }),
   finalPreflightCheckedAt: '',
@@ -144,6 +146,42 @@ assert.ok(!targetReadinessPending({ pageCount: 0, snapshot: { itemCount: 0 } }),
   assert.equal(result.hardProblemCount, 1);
 }
 
+// ---- 確認中だけのとき: 問題の件数に入れず、「確認が必要」とも言わない ----
+{
+  const result = renderFinalPreflight([entry('ja-main', volumeReadiness('ja-main'))]);
+  assert.equal(result.problemCount, 0, '確認中は問題の件数に入れない');
+  assert.equal(result.ready, false, '確認中は準備完了にしない');
+  const summary = elements['final-preflight-summary'];
+  assert.ok(summary.className.includes('checking'), summary.className);
+  assert.ok(summary.innerHTML.includes('確認中'), summary.innerHTML);
+  assert.ok(!summary.innerHTML.includes('確認が必要'), summary.innerHTML);
+  assert.ok(!summary.innerHTML.includes('項目を確認してください'), summary.innerHTML);
+  assert.ok(!elements['final-preflight-announce'].textContent.includes('確認が必要'), elements['final-preflight-announce'].textContent);
+}
+
+// ---- 確認中と本当の問題（変換PDFの未作成）が同時にあるとき: 本当の問題だけを1件と数える ----
+{
+  overrides.conversionPending = true;
+  const result = renderFinalPreflight([entry('ja-main', volumeReadiness('ja-main'))]);
+  overrides.conversionPending = false;
+  assert.equal(result.problemCount, 1, '確認中を除いた本当の問題だけを数える');
+  assert.equal(result.ready, false);
+  const summary = elements['final-preflight-summary'];
+  assert.ok(summary.className.includes('attention'), summary.className);
+  assert.ok(summary.innerHTML.includes('出力前に確認が必要です'), summary.innerHTML);
+  assert.ok(summary.innerHTML.includes('1項目を確認してください'), summary.innerHTML);
+  assert.ok(elements['final-preflight-announce'].textContent.includes('1項目の確認が必要'));
+}
+
+// ---- 取り直しても確認できなかった出力先: danger で数え、文言は確定した問題と分ける ----
+{
+  const ready = { readinessError: true, pageCount: 0, displayState: 'blocked', blockers: [{ code: 'readiness-failed', message: '確認できませんでした' }] };
+  const result = renderFinalPreflight([entry('ja-main', ready)]);
+  assert.equal(targetCheck(result).state, 'danger');
+  assert.equal(targetCheck(result).detail, '出力先の状態を確認できませんでした（再確認）');
+  assert.equal(result.hardProblemCount, 1, '確認できなかった出力先は出力を止める');
+}
+
 // ---- 出力先カードとまとめて出力も pageCount ではなく itemCount で見る ----
 const renderFinalBody = source.slice(source.indexOf('const renderFreshness=(ready,card)=>{'), source.indexOf('function renderFinalPreflight('));
 assert.ok(renderFinalBody.includes('targetItemCount(ready)===0'), 'card empty state must use itemCount');
@@ -171,6 +209,7 @@ async function readinessHarness() {
     activePackRecord: () => ({ packId: 'custom1' }),
     activePackId: 'custom1', activePreset: 'custom1',
     targetVolume: id => id,
+    activeTargetVolumes: () => ['ja-main'],
     log: (...args) => { throw new Error(`unexpected log: ${args.join(' ')}`); },
     activeView: 'final',
     renderGlobalHeader() {}, renderNavBadges() {}, renderStepBar() {}, renderFinalOverview() {}, renderVolumeLinks() {},
@@ -238,6 +277,135 @@ const flush = () => new Promise(r => setTimeout(r, 0));
   h.requests[2].resolve('built');
   await again; await flush();
   assert.equal(h.readiness(), 'built');
+}
+
+// ---- state をまるごと差し替えても、readiness が届く前に描かない ----
+// /api/state の finalReadiness は ecm/bod/dmm だけで、カスタム一式の readiness が消える。
+// readinessResponses: 呼ばれた順に返す readiness 応答（'error' は通信失敗）。
+function stateHarness(readinessResponses = []) {
+  const calls = [];
+  const observed = [];
+  const queue = readinessResponses.slice();
+  const api = url => {
+    calls.push(url);
+    if (url.includes('readiness')) {
+      const next = queue.length ? queue.shift() : { targets: { 'ja-main': { status: 'built', displayState: 'built' } } };
+      return next === 'error' ? Promise.reject(new Error('network')) : Promise.resolve(JSON.parse(JSON.stringify(next)));
+    }
+    if (url === '/api/state') return Promise.resolve({ finalReadiness: { ecm: { volumes: {} }, bod: { volumes: {} }, dmm: { volumes: {} } } });
+    if (url.includes('/review')) return Promise.resolve({ state: { finalReadiness: { ecm: { volumes: {} } } }, review: { packId: 'custom1' } });
+    return Promise.resolve({});
+  };
+  const logs = [];
+  const env = {
+    api, observed, logs,
+    configured: () => true,
+    activePackRecord: () => ({ packId: 'custom1' }),
+    activePackId: 'custom1', activePreset: 'custom1',
+    targetVolume: id => id,
+    activeTargetVolumes: () => ['ja-main'],
+    log: (...args) => logs.push(args.join(' ')),
+    activeView: 'final',
+    renderGlobalHeader() {}, renderNavBadges() {}, renderStepBar() {}, renderVolumeLinks() {}, renderPackReview() {},
+    renderSpreadBoardIfVisible() {},
+    shouldPreserveEditorDom: () => false,
+    loadFilesSilently: () => Promise.resolve([]),
+    runBusy: (button, fn) => fn(),
+    showMessage() {},
+    $: () => null,
+    asArray: value => (Array.isArray(value) ? value : value == null ? [] : [value]),
+  };
+  const names = Object.keys(env);
+  const factory = new Function(...names, [
+    'let state = { finalReadiness: { custom1: { volumes: { "ja-main": { status: "built", displayState: "built" } } } } }, finalPreflightCheckedAt = "";',
+    'const finalReadinessInFlight = new Map();',
+    'let finalReadinessEpoch = 0, updateMonitorInFlight = false, renderJobActive = false, activeFinalJobId = "", lastUpdateScanAt = 0, packReviewState = null;',
+    // 描画した時点の出力先の状態を記録する。
+    'function renderFinalOverview(){ observed.push(volumeReadiness("ja-main")); }',
+    'function renderAll(){ renderFinalOverview(); }',
+    extractFunction('normalizeStatePayload'),
+    extractFunction('volumeReadiness'),
+    extractFunction('targetReadinessPending'),
+    extractFunction('finalReadinessKey'),
+    extractFunction('finalReadinessLoaded'),
+    extractFunction('advanceFinalReadinessEpoch'),
+    'async ' + extractFunction('replaceStatePayload'),
+    'async ' + extractFunction('loadFinalReadiness'),
+    'async ' + extractFunction('scanUpdatesSilently'),
+    'async ' + extractFunction('performPackReviewAction'),
+    'return { scanUpdatesSilently, performPackReviewAction, loadFinalReadiness, volume: () => state.finalReadiness.custom1?.volumes?.["ja-main"] };',
+  ].join('\n'));
+  return { calls, observed, logs, ...factory(...names.map(name => env[name])) };
+}
+
+for (const [label, run] of [['scanUpdatesSilently', h => h.scanUpdatesSilently({ withFiles: true })], ['performPackReviewAction', h => h.performPackReviewAction('approve', null)]]) {
+  const h = stateHarness();
+  await run(h); await flush();
+  assert.ok(h.observed.length > 0, `${label} は描き直す`);
+  assert.ok(h.observed.every(ready => !targetReadinessPending(ready)), `${label}: readiness が届く前に描かない`);
+  assert.equal(h.volume()?.status, 'built');
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 1, `${label}: カスタム一式の readiness を1回取り直す`);
+}
+
+// 差し替え箇所が同じ順序（区切り番号→差し替え→readiness 取得→描画）を使っていること。
+for (const name of ['scanUpdatesSilently', 'scanAndRefresh', 'performPackReviewAction', 'saveSourceMetadata']) {
+  const body = extractFunction(name);
+  assert.ok(!/state\s*=\s*normalizeStatePayload/.test(body), `${name} は state を直接差し替えない`);
+  const replaced = body.indexOf('await replaceStatePayload(');
+  assert.ok(replaced >= 0 && replaced < body.indexOf('renderAll('), `${name} は readiness を待ってから描く`);
+}
+{
+  const body = extractFunction('refreshFinalPreflight');
+  assert.ok(body.indexOf('advanceFinalReadinessEpoch()') < body.indexOf('normalizeStatePayload('));
+  assert.ok(body.indexOf('await loadFinalPanels(') < body.indexOf('loadFiles('), '差し替えと readiness の取得の間に原稿一覧の読込を挟まない');
+}
+
+// ---- readiness-failed が1回だけ返る: 1回だけ取り直し、その間 danger を描かない ----
+const failed = { targets: { 'ja-main': { readinessError: true, canBuild: false, pageCount: 0, displayState: 'blocked', blockers: [{ code: 'readiness-failed', message: '確認できませんでした' }] } } };
+{
+  const h = stateHarness([failed]);
+  await h.loadFinalReadiness({ render: true }); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 2, '確認できなかったら1回だけ取り直す');
+  assert.ok(h.observed.length > 0);
+  assert.ok(h.observed.every(ready => !ready.readinessError || targetReadinessPending(ready)), '取り直しの間は確認中として描く');
+  assert.equal(h.volume().status, 'built', '取り直しが成功すれば届いた状態で描く');
+  assert.ok(!h.volume().readinessError);
+}
+
+// ---- 2回続けて失敗: danger として数える ----
+{
+  const h = stateHarness([failed, failed]);
+  await h.loadFinalReadiness({ render: false }); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 2, '取り直しは1回だけ');
+  const ready = h.volume();
+  assert.ok(ready.readinessError && !targetReadinessPending(ready), '2回失敗したら確認中で隠さない');
+  const result = renderFinalPreflight([entry('ja-main', ready)]);
+  assert.equal(targetCheck(result).state, 'danger');
+  assert.equal(result.hardProblemCount, 1);
+}
+
+// ---- 取り直しの要求自体が失敗: 確認中のまま止めない ----
+{
+  const h = stateHarness([failed, 'error']);
+  await h.loadFinalReadiness({ render: false }); await flush();
+  const ready = h.volume();
+  assert.ok(ready.readinessError && !targetReadinessPending(ready), '取り直しが通信失敗でも確認中のまま止めない');
+  assert.equal(h.logs.length, 1);
+}
+
+// ---- entry はあるのに出力先が欠けている: 確認中のまま止めない ----
+{
+  const h = stateHarness([{ targets: {} }, { targets: {} }]);
+  await h.loadFinalReadiness({ render: false }); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 2, '欠けた出力先も1回だけ取り直す');
+  const ready = h.volume();
+  assert.ok(ready && !targetReadinessPending(ready), '欠けた出力先を確認中のままにしない');
+  assert.equal(targetCheck(renderFinalPreflight([entry('ja-main', ready)])).state, 'danger');
+}
+{
+  const h = stateHarness([{ targets: {} }]);
+  await h.loadFinalReadiness({ render: false }); await flush();
+  assert.equal(h.volume().status, 'built', '取り直しで届けばそのまま使う');
 }
 
 console.log('final target readiness regression ok');

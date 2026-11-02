@@ -1,5 +1,16 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 提出用PDFの出力前チェックが一瞬「確認が必要」「出力できません」になるのを直した（2026-11-02）
+
+- 目的: 出力前チェックが一瞬だけ「出力前に確認が必要です／1項目」や赤い表示になり、すぐ「準備完了」に戻っていた。届く前の確認中や一時的な確認失敗を、確定した問題と同じに見せない。本当の問題は今までどおり出す。
+- 確認中を問題の件数から外した（`renderFinalPreflight`）。readiness が届いていない出力先の行（`pending`）は `problemCount` に入れず、`ready` は確認中が無いときだけ true にする。確認中だけのときは概要を「出力前チェックを確認中」（`checking`）、バッジを「確認中」にし、読み上げも「確認中です」にする。確認中の間は前回の「確認 hh:mm」を出さない。本当の問題が1件でもあれば今までどおり「確認が必要」と、その件数だけを出す。届いた出力先に問題があれば danger を優先する挙動は変えていない。
+- state をまるごと差し替えた直後に、readiness が無いまま描かないようにした。`/api/state` の `finalReadiness` は ecm/bod/dmm だけなので、カスタム一式の readiness が消えていた。`replaceStatePayload`（区切り番号を進める→差し替え→未取得なら `loadFinalReadiness({render:false})` を待つ）を足し、`scanUpdatesSilently`（5分ごと・タブ復帰）、`scanAndRefresh`、`performPackReviewAction`（確認済みにする）、一式の削除、`saveSourceMetadata`、原稿フォルダーの選択で使う。古い「最新」は引き継がない（#89 の再発防止）。`refreshFinalPreflight` は readiness を取り直してから原稿一覧を読む順にした。
+- `readinessError`（`readiness-failed`）が届いた出力先は、1回だけ自動で取り直し、その間は確認中として描く。取り直しても失敗したとき（取り直しの通信が失敗したときも）だけ、出力先を danger にして件数に入れ、出力も止める。行の文言は「出力先の状態を確認できませんでした（再確認）」で、確定した問題とは分けた。
+- 届いた readiness に出力先が欠けていると、既定値（確認中）のまま取り直しも起きずに止まっていた。欠けた出力先は `readinessError` として扱い、上の取り直しに乗せる。取り直し待ちの出力先が残っている間は `finalReadinessLoaded` を false にし、取り直しが捨てられても確認中で止まらないようにした。
+- `tests/final-target-readiness-regression.mjs` に、確認中だけ／確認中＋変換PDF未作成／確認できなかった出力先の文言、`scanUpdatesSilently`・`performPackReviewAction` で readiness が届く前に描かないこと、差し替え箇所の順序の静的検査、readiness-failed が1回だけ・2回続く・取り直しが通信失敗、出力先の欠けた応答を加えた。`tests/numeric-sheet-selection-regression.py` の readiness の試験環境に `activeTargetVolumes` を足した。
+- サーバー（PowerShell）・見開きの `buildSpreadLayout` と頁・左右をサーバー値で決める契約には手を入れていない。three.js／WebGL は使っていない。
+- RuntimeVersion `2026.10.30.20`、`app.js` `v20261030_v208` へ更新した。
+
 ## 「PDFイメージを横に表示」を最初から出すようにした（2026-10-30）
 
 - 目的: 横パネルは並べ替えながら並びを確かめるためのものなのに、既定が OFF で、トグルに気づかないと使われなかった。最初から表示し、要らない人だけが閉じられるようにする。
