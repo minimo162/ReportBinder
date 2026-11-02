@@ -1047,7 +1047,7 @@ async function scanUpdatesSilently({withFiles=false}={}) {
   updateMonitorInFlight = true;
   try {
     await api('/api/scan-updates', {method:'POST', body:{force:false}});
-    state = normalizeStatePayload(await api('/api/state'));
+    await replaceStatePayload(await api('/api/state'));
     if (withFiles && !shouldPreserveEditorDom()) await loadFilesSilently();
     renderAll({preserveEditors:true});
   } catch (e) {
@@ -1107,7 +1107,9 @@ function finalReadinessKey(){
 function finalReadinessLoaded(){
   const key=finalReadinessKey();
   if(!key)return true;
-  return !!state?.finalReadiness?.[key];
+  const entry=state?.finalReadiness?.[key];
+  // 取り直し待ちの出力先が残っていれば未取得として扱う（取り直しが捨てられても確認中で止めない）。
+  return !!entry&&!Object.values(entry.volumes||{}).some(ready=>ready?.readinessRetrying);
 }
 // Load everything the final screen needs, then paint once.
 // force: 進行中の読込を使い回さない。出力完了の前に始まった readiness の要求が
@@ -1153,12 +1155,34 @@ async function loadFinalReadiness(options){
     }
     state.finalReadiness=state.finalReadiness||{};
     const volumes=r.volumes||Object.fromEntries(Object.entries(r.targets||{}).map(([targetId,ready])=>[targetVolume(targetId),ready]));
+    // 応答に出力先が欠けていると既定値（確認中）のまま、取り直しも起きずに止まっていた。確認できなかった出力先として扱う。
+    for(const volume of activeTargetVolumes()){
+      if(!volumes[volume])volumes[volume]={readinessError:true,canBuild:false,pageCount:0,status:'not-built',displayState:'blocked',outputPdf:'',outputPdfExists:false,blockers:[{code:'readiness-failed',message:'出力先の状態を確認できませんでした（再確認）'}],staleReasons:[]};
+    }
+    // readiness-failed は変換PDFの置き換え中やファイルロックでも一時的に起きる。1回だけ取り直し、
+    // その間は確認中として描く。取り直しても失敗したときだけ、届いたとおり出力できない状態として描く。
+    const failedVolumes=Object.keys(volumes).filter(volume=>volumes[volume]?.readinessError);
+    if(failedVolumes.length&&!options.readinessRetried){
+      for(const volume of failedVolumes)volumes[volume]=Object.assign({},volumes[volume],{loaded:false,readinessRetrying:true});
+      state.finalReadiness[requestKey]={volumes,receivedAt:Date.now(),epoch:requestEpoch};
+      if(options.render!==false&&activeView==='final'){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
+      // この要求を進行中から外してから取り直す（同じ世代の要求として使い回されないように）。
+      if(finalReadinessInFlight.get(requestKey)?.promise===promise)finalReadinessInFlight.delete(requestKey);
+      return loadFinalReadiness({render:options.render,readinessRetried:true});
+    }
     state.finalReadiness[requestKey]={volumes,receivedAt:Date.now(),epoch:requestEpoch};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
     if(options.render!==false&&activeView==='final'&&String(activePackId)===String(pack?.packId||activePackId)){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
     // 見開きの頁・左右は readiness の physicalPages から描く。読み直しが届いたら「更新中」を外す。
     renderSpreadBoardIfVisible();
-  }).catch(e=>log('提出用PDF状態の確認でエラー',e.detail||e.message)).finally(()=>{
+  }).catch(e=>{
+    log('提出用PDF状態の確認でエラー',e.detail||e.message);
+    // 取り直し自体が失敗したら、確認中のまま隠さず「確認できなかった」を出す。
+    const volumes=options.readinessRetried?state.finalReadiness?.[requestKey]?.volumes:null;
+    for(const [volume,ready] of Object.entries(volumes||{})){
+      if(ready?.readinessRetrying){const failed=Object.assign({},ready);delete failed.loaded;delete failed.readinessRetrying;volumes[volume]=failed;}
+    }
+  }).finally(()=>{
     const current=finalReadinessInFlight.get(requestKey);
     if(current?.promise===promise)finalReadinessInFlight.delete(requestKey);
   });
@@ -1169,6 +1193,16 @@ async function loadFinalReadiness(options){
 function advanceFinalReadinessEpoch(){
   finalReadinessEpoch+=1;
   return finalReadinessEpoch;
+}
+
+// state をまるごと差し替える。/api/state の finalReadiness は ecm/bod/dmm だけなので、
+// カスタム一式の readiness が消えたまま描くと出力前チェックが一瞬「確認が必要」になっていた。
+// 古い「最新」は引き継がず、区切り番号を進めてから取り直し、届いてから呼び出し元が描く。
+async function replaceStatePayload(payload){
+  advanceFinalReadinessEpoch();
+  state=normalizeStatePayload(payload);
+  if(!finalReadinessLoaded())await loadFinalReadiness({render:false});
+  return state;
 }
 
 function markFinalReadinessStaleForPageMutation(affectedVolumes=[]){
@@ -1303,7 +1337,7 @@ async function scanAndRefresh(btn) {
     if (!configured()) { await refresh(); return; }
     showMessage('', '原稿の更新を確認しています', '登録済み原稿の保存日時・サイズ・内容を確認します。数十秒かかることがあります。', null, [], 0);
     const r = await api('/api/scan-updates', {method:'POST', body:{force:true}});
-    state = normalizeStatePayload(await api('/api/state'));
+    await replaceStatePayload(await api('/api/state'));
     if (configured()) await loadFiles(null);
     selectedWorkbooks.clear();
     lastWorkbookRangeAnchor = '';
@@ -1630,25 +1664,34 @@ function renderFinalPreflight(entries=[]) {
   checks.push({label:'変換PDF',state:workbooks.length===0||conversionPending.length?'danger':'ok',detail:workbooks.length===0?'原稿がまだ登録されていません':conversionPending.length?`${conversionPending.length}件の作成・更新が必要です`:`${workbooks.length}件すべて最新です`,view:'excel'});
   checks.push({label:'ページ構成',state:unassigned?'attention':'ok',detail:unassigned?`${unassigned}ページが未振り分けです`:'未振り分けページはありません',view:'pages'});
   const targetProblems=emptyRequiredTargets.length+blockedTargets.length;
+  // 取り直しても確認できなかった出力先は、件数に入れて出力も止めたうえで、確定した問題とは文言を分ける。
+  const unreadableTargets=blockedTargets.length>0&&blockedTargets.every(entry=>entry.ready?.readinessError);
   // readiness が届く前は判定できないので確認中として出し、出力を止める問題には数えない。
   if(!targetProblems&&pendingTargets.length)checks.push({label:'出力先',state:'attention',pending:true,detail:'出力先の状態を確認しています',view:'final'});
-  else checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':'excel'});
+  else checks.push({label:'出力先',state:targetProblems?'danger':'ok',detail:emptyRequiredTargets.length?`${emptyRequiredTargets.map(entry=>entry.target.displayName||entry.target.targetId).join('・')}にページがありません`:unreadableTargets?'出力先の状態を確認できませんでした（再確認）':blockedTargets.length?`${blockedTargets.length}件の出力先に解消が必要な問題があります`:'必須の出力先を出力できます',view:emptyRequiredTargets.length?'pages':unreadableTargets?'final':'excel'});
   checks.push({label:'出力ファイル名',state:pattern?'ok':'danger',detail:pattern?'出力名を設定済み':'出力ファイル名を設定してください',view:'final',focus:'pack-output-pattern'});
   const problems=checks.filter(check=>check.state!=='ok'),completed=checks.filter(check=>check.state==='ok');
-  const problemCount=problems.length,hardProblemCount=problems.filter(check=>check.label!=='ページ構成'&&!check.pending).length,ready=problemCount===0;
+  // 確認中（readiness 未到着）は問題の件数に入れない。数えると届く前の一瞬だけ「1項目を確認してください」になっていた。
+  const checking=problems.filter(check=>check.pending);
+  const problemCount=problems.length-checking.length,hardProblemCount=problems.filter(check=>check.label!=='ページ構成'&&!check.pending).length,ready=problemCount===0&&checking.length===0;
+  const outcome=ready?'ready':problemCount===0?'checking':'attention';
   // The whole block is re-rendered by every renderAll(), so an aria-live region
   // here re-read the full preflight text on unrelated edits. Announce only when
   // the outcome actually changes.
   const announce=$('final-preflight-announce');
   if(announce){
-    const key=`${ready?'ready':'attention'}:${problemCount}`;
+    const key=`${outcome}:${problemCount}:${checking.length}`;
     if(announce.dataset.key!==key){
       announce.dataset.key=key;
-      announce.textContent=ready?'出力前チェック：すべての確認項目を満たしています。':`出力前チェック：${problemCount}項目の確認が必要です。`;
+      announce.textContent=outcome==='ready'?'出力前チェック：すべての確認項目を満たしています。':outcome==='checking'?'出力前チェック：出力先の状態を確認中です。':`出力前チェック：${problemCount}項目の確認が必要です。`;
     }
   }
-  summary.className=`final-preflight-summary ${ready?'ready':'attention'}`;
-  setHtmlIfChanged(summary,`<div><strong>${ready?'出力準備が整っています':'出力前に確認が必要です'}</strong><span>${ready?'すべての確認項目を満たしています。':`${problemCount}項目を確認してください。`}</span></div>${badge(ready?'準備完了':`${problemCount}項目`,ready?'ok':'attention')}<time>確認 ${escapeHtml(finalPreflightCheckedAt?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`);
+  summary.className=`final-preflight-summary ${outcome}`;
+  const headline={ready:'出力準備が整っています',checking:'出力前チェックを確認中',attention:'出力前に確認が必要です'}[outcome];
+  const caption={ready:'すべての確認項目を満たしています。',checking:'出力先の状態を読み込んでいます。',attention:`${problemCount}項目を確認してください。`}[outcome];
+  const badgeHtml=outcome==='ready'?badge('準備完了','ok'):outcome==='checking'?badge('確認中','neutral'):badge(`${problemCount}項目`,'attention');
+  // 確認中は前回の確認時刻を出さない（確認中なのに「確認 hh:mm」と見えていた）。
+  setHtmlIfChanged(summary,`<div><strong>${headline}</strong><span>${caption}</span></div>${badgeHtml}<time>確認 ${escapeHtml(finalPreflightCheckedAt&&!checking.length?formatDateTime(finalPreflightCheckedAt):'状態取得中')}</time>`);
   const row=check=>`<div class="final-preflight-row ${escapeAttr(check.state)}"><span class="final-preflight-mark" aria-hidden="true">${check.state==='ok'?'✓':'!'}</span><div><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.detail)}</span></div>${check.state==='ok'?'':`<button class="btn ${check.label==='ページ構成'?'primary':'secondary'} compact" type="button" data-preflight-view="${escapeAttr(check.view)}"${check.focus?` data-preflight-focus="${escapeAttr(check.focus)}"`:''} aria-label="${escapeAttr(`${check.label}を確認する`)}">${check.label==='ページ構成'?`${unassigned}ページを確認`:`${check.label}を確認`}</button>`}</div>`;
   const listChanged=setHtmlIfChanged(list,problems.map(row).join('')+(completed.length?`<details class="preflight-complete" ${ready?'open':''}><summary>確認済み ${completed.length}項目</summary><div>${completed.map(row).join('')}</div></details>`:''));
   if(listChanged)list.querySelectorAll('[data-preflight-view]').forEach(button=>button.addEventListener('click',()=>{
@@ -1709,7 +1752,7 @@ async function performPackReviewAction(action,button){
       await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}/review`,{method:'POST',body:{action:'submit',note:''}});
     }
     const response=await api(`/api/v2/packs/${encodeURIComponent(pack.packId)}/review`,{method:'POST',body:{action,note}});
-    if(response.state)state=normalizeStatePayload(response.state);
+    if(response.state)await replaceStatePayload(response.state);
     packReviewState=response.review||null;
     if($('pack-review-note'))$('pack-review-note').value='';
     renderAll();renderPackReview();
@@ -1722,9 +1765,12 @@ async function refreshFinalPreflight(btn) {
   await runBusy(btn,async()=>{
     // 保存日時・サイズが変わった原稿だけハッシュする。全件の読み直しは「原稿の更新を確認」(scanAndRefresh)で行う。
     if(configured())await api('/api/scan-updates',{method:'POST',body:{force:false}});
+    // 差し替えから readiness の取得までに原稿一覧の読込を挟むと、その間に別の描画が
+    // 未取得のまま描いてしまう。readiness を先に取り直してから原稿一覧を読む。
+    advanceFinalReadinessEpoch();
     state=normalizeStatePayload(await api('/api/state'));
-    if(configured())await loadFiles(null);
     await loadFinalPanels({force:true, render:false});
+    if(configured())await loadFiles(null);
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
     renderAll();
     showMessage('ok','出力前チェックを更新しました','原稿・変換PDF・ページ構成・出力設定を最新状態で確認しました。');
@@ -2136,7 +2182,7 @@ async function deletePack(packId,btn) {
   closePackMenu();
   const accepted=await confirmAction({title:'この一式を削除しますか？',message:`「${pack.displayName||'一式'}」の登録情報とページ構成を削除します。`,detail:'元のExcel・Word・PowerPoint・PDFと、提出フォルダーへ出力済みのPDFは削除しません。ReportBinder内の原稿登録、ページ構成、出力状態は元に戻せません。',confirmLabel:'一式を削除',danger:true});
   if(!accepted)return;
-  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}`,{method:'DELETE'});packAdminPacks=[];state=normalizeStatePayload(response.state||await api('/api/state'));await loadPackAdminPacks();renderAll();const removed=response?.result||{};showMessage('ok','一式を削除しました',`登録原稿 ${Number(removed.removedWorkbookCount||0)}件、ページ ${Number(removed.removedPageCount||0)}件を一覧から削除しました。元ファイルは残っています。`);},false);
+  await runBusy(btn,async()=>{const response=await api(`/api/v2/packs/${encodeURIComponent(packId)}`,{method:'DELETE'});packAdminPacks=[];await replaceStatePayload(response.state||await api('/api/state'));await loadPackAdminPacks();renderAll();const removed=response?.result||{};showMessage('ok','一式を削除しました',`登録原稿 ${Number(removed.removedWorkbookCount||0)}件、ページ ${Number(removed.removedPageCount||0)}件を一覧から削除しました。元ファイルは残っています。`);},false);
 }
 async function upgradePackTemplate(packId,btn){
   closePackMenu();
@@ -4338,7 +4384,7 @@ async function saveSourceMetadata(sourceId, patch, control) {
   if(control)control.disabled=true;
   try{
     const response=await api(`/api/v2/sources/${encodeURIComponent(id)}`,{method:'PATCH',body:patch});
-    state=normalizeStatePayload(response.state||await api('/api/state'));
+    await replaceStatePayload(response.state||await api('/api/state'));
     if(control)control.disabled=false;
     renderAll({preserveEditors:true});
     const savedDetail=Object.prototype.hasOwnProperty.call(patch,'excelSheetSelectionMode')?`${workbookDisplayName(getWorkbook(id))}のExcelシートPDF化対象を更新しました。次回のPDF作成から反映されます。`:`${workbookDisplayName(getWorkbook(id))}の担当情報を更新しました。`;
@@ -6499,7 +6545,7 @@ async function chooseSubmissionFolder(btn) {
       return;
     }
     const nextState = data.state || (await api('/api/state'));
-    state = normalizeStatePayload(nextState);
+    await replaceStatePayload(nextState);
     availableFiles = asArray(data.files || []);
     availableFilesScannedAt = String(data.scannedAt || '');
     selectedFiles.clear();

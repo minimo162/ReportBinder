@@ -272,6 +272,7 @@ function configured(){return true;}
 function api(url){return new Promise(resolve=>requests.push({url,resolve}));}
 function asArray(value){return value==null?[]:(Array.isArray(value)?value:[value]);}
 function targetVolume(id){return String(id||'');}
+function activeTargetVolumes(){return ['ja-main'];}
 function log(){}
 function rememberLayoutFingerprint(){}
 function resolvedPageId(page){return String(page?.pageId||'');}
@@ -326,7 +327,7 @@ let activePack={packId:'pack_custom',category:''};
 let state={finalReadiness:{pack_custom:{volumes:{'ja-main':{status:'built',displayState:'built',pageCount:2}}}}};
 function activePackRecord(){return activePack;} function configured(){return true;}
 function normalizeStatePayload(payload){return payload;}
-function targetVolume(id){return String(id||'');} function log(){} function renderAll(){}
+function targetVolume(id){return String(id||'');} function activeTargetVolumes(){return ['ja-main'];} function log(){} function renderAll(){}
 let draggingRow=null, pagesRendered=0; function renderPages(){pagesRendered++;}
 let paneRefreshes=0; function schedulePdfImagePaneRefresh(){paneRefreshes++;}
 function showMessage(){} const snapshotHistoryResponseCache=new Map(); let historyPanelsInitialized=false;
