@@ -254,7 +254,7 @@ function Assert-PackageContents([string]$OutputRoot) {
         'app/tools/scale-benchmark.ps1', 'app/tools/history-logic-selfcheck.ps1',
         'app/tools/create-pdf-diff-corpus.py', 'app/tools/pdf-diff-corpus-selfcheck.ps1',
         'app/tools/pack-lifecycle-selfcheck.ps1', 'app/tools/custom-pack-workflow-selfcheck.ps1',
-        'app/tools/output-publish-selfcheck.ps1',
+        'app/tools/output-publish-selfcheck.ps1', 'app/tools/pack-change-selfcheck.ps1',
         'tests/',
         'docs/PDF_DIFF_CORPUS.md', 'docs/benchmarks/', '.github/'
     )
@@ -311,6 +311,8 @@ try {
         # 提出用PDFの出力先の重なりと共有用フォルダーへのコピーは、中身の違うPDFを
         # 「最新」として共有へ出しうる経路。Java も Office も要らないので毎回見る。
         Invoke-Checked 'Output and shared-copy regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'output-publish-selfcheck.ps1'))
+        # 一式の変更点（前回コピーした版との頁・左右の対応付け）も Java・Office なしで見られる。
+        Invoke-Checked 'Pack change regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-change-selfcheck.ps1'))
         # シートの振り分け（外したシート・改名の旧名が未振り分けに残らないこと）も毎回見る。
         Invoke-Checked 'Sheet assignment regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\sheet-assignment-regression.ps1'))
         Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
@@ -339,6 +341,7 @@ try {
     Invoke-Checked 'Operational readiness regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'operational-readiness-selfcheck.ps1'))
     Invoke-Checked 'Pack lifecycle regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-lifecycle-selfcheck.ps1'))
     Invoke-Checked 'Output and shared-copy regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'output-publish-selfcheck.ps1'))
+    Invoke-Checked 'Pack change regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'pack-change-selfcheck.ps1'))
     Invoke-Checked 'Sheet assignment regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\sheet-assignment-regression.ps1'))
     Invoke-Checked 'History logic regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'history-logic-selfcheck.ps1'))
     Invoke-Checked 'Custom pack workflow regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $toolsRoot 'custom-pack-workflow-selfcheck.ps1'))

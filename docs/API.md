@@ -63,6 +63,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する。出力を確定したときにPDFのサイズ・更新日時・SHA-256を`outputIntegrity`として記録し、発行の前にハッシュを、共有側へコピーした後にもハッシュを照合する。出力後に変更・上書きされたPDF、記録の無い（以前の版で出力した）PDFは発行せず、再出力を求める。readinessはサイズと更新日時が記録と違えば`needs-rebuild`（`staleReasons[].type`=`output-changed`）を返す。提出用PDFの出力ジョブの実行中は拒否し、出力と同じロックを持ってコピーする（`publish-all`も同じ）
 - `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`・`buildId`（コピーした出力のアーカイブ。組み込み一式は空）・`sha256`を返す
 - `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す。各行に`publishedAt`・`folderName`（その版を最後に共有用フォルダーへコピーした日時と発行フォルダー名。コピーしていなければ空）、`isLastPublished`（その出力先で最後にコピーした版）、`isCurrent`（今の提出用PDF。出力状態の`buildId`と`outputIntegrity.sha256`がアーカイブと一致し、出力フォルダーのPDFが出力後に変わっていないときだけ true）、`hasPageMap`（manifest に頁・左右の記録`physicalPages`がある）を含む
+- `GET /api/v2/outputs/changes?packId={packId}&targetId={targetId}[&fromBuildId=&toBuildId=]`: 出力先ごとに、前回共有用フォルダーへコピーした版（無ければ1つ前の出力）と今の提出用PDFの違いを、ページ番号・左右つきで返す。詳しくは「出力先ごとの変更点」
 
 `PATCH`の例：
 
@@ -720,6 +721,7 @@ POST  /api/v2/outputs/file
 POST  /api/v2/outputs/publish
 POST  /api/v2/outputs/publish-all
 GET   /api/v2/outputs/archives?packId=pack_...
+GET   /api/v2/outputs/changes?packId=pack_...&targetId=main[&fromBuildId=...&toBuildId=...]
 ```
 
 原稿登録:
@@ -760,6 +762,38 @@ GET   /api/v2/outputs/archives?packId=pack_...
 共有発行のたびに、出力先ごとの発行記録を`exports/publish-records/<packId>/<volume>/<時刻ID>.json`へ1件ずつ書きます（組み込み一式は`<packId>`の代わりに`ecm`など）。中身は`final.published`と同じ項目（`packId`・`targetId`・`volume`・`buildId`・`sha256`・`fileName`・`folderName`・`sharedFolder`・`destination`・`publishedAt`・`userName`ほか）です。「前回コピーした版」（`Get-LastPublishedBuildId`）は、その出力先のいちばん新しい記録の`buildId`で、古い記録へはさかのぼりません。履歴イベントの書き込み（`Write-HistoryEvent`）は廃止済みで何も書かないため、この記録が唯一の手がかりです。記録を書けなかったときもコピー自体は成功として返し、`publishRecordError`に理由を入れます。
 
 サーバー内部の`Get-FinalArchiveRecord`はアーカイブ1件を読み、`sha256.txt`・`metadata.json`の`outputPdfSha256`・`final.pdf`の実際のハッシュが一致しないもの（すり替えられた版）は読みません。`buildId`・`volume`は`Assert-SafeStorageSegment`で確かめます。
+
+### 出力先ごとの変更点（`GET /api/v2/outputs/changes`）
+
+`GET /api/v2/outputs/changes?packId={packId}&targetId={targetId}[&fromBuildId={buildId}][&toBuildId={buildId}]`は、同じ出力先の保存済み出力（アーカイブ）2件を比べ、ページごとの違いを返します。応答は`{ ok, apiVersion: 2, changes: {...} }`です。manifest と原稿の見た目のハッシュを読むだけなので、その場で計算して返します（画像は作りません）。
+
+比べる版の決め方:
+
+- 比べる先（`to`）: 省略時は今の提出用PDF（`/api/v2/outputs/archives`の`isCurrent`の行）。無ければ最後に出力した版にし、`notes`に`not-current`を入れます。
+- 比べる元（`from`）: 省略時は、その出力先で前回共有用フォルダーへコピーした版（発行記録の`buildId`。最後の記録に`buildId`が無ければ、記録の`sha256`と`outputPdfSha256`が同じアーカイブ）。まだコピーしていない（`not-published`）、前回コピーした版が今の版と同じ（`same-as-published`）、前回コピーした版のアーカイブが無い（`published-missing`）ときは、比べる先の1つ前の出力と比べます。
+- `fromBuildId`だけを指定すると、その版と今の提出用PDFを比べます（保存済み出力の「今の版と比べる」）。新しい版を比べる元に選んだときは古い→新しいの向きに入れ替え、`swapped: true`と`notes`の`swapped`を返します。
+- 指定した版がこの出力先の保存済み出力に無い（別の出力先の版を含む）、同じ版どうし、パスとして不正な識別子、一式に無い出力先は 400 です。
+
+`changes`の主な項目:
+
+| 項目 | 内容 |
+| --- | --- |
+| `status` | `ready`（比べた）／`no-output`（まだ出力していない）／`no-baseline`（はじめての出力で比べる元が無い）／`unavailable`（アーカイブのPDFが記録と合わず読めない）／`unsupported`（組み込み一式。出力の版を保存していない） |
+| `message` | `status`が`ready`以外のときの説明 |
+| `defaultPair` / `fromReason` / `swapped` | 既定の組み合わせか。比べる元の決め方（`published`＝前回コピーした版、`previous`＝1つ前の出力、`selected`＝指定、`none`） |
+| `from` / `to` | `buildId`・`builtAt`・`pageCount`（出力ページ数）・`itemCount`・`outputFileName`・`outputPdfSha256`・`hasPageMap`・`publishedAt`・`folderName`・`isLastPublished`・`isCurrent`・`isLatest`（`to`だけ。今の提出用PDFが原稿の最新内容で出力済みか） |
+| `hasSides` | 両方の版に頁・左右の記録（`physicalPages`）があり、左右の入れ替わりを比べたか |
+| `complete` | 見た目のハッシュがそろわず判定を保留したページ（`maybe-content`・`unavailable`）が無いか |
+| `counts` | `content`・`sameLook`・`maybeContent`・`unavailable`・`added`・`removed`・`moved`・`shifted`（`moved`のうち前のページの増減でずれただけのもの）・`side`・`renamed`・`unchanged`・`changed`（変わったページの数。`unchanged`と`sameLook`だけのページは数えない）・`partCountChanged`（ページ数が変わった原稿の数）・`total` |
+| `pages[]` | 今回のページ番号順（なくなったページは、前回その直前にあったページの後ろ）。`toPage`・`toSide`・`toSpreadIndex`・`fromPage`・`fromSide`・`fromSpreadIndex`・`itemId`・`pageId`・`sourceId`・`sourceName`・`title`・`fromTitle`・`sheetKey`（単位の`sourceKey`。例`worksheet:売上`）・`sheetName`（原稿単位の比較でのシート名）・`pagePartIndex`・`fromPartCount`・`toPartCount`・`partCountChanged`・`kinds[]`・`shiftOnly`・`changedRatio`/`regionCount`（画像の比較は行わないため常に`null`）・`fromSnapshotId`/`fromVersionId`・`toSnapshotId`/`toVersionId`・`detailAvailable`（同じ原稿の別の版どうしで、原稿単位の比較を開ける）・`message` |
+| `notes[]` | `{ code, message }`。上記のほか`not-latest`・`no-page-map`（古い形式の版で左右を比べていない）・`no-changes`・`some-unavailable` |
+| `report` | 変更点PDF。作成は未対応のため常に`{ exists: false, publishable: false, reason: "not-available" }` |
+
+`kinds[]`の値: `content`（原稿の版が違い、ページの見た目のハッシュも違う）、`same-look`（版は違うがハッシュが同じ）、`maybe-content`（版が違いハッシュが取れない）、`unavailable`（比べる版の記録が消えている）、`added`、`removed`、`moved`（出力ページ番号が違う）、`side`（記録された左右が違う）、`renamed`（ページ名が違う）、`unchanged`。
+
+ページの対応は項目（`itemId`、無ければ`pageId`）ごとに、`pagePartIndex`の小さい方から順に取ります。原稿のページ数が変わったときは余りを`added`／`removed`にします。原稿の版（`metadata.sourceWorkbooks`の`snapshotId`・`versionId`）とページの位置が同じページは、ハッシュを見ずに内容が同じとみなします。頁・左右・台紙はアーカイブに記録された値をそのまま返し、数え直しません。`physicalPages`の無い古い版は`pages[]`の`sourcePageStart`〜`sourcePageEnd`から出力ページ番号だけを数え、左右・台紙は空（推定しない）にします。
+
+計算結果は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/summary.json`に覚え、`complete`が true で、両方の`outputPdfSha256`が一致し、計算の版（`algorithmVersion`）が同じときだけ使い回します。見た目のハッシュがまだ無い結果は、解析が済むと変わるため使い回しません。
 
 ## 自動PDF作成
 
