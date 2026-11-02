@@ -640,7 +640,7 @@ function CommandLine-ContainsPath([string]$CommandLine, [string]$Path) {
 function Stop-StaleUiServerProcesses([string]$ServerPath) {
     # 単一ワークスペースのUIサーバーだけを起動し直す。
     # -RenderJobPath(PDF作成の子)、-DiffJobPath(差分画像の子)、
-    # -AutoSchedulerPath(自動処理の子) は対象外。
+    # -ChangeReportJobPath(変更点PDFの子)、-AutoSchedulerPath(自動処理の子) は対象外。
     try {
         $stale = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $cmd = Get-ProcessCommandLineText $_
@@ -649,6 +649,7 @@ function Stop-StaleUiServerProcesses([string]$ServerPath) {
              ($cmdLower -match '[\\/]reportbinder[\\/]runtime[\\/]versions[\\/][^\\/]+[\\/]app[\\/]server\.ps1')) -and
             ($cmdLower -notmatch '\s-renderjobpath\b') -and
             ($cmdLower -notmatch '\s-diffjobpath\b') -and
+            ($cmdLower -notmatch '\s-changereportjobpath\b') -and
             ($cmdLower -notmatch '\s-autoschedulerpath\b')
         })
         foreach ($p in $stale) {

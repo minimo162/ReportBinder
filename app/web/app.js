@@ -176,6 +176,8 @@ let finalArchivesState = { packId:'', loaded:false, list:[] };
 let packChangeState = { volume:'', targetId:'', fromBuildId:'', toBuildId:'', requestPath:'', changes:null, archives:[], filter:'all', showAll:false };
 let packChangeOpenSerial = 0;
 let packChangeReturnFocus = null;
+// 変更点PDFの作成ジョブ（画面に出ている組み合わせの分だけ）。組み合わせを切り替えたら捨てる。
+let packChangeReportJob = null;
 const DIFF_RENDER_SCALE = 120 / 72;
 const DIFF_PAGE_CACHE_LIMIT = 6;
 const DIFF_PDF_CACHE_LIMIT = 16;
@@ -985,7 +987,7 @@ function apiUrl(path, params={}) {
 }
 
 async function fetchPdfObjectUrl(path, params={}) {
-  const postPdf = (path === '/api/file' || path === '/api/final/file' || path === '/api/v2/outputs/file');
+  const postPdf = (path === '/api/file' || path === '/api/final/file' || path === '/api/v2/outputs/file' || path === '/api/v2/outputs/changes/report/file');
   const headers = {'X-ReportBinder-Token': token, 'Accept': 'application/pdf,application/json'};
   if (postPdf) headers['Content-Type'] = 'application/json';
   let res;
@@ -6998,6 +7000,9 @@ bind('pack-change-show-all','change',e=>{packChangeState.showAll=!!e.target.chec
 bind('pack-change-list','click',e=>{const btn=e.target.closest('[data-pack-change-detail]');if(!btn)return;void openPackChangeDetail(asArray(packChangeState.changes?.pages)[Number(btn.dataset.packChangeDetail)],btn);});
 bind('pack-change-compare','click',()=>{void comparePackChangeVersions();});
 bind('pack-change-default','click',()=>{void loadPackChanges({});});
+bind('pack-change-report-create','click',()=>{void createPackChangeReport();});
+bind('pack-change-report-open','click',()=>{void openPackChangeReport();});
+bind('pack-change-report-reveal','click',e=>{void revealPackChangeReport(e.currentTarget);});
 bind('final-archive-history','click',e=>{const btn=e.target.closest('[data-archive-compare]');if(!btn)return;void openPackChanges(String(btn.dataset.archiveVolume||''),btn,{fromBuildId:String(btn.dataset.archiveCompare||'')});});
 bind('diff-mode-side','click',()=>{diffViewState.mode='side';applyDiffMode();});
 bind('diff-mode-overlay','click',()=>{diffViewState.mode='overlay';applyDiffMode();});
@@ -7425,12 +7430,13 @@ function renderPackChanges(changes,archives){
   if($('pack-change-subtitle'))$('pack-change-subtitle').textContent=ready?`変わったページ ${Number(changes?.counts?.changed||0)}／全 ${Number(changes?.counts?.total||0)}ページ`:'';
   if(ready){renderPackChangeSummary();renderPackChangeList();}
   renderPackChangeOtherVersions(changes);
+  renderPackChangeReport();
 }
 function renderPackChangeError(message){
   packChangeState.changes=null;
   if($('pack-change-versions'))$('pack-change-versions').innerHTML='';
   if($('pack-change-notes'))$('pack-change-notes').innerHTML=`<p class="caption">変更点を読み込めません：${escapeHtml(message)}</p>`;
-  ['pack-change-summary','pack-change-show-all-wrap','pack-change-list'].forEach(id=>$(id)?.classList.add('hidden'));
+  ['pack-change-summary','pack-change-show-all-wrap','pack-change-list','pack-change-report'].forEach(id=>$(id)?.classList.add('hidden'));
   if($('pack-change-subtitle'))$('pack-change-subtitle').textContent='';
 }
 async function loadPackChangeArchives(packId){
@@ -7444,7 +7450,7 @@ async function loadPackChanges(range={}){
   const packId=String(activePackId||''),fromBuildId=String(range?.fromBuildId||''),toBuildId=String(range?.toBuildId||'');
   const requestPath=packChangeRequestPath(packId,packChangeState.targetId,fromBuildId,toBuildId);
   packChangeState.fromBuildId=fromBuildId;packChangeState.toBuildId=toBuildId;packChangeState.requestPath=requestPath;
-  packChangeState.filter='all';
+  packChangeState.filter='all';packChangeReportJob=null;
   if($('pack-change-notes'))$('pack-change-notes').innerHTML='<p class="caption">変更点を読み込んでいます。</p>';
   const stale=()=>serial!==packChangeOpenSerial||!isPackChangeOpen()||packChangeState.requestPath!==requestPath;
   try{
@@ -7463,7 +7469,7 @@ function openPackChanges(volume,opener,range={}){
   if($('pack-change-title'))$('pack-change-title').textContent=`${volumeLabel(volume)}の変更点`;
   if($('pack-change-subtitle'))$('pack-change-subtitle').textContent='';
   if($('pack-change-versions'))$('pack-change-versions').innerHTML='';
-  ['pack-change-summary','pack-change-show-all-wrap','pack-change-list'].forEach(id=>$(id)?.classList.add('hidden'));
+  ['pack-change-summary','pack-change-show-all-wrap','pack-change-list','pack-change-report'].forEach(id=>$(id)?.classList.add('hidden'));
   modal.classList.remove('hidden');
   requestAnimationFrame(()=>$('pack-change-close')?.focus());
   return loadPackChanges(range);
@@ -7485,6 +7491,95 @@ function comparePackChangeVersions(){
   if(!from||!to)return;
   if(from===to){if(hint)hint.textContent='同じ版が選ばれています。異なる2つの版を選んでください。';return;}
   return loadPackChanges({fromBuildId:from,toBuildId:to});
+}
+
+// ---- 変更点PDF（確認用。POST /api/v2/outputs/changes/report）----
+// 作るのは画面に出ている2つの版（changes.from → changes.to）。既定の組み合わせでも buildId を
+// 両方送り、表示と作成のあいだに出力・コピーがあっても別の組み合わせのPDFにならないようにする。
+const PACK_CHANGE_REPORT_TERMINAL=['completed','completed-with-errors','failed','cancelled','missing'];
+function packChangeReportBody(changes,packId,targetId){
+  const fromBuildId=String(changes?.from?.buildId||''),toBuildId=String(changes?.to?.buildId||'');
+  if(String(changes?.status||'')!=='ready'||!fromBuildId||!toBuildId||!packId||!targetId)return null;
+  return {packId:String(packId),targetId:String(targetId),fromBuildId,toBuildId};
+}
+// 変更点PDFの欄の見え方。job は作成中・作成後のジョブ（無ければ null）。
+function packChangeReportView(changes,job){
+  const hidden={show:false,busy:false,canCreate:false,canOpen:false,createLabel:'変更点をPDFにする',status:'',percent:0};
+  if(String(changes?.status||'')!=='ready'||!changes?.from?.buildId||!changes?.to?.buildId)return hidden;
+  const report=changes?.report||{};
+  const status=String(job?.status||'');
+  if(job&&!PACK_CHANGE_REPORT_TERMINAL.includes(status)){
+    const percent=Math.max(0,Math.min(100,Number(job.percent||0)));
+    return {...hidden,show:true,busy:true,createLabel:'変更点PDFを作っています',status:`${String(job.message||'変更点PDFを作っています。')}（${percent}%）`,percent};
+  }
+  if(job&&status==='completed')return {...hidden,show:true,canOpen:true,status:'変更点PDFを作りました。「開く」で確かめられます。'};
+  if(job&&status)return {...hidden,show:true,canCreate:true,createLabel:'もう一度PDFにする',status:String(job.message||'変更点PDFを作れませんでした。')};
+  if(report.exists)return {...hidden,show:true,canOpen:true,status:`変更点PDFは作成済みです${report.createdAt?`（${formatDateTime(report.createdAt)}）`:''}。`};
+  if(report.reason==='outdated')return {...hidden,show:true,canCreate:true,createLabel:'変更点PDFを作り直す',status:'前に作った変更点PDFは、今の比べた結果と合いません。作り直してください。'};
+  return {...hidden,show:true,canCreate:true,status:'この変更点を、紙やメールで渡せる確認用のPDFにします（提出物ではありません）。'};
+}
+function renderPackChangeReport(){
+  const box=$('pack-change-report');if(!box)return;
+  const view=packChangeReportView(packChangeState.changes,packChangeReportJob);
+  box.classList.toggle('hidden',!view.show);
+  const create=$('pack-change-report-create');
+  if(create){create.textContent=view.createLabel;create.disabled=view.busy;create.classList.toggle('hidden',!view.canCreate&&!view.busy);}
+  $('pack-change-report-open')?.classList.toggle('hidden',!view.canOpen);
+  $('pack-change-report-reveal')?.classList.toggle('hidden',!view.canOpen);
+  const progress=$('pack-change-report-progress');
+  if(progress){progress.classList.toggle('hidden',!view.busy);progress.value=view.percent;}
+  const status=$('pack-change-report-status');if(status)status.textContent=view.status;
+}
+// 作成中に組み合わせを切り替えた・閉じたら、その後のジョブの状態では画面を書き換えない
+// （ジョブはサーバーで最後まで進む。同じ組み合わせでもう一度押すと、そのジョブに合流する）。
+async function createPackChangeReport(){
+  const body=packChangeReportBody(packChangeState.changes,activePackId,packChangeState.targetId);
+  if(!body)return;
+  if(packChangeReportJob&&!PACK_CHANGE_REPORT_TERMINAL.includes(String(packChangeReportJob.status||'')))return;
+  const serial=packChangeOpenSerial,requestPath=packChangeState.requestPath;
+  const stale=()=>serial!==packChangeOpenSerial||!isPackChangeOpen()||packChangeState.requestPath!==requestPath;
+  packChangeReportJob={status:'queued',percent:0,message:'変更点PDFを準備しています。'};
+  renderPackChangeReport();
+  try{
+    const started=await api('/api/v2/outputs/changes/report',{method:'POST',body});
+    if(stale())return;
+    let job=started?.job||{};
+    const jobId=String(job.jobId||'');
+    while(jobId&&!PACK_CHANGE_REPORT_TERMINAL.includes(String(job.status||''))){
+      packChangeReportJob=job;renderPackChangeReport();
+      await sleep(1000);
+      if(stale())return;
+      job=(await api(`/api/v2/outputs/changes/report/status?jobId=${encodeURIComponent(jobId)}`))?.job||{};
+      if(stale())return;
+    }
+    if(String(job.status||'')==='completed'&&packChangeState.changes){
+      packChangeState.changes={...packChangeState.changes,report:job.report||{...(packChangeState.changes.report||{}),exists:true}};
+    }else if(!String(job.status||'')){
+      job={status:'failed',message:'変更点PDFの作成を始められませんでした。もう一度押してください。'};
+    }
+    packChangeReportJob=job;
+    renderPackChangeReport();
+  }catch(error){
+    if(stale())return;
+    packChangeReportJob={status:'failed',message:userFriendlyError(error.message)};
+    renderPackChangeReport();
+  }
+}
+async function openPackChangeReport(){
+  const body=packChangeReportBody(packChangeState.changes,activePackId,packChangeState.targetId);if(!body)return;
+  // 提出用PDF（reportbinder-pdf）のタブとは分ける。並べて見比べられるように。
+  let blank=null;try{blank=window.open('about:blank','reportbinder-change-report');}catch{}if(blank){try{blank.opener=null;}catch{}}
+  try{
+    const objectUrl=await fetchPdfObjectUrl('/api/v2/outputs/changes/report/file',{...body,action:'open'});
+    if(blank&&!blank.closed)blank.location.href=objectUrl;else window.open(objectUrl,'reportbinder-change-report');
+  }catch(e){if(blank){try{blank.close();}catch{}}showMessage('danger','変更点PDFを開けません',userFriendlyError(e.message),e.detail||e.stack||e.message);}
+}
+async function revealPackChangeReport(trigger=null){
+  const body=packChangeReportBody(packChangeState.changes,activePackId,packChangeState.targetId);if(!body)return;
+  await runBusy(trigger,async()=>{
+    await api('/api/v2/outputs/changes/report/file',{method:'POST',body:{...body,action:'reveal'}});
+    showMessage('ok','変更点PDFの保存先を開きました','エクスプローラーで変更点PDFが選択された状態になっています。提出用PDFの出力フォルダーとは別の場所です。');
+  });
 }
 
 // ---- V5-P1(#12): 版の履歴・差分・保護（手動pin / 2版差分 / 過去content-pdf表示）----

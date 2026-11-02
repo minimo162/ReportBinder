@@ -64,6 +64,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`・`buildId`（コピーした出力のアーカイブ。組み込み一式は空）・`sha256`を返す
 - `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す。各行に`publishedAt`・`folderName`（その版を最後に共有用フォルダーへコピーした日時と発行フォルダー名。コピーしていなければ空）、`isLastPublished`（その出力先で最後にコピーした版）、`isCurrent`（今の提出用PDF。出力状態の`buildId`と`outputIntegrity.sha256`がアーカイブと一致し、出力フォルダーのPDFが出力後に変わっていないときだけ true）、`hasPageMap`（manifest に頁・左右の記録`physicalPages`がある）を含む
 - `GET /api/v2/outputs/changes?packId={packId}&targetId={targetId}[&fromBuildId=&toBuildId=]`: 出力先ごとに、前回共有用フォルダーへコピーした版（無ければ1つ前の出力）と今の提出用PDFの違いを、ページ番号・左右つきで返す。詳しくは「出力先ごとの変更点」
+- `POST /api/v2/outputs/changes/report`: 変更点を確認用のPDF（変更点PDF）にするジョブを始める（Edge のヘッドレス印刷）。`GET /api/v2/outputs/changes/report/status?jobId=`で状態を読み、`POST /api/v2/outputs/changes/report/file`で開く／保存先フォルダーを開く。詳しくは「変更点PDF」
 
 `PATCH`の例：
 
@@ -722,6 +723,9 @@ POST  /api/v2/outputs/publish
 POST  /api/v2/outputs/publish-all
 GET   /api/v2/outputs/archives?packId=pack_...
 GET   /api/v2/outputs/changes?packId=pack_...&targetId=main[&fromBuildId=...&toBuildId=...]
+POST  /api/v2/outputs/changes/report
+GET   /api/v2/outputs/changes/report/status?jobId=job_...
+POST  /api/v2/outputs/changes/report/file
 ```
 
 原稿登録:
@@ -787,7 +791,7 @@ GET   /api/v2/outputs/changes?packId=pack_...&targetId=main[&fromBuildId=...&toB
 | `counts` | `content`・`sameLook`・`maybeContent`・`unavailable`・`added`・`removed`・`moved`・`shifted`（`moved`のうち前のページの増減でずれただけのもの）・`side`・`renamed`・`unchanged`・`changed`（変わったページの数。`unchanged`と`sameLook`だけのページは数えない）・`partCountChanged`（ページ数が変わった原稿の数）・`total` |
 | `pages[]` | 今回のページ番号順（なくなったページは、前回その直前にあったページの後ろ）。`toPage`・`toSide`・`toSpreadIndex`・`fromPage`・`fromSide`・`fromSpreadIndex`・`itemId`・`pageId`・`sourceId`・`sourceName`・`title`・`fromTitle`・`sheetKey`（単位の`sourceKey`。例`worksheet:売上`）・`sheetName`（原稿単位の比較でのシート名）・`pagePartIndex`・`fromPartCount`・`toPartCount`・`partCountChanged`・`kinds[]`・`shiftOnly`・`changedRatio`/`regionCount`（画像の比較は行わないため常に`null`）・`fromSnapshotId`/`fromVersionId`・`toSnapshotId`/`toVersionId`・`detailAvailable`（同じ原稿の別の版どうしで、原稿単位の比較を開ける）・`message` |
 | `notes[]` | `{ code, message }`。上記のほか`not-latest`・`no-page-map`（古い形式の版で左右を比べていない）・`no-changes`・`some-unavailable` |
-| `report` | 変更点PDF。作成は未対応のため常に`{ exists: false, publishable: false, reason: "not-available" }` |
+| `report` | 変更点PDF（`{ exists, reportId, fileName, createdAt, publishable, reason }`）。`status`が`ready`のときだけ調べ、`exists`は作成済みで記録と中身が合うとき true。`reason`は`not-created`（まだ作っていない）・`outdated`（作ったものが今の比べた結果と合わない）・`copy-not-available`（作成済み。共有用フォルダーへの同梱はまだ未対応）・`not-available`（比べられない）。`publishable`は常に false。詳しくは「変更点PDF」 |
 
 `kinds[]`の値: `content`（原稿の版が違い、ページの見た目のハッシュも違う）、`same-look`（版は違うがハッシュが同じ）、`maybe-content`（版が違いハッシュが取れない）、`unavailable`（比べる版の記録が消えている）、`added`、`removed`、`moved`（出力ページ番号が違う）、`side`（記録された左右が違う）、`renamed`（ページ名が違う）、`unchanged`。
 
@@ -796,6 +800,27 @@ GET   /api/v2/outputs/changes?packId=pack_...&targetId=main[&fromBuildId=...&toB
 画面での使い方: 提出用PDF画面の出力先カードの「前回コピーしたときからの変更点を見る」は`fromBuildId`・`toBuildId`を付けずに呼び（既定の組み合わせ）、保存済み出力の「今の版と比べる」は`fromBuildId`だけ、変更点の画面の「ほかの版と比べる」は両方を付けて呼びます。画面は`pages[]`の`toPage`/`toSide`/`fromPage`/`fromSide`をそのまま表示し、左右が空の行で左右を補いません。「くわしく見る」は`detailAvailable`の行だけで、`GET /api/history/diff-detail?workbookId={sourceId}&fromSnapshotId={fromSnapshotId}&toSnapshotId={toSnapshotId}`（原稿単位の比較）を開きます。組み合わせを切り替えた後に届いた前の応答は表示に使いません。
 
 計算結果は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/summary.json`に覚え、`complete`が true で、両方の`outputPdfSha256`が一致し、計算の版（`algorithmVersion`）が同じときだけ使い回します。見た目のハッシュがまだ無い結果は、解析が済むと変わるため使い回しません。
+
+### 変更点PDF（`POST /api/v2/outputs/changes/report`）
+
+変更点を、紙やメールで渡せる確認用のPDF（A4 横）にします。提出物ではありません。中身は表紙（一式名・出力先名、比べた2つの版の出力日時・ページ数・共有用フォルダーにコピーした日時と発行フォルダー名・出力ファイル名、まとめの数字、「このPDFは確認用です。提出物ではありません。」）と変更一覧（今回 p.／左右・前回 p.／左右・原稿名 / シート名・変わったこと・見た目の変化）です。全ページの上に「確認用」、下に「変更点 n / N」を入れます。ページごとの画像はまだ載せません。
+
+- 変わっていないページ（`unchanged`・`same-look`だけのページ）は載せません。前のページの増減でずれただけのページ（`shiftOnly`）は、ずれ幅が同じで今回のページ番号が続いている間を「p.15〜p.34 は前のページが増えたため2ページ後ろにずれました」の1行にまとめます。ずれた結果左右が入れ替わったページはまとめません。
+- 頁・左右は`pages[]`の値をそのまま書き、左右の記録が無い版の行には頁番号だけを書きます（推定しません）。左右の記録が無い版との比較では、左右の入れ替わりの数を書きません。変更が1つも無いときは「変わったページはありません」と書いた表紙1枚だけです。
+- 原稿名・シート名・ページ名・一式名はすべて HTML エスケープします。
+- 1ページに載せる一覧の行数を固定し（12行。1行は3行分の高さで、あふれた分は省きます）、総ページ数をサーバーで決めます。
+
+作り方: サーバーが`report.html`（UTF-8、`@page { size: A4 landscape }`）を作り、Microsoft Edge のヘッドレス印刷（`msedge.exe --headless --disable-gpu --no-first-run --user-data-dir=<一時フォルダー> --no-pdf-header-footer --print-to-pdf=<pdf> <file:///…/report.html>`）で PDF にします。起動中の Edge に処理を取られないよう、毎回 TEMP に作る専用の`--user-data-dir`を渡し、終わったら消します。印刷は TEMP の短い名前の作業フォルダー（`rb-chg-<guid>`）で行い、`file://`のパスに日本語・空白・長いパスが入らないようにします。待ち時間の上限は 60 秒＋一覧の行1件あたり 0.5 秒（最大 10 分）で、時間切れ（`timedOut`）は「時間内に終わりませんでした」として返します。Edge が正常終了しても、PDF が存在し先頭が`%PDF-`でなければ失敗にします（管理ポリシーでヘッドレスが止められている PC など）。
+
+| メソッド・パス | 内容 |
+| --- | --- |
+| `POST /api/v2/outputs/changes/report` | 本文`{ packId, targetId, fromBuildId, toBuildId }`（両方必須。画面に出ている`changes.from.buildId`・`changes.to.buildId`）。比べられない組み合わせ・組み込み一式・片方の版の省略は 400。作成済みなら作り直さず`{ jobType: "change-report", jobId: "", status: "completed", reportReady: true, report }`を返します。同じ組み合わせの作成中のジョブがあればそれに合流し（`joinedExistingReportJob: true`）、無ければ子プロセス（`server.ps1 -ChangeReportJobPath`）を起動してジョブ（`jobType: "change-report"`）を返します。応答は`{ ok, apiVersion: 2, job }` |
+| `GET /api/v2/outputs/changes/report/status?jobId={jobId}` | ジョブの状態（`Read-RenderJobStatus`）。`status`（`queued`・`launching`・`running`・`completed`・`failed`）・`percent`・`message`。完了時は`report`（上の`report`と同じ形）、失敗時は`code`（`edge-missing`＝Edge が見つからない、`timeout`＝時間切れ、`no-pdf`＝PDF ができなかった）と`errors[]`（`error`・`code`・`detail`・`edgeLog`＝Edge の出力。診断用） |
+| `POST /api/v2/outputs/changes/report/file` | 本文`{ packId, targetId, fromBuildId, toBuildId, action }`。`action: "open"`（既定）は PDF そのもの（`application/pdf`）を返し、`action: "reveal"`は保存先フォルダーをエクスプローラーで開いて PDF を選択状態にします（応答`{ ok, apiVersion: 2, path }`）。`meta.json`の`reportSha256`と`report.pdf`の中身が合わなければ開きません |
+
+保存先は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/`（`report.pdf`・`report.html`・`meta.json`・`summary.json`）です。ローカルの出力フォルダーにはコピーしません（提出用PDFと取り違えないため）。`report.pdf`は一時名で書いてから名前を変え、`meta.json`（`reportVersion`・`fromBuildId`・`toBuildId`・`fromOutputPdfSha256`・`toOutputPdfSha256`・`reportSha256`・`complete`・`changedCount`・`fileName`・`createdAt`）を最後に書きます。作成済み（`report.exists`）とみなすのは、`meta.json`の両方の`outputPdfSha256`が比べた2つの版と同じで、`reportSha256`が`report.pdf`の中身と合い、作成の版（`reportVersion`）が同じときだけです。見た目のハッシュがそろわないうち（`complete: false`）に作ったものは、そろった後は`outdated`です。`fileName`は`<提出用PDFのファイル名（拡張子なし）>_変更点.pdf`で、共有用フォルダーへ同梱するときの名前です（同梱は後の版で足します）。
+
+画面での使い方: 変更点の画面の「変更点をPDFにする」で作成を始め、1秒ごとに状態を読んで進み具合を出します。終わると「開く」（別タブ）と「フォルダーを開く」が押せます。作成中に組み合わせを切り替えたり画面を閉じたりしたら、そのジョブの状態では画面を書き換えません（ジョブはサーバーで最後まで進み、同じ組み合わせでもう一度押すと合流します）。
 
 ## 自動PDF作成
 

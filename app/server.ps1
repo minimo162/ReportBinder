@@ -7,6 +7,7 @@
     [string]$RenderJobPath = '',
     [string]$FinalJobPath = '',
     [string]$DiffJobPath = '',
+    [string]$ChangeReportJobPath = '',
     [string]$AutoSchedulerPath = '',
     [string]$SharedAppRoot = '',
     [int]$ParentProcessId = 0
@@ -10131,6 +10132,27 @@ function Handle-Api($Context) {
             $changes = Get-PackChangeSummary $language ([string]$query['packId']) ([string]$query['targetId']) ([string]$query['fromBuildId']) ([string]$query['toBuildId'])
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; changes=$changes }); return
         }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/changes/report') {
+            # 変更点PDF（確認用）の作成は Edge の印刷で時間がかかるので、子プロセスのジョブにする。
+            $body = Read-BodyJson $Context.Request
+            $reportJob = Start-PackChangeReportJob $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' '')) ([string](Get-DataProperty $body 'fromBuildId' '')) ([string](Get-DataProperty $body 'toBuildId' ''))
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=$reportJob }); return
+        }
+        if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/changes/report/status') {
+            Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=(Read-RenderJobStatus $language ([string]$Context.Request.QueryString['jobId'])) }); return
+        }
+        if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/changes/report/file') {
+            # action=open は PDF そのものを返し、action=reveal は保存先フォルダーで選択状態にする。
+            $body = Read-BodyJson $Context.Request
+            $reportPath = Resolve-PackChangeReportFile $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' '')) ([string](Get-DataProperty $body 'fromBuildId' '')) ([string](Get-DataProperty $body 'toBuildId' ''))
+            $reportAction = ([string](Get-DataProperty $body 'action' 'open')).Trim().ToLowerInvariant()
+            if ($reportAction -eq 'reveal') {
+                Open-OutputPdfLocation $reportPath
+                Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; path=$reportPath }); return
+            }
+            if ($reportAction -ne 'open') { throw [ArgumentException]::new('action が不正です。') }
+            Write-FileResponse $Context 200 $reportPath 'application/pdf'; return
+        }
         if ($method -eq 'GET' -and $path -eq '/api/state') {
             Write-JsonResponse $Context 200 (Get-StatePayload $language); return
         }
@@ -14121,8 +14143,9 @@ function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$Targ
         counts = (New-PackChangeCounts)
         pages = @()
         notes = @()
-        # 変更点PDFはまだ作れない（作成・共有コピーへの同梱は後の版で足す）。
-        report = [ordered]@{ exists = $false; reportId = ''; publishable = $false; reason = 'not-available' }
+        # 変更点PDF。比べられた（status=ready）ときだけ Get-PackChangeReportState で埋める。
+        # 共有コピーへの同梱は後の版で足すので、publishable は常に false。
+        report = [ordered]@{ exists = $false; reportId = ''; fileName = ''; createdAt = ''; publishable = $false; reason = 'not-available' }
     }
     if ([bool]$scope.builtIn) {
         $result.status = 'unsupported'
@@ -14223,7 +14246,599 @@ function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$Targ
         [void]$notes.Add([ordered]@{ code = 'some-unavailable'; message = '前の版の記録が残っていないページは比べられません（ほかのページは比べています）。' })
     }
     $result.notes = @($notes)
+    try {
+        $result.report = Get-PackChangeReportState $Language $packId $targetId ([string]$fromRecord.buildId) ([string]$toRecord.buildId) ([string]$fromRecord.outputPdfSha256) ([string]$toRecord.outputPdfSha256) ([bool]$result.complete) ([string]$toRecord.outputFileName)
+    } catch { }
     return $result
+}
+
+# ---- 変更点PDF（確認用。提出物ではない） ------------------------------------
+# 中身は表紙と変更一覧だけ（ページごとの画像は後の版）。サーバーが report.html を作り、
+# Edge のヘッドレス印刷で report.pdf にする。日本語を PDFBox で書くにはフォントの埋め込みと
+# jar の作り直しが要るため、このアプリの前提として入っている Edge を使う。
+# 保存先は Get-PackChangeReportDir（exports\change-reports\<packId>\<targetId>\<from>__<to>）。
+# ローカルの出力フォルダーにはコピーしない（提出用PDFと取り違えないため）。
+$Script:PackChangeReportVersion = 1
+# 1ページに載せる一覧の行数。行の高さを固定し、ページ割りをサーバーで決める
+# （「変更点 1 / 8」の総ページ数を HTML を作る時点で決めるため。Edge の余白欄の機能には頼らない）。
+$Script:PackChangeReportRowsPerPage = 12
+# Edge の印刷の待ち時間の上限（件数に比例させた値もこれを超えない）。
+$Script:EdgePrintMaxTimeoutSeconds = 600
+
+function ConvertTo-PackChangeHtmlText($Value) {
+    # 原稿名・シート名・ページ名は利用者の入力。必ずエスケープする。
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+function Get-PackChangeReportSideLabel([string]$Side) {
+    if ($Side -eq 'right') { return '右' }
+    if ($Side -eq 'left') { return '左' }
+    return ''
+}
+
+# 頁と左右はアーカイブに記録された値だけで書く。左右の記録が無い版は頁番号だけ（推定しない）。
+function Get-PackChangeReportPageLabel($Page, [string]$Side) {
+    $number = 0
+    if ($null -ne $Page) { try { $number = [int]$Page } catch { $number = 0 } }
+    if ($number -le 0) { return 'なし' }
+    $sideLabel = Get-PackChangeReportSideLabel $Side
+    if ($sideLabel) { return ('p.{0}（{1}）' -f $number, $sideLabel) }
+    return ('p.{0}' -f $number)
+}
+
+function Get-PackChangeReportRowKinds($Row) {
+    return @(Get-Array (Get-DataProperty $Row 'kinds' @()) | ForEach-Object { [string]$_ })
+}
+
+# 変わっていないページ（版が変わっても見た目が同じものを含む）。変更点PDFには載せない。
+function Test-PackChangeReportQuietRow($Row) {
+    $kinds = @(Get-PackChangeReportRowKinds $Row)
+    if ($kinds.Count -eq 0) { return $true }
+    return (@($kinds | Where-Object { $_ -notin @('unchanged','same-look') }).Count -eq 0)
+}
+
+# 前のページの増減でずれただけのページ（左右は変わっていない）。連続したものは1行にまとめる。
+function Test-PackChangeReportShiftOnlyRow($Row) {
+    if (-not [bool](Get-DataProperty $Row 'shiftOnly' $false)) { return $false }
+    $kinds = @(Get-PackChangeReportRowKinds $Row)
+    if ($kinds -notcontains 'moved') { return $false }
+    return (@($kinds | Where-Object { $_ -notin @('moved','unchanged','same-look') }).Count -eq 0)
+}
+
+function Get-PackChangeReportKindLabels($Row) {
+    $labels = New-Object System.Collections.ArrayList
+    foreach ($kind in @(Get-PackChangeReportRowKinds $Row)) {
+        $label = $kind
+        switch ($kind) {
+            'content' { $label = '内容が変わった' }
+            'same-look' { $label = '原稿は更新されたが、見た目は同じ' }
+            'maybe-content' { $label = '内容が変わった可能性あり（くわしく見てください）' }
+            'unavailable' { $label = '比べられません（前の版の記録が残っていません）' }
+            'added' { $label = '増えたページ' }
+            'removed' { $label = 'なくなったページ' }
+            'moved' { $label = $(if ([bool](Get-DataProperty $Row 'shiftOnly' $false)) { '前のページが増減したためずれた' } else { '場所が変わった' }) }
+            'side' { $label = '左右が入れ替わった' }
+            'renamed' {
+                $fromTitle = [string](Get-DataProperty $Row 'fromTitle' '')
+                $label = $(if ($fromTitle) { '名前が変わった（{0} → {1}）' -f $fromTitle, [string](Get-DataProperty $Row 'title' '') } else { '名前が変わった' })
+            }
+            'unchanged' { $label = '変わっていない' }
+        }
+        [void]$labels.Add([string]$label)
+    }
+    return @($labels)
+}
+
+# 見た目の変化の欄。画像の比較（枠・変化の割合）は後の版で埋まる。無いときは分かることだけを書く。
+function Get-PackChangeReportVisualText($Row) {
+    $kinds = @(Get-PackChangeReportRowKinds $Row)
+    $ratio = Get-DataProperty $Row 'changedRatio' $null
+    $regions = Get-DataProperty $Row 'regionCount' $null
+    if ($null -ne $ratio -and $kinds -contains 'content') {
+        $percent = [double]$ratio * 100.0
+        $percentText = $(if ($percent -lt 1.0) { '1% 未満' } else { ('約 {0}%' -f [int][Math]::Round($percent)) })
+        if ($null -ne $regions -and [int]$regions -gt 0) { return ('ページの{0}が変わっています（{1}か所）' -f $percentText, [int]$regions) }
+        return ('ページの{0}が変わっています' -f $percentText)
+    }
+    if ($kinds -contains 'content') { return '見た目が変わっています（アプリの「くわしく見る」で確認できます）' }
+    if ($kinds -contains 'maybe-content') { return 'まだ確かめられていません' }
+    if ($kinds -contains 'added') { return '今回だけにあるページ' }
+    if ($kinds -contains 'removed') { return '前回だけにあったページ' }
+    return '—'
+}
+
+# 一覧に載せる行を決める。変わっていないページは載せず、ずれただけのページは、ずれ幅が同じで
+# 今回のページ番号が続いている間を1行にまとめる。副作用なし。
+function Get-PackChangeReportEntries($Pages) {
+    $entries = New-Object System.Collections.ArrayList
+    $run = $null
+    foreach ($row in @(Get-Array $Pages)) {
+        if (Test-PackChangeReportShiftOnlyRow $row) {
+            $toPage = [int](Get-DataProperty $row 'toPage' 0)
+            $fromPage = [int](Get-DataProperty $row 'fromPage' 0)
+            $shift = $toPage - $fromPage
+            if ($null -ne $run -and [int]$run.shift -eq $shift -and $toPage -eq ([int]$run.endPage + 1)) {
+                $run.endPage = $toPage
+                $run.count = [int]$run.count + 1
+                continue
+            }
+            $run = [pscustomobject][ordered]@{ type = 'shift'; startPage = $toPage; endPage = $toPage; shift = $shift; count = 1; row = $null }
+            [void]$entries.Add($run)
+            continue
+        }
+        $run = $null
+        if (Test-PackChangeReportQuietRow $row) { continue }
+        [void]$entries.Add([pscustomobject][ordered]@{ type = 'row'; startPage = 0; endPage = 0; shift = 0; count = 1; row = $row })
+    }
+    return @($entries)
+}
+
+function Get-PackChangeReportShiftText($Entry) {
+    $start = [int]$Entry.startPage
+    $end = [int]$Entry.endPage
+    $range = $(if ($start -eq $end) { 'p.{0}' -f $start } else { 'p.{0}〜p.{1}' -f $start, $end })
+    $amount = [Math]::Abs([int]$Entry.shift)
+    if ([int]$Entry.shift -gt 0) { return ('{0} は前のページが増えたため{1}ページ後ろにずれました' -f $range, $amount) }
+    return ('{0} は前のページが減ったため{1}ページ前にずれました' -f $range, $amount)
+}
+
+function Format-PackChangeReportDate([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    try {
+        $parsed = [DateTimeOffset]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture)
+        return $parsed.ToLocalTime().ToString('yyyy年M月d日 H:mm', [Globalization.CultureInfo]::InvariantCulture)
+    } catch { return $Value }
+}
+
+# 変更点PDFの HTML（§6.1 の 表紙・変更一覧・全ページの「確認用」と「変更点 n / N」）。副作用なし。
+# $Summary は Get-PackChangeSummary の結果（status=ready）。文字はすべてエスケープする。
+function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetName, [string]$GeneratedAt = '') {
+    $h = { param($Value) ConvertTo-PackChangeHtmlText $Value }
+    $from = Get-DataProperty $Summary 'from' $null
+    $to = Get-DataProperty $Summary 'to' $null
+    $counts = Get-DataProperty $Summary 'counts' $null
+    $entries = @(Get-PackChangeReportEntries (Get-DataProperty $Summary 'pages' @()))
+    $perPage = [Math]::Max(1, [int]$Script:PackChangeReportRowsPerPage)
+    $listPageCount = [int][Math]::Ceiling($entries.Count / [double]$perPage)
+    $totalPages = 1 + $listPageCount
+    $title = '提出用PDF 変更点のお知らせ'
+    $subject = (@($PackName, $TargetName) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join ' ／ '
+    $mark = '<div class="mark"><span class="mark-badge">確認用</span><span class="mark-title">' + (& $h ($title + $(if ($subject) { ' ／ ' + $subject } else { '' }))) + '</span></div>'
+    $footer = {
+        param([int]$Number)
+        return ('<div class="foot"><span>このPDFは確認用です。提出物ではありません。</span><span class="page-no">変更点 {0} / {1}</span></div>' -f $Number, $totalPages)
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>')
+    [void]$sb.Append((& $h $title))
+    [void]$sb.Append('</title><style>')
+    [void]$sb.Append('@page{size:A4 landscape;margin:0}html,body{margin:0;padding:0}')
+    [void]$sb.Append('body{font-family:"Yu Gothic UI","Yu Gothic","Meiryo",sans-serif;color:#1f2328;font-size:10.5pt;-webkit-print-color-adjust:exact;print-color-adjust:exact}')
+    [void]$sb.Append('.sheet{box-sizing:border-box;width:297mm;height:209mm;padding:9mm 12mm 14mm;position:relative;overflow:hidden;break-after:page;page-break-after:always}.sheet:last-child{break-after:auto;page-break-after:auto}')
+    [void]$sb.Append('.mark{display:flex;align-items:center;gap:3mm;border-bottom:0.4mm solid #9a6700;padding-bottom:2mm;margin-bottom:4mm;font-size:9.5pt;color:#57606a}.mark-badge{border:0.5mm solid #9a6700;color:#9a6700;font-weight:700;padding:0.5mm 3mm;font-size:11pt}')
+    [void]$sb.Append('.foot{position:absolute;left:12mm;right:12mm;bottom:6mm;display:flex;justify-content:space-between;font-size:9pt;color:#57606a}')
+    [void]$sb.Append('h1{font-size:20pt;margin:2mm 0 1mm}h2{font-size:13pt;margin:0 0 3mm}.subject{font-size:12pt;margin:0 0 5mm}')
+    [void]$sb.Append('.versions{display:flex;gap:5mm;margin-bottom:5mm}.version{flex:1;border:0.3mm solid #d0d7de;padding:3mm 4mm}.version h3{margin:0 0 2mm;font-size:11.5pt}.version p{margin:0.8mm 0}.arrow{align-self:center;font-size:16pt;color:#57606a}')
+    [void]$sb.Append('.counts{border-collapse:collapse;margin-bottom:4mm}.counts td{border:0.3mm solid #d0d7de;padding:1.2mm 4mm}.counts td.n{text-align:right;font-weight:700;min-width:16mm}')
+    [void]$sb.Append('.notes p{margin:1mm 0}.none{font-size:14pt;font-weight:700;margin:6mm 0}.notice{font-weight:700;margin-top:4mm}')
+    [void]$sb.Append('table.list{width:100%;border-collapse:collapse;table-layout:fixed}.list th,.list td{border:0.3mm solid #d0d7de;padding:1mm 2mm;text-align:left;vertical-align:top;overflow:hidden}.list th{background:#f6f8fa;font-size:9.5pt}')
+    [void]$sb.Append('.list tr.r td{height:12.4mm;font-size:9pt;line-height:1.35}.clip{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.list small{color:#57606a}.list tr.shift td{color:#57606a}')
+    [void]$sb.Append('</style></head><body>')
+
+    # ---- 表紙 ----
+    [void]$sb.Append('<section class="sheet cover">')
+    [void]$sb.Append($mark)
+    [void]$sb.Append('<h1>' + (& $h $title) + '</h1>')
+    if ($subject) { [void]$sb.Append('<p class="subject">' + (& $h $subject) + '</p>') }
+    $fromPublished = [string](Get-DataProperty $from 'publishedAt' '')
+    $fromHeading = $(if ([bool](Get-DataProperty $from 'isLastPublished' $false) -and $fromPublished) { '前回（共有用フォルダーにコピーした版）' } else { '比べる元' })
+    $toHeading = $(if ([bool](Get-DataProperty $to 'isCurrent' $false)) { '今回（今の提出用PDF）' } else { '比べる先' })
+    [void]$sb.Append('<div class="versions"><div class="version"><h3>' + (& $h $fromHeading) + '</h3>')
+    [void]$sb.Append('<p>出力日時: ' + (& $h (Format-PackChangeReportDate ([string](Get-DataProperty $from 'builtAt' '')))) + '</p>')
+    [void]$sb.Append('<p>ページ数: ' + [int](Get-DataProperty $from 'pageCount' 0) + 'ページ</p>')
+    if ($fromPublished) {
+        $folderName = [string](Get-DataProperty $from 'folderName' '')
+        [void]$sb.Append('<p>共有用フォルダーにコピー: ' + (& $h (Format-PackChangeReportDate $fromPublished)) + $(if ($folderName) { '（発行フォルダー ' + (& $h $folderName) + '）' } else { '' }) + '</p>')
+    } else {
+        [void]$sb.Append('<p>共有用フォルダーにはコピーしていない版です</p>')
+    }
+    [void]$sb.Append('</div><div class="arrow">→</div><div class="version"><h3>' + (& $h $toHeading) + '</h3>')
+    [void]$sb.Append('<p>出力日時: ' + (& $h (Format-PackChangeReportDate ([string](Get-DataProperty $to 'builtAt' '')))) + '</p>')
+    [void]$sb.Append('<p>ページ数: ' + [int](Get-DataProperty $to 'pageCount' 0) + 'ページ</p>')
+    [void]$sb.Append('<p>出力ファイル名: ' + (& $h ([string](Get-DataProperty $to 'outputFileName' ''))) + '</p>')
+    [void]$sb.Append('</div></div>')
+
+    $countRows = New-Object System.Collections.ArrayList
+    [void]$countRows.Add(@('変わったページ', [int](Get-DataProperty $counts 'changed' 0)))
+    [void]$countRows.Add(@('内容が変わったページ', [int](Get-DataProperty $counts 'content' 0)))
+    if ([int](Get-DataProperty $counts 'maybeContent' 0) -gt 0) { [void]$countRows.Add(@('内容が変わった可能性があるページ', [int](Get-DataProperty $counts 'maybeContent' 0))) }
+    [void]$countRows.Add(@('増えたページ', [int](Get-DataProperty $counts 'added' 0)))
+    [void]$countRows.Add(@('なくなったページ', [int](Get-DataProperty $counts 'removed' 0)))
+    [void]$countRows.Add(@('場所が変わったページ', [int](Get-DataProperty $counts 'moved' 0)))
+    [void]$countRows.Add(@('　うち、前のページが増減したためにずれたページ', [int](Get-DataProperty $counts 'shifted' 0)))
+    # 左右は両方の版に記録があるときだけ比べている。記録が無いのに 0 と書くと「入れ替わりなし」と読まれる。
+    if ([bool](Get-DataProperty $Summary 'hasSides' $false)) { [void]$countRows.Add(@('左右が入れ替わったページ', [int](Get-DataProperty $counts 'side' 0))) }
+    if ([int](Get-DataProperty $counts 'renamed' 0) -gt 0) { [void]$countRows.Add(@('名前が変わったページ', [int](Get-DataProperty $counts 'renamed' 0))) }
+    if ([int](Get-DataProperty $counts 'unavailable' 0) -gt 0) { [void]$countRows.Add(@('比べられないページ', [int](Get-DataProperty $counts 'unavailable' 0))) }
+    [void]$sb.Append('<table class="counts">')
+    foreach ($countRow in @($countRows)) { [void]$sb.Append('<tr><td>' + (& $h $countRow[0]) + '</td><td class="n">' + [int]$countRow[1] + '</td></tr>') }
+    [void]$sb.Append('</table>')
+    if (-not [bool](Get-DataProperty $Summary 'hasSides' $false)) {
+        [void]$sb.Append('<p>この版は古い形式のため、ページの左右までは比べていません。</p>')
+    }
+    if ($entries.Count -eq 0) {
+        $noneText = $(if ([bool](Get-DataProperty $from 'isLastPublished' $false) -and $fromPublished) { '前回コピーしたときから、変わったページはありません。' } else { '比べた2つの版のあいだで、変わったページはありません。' })
+        [void]$sb.Append('<p class="none">' + (& $h $noneText) + '</p>')
+    }
+    $noteTexts = @(Get-Array (Get-DataProperty $Summary 'notes' @()) | ForEach-Object { [string](Get-DataProperty $_ 'message' '') } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -notlike '*変わったページはありません*' })
+    if ($noteTexts.Count -gt 0) {
+        [void]$sb.Append('<div class="notes">')
+        foreach ($noteText in $noteTexts) { [void]$sb.Append('<p>' + (& $h $noteText) + '</p>') }
+        [void]$sb.Append('</div>')
+    }
+    [void]$sb.Append('<p class="notice">このPDFは確認用です。提出物ではありません。</p>')
+    if ($GeneratedAt) { [void]$sb.Append('<p>作成日時: ' + (& $h (Format-PackChangeReportDate $GeneratedAt)) + '</p>') }
+    [void]$sb.Append((& $footer 1))
+    [void]$sb.Append('</section>')
+
+    # ---- 変更一覧 ----
+    for ($pageIndex = 0; $pageIndex -lt $listPageCount; $pageIndex++) {
+        [void]$sb.Append('<section class="sheet list-page">')
+        [void]$sb.Append($mark)
+        [void]$sb.Append('<h2>変更一覧</h2>')
+        [void]$sb.Append('<table class="list"><colgroup><col style="width:13%"><col style="width:13%"><col style="width:25%"><col style="width:30%"><col style="width:19%"></colgroup>')
+        [void]$sb.Append('<thead><tr><th>今回 p.／左右</th><th>前回 p.／左右</th><th>原稿名 / シート名</th><th>変わったこと</th><th>見た目の変化</th></tr></thead><tbody>')
+        $startIndex = $pageIndex * $perPage
+        $endIndex = [Math]::Min($entries.Count, $startIndex + $perPage) - 1
+        for ($i = $startIndex; $i -le $endIndex; $i++) {
+            $entry = $entries[$i]
+            if ([string]$entry.type -eq 'shift') {
+                [void]$sb.Append('<tr class="r shift"><td colspan="5"><div class="clip">' + (& $h (Get-PackChangeReportShiftText $entry)) + '</div></td></tr>')
+                continue
+            }
+            $row = $entry.row
+            $sheetLabel = [string](Get-DataProperty $row 'sheetName' '')
+            if ([string]::IsNullOrWhiteSpace($sheetLabel)) { $sheetLabel = [string](Get-DataProperty $row 'title' '') }
+            $name = (@([string](Get-DataProperty $row 'sourceName' ''), $sheetLabel) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' / '
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = [string](Get-DataProperty $row 'title' '') }
+            $kindsText = (@(Get-PackChangeReportKindLabels $row)) -join '、'
+            $rowMessage = [string](Get-DataProperty $row 'message' '')
+            [void]$sb.Append('<tr class="r">')
+            [void]$sb.Append('<td>' + (& $h (Get-PackChangeReportPageLabel (Get-DataProperty $row 'toPage' $null) ([string](Get-DataProperty $row 'toSide' '')))) + '</td>')
+            [void]$sb.Append('<td>' + (& $h (Get-PackChangeReportPageLabel (Get-DataProperty $row 'fromPage' $null) ([string](Get-DataProperty $row 'fromSide' '')))) + '</td>')
+            [void]$sb.Append('<td><div class="clip">' + (& $h $name) + '</div></td>')
+            [void]$sb.Append('<td><div class="clip">' + (& $h $kindsText) + $(if ($rowMessage) { ' <small>' + (& $h $rowMessage) + '</small>' } else { '' }) + '</div></td>')
+            [void]$sb.Append('<td><div class="clip">' + (& $h (Get-PackChangeReportVisualText $row)) + '</div></td>')
+            [void]$sb.Append('</tr>')
+        }
+        [void]$sb.Append('</tbody></table>')
+        [void]$sb.Append((& $footer ($pageIndex + 2)))
+        [void]$sb.Append('</section>')
+    }
+    [void]$sb.Append('</body></html>')
+    return $sb.ToString()
+}
+
+# 変更点PDFを作る待ち時間の上限。件数に比例させる（60秒＋1件あたり0.5秒、最大10分）。
+function Get-PackChangeReportTimeoutSeconds([int]$ItemCount) {
+    $seconds = 60 + [int][Math]::Ceiling([Math]::Max(0, $ItemCount) * 0.5)
+    return [int][Math]::Min([int]$Script:EdgePrintMaxTimeoutSeconds, $seconds)
+}
+
+# Edge のヘッドレス印刷の引数。専用の --user-data-dir を必ず渡す（起動中の Edge と同じ
+# プロファイルだと、処理が起動中の窓に渡されてすぐ終わり、PDF ができない）。
+function Get-EdgePrintToPdfArguments([string]$ProfileDir, [string]$PdfPath, [string]$Url) {
+    if ([string]::IsNullOrWhiteSpace($ProfileDir)) { throw 'Edge の印刷には専用のプロファイルフォルダーが必要です。' }
+    return @(
+        '--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+        '--disable-extensions', '--disable-sync',
+        ('--user-data-dir=' + $ProfileDir),
+        '--no-pdf-header-footer',
+        ('--print-to-pdf=' + $PdfPath),
+        $Url
+    )
+}
+
+# HTML を Edge のヘッドレス印刷で PDF にする。結果は ok / code（edge-missing・timeout・no-pdf）/
+# message / timedOut / exitCode / log（Edge の出力。診断用）。
+function Invoke-EdgePrintToPdf([string]$HtmlPath, [string]$PdfPath, [int]$TimeoutSeconds = 60) {
+    $result = [ordered]@{ ok = $false; code = ''; message = ''; timedOut = $false; exitCode = -1; log = ''; edgePath = '' }
+    $edge = Get-EdgeExecutablePath
+    if ([string]::IsNullOrWhiteSpace($edge)) {
+        $result.code = 'edge-missing'
+        $result.message = 'この PC では Microsoft Edge が見つからないため、変更点PDFを作れませんでした。画面の一覧は使えます。'
+        return [pscustomobject]$result
+    }
+    $result.edgePath = $edge
+    $profileDir = Join-Path ([IO.Path]::GetTempPath()) ('rb-chg-edge-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    try {
+        if (Test-Path -LiteralPath $PdfPath) { Remove-Item -LiteralPath $PdfPath -Force }
+        $url = ([Uri]([IO.Path]::GetFullPath($HtmlPath))).AbsoluteUri
+        $TimeoutSeconds = [int][Math]::Min([Math]::Max(1, $TimeoutSeconds), $Script:EdgePrintMaxTimeoutSeconds)
+        $capture = Invoke-NativeCapture $edge @(Get-EdgePrintToPdfArguments $profileDir $PdfPath $url) ([int][Math]::Min($TimeoutSeconds, $Script:EdgePrintMaxTimeoutSeconds))
+        $result.exitCode = [int]$capture.exitCode
+        $result.timedOut = [bool]$capture.timedOut
+        $result.log = [string]$capture.text
+        if ([bool]$capture.timedOut) {
+            $result.code = 'timeout'
+            $result.message = ('変更点PDFの作成が時間内（{0}秒）に終わりませんでした。画面の一覧は使えます。しばらくしてからもう一度作ってください。' -f $TimeoutSeconds)
+            return [pscustomobject]$result
+        }
+        # 管理ポリシーでヘッドレスが止められていても、Edge は正常終了することがある。PDF そのものを確かめる。
+        $item = $null
+        if (Test-Path -LiteralPath $PdfPath -PathType Leaf) { $item = Get-Item -LiteralPath $PdfPath -ErrorAction SilentlyContinue }
+        if ($null -eq $item -or [int64]$item.Length -le 0 -or -not (Test-PdfMagic $PdfPath)) {
+            $result.code = 'no-pdf'
+            $result.message = 'この PC では変更点PDFを作れませんでした。画面の一覧は使えます。管理者に『Edge のヘッドレス印刷』が使えるか確認してください。'
+            return [pscustomobject]$result
+        }
+        $result.ok = $true
+        return [pscustomobject]$result
+    } finally {
+        # 終了直後は Edge の子プロセスがプロファイルを掴んでいることがある。消せなくても失敗にはしない。
+        for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            try { Remove-Item -LiteralPath $profileDir -Recurse -Force -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 300 }
+        }
+    }
+}
+
+# 変更点PDFの名前（発行フォルダーで提出用PDFのすぐ下に並ぶ）。
+function Get-PackChangeReportFileName([string]$OutputFileName) {
+    $stem = [IO.Path]::GetFileNameWithoutExtension([string]$OutputFileName)
+    if ([string]::IsNullOrWhiteSpace($stem)) { $stem = '提出用PDF' }
+    return ($stem + '_変更点.pdf')
+}
+
+# 作った変更点PDFの状態。meta.json の記録と report.pdf の中身が合い、同じ2つの版
+# （outputPdfSha256）についてのもので、作成の版が同じときだけ「作成済み」。見た目のハッシュが
+# そろわないうちに作ったものは、そろった後には古い（一覧の中身が変わる）。
+# 共有用フォルダーへの同梱（publishable）は後の版で足すので、今は常に false。
+function Get-PackChangeReportState([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId, [string]$FromOutputPdfSha256, [string]$ToOutputPdfSha256, [bool]$Complete, [string]$OutputFileName = '') {
+    $reportId = ([string]$FromBuildId + '__' + [string]$ToBuildId)
+    $state = [ordered]@{ exists = $false; reportId = $reportId; fileName = (Get-PackChangeReportFileName $OutputFileName); createdAt = ''; publishable = $false; reason = 'not-created' }
+    $dir = Get-PackChangeReportDir $Language $PackId $TargetId $FromBuildId $ToBuildId
+    $metaPath = Join-Path $dir 'meta.json'
+    $pdfPath = Join-Path $dir 'report.pdf'
+    if (-not (Test-Path -LiteralPath $metaPath -PathType Leaf)) { return $state }
+    $meta = Read-JsonFile $metaPath $null
+    $valid = ($null -ne $meta -and (Test-Path -LiteralPath $pdfPath -PathType Leaf) -and
+        [int](Get-DataProperty $meta 'reportVersion' 0) -eq [int]$Script:PackChangeReportVersion -and
+        [string](Get-DataProperty $meta 'fromBuildId' '') -eq [string]$FromBuildId -and
+        [string](Get-DataProperty $meta 'toBuildId' '') -eq [string]$ToBuildId -and
+        (Normalize-FileHash ([string](Get-DataProperty $meta 'fromOutputPdfSha256' ''))) -eq (Normalize-FileHash $FromOutputPdfSha256) -and
+        (Normalize-FileHash ([string](Get-DataProperty $meta 'toOutputPdfSha256' ''))) -eq (Normalize-FileHash $ToOutputPdfSha256) -and
+        ([bool](Get-DataProperty $meta 'complete' $false) -or -not $Complete))
+    if ($valid) {
+        $recorded = Normalize-FileHash ([string](Get-DataProperty $meta 'reportSha256' ''))
+        $valid = (-not [string]::IsNullOrWhiteSpace($recorded) -and (Normalize-FileHash (New-Sha256 $pdfPath)) -eq $recorded)
+    }
+    if (-not $valid) { $state.reason = 'outdated'; return $state }
+    $state.exists = $true
+    $state.createdAt = [string](Get-DataProperty $meta 'createdAt' '')
+    $state.reason = 'copy-not-available'
+    return $state
+}
+
+function Get-PackChangeReportLockPath([string]$Language, [string]$Kind, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId) {
+    $key = (Get-Sha256Text ((Get-FinalArchiveStorageId $PackId) + '|' + $TargetId + '|' + $FromBuildId + '|' + $ToBuildId)).Substring(7, 24)
+    return (Join-Path (Get-WorkspacePath $Language) ('locks\change-report-{0}_{1}.lock' -f $Kind, $key))
+}
+
+# 変更点PDFの作成を始める（POST /api/v2/outputs/changes/report）。比べる2つの版は画面に出ている
+# 組み合わせ（fromBuildId・toBuildId の両方）で受け取る。作成済みなら作り直さない。同じ組み合わせの
+# 作成中のジョブがあれば、それに合流する（起動ロックで1本にまとめる）。
+function Start-PackChangeReportJob([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId) {
+    if ([string]::IsNullOrWhiteSpace($FromBuildId) -or [string]::IsNullOrWhiteSpace($ToBuildId)) {
+        throw [ArgumentException]::new('変更点PDFを作る2つの版（fromBuildId・toBuildId）を指定してください。')
+    }
+    $summary = Get-PackChangeSummary $Language $PackId $TargetId $FromBuildId $ToBuildId
+    if ([string]$summary.status -ne 'ready') {
+        $reason = [string]$summary.message
+        if ([string]::IsNullOrWhiteSpace($reason)) { $reason = '比べられる2つの版がありません。' }
+        throw [ArgumentException]::new($reason)
+    }
+    $packId = [string]$summary.packId
+    $targetId = [string]$summary.targetId
+    # 逆向きに指定されたら、サーバーが古い→新しいに入れ替えた組み合わせで作る。
+    $fromBuildId = [string]$summary.from.buildId
+    $toBuildId = [string]$summary.to.buildId
+    $reportDir = Get-PackChangeReportDir $Language $packId $targetId $fromBuildId $toBuildId
+    $launchLock = Get-PackChangeReportLockPath $Language 'launch' $packId $targetId $fromBuildId $toBuildId
+    return Invoke-WithLock $launchLock {
+        if ([bool](Get-DataProperty $summary.report 'exists' $false)) {
+            return [pscustomobject][ordered]@{ ok = $true; jobType = 'change-report'; jobId = ''; status = 'completed'; percent = 100; message = '変更点PDFは作成済みです。'; reportReady = $true; report = $summary.report; fromBuildId = $fromBuildId; toBuildId = $toBuildId }
+        }
+        if (-not (Test-Path -LiteralPath $reportDir)) { New-Item -ItemType Directory -Path $reportDir -Force | Out-Null }
+        $pointerPath = Join-Path $reportDir 'report-job.json'
+        if (Test-Path -LiteralPath $pointerPath) {
+            try {
+                $pointer = Read-JsonFile $pointerPath $null
+                $activeId = [string](Get-DataProperty $pointer 'jobId' '')
+                if (-not [string]::IsNullOrWhiteSpace($activeId)) {
+                    $active = Read-RenderJobStatus $Language $activeId
+                    # 状態ファイルが消えたジョブ（transientMissing）に合流すると、いつまでも「準備中」のまま待ち続ける。
+                    if (@('completed','completed-with-errors','failed','missing','cancelled') -notcontains [string](Get-DataProperty $active 'status' '') -and
+                        -not [bool](Get-DataProperty $active 'transientMissing' $false)) {
+                        Set-NoteProperty $active 'joinedExistingReportJob' $true
+                        return $active
+                    }
+                }
+            } catch { }
+        }
+        $jobId = 'job_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '_' + ([Guid]::NewGuid().ToString('N').Substring(0,8))
+        $jobDir = Get-RenderJobDir $Language
+        $inputPath = Join-Path $jobDir "$jobId.change-report.input.json"
+        $statusPath = Join-Path $jobDir "$jobId.status.json"
+        $stdoutPath = Join-Path $jobDir "$jobId.change-report.out.log"
+        $stderrPath = Join-Path $jobDir "$jobId.change-report.err.log"
+        $initial = [pscustomobject][ordered]@{
+            ok = $true; jobType = 'change-report'; jobId = $jobId; status = 'queued'; total = 1
+            completed = 0; failed = 0; percent = 1; message = '変更点PDFを準備しています。'
+            currentWorkbookId = ''; currentWorkbookName = ''; currentSheet = ''
+            processId = 0; stdoutPath = $stdoutPath; stderrPath = $stderrPath
+            packId = $packId; targetId = $targetId; fromBuildId = $fromBuildId; toBuildId = $toBuildId
+            code = ''; report = $null
+            results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = ''
+        }
+        try {
+            Write-RenderJobStatus $statusPath $initial
+            Write-JsonFile $inputPath ([ordered]@{
+                jobId = $jobId; mode = $Language; packId = $packId; targetId = $targetId
+                fromBuildId = $fromBuildId; toBuildId = $toBuildId
+                reportDir = $reportDir; statusPath = $statusPath
+                stdoutPath = $stdoutPath; stderrPath = $stderrPath
+                generationLockPath = (Get-PackChangeReportLockPath $Language 'generate' $packId $targetId $fromBuildId $toBuildId)
+            })
+            Write-JsonFile $pointerPath ([ordered]@{ jobId = $jobId; createdAt = New-NowIso })
+            $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            if (-not (Test-Path -LiteralPath $psExe)) { $psExe = 'powershell.exe' }
+            $serverScript = Join-Path $Script:AppRoot 'server.ps1'
+            $command = "& '$($serverScript.Replace("'", "''"))' -Mode '$($Language.Replace("'", "''"))' -ChangeReportJobPath '$($inputPath.Replace("'", "''"))'"
+            $proc = Start-HiddenPowerShellChild $psExe $command $stdoutPath $stderrPath
+            if (-not $proc -or -not $proc.Id) { throw '変更点PDFの作成プロセスIDを取得できませんでした。' }
+            $initial.processId = [int]$proc.Id; $initial.status = 'launching'; $initial.percent = 2
+            $initial.message = '変更点PDFの作成を始めました。'
+            Write-RenderJobStatus $statusPath $initial
+            return $initial
+        } catch {
+            $initial.status = 'failed'; $initial.percent = 100; $initial.message = '変更点PDFの作成プロセスを起動できませんでした。'
+            $initial.errors = @([ordered]@{ error = $_.Exception.Message; detail = Get-ErrorDetail $_ })
+            try { Write-RenderJobStatus $statusPath $initial } catch { }
+            throw
+        }
+    }
+}
+
+# 子プロセスの本体。比べ直し → HTML → Edge で PDF → ハッシュを記録。report.pdf は一時名で書いてから
+# 名前を変え、meta.json を最後に書く（meta.json と report.pdf のハッシュが合わないものは作成済みにしない）。
+function Invoke-PackChangeReportJobCore($Job) {
+    $language = [string](Get-DataProperty $Job 'mode' $Mode)
+    $statusPath = [string](Get-DataProperty $Job 'statusPath' '')
+    $jobId = [string](Get-DataProperty $Job 'jobId' '')
+    $packId = [string](Get-DataProperty $Job 'packId' '')
+    $targetId = [string](Get-DataProperty $Job 'targetId' '')
+    $fromBuildId = [string](Get-DataProperty $Job 'fromBuildId' '')
+    $toBuildId = [string](Get-DataProperty $Job 'toBuildId' '')
+    $status = [pscustomobject][ordered]@{
+        ok = $true; jobType = 'change-report'; jobId = $jobId; status = 'running'; total = 1; completed = 0; failed = 0
+        percent = 5; message = '変更点をまとめています。'
+        currentWorkbookId = ''; currentWorkbookName = ''; currentSheet = ''
+        processId = $PID; packId = $packId; targetId = $targetId; fromBuildId = $fromBuildId; toBuildId = $toBuildId
+        code = ''; report = $null
+        results = @(); errors = @(); startedAt = New-NowIso; updatedAt = New-NowIso; stateSavedAt = ''
+    }
+    Write-RenderJobStatus $statusPath $status
+    $workDir = Join-Path ([IO.Path]::GetTempPath()) ('rb-chg-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))
+    try {
+        $reportDir = Get-PackChangeReportDir $language $packId $targetId $fromBuildId $toBuildId
+        $summary = Get-PackChangeSummary $language $packId $targetId $fromBuildId $toBuildId
+        if ([string]$summary.status -ne 'ready') { throw ([string]$summary.message) }
+        if ([string]$summary.from.buildId -ne $fromBuildId -or [string]$summary.to.buildId -ne $toBuildId) { throw '比べる版が変わりました。変更点を開き直してください。' }
+        $structure = Get-Structure $language
+        $scope = Resolve-DocumentPackScope $structure $packId $true
+        $packName = [string](Get-DataProperty $scope.pack 'displayName' '')
+        $targetName = ''
+        try { $targetName = Get-PackTargetDisplayName $language $scope.pack $targetId } catch { $targetName = $targetId }
+        $createdAt = New-NowIso
+        $html = New-PackChangeReportHtml $summary $packName $targetName $createdAt
+        $status.percent = 30; $status.message = '変更点PDFを作っています（Microsoft Edge で印刷しています）。'
+        Write-RenderJobStatus $statusPath $status
+
+        # file:// のパスに日本語・空白・長いパスが入らないよう、TEMP の短い作業フォルダーで印刷する。
+        New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+        $workHtml = Join-Path $workDir 'report.html'
+        $workPdf = Join-Path $workDir 'report.pdf'
+        Write-Utf8NoBomFile $workHtml $html
+        $timeout = Get-PackChangeReportTimeoutSeconds (@(Get-Array $summary.pages).Count)
+        $print = Invoke-EdgePrintToPdf $workHtml $workPdf $timeout
+        if (-not [bool]$print.ok) {
+            $status.code = [string]$print.code
+            $printError = [System.Exception]::new([string]$print.message)
+            $printError.Data['edgeLog'] = [string]$print.log
+            $printError.Data['code'] = [string]$print.code
+            throw $printError
+        }
+        $status.percent = 90; $status.message = '変更点PDFを保存しています。'
+        Write-RenderJobStatus $statusPath $status
+
+        if (-not (Test-Path -LiteralPath $reportDir)) { New-Item -ItemType Directory -Path $reportDir -Force | Out-Null }
+        $reportSha = Normalize-FileHash (New-Sha256 $workPdf)
+        $tmpPdf = Join-Path $reportDir ('report.pdf.tmp.' + [Guid]::NewGuid().ToString('N'))
+        Copy-Item -LiteralPath $workPdf -Destination $tmpPdf -Force
+        if ((Normalize-FileHash (New-Sha256 $tmpPdf)) -ne $reportSha) { throw '変更点PDFを保存先へ書き込めませんでした。' }
+        $metaPath = Join-Path $reportDir 'meta.json'
+        # 古い meta.json が新しい report.pdf を「作成済み」と言わないよう、先に外す。
+        if (Test-Path -LiteralPath $metaPath) { Remove-Item -LiteralPath $metaPath -Force }
+        Move-FileAtomicCompat $tmpPdf (Join-Path $reportDir 'report.pdf')
+        Write-Utf8NoBomFile (Join-Path $reportDir 'report.html') $html
+        Write-JsonFile $metaPath ([ordered]@{
+            schemaVersion = 1
+            reportVersion = $Script:PackChangeReportVersion
+            packId = $packId; targetId = $targetId
+            fromBuildId = $fromBuildId; toBuildId = $toBuildId
+            fromOutputPdfSha256 = [string]$summary.from.outputPdfSha256
+            toOutputPdfSha256 = [string]$summary.to.outputPdfSha256
+            reportSha256 = $reportSha
+            complete = [bool]$summary.complete
+            changedCount = [int](Get-DataProperty $summary.counts 'changed' 0)
+            fileName = (Get-PackChangeReportFileName ([string]$summary.to.outputFileName))
+            createdAt = $createdAt
+        })
+        $state = Get-PackChangeReportState $language $packId $targetId $fromBuildId $toBuildId ([string]$summary.from.outputPdfSha256) ([string]$summary.to.outputPdfSha256) ([bool]$summary.complete) ([string]$summary.to.outputFileName)
+        if (-not [bool]$state.exists) { throw '変更点PDFを保存しましたが、記録と中身が合いません。もう一度作ってください。' }
+        $status.status = 'completed'; $status.completed = 1; $status.percent = 100
+        $status.message = '変更点PDFを作りました。'
+        $status.report = $state
+        Set-NoteProperty $status 'finishedAt' (New-NowIso)
+        Write-RenderJobStatus $statusPath $status
+    } catch {
+        $code = [string]$_.Exception.Data['code']
+        if ($code) { $status.code = $code }
+        $status.status = 'failed'; $status.failed = 1; $status.percent = 100
+        $status.message = [string]$_.Exception.Message
+        $status.errors = @([ordered]@{ error = [string]$_.Exception.Message; code = $code; detail = Get-ErrorDetail $_; edgeLog = [string]$_.Exception.Data['edgeLog'] })
+        Set-NoteProperty $status 'finishedAt' (New-NowIso)
+        Write-RenderJobStatus $statusPath $status
+    } finally {
+        if (Test-Path -LiteralPath $workDir) { Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-PackChangeReportJobFromFile([string]$JobPath) {
+    $job = Read-JsonFile $JobPath $null
+    if ($null -eq $job) { throw "Change report job file is not readable: $JobPath" }
+    $language = [string](Get-DataProperty $job 'mode' $Mode)
+    $packId = [string](Get-DataProperty $job 'packId' '')
+    $targetId = [string](Get-DataProperty $job 'targetId' '')
+    $fromBuildId = [string](Get-DataProperty $job 'fromBuildId' '')
+    $toBuildId = [string](Get-DataProperty $job 'toBuildId' '')
+    # 渡されたロックの場所は信用せず、組み合わせから計算し直したものと同じときだけ使う。
+    $expectedLock = [IO.Path]::GetFullPath((Get-PackChangeReportLockPath $language 'generate' $packId $targetId $fromBuildId $toBuildId))
+    $providedLockText = [string](Get-DataProperty $job 'generationLockPath' '')
+    if ([string]::IsNullOrWhiteSpace($providedLockText) -or [IO.Path]::GetFullPath($providedLockText) -ne $expectedLock) { throw '変更点PDFの作成ロックの保存先が不正です。' }
+    Invoke-WithLock $expectedLock { Invoke-PackChangeReportJobCore $job }
+}
+
+# 作った変更点PDFを開く／保存先フォルダーを開く（POST /api/v2/outputs/changes/report/file）。
+# 記録（meta.json）と中身が合うものだけ。exports\change-reports の外は開かない。
+function Resolve-PackChangeReportFile([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId) {
+    $structure = Get-Structure $Language
+    $scope = Resolve-DocumentPackScope $structure $PackId $true
+    if ([bool]$scope.builtIn) { throw [ArgumentException]::new('組み込みの一式には変更点PDFがありません。') }
+    $targetId = Assert-PackTargetId $Language $scope.pack $TargetId
+    if ([string]::IsNullOrWhiteSpace($FromBuildId) -or [string]::IsNullOrWhiteSpace($ToBuildId)) { throw [ArgumentException]::new('変更点PDFの2つの版を指定してください。') }
+    $dir = [IO.Path]::GetFullPath((Get-PackChangeReportDir $Language ([string]$scope.packId) $targetId $FromBuildId $ToBuildId))
+    $root = [IO.Path]::GetFullPath((Join-Path (Get-WorkspacePath $Language) 'exports\change-reports'))
+    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+    if (-not $dir.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw [ArgumentException]::new('変更点PDFの場所が不正です。') }
+    $pdfPath = Join-Path $dir 'report.pdf'
+    $meta = Read-JsonFile (Join-Path $dir 'meta.json') $null
+    if ($null -eq $meta -or -not (Test-Path -LiteralPath $pdfPath -PathType Leaf)) { throw '変更点PDFはまだ作られていません。「変更点をPDFにする」を押してください。' }
+    $recorded = Normalize-FileHash ([string](Get-DataProperty $meta 'reportSha256' ''))
+    if ([string]::IsNullOrWhiteSpace($recorded) -or (Normalize-FileHash (New-Sha256 $pdfPath)) -ne $recorded) { throw '変更点PDFが作ったときから変わっています。「変更点をPDFにする」でもう一度作ってください。' }
+    return $pdfPath
 }
 
 
@@ -16212,6 +16827,11 @@ if (-not [string]::IsNullOrWhiteSpace($AutoSchedulerPath)) {
 
 if (-not [string]::IsNullOrWhiteSpace($DiffJobPath)) {
     Invoke-DiffDetailJobFromFile $DiffJobPath
+    return
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ChangeReportJobPath)) {
+    Invoke-PackChangeReportJobFromFile $ChangeReportJobPath
     return
 }
 
