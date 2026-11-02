@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v209', 'style.css?v=20261030_v127']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v210', 'style.css?v=20261030_v127']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v209' not in html:
+if 'app.js?v=20261030_v210' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v209' not in html:
+if 'app.js?v=20261030_v210' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -1862,6 +1862,32 @@ if _publish.count('Move-Item -LiteralPath $stagingDir -Destination $publishDir')
 _publish_all = server.split('function Publish-DocumentPackAllPdfsToShared',1)[1].split('\nfunction ',1)[0] if 'function Publish-DocumentPackAllPdfsToShared' in server else ''
 if 'Get-PackTargetIds' not in _publish_all or 'Publish-DocumentPackPdfToShared $Language $volumes' not in _publish_all:
     raise SystemExit('publish-all must collect every target with pages and publish them together')
+# 変更点の下準備: 「前回コピーした版」を後から引けるよう、発行ごとに buildId と sha256 を
+# 出力先ごとの発行記録に残す。Write-HistoryEvent は何も書かない（履歴タイムラインは廃止）ので、
+# final.published のイベントに足すだけでは残らない。振る舞いは output-publish-selfcheck.ps1 が見る。
+for needed in ['buildId = [string]$entry.buildId', 'sha256 = [string]$entry.sha256',
+               "Write-PublishRecord $Language $packId ([string]$entry.volume) $publishedEvent"]:
+    if needed not in _publish:
+        raise SystemExit(f'shared publishing must record which output was copied: {needed}')
+def _publish_server_function(name):
+    if f'function {name}(' not in server: raise SystemExit(f'server function is missing: {name}')
+    return server.split(f'function {name}(',1)[1].split('\nfunction ',1)[0]
+_last_published = _publish_server_function('Get-LastPublishedBuildId')
+if 'Get-PublishRecords' not in _last_published or 'Get-HistoryTimeline' in _last_published:
+    raise SystemExit('the last published build must come from the publish records, not the (unwritten) history timeline')
+if "'exports\\publish-records'" not in _publish_server_function('Get-PublishRecordDir'):
+    raise SystemExit('publish records must stay outside the archive tree')
+_archive_record = _publish_server_function('Get-FinalArchiveRecord')
+for needed in ['Assert-SafeStorageSegment $BuildId', 'Assert-SafeStorageSegment $Volume', "'sha256.txt'", 'New-Sha256 $pdfPath']:
+    if needed not in _archive_record:
+        raise SystemExit(f'Get-FinalArchiveRecord must refuse unsafe ids and swapped PDFs: {needed}')
+# 覚えたハッシュはサイズ・更新日時で引くので、それを揃えたすり替えを見逃す。
+if 'Get-Sha256Reusing' in _archive_record:
+    raise SystemExit('Get-FinalArchiveRecord must hash the archived PDF every time')
+_archive_list = _publish_server_function('Get-FinalArchives')
+for needed in ['isLastPublished =', 'isCurrent =', 'hasPageMap =', 'publishedAt =', 'folderName =', 'Get-OutputPdfIntegrityProblem']:
+    if needed not in _archive_list:
+        raise SystemExit(f'the archive list must say which output is current and which was copied: {needed}')
 # H-1: 出力先パスの重なりの検査そのものは output-publish-selfcheck.ps1 が振る舞いで見る。
 # ここでは、組版（Java）より前に両方の出力経路から呼ばれていることを見る。
 for _fn in ['function Build-DocumentPackPdf', 'function Invoke-FinalBuildTransaction']:
