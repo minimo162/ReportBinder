@@ -417,7 +417,8 @@ Assert-ChangeTest ([string]$doneJob.status -eq 'completed' -and [string]$doneJob
 $reportDir = Get-PackChangeReportDir 'ja' $packId 'main' $build3 $build4
 foreach ($name in @('report.pdf','report.html','meta.json','summary.json')) { Assert-ChangeTest (Test-Path -LiteralPath (Join-Path $reportDir $name) -PathType Leaf) "The report folder is missing $name." }
 Assert-ChangeTest ($reportDir.StartsWith((Join-Path (Get-WorkspacePath 'ja') 'exports\change-reports'))) 'The report was not kept under exports\change-reports.'
-Assert-ChangeTest (@(Get-ChildItem -LiteralPath $outputDir -Filter '*変更点*' -ErrorAction SilentlyContinue).Count -eq 0) 'The change report was copied into the local output folder.'
+# 一式の名前（変更点の一式）は提出用PDFの名前にも入るので、変更点PDFの名前（…_変更点.pdf）で探す。
+Assert-ChangeTest (@(Get-ChildItem -LiteralPath $outputDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*_変更点.pdf' }).Count -eq 0) 'The change report was copied into the local output folder.'
 $reportSummary = Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4
 Assert-ChangeTest ([int]$Script:EdgeCalls[$Script:EdgeCalls.Count - 1].timeout -eq (Get-PackChangeReportTimeoutSeconds @($reportSummary.pages).Count)) 'The report job did not use the proportional timeout.'
 # 好きな2回（比べる元が前回コピーした版でない）で作ったものは、作成済みでも共有コピーへは付けない。
