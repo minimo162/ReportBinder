@@ -203,4 +203,13 @@ for (const name of ['renderPdfImagePane', 'pdfImagePaneSheetHtml', 'pdfImagePane
   for (const banned of ['outputPageNumber', 'spreadIndex', 'buildSpreadLayout']) assert.ok(!extractFunction(name).includes(banned), `${name} must not use ${banned}`);
 }
 
+// 既定は表示する。'0'（利用者が閉じた）ときだけ閉じたまま。sessionStorage が読めなければ表示する。
+const readEnabled = storage => new Function('sessionStorage', `${extractFunction('readPdfImagePaneEnabled')}\nreturn readPdfImagePaneEnabled();`)(storage);
+const storageWith = value => ({ getItem: key => (key === 'ReportBinderPdfImagePane' ? value : null) });
+assert.equal(readEnabled(storageWith(null)), true, 'the pane is on by default when nothing is saved');
+assert.equal(readEnabled(storageWith('0')), false, "the pane stays off after the user turned it off ('0')");
+assert.equal(readEnabled(storageWith('1')), true, "the pane is on when '1' is saved");
+assert.equal(readEnabled({ getItem() { throw new Error('SecurityError'); } }), true, 'the pane is on when sessionStorage cannot be read');
+assert.ok(source.includes('let pdfImagePaneEnabled = readPdfImagePaneEnabled();'), 'the toggle state must start from readPdfImagePaneEnabled');
+
 console.log('pdf image pane regression ok');

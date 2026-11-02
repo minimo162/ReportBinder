@@ -1,5 +1,13 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 「PDFイメージを横に表示」を最初から出すようにした（2026-10-30）
+
+- 目的: 横パネルは並べ替えながら並びを確かめるためのものなのに、既定が OFF で、トグルに気づかないと使われなかった。最初から表示し、要らない人だけが閉じられるようにする。
+- 初期状態は`readPdfImagePaneEnabled`で決める。sessionStorage（`ReportBinderPdfImagePane`）が`'0'`（利用者が閉じた）のときだけ OFF、未設定・`'1'`・sessionStorage が読めないときは ON。トグルで切り替えたときの保存（`'1'`／`'0'`）は今までどおり。
+- 画面幅 1100px 未満では出さない挙動（`pdfImagePaneWideEnough`）、見開き・PDFイメージ表示ではトグルを出さないことは変えていない。`index.html`の`aria-pressed="false"`と`hidden`は、幅を確かめる前に一瞬出ないよう残し、起動時の`syncPdfImagePaneControls`で合わせる。見開きの`buildSpreadLayout`と、頁・左右をサーバー値で決める契約には手を入れていない。three.js／WebGL は使っていない。
+- `tests/pdf-image-pane-regression.mjs`に、未設定→ON、`'0'`→OFF、`'1'`→ON、読めない→ON を加えた。`app/tools/selfcheck.py`に、既定 ON と`'0'`のときだけ OFF の静的検査を加えた。
+- RuntimeVersion `2026.10.30.19`、`app.js` `v20261030_v207` へ更新した。
+
 ## サムネイル・詳細で並べ替えながら、横のパネルで提出用PDFの並びを確かめられるようにした（2026-10-30）
 
 - 目的: PDFイメージ表示は見るだけなので、並べ替えの操作と並びの確認を行き来する必要があった。サムネイル・詳細の盤面の右に、表示中の出力先の物理ページを小さく縦に並べ、操作しながら提出用PDFの並びを見られるようにする。three.js／WebGL は使わず、PDFイメージと同じ PDF.js（canvas 2D）と DOM／CSS で描く。
