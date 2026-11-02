@@ -897,7 +897,7 @@ POST  /api/v2/outputs/changes/report/file
 - 応答の`changeReports[]`に同梱したもの（`targetId`・`targetName`・`fileName`・`sharedPath`・`fromBuildId`・`toBuildId`・`sha256`）、`files[].changeReport`にも同じ内容を返します。履歴イベントは`final.published`に`changeReport`を足し、同梱した変更点PDFごとに`final.change-report.published`を書きます（`Write-HistoryEvent`は今は何も書きません。発行記録の`changeReport`に残ります）。
 - 見た目のハッシュがそろわないうちに作ったもの（`complete: false`）も、4つの条件を満たせば付けます（同じ2つの版の比較です）。画面では、そろった後は作り直してからコピーします。
 
-画面での使い方: 「共有用フォルダーにコピー」・「まとめて共有用フォルダーにコピー」を押すと、出力先ごとに`GET /api/v2/outputs/changes`（既定の組み合わせ）を読み、`report.attachable`の出力先があれば確認画面に「変更点PDFもいっしょにコピーする」（最初からチェックあり）を出します。まだ作っていない（`publishable`が false）ものがあれば、ボタンが「変更点PDFを作ってからコピーする」になり、先に変更点PDFを作ってからコピーします。作れなかったときは何もコピーせず、チェックを外せば提出用PDFだけをコピーできると伝えます。付けられるものが無い出力先だけなら、今までどおり確認なしでコピーします。組み込み一式は対象外です。
+画面での使い方: 「共有用フォルダーにコピー」・「まとめて共有用フォルダーにコピー」を押すと、出力先ごとに`GET /api/v2/outputs/changes`（既定の組み合わせ）を読み、`report.attachable`の出力先があれば確認画面に「変更点PDFもいっしょにコピーする」（最初はチェックなし）を出します。チェックを付けないままなら変更点PDFは作らず・入れず（`includeChangeReports: false`）、提出用PDFだけをコピーします。チェックを付けたときだけ`includeChangeReports: true`で同梱し、まだ作っていない（`publishable`が false）ものがあれば、ボタンが「変更点PDFを作ってからコピーする」になり、先に変更点PDFを作ってからコピーします。作れなかったときは何もコピーせず、チェックを外せば提出用PDFだけをコピーできると伝えます。付けられるものが無い出力先だけなら、今までどおり確認なしでコピーします。組み込み一式は対象外です。
 
 ## 自動PDF作成
 

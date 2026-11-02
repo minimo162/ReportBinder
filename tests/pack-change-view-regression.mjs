@@ -450,7 +450,7 @@ const publishHelpers = ['publishChangeReportPlan', 'publishChangeReportNote'].ma
   assert.equal(ctx.publishChangeReportNote({ changeReports: [{ fileName: 'a_変更点.pdf' }] }, false), '');
 }
 
-function makePublishContext({ changes, confirm = true, checked = true, reportJob = { status: 'completed' } }) {
+function makePublishContext({ changes, confirm = true, tick = false, reportJob = { status: 'completed' } }) {
   const elements = new Map();
   const el = id => {
     if (!elements.has(id)) {
@@ -492,7 +492,7 @@ async function api(path,options){
   ctx.confirmAction = opts => {
     const p = realConfirm(opts);
     ctx.confirms.push({ opts, accept: el('confirm-accept').textContent, wrapHidden: el('confirm-check-wrap').classList.contains('hidden'), checked: el('confirm-check').checked });
-    if (!checked) { el('confirm-check').checked = false; el('confirm-check').onchange?.(); ctx.confirms.at(-1).acceptAfterUncheck = el('confirm-accept').textContent; }
+    if (tick) { el('confirm-check').checked = true; el('confirm-check').onchange?.(); ctx.confirms.at(-1).acceptAfterCheck = el('confirm-accept').textContent; }
     ctx.confirmResolver(confirm);
     return p;
   };
@@ -500,22 +500,24 @@ async function api(path,options){
 }
 const attachChanges = report => ({ status: 'ready', from: { buildId: 'b1' }, to: { buildId: 'b2' }, report });
 {
-  // 作成済み: チェックありの確認を出し、そのままコピーすると includeChangeReports:true。
-  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: true, exists: true }) });
+  // 作成済み: チェックなしの確認を出し、チェックを付けてコピーすると includeChangeReports:true。
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: true, exists: true }), tick: true });
   await ctx.publishFinalVolume('v-main', null);
   assert.equal(ctx.confirms.length, 1);
-  assert.equal(ctx.confirms[0].wrapHidden, false); assert.equal(ctx.confirms[0].checked, true, 'the copy-together box must start checked');
+  assert.equal(ctx.confirms[0].wrapHidden, false); assert.equal(ctx.confirms[0].checked, false, 'the copy-together box must start unchecked');
   assert.equal(ctx.confirms[0].accept, 'コピーする');
+  assert.equal(ctx.confirms[0].acceptAfterCheck, 'コピーする');
   const publish = ctx.calls.find(c => c.path === '/api/v2/outputs/publish');
   assert.equal(publish.body.includeChangeReports, true);
   assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/changes/report').length, 0, 'a made report must not be made again');
   assert.match(ctx.messages.at(-1).message, /a_変更点\.pdf/);
 }
 {
-  // 未作成: ボタンは「変更点PDFを作ってからコピーする」。先に作ってからコピーする。
-  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false, exists: false }) });
+  // 未作成: チェックを付けるとボタンは「変更点PDFを作ってからコピーする」。先に作ってからコピーする。
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false, exists: false }), tick: true });
   await ctx.publishFinalVolume('v-main', null);
-  assert.equal(ctx.confirms[0].accept, '変更点PDFを作ってからコピーする');
+  assert.equal(ctx.confirms[0].accept, 'コピーする', 'unchecked by default, so the button must not say it makes the report');
+  assert.equal(ctx.confirms[0].acceptAfterCheck, '変更点PDFを作ってからコピーする');
   const order = ctx.calls.map(c => c.path.split('?')[0]);
   const created = order.indexOf('/api/v2/outputs/changes/report'), published = order.indexOf('/api/v2/outputs/publish');
   assert.ok(created >= 0 && published > created, `the report must be made before the copy: ${order.join(', ')}`);
@@ -527,18 +529,25 @@ const attachChanges = report => ({ status: 'ready', from: { buildId: 'b1' }, to:
 }
 {
   // 作れなかったら、何もコピーしない。
-  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false }), reportJob: { status: 'failed', message: 'この PC では変更点PDFを作れませんでした。' } });
+  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false }), tick: true, reportJob: { status: 'failed', message: 'この PC では変更点PDFを作れませんでした。' } });
   await ctx.publishFinalVolume('v-main', null);
   assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/publish').length, 0, 'a failed report must stop the copy');
   assert.match(ctx.messages.at(-1).title, /コピーしていません/);
 }
 {
-  // チェックを外すと、作らずに提出用PDFだけ。ボタンの文言も戻る。
-  const ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false }), checked: false });
+  // 既定（チェックを付けないまま）: 作らずに提出用PDFだけ。ボタンは「コピーする」。
+  let ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: false }) });
   await ctx.publishFinalVolume('v-main', null);
-  assert.equal(ctx.confirms[0].acceptAfterUncheck, 'コピーする');
+  assert.equal(ctx.confirms[0].checked, false);
+  assert.equal(ctx.confirms[0].accept, 'コピーする');
+  assert.equal(ctx.collects.length, 0, 'nothing is collected for a report that is not made');
   assert.equal(ctx.calls.filter(c => c.path === '/api/v2/outputs/changes/report').length, 0);
   assert.equal(ctx.calls.find(c => c.path === '/api/v2/outputs/publish').body.includeChangeReports, false);
+  // 作成済みでも、チェックを付けなければ同梱しない。
+  ctx = makePublishContext({ changes: attachChanges({ attachable: true, publishable: true, exists: true }) });
+  await ctx.publishFinalVolume('v-main', null);
+  assert.equal(ctx.calls.find(c => c.path === '/api/v2/outputs/publish').body.includeChangeReports, false);
+  assert.doesNotMatch(ctx.messages.at(-1).message, /変更点\.pdf/);
 }
 {
   // キャンセルなら何もしない。付けられるものが無ければ、今までどおり確認なしでコピーする。
