@@ -314,6 +314,9 @@ try {
         # シートの振り分け（外したシート・改名の旧名が未振り分けに残らないこと）も毎回見る。
         Invoke-Checked 'Sheet assignment regression' 'powershell.exe' @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repoRoot 'tests\sheet-assignment-regression.ps1'))
         Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
+        # 画面本体は抜き出し型のテストだけでは全体の構文を見ない。読み込めないと画面が丸ごと動かない。
+        Invoke-Checked 'Web app JavaScript syntax' $node @('--check',(Join-Path $appRoot 'web\app.js'))
+        Invoke-Checked 'Diff worker JavaScript syntax' $node @('--check',(Join-Path $appRoot 'web\diff-worker.js'))
         Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
         # 何を見ていないかを結果に残す。通った表示だけが後から参照されるため。
         Write-Output 'ReportBinder CI fast gate OK. (regression suites and package smoke tests were not run)'
@@ -324,6 +327,9 @@ try {
     Remove-CiGeneratedFiles
     Invoke-Checked 'Repository selfcheck' $python.file (@($python.prefix) + @((Join-Path $toolsRoot 'selfcheck.py')))
     Invoke-Checked 'JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\diff-regression.mjs'))
+    # 画面本体は抜き出し型のテストだけでは全体の構文を見ない。読み込めないと画面が丸ごと動かない。
+    Invoke-Checked 'Web app JavaScript syntax' $node @('--check',(Join-Path $appRoot 'web\app.js'))
+    Invoke-Checked 'Diff worker JavaScript syntax' $node @('--check',(Join-Path $appRoot 'web\diff-worker.js'))
     Invoke-Checked 'PDF corpus JavaScript syntax' $node @('--check',(Join-Path $repoRoot 'tests\pdf-diff-corpus.mjs'))
     Invoke-CheckedInParallel @(
         @{ Label = 'Diff regression'; FilePath = $node; Arguments = @((Join-Path $repoRoot 'tests\diff-regression.mjs')) },

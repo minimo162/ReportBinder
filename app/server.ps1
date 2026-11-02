@@ -11090,16 +11090,29 @@ function Get-SnapshotPins([string]$Language, [string]$WorkbookId, [string]$Snaps
 function Set-ManualSnapshotPin([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [bool]$Pinned) {
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
     $safeSnapshotId = Assert-SafeStorageSegment $SnapshotId 'snapshotId'
-    $historyLock = Join-Path (Get-WorkspacePath $Language) 'locks\history-cleanup.lock'
+    $workspace = Get-WorkspacePath $Language
+    $historyLock = Join-Path $workspace 'locks\history-cleanup.lock'
+    $contentLock = Get-ContentPdfMaintenanceLockPath $workspace $safeWorkbookId
     return Invoke-WithLock $historyLock {
         if ($null -eq (Get-SnapshotManifest $Language $safeWorkbookId $safeSnapshotId)) {
             throw [ArgumentException]::new('保護する履歴版が見つかりません。')
         }
+        # snapshot だけを守っても content PDF が整理されると比較できなくなる。
+        # その版の全 render version の content PDF にも同じ manual pin を付け外しする。
+        $versionIds = @(Get-RenderVersionIds $Language $safeWorkbookId $safeSnapshotId)
         if ($Pinned) {
-            if (-not (New-SnapshotPin $Language $safeWorkbookId $safeSnapshotId 'manual' ([ordered]@{ pinnedAt = New-NowIso }))) {
+            $pinData = [ordered]@{ snapshotId = $safeSnapshotId; pinnedAt = New-NowIso }
+            if (-not (New-SnapshotPin $Language $safeWorkbookId $safeSnapshotId 'manual' $pinData)) {
                 throw '履歴の保護情報を保存できませんでした。'
             }
+            Invoke-WithLock $contentLock {
+                # 既に整理済みの version はフォルダーが無いので作れない。保護自体は失敗にしない。
+                foreach ($versionId in $versionIds) { [void](New-ContentPdfPin $workspace $safeWorkbookId $versionId 'manual' $pinData) }
+            } | Out-Null
         } else {
+            Invoke-WithLock $contentLock {
+                foreach ($versionId in $versionIds) { Remove-ContentPdfPin $workspace $safeWorkbookId $versionId 'manual' }
+            } | Out-Null
             Remove-SnapshotPin $Language $safeWorkbookId $safeSnapshotId 'manual'
         }
         [void](Update-SnapshotSummaryCacheEntry $Language $safeWorkbookId $safeSnapshotId)
@@ -12939,6 +12952,12 @@ function Invoke-PostRenderAnalysis([string]$Language, [string]$WorkbookId, [stri
             $analysisRecordDir = Get-RenderRecordDir $Language $WorkbookId $SnapshotId $VersionId
             Write-JsonFile (Join-Path $analysisRecordDir 'comparison-analysis.json') $cmp
         } catch { }
+        # complete は Compare-SnapshotVisual が要約まで書く。それ以外でも前回の「見た目変更 N」を残さない。
+        if ($null -ne $cmp -and [string](Get-DataProperty $cmp 'status' '') -ne 'complete') {
+            try { [void](Publish-LatestComparisonSummary $Language $WorkbookId $cmp) } catch {
+                Write-Warning ('比較要約の更新に失敗しました: ' + $_.Exception.Message)
+            }
+        }
         # V5-§6.6: baseline を更新するのは今回の解析に成功したときだけ。
         # unknown 版を基準にすると次回の比較元が失われる。
         $hasOk = @(Get-Array (Get-DataProperty $parsed 'sheets' @()) | Where-Object { [string]$_.status -eq 'ok' }).Count -gt 0
@@ -14783,11 +14802,18 @@ function Get-LocalDiffDetailCache([string]$Language, [string]$WorkbookId, [strin
     return $detail
 }
 
-function Publish-LatestComparisonCaches([string]$Language, [string]$WorkbookId, $Comparison, $CurrentHashes, $BaselineHashes) {
-    if ($null -eq $Comparison -or [string](Get-DataProperty $Comparison 'status' '') -ne 'complete') { return }
+function Publish-LatestComparisonSummary([string]$Language, [string]$WorkbookId, $Comparison) {
+    # 登録画面の「見た目変更 N」は structure の小さな要約だけで描く。complete 以外でも書き直し、
+    # 前回の比較が残らないようにする。どの版の比較かを要約に持たせ、structure の
+    # lastRendered* と一致しないとき（後から別の版が作られたなど）は書かない。
+    if ($null -eq $Comparison) { return $null }
+    $currentSnapshotId = [string](Get-DataProperty $Comparison 'currentSnapshotId' '')
+    $currentVersionId = [string](Get-DataProperty $Comparison 'currentVersionId' '')
     $summary = [ordered]@{
         status = [string](Get-DataProperty $Comparison 'status' '')
         method = [string](Get-DataProperty $Comparison 'method' '')
+        currentSnapshotId = $currentSnapshotId
+        currentVersionId = $currentVersionId
         changedSheets = @(Get-Array (Get-DataProperty $Comparison 'changedSheets' @()))
         unchangedSheets = @(Get-Array (Get-DataProperty $Comparison 'unchangedSheets' @()))
         unknownSheets = @(Get-Array (Get-DataProperty $Comparison 'unknownSheets' @()))
@@ -14796,13 +14822,23 @@ function Publish-LatestComparisonCaches([string]$Language, [string]$WorkbookId, 
         message = [string](Get-DataProperty $Comparison 'message' '')
         comparedAt = [string](Get-DataProperty $Comparison 'comparedAt' '')
     }
-    $workbook = Update-StructureLocked $Language {
+    $outcome = Update-StructureLocked $Language {
         param($structure)
         $matches = @(Get-Array $structure.workbooks | Where-Object { [string]$_.workbookId -eq $WorkbookId } | Select-Object -First 1)
-        if ($matches.Count -eq 0) { return $null }
+        if ($matches.Count -eq 0) { return [ordered]@{ workbook = $null; __noStructureWrite = $true } }
+        $sameVersion = ([string](Get-DataProperty $matches[0] 'lastRenderedSnapshotId' '') -eq $currentSnapshotId -and
+            [string](Get-DataProperty $matches[0] 'lastRenderedVersionId' '') -eq $currentVersionId)
+        if (-not $sameVersion) { return [ordered]@{ workbook = $matches[0]; __noStructureWrite = $true } }
         Set-NoteProperty $matches[0] 'latestComparisonSummary' $summary
-        return $matches[0]
+        return [ordered]@{ workbook = $matches[0]; __noStructureWrite = $false }
     }
+    if ($null -eq $outcome) { return $null }
+    return $outcome['workbook']
+}
+
+function Publish-LatestComparisonCaches([string]$Language, [string]$WorkbookId, $Comparison, $CurrentHashes, $BaselineHashes) {
+    if ($null -eq $Comparison -or [string](Get-DataProperty $Comparison 'status' '') -ne 'complete') { return }
+    $workbook = Publish-LatestComparisonSummary $Language $WorkbookId $Comparison
     if ($null -eq $workbook) { return }
     $displayName = [string](Get-DataProperty $workbook 'displayName' '')
     if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = [string](Get-DataProperty $workbook 'fileName' $WorkbookId) }

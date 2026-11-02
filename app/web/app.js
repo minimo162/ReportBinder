@@ -168,6 +168,7 @@ const diffPdfDocumentCache = new Map();
 const diffPdfTextDocumentCache = new Map();
 const diffBrowserPageCache = new Map();
 const diffDetailResponseCache = new Map();
+let diffDetailOpenSerial = 0;
 const DIFF_RENDER_SCALE = 120 / 72;
 const DIFF_PAGE_CACHE_LIMIT = 6;
 const DIFF_PDF_CACHE_LIMIT = 16;
@@ -1294,6 +1295,7 @@ async function refresh(options) {
     if(authoritativeReadiness) await loadFinalReadiness({render:false});
     const reloadHistory = activeView === 'history' && historyPanelsInitialized;
     snapshotHistoryResponseCache.clear();
+    diffDetailResponseCache.clear();
     // render:false lets a caller fold several sequential loads into one paint.
     if (options.render !== false) renderAll();
     if (reloadHistory) void loadHistoryPanels({force:true});
@@ -3058,7 +3060,16 @@ let showChangedOnly = false;
 function changeSummaryFor(workbookId){
   const map = state?.changeSummaries;
   if (!map) return null;
-  return map[String(workbookId||'')] || null;
+  const cs = map[String(workbookId||'')] || null;
+  if (!cs) return null;
+  // 要約はPDF作成時に structure へ書く。いまの変換PDF（lastRendered*）の比較でなければ、
+  // 前回の「見た目変更 N」や「変更あり」を出さない（ID の無い旧形式の要約も同じ）。
+  const w = getWorkbook(workbookId);
+  if (!w) return null;
+  const snapshotId = String(w.lastRenderedSnapshotId||''), versionId = String(w.lastRenderedVersionId||'');
+  if (!snapshotId || !versionId) return null;
+  if (String(cs.currentSnapshotId||'') !== snapshotId || String(cs.currentVersionId||'') !== versionId) return null;
+  return cs;
 }
 function changedSheetSet(workbookId){
   return new Set(asArray(changeSummaryFor(workbookId)?.changedSheets).map(String));
@@ -4045,7 +4056,11 @@ async function fetchDiffDetailResponse(path,workbookId){
   })();
   diffDetailResponseCache.set(key,promise);
   while(diffDetailResponseCache.size>DIFF_DETAIL_CACHE_LIMIT)diffDetailResponseCache.delete(diffDetailResponseCache.keys().next().value);
-  try{return await promise;}catch(error){diffDetailResponseCache.delete(key);throw error;}
+  let loaded;
+  try{loaded=await promise;}catch(error){if(diffDetailResponseCache.get(key)===promise)diffDetailResponseCache.delete(key);throw error;}
+  // 「比較できない」などの一時的な応答は持ち続けない。開き直したときに取り直す。
+  if(String(loaded?.detail?.status||'')!=='ready'&&diffDetailResponseCache.get(key)===promise)diffDetailResponseCache.delete(key);
+  return loaded;
 }
 
 function updateDiffProgress(generation={}){
@@ -4131,18 +4146,20 @@ function renderDiffReviewControl(){
   button.setAttribute('aria-pressed',String(!!sheet?.confirmed));
 }
 async function toggleDiffSheetReviewed(button=$('diff-confirm-sheet')){
-  const sheet=diffCurrentSheet(),cmp=diffViewState.detail?.comparison||{};if(!sheet||!diffViewState.detail)return;
+  const sheet=diffCurrentSheet(),detail=diffViewState.detail,cmp=detail?.comparison||{};if(!sheet||!detail)return;
   const confirmed=!sheet.confirmed;
   await runBusy(button,async()=>{
     const response=await api('/api/history/diff-review',{method:'POST',body:{
       workbookId:diffViewState.workbookId,fromSnapshotId:diffViewState.fromSnapshotId,toSnapshotId:diffViewState.toSnapshotId,
       baselineVersionId:String(cmp.baselineVersionId||''),currentVersionId:String(cmp.currentVersionId||''),sheetKey:String(sheet.sheetKey||''),confirmed
     }});
-    const confirmedKeys=new Set(asArray(response.review?.confirmedSheetKeys).map(String));
-    for(const item of asArray(diffViewState.detail?.sheets))item.confirmed=confirmedKeys.has(String(item.sheetKey||''));
-    diffViewState.detail.review=response.review||null;
-    if(diffViewState.detail.summary)diffViewState.detail.summary.confirmed=confirmedKeys.size;
     diffDetailResponseCache.clear();
+    // 応答待ちの間に別の比較へ切り替わっていたら、その画面へは書き込まない。
+    if(diffViewState.detail!==detail)return;
+    const confirmedKeys=new Set(asArray(response.review?.confirmedSheetKeys).map(String));
+    for(const item of asArray(detail.sheets))item.confirmed=confirmedKeys.has(String(item.sheetKey||''));
+    detail.review=response.review||null;
+    if(detail.summary)detail.summary.confirmed=confirmedKeys.size;
     const visible=diffFilteredSheets();
     if(!visible.some(item=>String(item.sheetKey||'')===diffViewState.selectedSheetKey)){
       diffViewState.selectedSheetKey=String(visible[0]?.sheetKey||'');diffViewState.pageIndex=preferredDiffPageIndex(visible[0]);diffViewState.regionIndex=-1;
@@ -4350,6 +4367,8 @@ function renderDiffDetail(detail){
 }
 async function openDiffDetail(workbookId,opener,historyRange=null){
   const id=String(workbookId||'');if(!id)return;
+  // 同じ原稿で比較ペアを切り替えたとき、前のペアの応答で画面を上書きしない。
+  const serial=++diffDetailOpenSerial;
   diffReturnFocus=opener||document.activeElement;clearDiffBrowserResources();
   diffViewState.workbookId=id;diffViewState.fromSnapshotId=String(historyRange?.fromSnapshotId||'');diffViewState.toSnapshotId=String(historyRange?.toSnapshotId||'');
   diffViewState.detail=null;diffViewState.selectedSheetKey='';diffViewState.pageIndex=0;diffViewState.regionIndex=-1;diffViewState.filter='all';diffViewState.unreviewedOnly=false;diffViewState.mode='side';diffViewState.mobileTab='before';
@@ -4365,10 +4384,11 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   const detailRequest=fetchDiffDetailResponse(requestPath,id);
   void ensureDiffPdfJs().catch(()=>{});
   try{getDiffAnalysisWorker();}catch{}
-  try{const loaded=await detailRequest;if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail(loaded.detail);}
-  // 成功側と同じ古さガードを掛ける。これが無いと、閉じた後や別の原稿へ切り替えた後に
+  const stale=()=>serial!==diffDetailOpenSerial||!isDiffModalOpen()||diffViewState.workbookId!==id||diffDetailRequestPath()!==requestPath;
+  try{const loaded=await detailRequest;if(stale())return;renderDiffDetail(loaded.detail);}
+  // 成功側と同じ古さガードを掛ける。これが無いと、閉じた後や別の原稿・別のペアへ切り替えた後に
   // 届いた失敗応答が、いま表示している比較画面を上書きしてしまう。
-  catch(error){if(!isDiffModalOpen()||diffViewState.workbookId!==id)return;renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
+  catch(error){if(stale())return;renderDiffDetail({status:'failed',message:userFriendlyError(error.message),workbookName:workbookDisplayName(getWorkbook(id)),sheets:[],summary:{},generation:{status:'failed'}});}
 }
 
 function closeDiffDetail(){
