@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v217', 'style.css?v=20261030_v131']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v218', 'style.css?v=20261030_v131']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v217' not in html:
+if 'app.js?v=20261030_v218' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v217' not in html:
+if 'app.js?v=20261030_v218' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3613,5 +3613,47 @@ if 'detailSource' not in _report_state or 'packChangeReportDetailNote(report)' n
 for name in ['fromSourceId = ', 'fromSheetName = ']:
     if name not in _page_maps:
         raise SystemExit(f'pack change rows must carry the previous source and sheet for the previous picture: {name}')
+
+# 変更点PDFの詳細ページの画像を大きくする（PR-A）------------------------------------------
+# 寸法は PackChangeReport*Mm の変数1か所で決め、CSS とページ割りの見積もりの両方がそこから作る
+# （片方だけ直すと .sheet{overflow:hidden} で文字の一覧が黙って切れる）。振る舞い（見積もりの合計が
+# 186mm を超えないこと・縦長／横長の画像の mm）は pack-change-selfcheck.ps1 が見る。
+if '$Script:PackChangeReportImageDpi = 120' not in server:
+    raise SystemExit('the change report pictures must be rendered at the diff screen resolution (120dpi)')
+if '$Script:PackChangeReportVersion = 2' not in server:
+    raise SystemExit('PackChangeReportVersion must stay 2: the bigger pictures alone must not make existing reports outdated')
+_pack_mm = {}
+for _name in ['BodyWidthMm', 'BodyHeightMm', 'MarkMm', 'SideHeadMm', 'PairGapMm', 'PairMarginMm', 'DetailSlackMm', 'LegendWidthMm',
+              'HeadingCharMm', 'HeadingLineMm', 'HeadingMarginMm', 'PicMaxMm', 'PicMinMm']:
+    _m = re.search(r'^\$Script:PackChangeReport' + _name + r' = ([0-9.]+)\r?$', server, re.M)
+    if not _m:
+        raise SystemExit(f'the change report detail size must be a named variable: PackChangeReport{_name}')
+    _pack_mm[_name] = float(_m.group(1))
+if _pack_mm['BodyWidthMm'] != 273.0 or _pack_mm['BodyHeightMm'] != 186.0 or 'width:297mm;height:209mm;padding:9mm 12mm 14mm' not in _report_html:
+    raise SystemExit('the change report body size must match the .sheet box (A4 landscape minus its padding)')
+if not (_pack_mm['PicMinMm'] < _pack_mm['PicMaxMm'] <= 158.0):
+    raise SystemExit('the change report picture height must range up to 158mm')
+# 見出しが2行でも、最小の画像の下に文字の一覧を 10mm 以上入れられること。
+if _pack_mm['MarkMm'] + 2 * _pack_mm['HeadingLineMm'] + _pack_mm['HeadingMarginMm'] + _pack_mm['SideHeadMm'] + _pack_mm['PicMinMm'] + _pack_mm['PairMarginMm'] + _pack_mm['DetailSlackMm'] + 10.0 > _pack_mm['BodyHeightMm']:
+    raise SystemExit('the minimum picture height leaves no room for the changed text')
+_detail_layout = _publish_server_function('Get-PackChangeReportDetailLayout')
+for needed in ['PackChangeReportBodyHeightMm', 'PackChangeReportMarkMm', 'PackChangeReportSideHeadMm', 'PackChangeReportPairMarginMm', 'PackChangeReportDetailSlackMm',
+               'PackChangeReportPicMaxMm', 'PackChangeReportPicMinMm', 'PackChangeReportLegendWidthMm', 'PackChangeReportHeadingCharMm', 'firstBudget', 'moreBudget', 'picHeight']:
+    if needed not in _detail_layout:
+        raise SystemExit(f'the detail page size must be computed from the shared variables: {needed}')
+if re.search(r'\b(186|104|96|95|133|134|158|110)(\.0)?\b', _detail_layout):
+    raise SystemExit('the detail page size must not use hand-written millimetres')
+for needed in ['Get-PackChangeReportDetailLayout $heading $lineHeights', 'Split-PackChangeReportPages $lineHeights $size.firstBudget $size.moreBudget 0',
+               'Get-PackChangeReportImageMm', '$layout.picHeight', '<div class="dhr"><h2 class="dh">', 'PackChangeReportPicMaxMm', 'Get-PackChangeReportPicWidthMm',
+               "<img src=\"' + (& $h ([string]$image.src)) + '\" alt=\"\" style=\"' + $imgStyle + '\">'"]:
+    if needed not in _report_html:
+        raise SystemExit(f'the detail page CSS and page split must share one size: {needed}')
+for forbidden in ['104.0', '186.0', 'height:96mm', 'max-height:95mm', 'max-width:133mm', '.legend{display:flex;flex-wrap:wrap']:
+    if forbidden in _report_html:
+        raise SystemExit(f'the detail page must not keep hand-written sizes: {forbidden}')
+if "width = [int](Get-DataProperty $BeforeImage 'width' 0)" not in _publish_server_function('New-PackChangeReportDetailPage'):
+    raise SystemExit('the detail page must carry the picture size so the HTML can fit it without reading files')
+if '* 2.5)' not in _publish_server_function('Get-PackChangeReportTimeoutSeconds') or '$Script:EdgePrintMaxTimeoutSeconds = 900' not in server:
+    raise SystemExit('the change report timeout must account for the 120dpi pictures')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))
