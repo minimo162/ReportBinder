@@ -106,7 +106,7 @@ function setDiffPaneEmpty(){}
 function ensureDiffPdfJs(){return Promise.resolve();}
 function getDiffAnalysisWorker(){}
 function userFriendlyError(message){return message;}
-` + extractFunction('diffDetailRequestPath') + '\n' + extractFunction('openDiffDetail'), ctx);
+` + extractFunction('diffDetailPath') + '\n' + extractFunction('diffDetailRequestPath') + '\n' + extractFunction('openDiffDetail'), ctx);
   ctx.fetchDiffDetailResponse = path => { const d = deferred(); pending.set(path, d); return d.promise; };
   ctx.renderDiffDetail = detail => rendered.push(detail);
 
@@ -133,6 +133,24 @@ function userFriendlyError(message){return message;}
   [...pending.entries()].find(([p]) => p.includes('fromSnapshotId=B'))[1].resolve({ detail: { status: 'ready', pair: 'B-C' } });
   await fourth;
   assert.deepEqual(rendered.map(d => d.pair), ['B-C']);
+
+  // 版を指定して開くと、その版どうしの比較を求める（提出用PDF一式の変更点から開いたとき）。
+  // 版だけが違う2つの開き方も別のペアとして扱い、前の応答で上書きしない。
+  rendered.length = 0; pending.clear();
+  const pinned = ctx.openDiffDetail('w1', null, { fromSnapshotId: 'A', toSnapshotId: 'B', fromVersionId: 'v1', toVersionId: 'v2' });
+  const repinned = ctx.openDiffDetail('w1', null, { fromSnapshotId: 'A', toSnapshotId: 'B', fromVersionId: 'v1', toVersionId: 'v3' });
+  const pinnedPath = [...pending.keys()].find(p => p.endsWith('fromVersionId=v1&toVersionId=v2'));
+  const repinnedPath = [...pending.keys()].find(p => p.endsWith('fromVersionId=v1&toVersionId=v3'));
+  assert.ok(pinnedPath && repinnedPath, 'the exact versions are part of the request');
+  pending.get(repinnedPath).resolve({ detail: { status: 'ready', pair: 'v3' } });
+  await repinned;
+  pending.get(pinnedPath).resolve({ detail: { status: 'ready', pair: 'v2' } });
+  await pinned;
+  assert.deepEqual(rendered.map(d => d.pair), ['v3']);
+  assert.equal(ctx.diffViewState.toVersionId, 'v3');
+  // 版を渡さずに開き直したら、前の指定を持ち越さない。
+  void ctx.openDiffDetail('w1', null, { fromSnapshotId: 'A', toSnapshotId: 'B' });
+  assert.equal(ctx.diffViewState.fromVersionId, ''); assert.equal(ctx.diffViewState.toVersionId, '');
 }
 
 async function testReviewToggleKeepsOwnDetail() {
@@ -175,6 +193,13 @@ function renderDiffPage(){}
   assert.equal(oldDetail.sheets[0].confirmed, true);
   assert.equal(oldDetail.summary.confirmed, 1);
   assert.equal(ctx.renders, 1);
+
+  // 版を指定して開いた比較は、同じ版の指定で「確認済み」を保存する（サーバーが同じ比較だと確かめられるように）。
+  let body = null;
+  ctx.api = (path, options) => { body = options.body; return Promise.resolve({ review: { confirmedSheetKeys: [] } }); };
+  Object.assign(ctx.diffViewState, { workbookId: 'w1', fromSnapshotId: 'A', toSnapshotId: 'B', fromVersionId: 'v1', toVersionId: 'v2', detail: oldDetail });
+  await ctx.toggleDiffSheetReviewed(null);
+  assert.equal(body.fromVersionId, 'v1'); assert.equal(body.toVersionId, 'v2');
 }
 
 // ---- M3: ready 以外の応答はキャッシュに残さない --------------------------------

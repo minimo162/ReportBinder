@@ -23,8 +23,8 @@ function constantSource(code,name){
   if(!match)throw new Error(`missing constant: ${name}`);
   return match[0];
 }
-const constants=['DIFF_TEXT_ROW_ITEM_LIMIT'];
-const names=['normalizeDiffPdfText','diffPdfNumericFragments','diffPdfTextTemplate','diffPdfTextTemplatesMatch',
+const constants=['DIFF_TEXT_ROW_ITEM_LIMIT','DIFF_REGION_TEXT_LIMIT'];
+const names=['normalizeDiffPdfText','diffRegionText','diffPdfNumericFragments','diffPdfTextTemplate','diffPdfTextTemplatesMatch',
   'diffPdfNonNumericFingerprint','diffPdfNumericItems','diffPdfNumericCenterDistance','unmatchedDiffPdfNumericItems',
   'pairChangedDiffPdfNumbers','diffPdfTextPixelBox','dedupeDiffPdfRowItems','groupDiffPdfTextRows','matchDiffPdfTextRows',
   'diffPdfTextBoxUnion','mergeAdjacentDiffTextRegions','buildTextRowStructureDiffResult','findDiffPdfTextColumnSplit',
@@ -398,5 +398,111 @@ for(const [name,semantic] of Object.entries({numeric,cumulativeText,row,duplicat
   richRowIntegrated,richRowRemovedIntegrated,richNumeric,docPage1Semantic,spacingSemantic,imageOnlySemantic})){
   assert.equal(semantic.message,'',`${name} (${semantic.mode}) must not show a calculation note over the diff`);
 }
+
+// ---- 枠に変更前後の文字を添える（変更点PDF用。表示は変えない） ------------------------
+// vm の中の配列は別の realm なので、JSON にしてから比べる。
+const sameJson=(actual,expected,message)=>assert.equal(JSON.stringify(actual),JSON.stringify(expected),message);
+// numeric の枠は変わった数値の前後、text-fragment の枠は追加・削除・変更された文字片。
+sameJson(numeric.regions.map(region=>[region.beforeText,region.afterText]),
+  [['580,400','580,410'],['622,400','622,410']],'numeric regions carry the changed number before and after');
+const addedFragments=cumulativeText.regions.filter(region=>region.source==='pdf-fragment');
+sameJson(addedFragments.map(region=>region.afterText).sort(),['11','38','a','d'],'added text fragments carry their text');
+assert.ok(addedFragments.every(region=>region.kind==='added'&&region.beforeText===''),'an added fragment has no before text');
+const fragmentEdit=app.buildTextFragmentDiffResult([item('Title',40,20,80),item('Old name',40,60,120),item('Gone',40,100,60)],
+  [item('Title',40,20,80),item('New name',40,60,120)],600,400);
+sameJson(fragmentEdit.regions.map(region=>[region.kind,region.beforeText,region.afterText]),
+  [['modified','Old name','New name'],['removed','Gone','']],'modified and removed fragments carry before/after text');
+const longText='長'.repeat(500);
+const longEdit=app.buildTextFragmentDiffResult([item(longText,40,60,300)],[item(longText+'X',40,60,300)],600,400);
+assert.equal(longEdit.regions[0].beforeText.length,200,'region text is cut at DIFF_REGION_TEXT_LIMIT');
+
+// ---- 「くわしく見る」の計算の切り出し ------------------------------------------------
+// computeDiffPageResult は画面に触らない純粋な計算で、buildDiffBrowserPage はそれを呼ぶだけ。
+// 偽の PDF.js（ページの描画と文字）と偽の画素比較で動かし、2つの結果が同じであること、
+// 計算が文字照合まで進むこと、古くなったら null を返すこと、収集用の source が差分画面の
+// キャッシュ・描画タスクに触らないことを確かめる。
+// async 関数と、引数に分割代入（{...}={}）を持つ関数も取り出す（本体の { は引数の ) の後ろから探す）。
+function anyFunctionSource(code,name){
+  const at=code.indexOf(`function ${name}(`);if(at<0)throw new Error(`missing function: ${name}`);
+  const start=code.slice(Math.max(0,at-6),at)==='async '?at-6:at;
+  let index=code.indexOf('(',at),depth=0,quote='',escaped=false;
+  for(;index<code.length;index++){
+    const ch=code[index];
+    if(quote){if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch===quote)quote='';continue;}
+    if(ch==='\''||ch==='"'||ch==='`'){quote=ch;continue;}
+    if(ch==='(')depth++;else if(ch===')'&&--depth===0)break;
+  }
+  const brace=code.indexOf('{',index);depth=0;
+  for(index=brace;index<code.length;index++){
+    const ch=code[index];
+    if(quote){if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch===quote)quote='';continue;}
+    if(ch==='\''||ch==='"'||ch==='`'){quote=ch;continue;}
+    if(ch==='{')depth++;else if(ch==='}'&&--depth===0)return code.slice(start,index+1);
+  }
+  throw new Error(`unterminated function: ${name}`);
+}
+const pageNames=['diffComputeIdentity','diffComparisonIdentity','newDiffComputeSource','diffViewComputeSource','diffSheetPageCount',
+  'diffPdfDocumentKey','diffHistoryPdfParams','fetchDiffPdfDocument','createWhiteDiffCanvas','renderDiffPdfPage','mapDiffPdfTextContentItems',
+  'extractDiffPdfTextItems','extractDiffPdfDocumentTextPages','fullDiffRegion','computeDiffPageResult','buildDiffBrowserPage'];
+const pageConstants=['DIFF_RENDER_SCALE','DIFF_PDF_CACHE_LIMIT'];
+const pdfItems=items=>({items:items.map(value=>({str:value.text,transform:[1,0,0,value.height,value.x,value.y+value.height],width:value.width,height:value.height}))});
+const fakeCanvas=()=>({width:1,height:1,getContext:()=>({fillStyle:'',fillRect(){},drawImage(){}})});
+let pdfOpenCount=0;
+const fakeLib={getDocument:({url})=>({promise:Promise.resolve((pdfOpenCount++,{numPages:1,destroy(){},
+  getPage:async()=>({
+    getViewport:()=>({width:600,height:400,scale:1,convertToViewportPoint:(x,y)=>[x,y]}),
+    render:()=>({promise:Promise.resolve(),cancel(){}}),
+    getTextContent:async()=>pdfItems(url.includes('side=before')?beforeNumbers:afterNumbers)
+  })}))})};
+const progressCalls=[];
+const pageApp={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error,Promise,URLSearchParams,
+  document:{createElement:()=>fakeCanvas()},
+  ensureDiffPdfJs:async()=>fakeLib,
+  // 前後どちらのPDFかを URL に入れて、偽の PDF.js が返す文字を切り替える。
+  apiUrl:(path,params)=>`${path}?side=${params.snapshotId==='snap-before'?'before':'after'}&${new URLSearchParams(params)}`,
+  token:'t',
+  setDiffBrowserProgress:(active,message,percent)=>progressCalls.push([active,message,percent]),
+  analyzeDiffCanvases:async()=>({regions:[],changedRatio:.002,alignmentAdjusted:false,fallbackUsed:false,rowStructureAdjusted:false}),
+  userFriendlyError:message=>String(message||''),
+  asArray:value=>value==null?[]:(Array.isArray(value)?value:[value])};
+vm.createContext(pageApp);
+vm.runInContext([...constants,...pageConstants].map(name=>constantSource(appCode,name))
+  .concat(names.map(name=>functionSource(appCode,name)),pageNames.map(name=>anyFunctionSource(appCode,name)))
+  .concat([
+    'let diffBrowserRenderSerial=1;',
+    "const diffViewState={workbookId:'wb_a',detail:{comparison:{scope:'history',baselineSnapshotId:'snap-before',baselineVersionId:'v1',currentSnapshotId:'snap-after',currentVersionId:'v2'}}};",
+    'const diffPdfDocumentCache=new Map(),diffPdfTextDocumentCache=new Map(),diffActiveRenderTasks=new Set();',
+    'function bumpDiffSerial(){diffBrowserRenderSerial++;}',
+    'function currentDiffSerial(){return diffBrowserRenderSerial;}',
+    'function viewCacheSizes(){return [diffPdfDocumentCache.size,diffPdfTextDocumentCache.size,diffActiveRenderTasks.size];}'
+  ]).join('\n'),pageApp);
+const diffSheet={sheetKey:'s1',kind:'modified',beforeSheetName:'S1',afterSheetName:'S1',beforePages:1,afterPages:1,
+  pages:[{beforePageNumber:1,afterPageNumber:1,comparisonKind:'modified'}]};
+const viewResult=await pageApp.buildDiffBrowserPage(diffSheet,0,pageApp.currentDiffSerial());
+assert.ok(viewResult,'the diff screen page is computed');
+assert.ok(progressCalls.length>=2&&progressCalls.every(call=>call[0]===true),'the diff screen still shows its progress band');
+const viewSizes=pageApp.viewCacheSizes();
+const pageComparison={scope:'history',baselineSnapshotId:'snap-before',baselineVersionId:'v1',currentSnapshotId:'snap-after',currentVersionId:'v2'};
+const collectSource=pageApp.newDiffComputeSource({workbookId:'wb_a',comparison:pageComparison,analyze:pageApp.analyzeDiffCanvases});
+const progressBefore=progressCalls.length,computeProgress=[];
+const computed=await pageApp.computeDiffPageResult(diffSheet,0,{source:collectSource,onProgress:(message,percent)=>computeProgress.push([message,percent])});
+assert.equal(JSON.stringify(computed.page),JSON.stringify(viewResult.page),'computeDiffPageResult and buildDiffBrowserPage give the same page result');
+assert.equal(computed.page.regions.length,2,'the computation reaches the PDF text matching (two numeric boxes)');
+assert.ok(computed.page.regions.every(region=>region.source==='pdf-text'&&region.beforeText&&region.afterText),'computed boxes come from the PDF text and carry text');
+assert.equal(computed.page.analysisFailed,false);
+assert.equal(progressCalls.length,progressBefore,'computeDiffPageResult does not touch the diff screen progress band');
+assert.ok(computeProgress.length>=2,'computeDiffPageResult reports progress through onProgress');
+sameJson(pageApp.viewCacheSizes(),viewSizes,'a separate source does not use the diff screen caches or render tasks');
+assert.equal(collectSource.documentCache.size,2,'a separate source keeps its own PDF documents');
+// 古くなったら null。差分画面は通し番号が変わったら捨てる。
+assert.equal(await pageApp.computeDiffPageResult(diffSheet,0,{source:collectSource,isStale:()=>true}),null,'a stale computation returns null');
+const serialAtStart=pageApp.currentDiffSerial();
+const stalePromise=pageApp.buildDiffBrowserPage(diffSheet,0,serialAtStart);
+pageApp.bumpDiffSerial();
+assert.equal(await stalePromise,null,'the diff screen drops a page computed for an old serial');
+// 画素比較が失敗したときは analysisFailed（変更点PDF用の収集はこの結果を送らない）。
+const failingSource=pageApp.newDiffComputeSource({workbookId:'wb_a',comparison:pageComparison,analyze:async()=>{throw new Error('worker stopped');}});
+const failed=await pageApp.computeDiffPageResult(diffSheet,0,{source:failingSource});
+assert.equal(failed.page.analysisFailed,true);assert.equal(failed.page.status,'unknown');
 
 console.log('diff regression tests OK');

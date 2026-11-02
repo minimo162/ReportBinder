@@ -10191,6 +10191,7 @@ function Handle-Api($Context) {
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/changes/report') {
             # 変更点PDF（確認用）の作成は Edge の印刷で時間がかかるので、子プロセスのジョブにする。
+            # 本文の details（画面が集めた「くわしく見る」の結果）は、まだ読まない（ページごとの詳細は未実装）。
             $body = Read-BodyJson $Context.Request
             $reportJob = Start-PackChangeReportJob $language ([string](Get-DataProperty $body 'packId' '')) ([string](Get-DataProperty $body 'targetId' '')) ([string](Get-DataProperty $body 'fromBuildId' '')) ([string](Get-DataProperty $body 'toBuildId' ''))
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; job=$reportJob }); return
@@ -10447,7 +10448,10 @@ function Handle-Api($Context) {
             $wbId = [string]$Context.Request.QueryString['workbookId']
             $fromId = [string]$Context.Request.QueryString['fromSnapshotId']
             $toId = [string]$Context.Request.QueryString['toSnapshotId']
-            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; detail = (Get-DiffDetail $language $wbId $fromId $toId) }); return
+            # 任意。指定すると、その版どうしだけを比べる（提出用PDFに入った版。別の版には代えない）。
+            $fromVersion = [string]$Context.Request.QueryString['fromVersionId']
+            $toVersion = [string]$Context.Request.QueryString['toVersionId']
+            Write-JsonResponse $Context 200 ([ordered]@{ ok = $true; detail = (Get-DiffDetail $language $wbId $fromId $toId $fromVersion $toVersion) }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/history/diff-review') {
             $body = Read-BodyJson $Context.Request
@@ -13661,7 +13665,8 @@ function Get-LastPublishedBuildId([string]$Language, [string]$PackId, [string]$T
 # 比べる版はアーカイブ1件（buildId）。アーカイブは書き換わらないので、組み合わせごとの
 # 計算結果を exports\change-reports の下に覚える。頁・左右・台紙はアーカイブに記録された
 # 値をそのまま使い、数え直さない（見開きの契約。左右を決めるのは Get-FinalBuildInputSnapshot だけ）。
-$Script:PackChangeAlgorithmVersion = 1
+# 2: pages[] に rowKey・fromSourcePageNumber・toSourcePageNumber を足した（古い summary.json は作り直す）。
+$Script:PackChangeAlgorithmVersion = 2
 
 # アーカイブの manifest から比べるためのページ表を作る。physicalPages の無い古い形式は
 # pages[]（sourcePageStart/End）から出力ページ番号だけを順に数え、左右・台紙は空のまま
@@ -13841,6 +13846,8 @@ function Compare-PackArchivePageMaps($FromManifest, $FromMetadata, $ToManifest, 
             [void]$pairs.Add([pscustomobject]@{
                 from = $(if ($i -lt $fromParts.Count) { $fromParts[$i] } else { $null })
                 to = $(if ($i -lt $toParts.Count) { $toParts[$i] } else { $null })
+                # 行の安定したキー（項目のキー#項目内の順番）。出力ページ番号は使わない（前のページの増減で変わる）。
+                rowKey = ([string]$k + '#' + [string]($i + 1))
                 partCountChanged = $partCountChanged
                 fromPartCount = $fromParts.Count
                 toPartCount = $toParts.Count
@@ -13935,6 +13942,10 @@ function Compare-PackArchivePageMaps($FromManifest, $FromMetadata, $ToManifest, 
             toPage = $(if ($null -ne $t) { [int]$t.outputPageNumber } else { $null })
             toSide = $(if ($null -ne $t -and [bool]$toMap.hasSides) { [string]$t.side } else { '' })
             toSpreadIndex = $(if ($null -ne $t -and [bool]$toMap.hasSides) { $t.spreadIndex } else { $null })
+            rowKey = [string]$pair.rowKey
+            # 原稿の変換PDFの中で何ページ目か（「くわしく見る」の pages[].afterPageNumber／beforePageNumber と同じ数え方）。
+            toSourcePageNumber = $(if ($null -ne $t) { [int]$t.sourcePdfPageNumber } else { $null })
+            fromSourcePageNumber = $(if ($null -ne $f) { [int]$f.sourcePdfPageNumber } else { $null })
             fromPage = $(if ($null -ne $f) { [int]$f.outputPageNumber } else { $null })
             fromSide = $(if ($null -ne $f -and [bool]$fromMap.hasSides) { [string]$f.side } else { '' })
             fromSpreadIndex = $(if ($null -ne $f -and [bool]$fromMap.hasSides) { $f.spreadIndex } else { $null })
@@ -15904,11 +15915,24 @@ function Save-HistoricalSnapshotComparison([string]$Language, [string]$WorkbookI
 }
 
 
+# 履歴比較の版（versionId）を決める。指定があればその版だけを使い、別の版へは決して代えない
+# （提出用PDFに実際に入った版＝アーカイブの metadata.sourceWorkbooks[].versionId と、比べる変換PDFを一致させる）。
+# 指定が無ければ今までどおり、その snapshot のいちばん新しい ready な版。使えなければ ''。
+function Resolve-DiffHistoryVersionId([string]$Language, [string]$WorkbookId, [string]$SnapshotId, [string]$RequestedVersionId = '') {
+    if ([string]::IsNullOrWhiteSpace($RequestedVersionId)) { return (Get-PreferredHistoryRenderVersion $Language $WorkbookId $SnapshotId) }
+    $versionId = Assert-SafeStorageSegment $RequestedVersionId 'versionId'
+    if (@(Get-RenderVersionIds $Language $WorkbookId $SnapshotId) -notcontains $versionId) { return '' }
+    if (-not [bool](Get-HistoryRenderVersionAvailability $Language $WorkbookId $SnapshotId $versionId).ready) { return '' }
+    return $versionId
+}
+
 function Get-DiffDetailContext(
     [string]$Language,
     [string]$WorkbookId,
     [string]$BaselineSnapshotId = '',
-    [string]$CurrentSnapshotId = ''
+    [string]$CurrentSnapshotId = '',
+    [string]$RequestedBaselineVersionId = '',
+    [string]$RequestedCurrentVersionId = ''
 ) {
     $safeWorkbookId = Assert-SafeStorageSegment $WorkbookId 'workbookId'
     $structure = Get-Structure $Language
@@ -15933,20 +15957,28 @@ function Get-DiffDetailContext(
     $hasBaseline = -not [string]::IsNullOrWhiteSpace($BaselineSnapshotId)
     $hasCurrent = -not [string]::IsNullOrWhiteSpace($CurrentSnapshotId)
     if ($hasBaseline -xor $hasCurrent) { throw '履歴比較では比較元と比較先の両方を指定してください。' }
+    $hasBaselineVersion = -not [string]::IsNullOrWhiteSpace($RequestedBaselineVersionId)
+    $hasCurrentVersion = -not [string]::IsNullOrWhiteSpace($RequestedCurrentVersionId)
+    if ($hasBaselineVersion -xor $hasCurrentVersion) { throw [ArgumentException]::new('版を指定するときは比較元と比較先の両方を指定してください。') }
+    $exactVersions = ($hasBaselineVersion -and $hasCurrentVersion)
+    if ($exactVersions -and -not ($hasBaseline -and $hasCurrent)) { throw [ArgumentException]::new('版を指定するときは比較元と比較先の履歴版も指定してください。') }
     if ($hasBaseline -and $hasCurrent) {
         $baselineSnapshotId = Assert-SafeStorageSegment $BaselineSnapshotId 'baselineSnapshotId'
         $currentSnapshotId = Assert-SafeStorageSegment $CurrentSnapshotId 'currentSnapshotId'
         $baseResult.scope = 'history'
-        if ($baselineSnapshotId -eq $currentSnapshotId) { $baseResult.message = '異なる2版を選択してください。'; return [pscustomobject]$baseResult }
+        # 同じ snapshot を描き直した2つの版は、版を指定したときだけ比べられる。
+        if ($baselineSnapshotId -eq $currentSnapshotId -and (-not $exactVersions -or $RequestedBaselineVersionId -eq $RequestedCurrentVersionId)) {
+            $baseResult.message = '異なる2版を選択してください。'; return [pscustomobject]$baseResult
+        }
         if ($null -eq (Get-SnapshotManifest $Language $safeWorkbookId $baselineSnapshotId) -or
             $null -eq (Get-SnapshotManifest $Language $safeWorkbookId $currentSnapshotId)) {
             $baseResult.message = '選択した履歴版が見つかりません。保存期限または履歴整理を確認してください。'
             return [pscustomobject]$baseResult
         }
-        $baselineVersionId = Get-PreferredHistoryRenderVersion $Language $safeWorkbookId $baselineSnapshotId
-        $currentVersionId = Get-PreferredHistoryRenderVersion $Language $safeWorkbookId $currentSnapshotId
+        $baselineVersionId = Resolve-DiffHistoryVersionId $Language $safeWorkbookId $baselineSnapshotId $RequestedBaselineVersionId
+        $currentVersionId = Resolve-DiffHistoryVersionId $Language $safeWorkbookId $currentSnapshotId $RequestedCurrentVersionId
         if ([string]::IsNullOrWhiteSpace($baselineVersionId) -or [string]::IsNullOrWhiteSpace($currentVersionId)) {
-            $baseResult.message = '選択した2版は、画像ハッシュと同一世代のcontent PDFがそろっていないため視覚比較できません。'
+            $baseResult.message = $(if ($exactVersions) { '提出用PDFに使った版の画像ハッシュと変換PDFがそろっていないため、その版どうしでは比べられません。' } else { '選択した2版は、画像ハッシュと同一世代のcontent PDFがそろっていないため視覚比較できません。' })
             return [pscustomobject]$baseResult
         }
         $comparison = Get-StoredComparison $Language $safeWorkbookId $baselineSnapshotId $currentSnapshotId $baselineVersionId $currentVersionId 'history'
@@ -16056,7 +16088,10 @@ function Set-DiffReviewState([string]$Language, $Body) {
     $workbookId = Assert-SafeStorageSegment ([string](Get-DataProperty $Body 'workbookId' '')) 'workbookId'
     $fromSnapshotId = [string](Get-DataProperty $Body 'fromSnapshotId' '')
     $toSnapshotId = [string](Get-DataProperty $Body 'toSnapshotId' '')
-    $context = Get-DiffDetailContext $Language $workbookId $fromSnapshotId $toSnapshotId
+    # 版を指定して開いた比較（GET /api/history/diff-detail の fromVersionId／toVersionId）は、同じ指定で確かめる。
+    $fromVersionId = [string](Get-DataProperty $Body 'fromVersionId' '')
+    $toVersionId = [string](Get-DataProperty $Body 'toVersionId' '')
+    $context = Get-DiffDetailContext $Language $workbookId $fromSnapshotId $toSnapshotId $fromVersionId $toVersionId
     if (-not [bool]$context.available) { throw [ArgumentException]::new([string](Get-DataProperty $context 'message' '比較対象を確認できません。')) }
     foreach ($field in @('baselineVersionId','currentVersionId')) {
         $requested = [string](Get-DataProperty $Body $field '')
@@ -16296,13 +16331,16 @@ function Get-LocalDiffDetailCachePath(
     return (Join-Path $Script:LocalRuntimeCacheRoot ("diff-{0}-{1}-{2}.json" -f $Language, $safeWorkbookId, $pair))
 }
 
-function Get-LocalDiffDetailCacheIdentity([string]$Language, [string]$WorkbookId, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '') {
+function Get-LocalDiffDetailCacheIdentity([string]$Language, [string]$WorkbookId, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '', [string]$RequestedBaselineVersionId = '', [string]$RequestedCurrentVersionId = '') {
     $hasBaseline = -not [string]::IsNullOrWhiteSpace($BaselineSnapshotId)
     $hasCurrent = -not [string]::IsNullOrWhiteSpace($CurrentSnapshotId)
     if ($hasBaseline -xor $hasCurrent) { return $null }
+    # 版の指定は Get-DiffDetailContext が確かめる（片方だけ・履歴版なしは要求の誤り）。ここでは使わない。
+    if (([string]::IsNullOrWhiteSpace($RequestedBaselineVersionId) -xor [string]::IsNullOrWhiteSpace($RequestedCurrentVersionId)) -or
+        (-not [string]::IsNullOrWhiteSpace($RequestedBaselineVersionId) -and -not $hasBaseline)) { return $null }
     if ($hasBaseline -and $hasCurrent) {
-        $baselineVersionId = Get-PreferredHistoryRenderVersion $Language $WorkbookId $BaselineSnapshotId
-        $currentVersionId = Get-PreferredHistoryRenderVersion $Language $WorkbookId $CurrentSnapshotId
+        $baselineVersionId = Resolve-DiffHistoryVersionId $Language $WorkbookId $BaselineSnapshotId $RequestedBaselineVersionId
+        $currentVersionId = Resolve-DiffHistoryVersionId $Language $WorkbookId $CurrentSnapshotId $RequestedCurrentVersionId
         if ([string]::IsNullOrWhiteSpace($baselineVersionId) -or [string]::IsNullOrWhiteSpace($currentVersionId)) { return $null }
         return [pscustomobject][ordered]@{
             scope = 'history'
@@ -16347,8 +16385,8 @@ function Save-LocalDiffDetailCache([string]$Language, $Detail, [string]$Baseline
     try { Write-JsonFile $path $Detail } catch { }
 }
 
-function Get-LocalDiffDetailCache([string]$Language, [string]$WorkbookId, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '') {
-    $identity = Get-LocalDiffDetailCacheIdentity $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
+function Get-LocalDiffDetailCache([string]$Language, [string]$WorkbookId, [string]$BaselineSnapshotId = '', [string]$CurrentSnapshotId = '', [string]$RequestedBaselineVersionId = '', [string]$RequestedCurrentVersionId = '') {
+    $identity = Get-LocalDiffDetailCacheIdentity $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId $RequestedBaselineVersionId $RequestedCurrentVersionId
     if ($null -eq $identity) { return $null }
     $path = Get-LocalDiffDetailCachePath $Language $WorkbookId ([string]$identity.baselineSnapshotId) ([string]$identity.currentSnapshotId) ([string]$identity.baselineVersionId) ([string]$identity.currentVersionId) ([string]$identity.scope)
     $cacheKey = ([IO.Path]::GetFullPath($path)).ToLowerInvariant()
@@ -16432,9 +16470,11 @@ function Get-DiffDetail(
     [string]$Language,
     [string]$WorkbookId,
     [string]$BaselineSnapshotId = '',
-    [string]$CurrentSnapshotId = ''
+    [string]$CurrentSnapshotId = '',
+    [string]$RequestedBaselineVersionId = '',
+    [string]$RequestedCurrentVersionId = ''
 ) {
-    $cached = Get-LocalDiffDetailCache $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
+    $cached = Get-LocalDiffDetailCache $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId $RequestedBaselineVersionId $RequestedCurrentVersionId
     if ($null -ne $cached) {
         Set-NoteProperty $cached 'performance' ([ordered]@{ contextMs = 0; skeletonMs = 0; totalMs = 0; source = 'local-cache' })
         return $cached
@@ -16442,7 +16482,7 @@ function Get-DiffDetail(
     # 比較PNGと差分JSONは事前生成しない。対象版・シート・ページ数だけを返し、
     # 表示中の1ページをPDF.jsとWeb Workerでブラウザ内比較する。
     $totalTimer = [Diagnostics.Stopwatch]::StartNew()
-    $context = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId
+    $context = Get-DiffDetailContext $Language $WorkbookId $BaselineSnapshotId $CurrentSnapshotId $RequestedBaselineVersionId $RequestedCurrentVersionId
     $contextMs = $totalTimer.ElapsedMilliseconds
     $detail = New-DiffDetailSkeleton $Language $context
     $totalTimer.Stop()

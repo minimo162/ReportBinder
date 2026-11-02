@@ -166,7 +166,7 @@ function $(id){return __el(id);}
 function api(path){const d=__deferred();pending.push({path,d});return d.promise;}
 function renderPackChanges(changes,archives){rendered.push(changes);}
 function renderPackChangeError(message){errors.push(message);}
-` + ['isPackChangeOpen', 'loadPackChangeArchives', 'loadPackChanges', 'comparePackChangeVersions', 'closePackChanges', 'openPackChangeDetail'].map(extractFunction).join('\n'), Object.assign(ctx, { __el: el, __deferred: deferred }));
+` + ['isPackChangeOpen', 'loadPackChangeArchives', 'loadPackChanges', 'comparePackChangeVersions', 'closePackChanges', 'packChangeDetailRange', 'openPackChangeDetail'].map(extractFunction).join('\n'), Object.assign(ctx, { __el: el, __deferred: deferred }));
   return { ctx, el };
 }
 {
@@ -218,12 +218,15 @@ function renderPackChangeError(message){errors.push(message);}
   const seen = [];
   ctx.openDiffDetail = (...args) => { seen.push(args); };
   const opener = { id: 'btn' };
-  ctx.openPackChangeDetail({ sourceId: 'wb_1', fromSnapshotId: 'snap_old', toSnapshotId: 'snap_new', detailAvailable: true }, opener);
+  ctx.openPackChangeDetail({ sourceId: 'wb_1', fromSnapshotId: 'snap_old', toSnapshotId: 'snap_new', fromVersionId: 'ver_old', toVersionId: 'ver_new', detailAvailable: true }, opener);
   assert.equal(seen.length, 1);
   assert.equal(seen[0][0], 'wb_1');
   assert.equal(seen[0][1], opener);
   assert.equal(seen[0][2].fromSnapshotId, 'snap_old', 'from must be the earlier version');
   assert.equal(seen[0][2].toSnapshotId, 'snap_new', 'to must be the later version');
+  // 版は提出用PDFに入った版（行の記録）で固定する。渡さないと、同じ snapshot の新しい描き直しと比べてしまう。
+  assert.equal(seen[0][2].fromVersionId, 'ver_old', 'the exact archived version must be passed');
+  assert.equal(seen[0][2].toVersionId, 'ver_new', 'the exact archived version must be passed');
   ctx.openPackChangeDetail({ sourceId: 'wb_1', fromSnapshotId: 'a', toSnapshotId: 'b', detailAvailable: false }, opener);
   ctx.openPackChangeDetail({ sourceId: '', fromSnapshotId: 'a', toSnapshotId: 'b', detailAvailable: true }, opener);
   assert.equal(seen.length, 1);
@@ -272,8 +275,15 @@ function makeReportContext() {
     }
     return elements.get(id);
   };
-  const ctx = browserContext({ calls: [], pending: [], renders: [] });
+  const ctx = browserContext({ calls: [], pending: [], renders: [], collects: [], __details: [] });
   vm.runInContext(stubs + helpers + reportHelpers + `
+// 「くわしく見る」の収集は別のテストで実物を確かめる。ここでは呼び方と送り方だけを見る。
+async function collectPackChangeReportDetails(changes,onProgress,options){
+  const call={changes,options,gate:__deferred()};collects.push(call);
+  if(onProgress)onProgress({done:1,total:2});
+  await call.gate.promise;
+  return options?.isStale?.()?null:__details;
+}
 var activePackId='pack_1';
 var finalArchivesState={packId:'pack_1',loaded:true,list:[]};
 var packChangeState={volume:'v-main',targetId:'main',fromBuildId:'',toBuildId:'',requestPath:'',changes:null,archives:[],filter:'all',showAll:false};
@@ -289,6 +299,11 @@ function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChang
 ` + ['isPackChangeOpen', 'loadPackChangeArchives', 'loadPackChanges', 'closePackChanges', 'createPackChangeReport'].map(extractFunction).join('\n'), Object.assign(ctx, { __el: el, __deferred: deferred }));
   return ctx;
 }
+// 収集を終わらせて、作成の要求まで進める。
+async function finishCollect(ctx) {
+  ctx.collects.at(-1).gate.resolve();
+  await flush();
+}
 {
   const ctx = makeReportContext();
   // 既定の組み合わせを開いた状態（b1 → b3）。
@@ -297,11 +312,22 @@ function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChang
   await load;
   assert.equal(ctx.packChangeState.changes.to.buildId, 'b3');
 
-  // 作成 → 状態を見る → 完了。送るのは画面の2つの版。
+  // 作成 → 先に「くわしく見る」の結果を集める（進み具合は欄に出す）→ 状態を見る → 完了。送るのは画面の2つの版と集めた結果。
+  ctx.__details = [{ rowKey: 'item:A#1', regions: [] }];
   const creating = ctx.createPackChangeReport();
+  assert.equal(ctx.collects.length, 1);
+  assert.equal(ctx.collects[0].changes, ctx.packChangeState.changes, 'details are collected for the shown pair');
+  assert.equal(ctx.pending.length, 0, 'the job must not start before the details are collected');
+  assert.equal(ctx.renders.at(-1).status, 'collecting');
+  assert.match(ctx.renders.at(-1).message, /1 \/ 2ページ/);
+  assert.equal(ctx.renders.at(-1).percent, 50);
+  // 集めている間にもう一度押しても、2本目は始めない。
+  await ctx.createPackChangeReport();
+  assert.equal(ctx.collects.length, 1);
+  await finishCollect(ctx);
   const start = ctx.pending.shift();
   assert.equal(start.path, '/api/v2/outputs/changes/report');
-  assert.deepEqual({ ...start.options.body }, { packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b3' });
+  assert.equal(JSON.stringify(start.options.body), JSON.stringify({ packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b3', details: [{ rowKey: 'item:A#1', regions: [] }] }));
   // 作成中にもう一度押しても、2本目は始めない。
   await ctx.createPackChangeReport();
   assert.equal(ctx.pending.length, 0);
@@ -321,6 +347,7 @@ function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChang
   ctx.pending.shift().d.resolve({ changes: readyChanges() });
   await load;
   const creating = ctx.createPackChangeReport();
+  await finishCollect(ctx);
   ctx.pending.shift().d.resolve({ job: { jobId: 'job_1', status: 'running', percent: 30 } });
   await flush(); await flush();
   const poll = ctx.pending.shift();
@@ -343,6 +370,7 @@ function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChang
   ctx.pending.shift().d.resolve({ changes: readyChanges() });
   await load;
   let creating = ctx.createPackChangeReport();
+  await finishCollect(ctx);
   ctx.pending.shift().d.resolve({ job: { jobId: 'job_2', status: 'running' } });
   await flush(); await flush();
   ctx.pending.shift().d.resolve({ job: { jobId: 'job_2', status: 'failed', message: 'この PC では変更点PDFを作れませんでした。' } });
@@ -350,11 +378,36 @@ function renderPackChangeReport(){renders.push(packChangeReportJob?{...packChang
   assert.equal(ctx.packChangeReportJob.status, 'failed');
   assert.match(ctx.packChangeReportJob.message, /作れませんでした/);
   creating = ctx.createPackChangeReport();
+  await finishCollect(ctx);
   ctx.closePackChanges();
   const rendersBefore = ctx.renders.length;
   ctx.pending.shift().d.reject(new Error('boom'));
   await creating;
   assert.equal(ctx.renders.length, rendersBefore, 'a failure after closing must not repaint');
+}
+{
+  // 集めている間に組み合わせを切り替えた・閉じたら、作成を始めない（前の組み合わせの結果を送らない）。
+  const ctx = makeReportContext();
+  const load = ctx.loadPackChanges({});
+  ctx.pending.shift().d.resolve({ changes: readyChanges() });
+  await load;
+  const creating = ctx.createPackChangeReport();
+  const switched = ctx.loadPackChanges({ fromBuildId: 'b2', toBuildId: 'b3' });
+  ctx.pending.shift().d.resolve({ changes: readyChanges({ from: { buildId: 'b2' } }) });
+  await switched;
+  assert.equal(ctx.collects[0].options.isStale(), true, 'the collection must see that the pair changed');
+  await finishCollect(ctx);
+  await creating;
+  assert.equal(ctx.pending.length, 0, 'no report job may start for a pair that is no longer shown');
+  // 収集そのものが失敗しても、作成は止めない（詳細なしで送る）。
+  ctx.collectPackChangeReportDetails = async () => { throw new Error('pdf.js missing'); };
+  const retry = ctx.createPackChangeReport();
+  await flush();
+  const start = ctx.pending.shift();
+  assert.equal(start.path, '/api/v2/outputs/changes/report');
+  assert.equal(JSON.stringify(start.options.body.details), '[]');
+  start.d.resolve({ job: { status: 'completed' } });
+  await retry;
 }
 
 // ---- 共有用フォルダーへのコピーに変更点PDFを同梱する ------------------------------------
@@ -394,8 +447,9 @@ function makePublishContext({ changes, confirm = true, checked = true, reportJob
     }
     return elements.get(id);
   };
-  const ctx = browserContext({ calls: [], messages: [], confirms: [] });
+  const ctx = browserContext({ calls: [], messages: [], confirms: [], collects: [] });
   vm.runInContext(stubs + helpers + reportHelpers + publishHelpers + `
+async function collectPackChangeReportDetails(changes,onProgress){collects.push(changes);if(onProgress)onProgress({done:2,total:2});return [{rowKey:'item:A#1',regions:[]}];}
 var activePackId='pack_1',activePreset='p',activeFinalJobId='';
 var confirmResolver=null,confirmReturnFocus=null;
 var document={activeElement:null};
@@ -452,7 +506,10 @@ const attachChanges = report => ({ status: 'ready', from: { buildId: 'b1' }, to:
   const order = ctx.calls.map(c => c.path.split('?')[0]);
   const created = order.indexOf('/api/v2/outputs/changes/report'), published = order.indexOf('/api/v2/outputs/publish');
   assert.ok(created >= 0 && published > created, `the report must be made before the copy: ${order.join(', ')}`);
-  assert.deepEqual({ ...ctx.calls[created].body }, { packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b2' });
+  // 画面の「変更点をPDFにする」と同じく、集めた「くわしく見る」の結果も送る。
+  assert.equal(ctx.collects.length, 1);
+  assert.equal(JSON.stringify(ctx.calls[created].body), JSON.stringify({ packId: 'pack_1', targetId: 'main', fromBuildId: 'b1', toBuildId: 'b2', details: [{ rowKey: 'item:A#1', regions: [] }] }));
+  assert.ok(ctx.messages.some(m => /変わったページを比べています（2 \/ 2ページ）/.test(m.message)), 'collection progress is shown');
   assert.equal(ctx.calls[published].body.includeChangeReports, true);
 }
 {
@@ -484,6 +541,150 @@ const attachChanges = report => ({ status: 'ready', from: { buildId: 'b1' }, to:
   void ctx.confirmAction({ title: 'x' });
   assert.equal(ctx.confirms[0].wrapHidden, true);
   assert.equal(ctx.confirmCheckState(), false);
+}
+
+// ---- 変更点PDF用に「くわしく見る」の結果を集める ------------------------------------------
+// 引数に分割代入（{isStale=()=>false,...}={}）を持つ関数も取り出せるよう、引数の ) を数えてから本体を探す。
+function extractFunctionWithParams(name) {
+  let start = source.indexOf(`async function ${name}(`);
+  if (start < 0) start = source.indexOf(`function ${name}(`);
+  assert.ok(start >= 0, `function ${name} is missing from app.js`);
+  let i = source.indexOf('(', start), depth = 0;
+  for (; i < source.length; i++) { if (source[i] === '(') depth++; else if (source[i] === ')' && --depth === 0) break; }
+  const open = source.indexOf('{', i);
+  depth = 0;
+  for (let j = open; j < source.length; j++) {
+    if (source[j] === '{') depth++;
+    else if (source[j] === '}' && --depth === 0) return source.slice(start, j + 1);
+  }
+  throw new Error(`unterminated function ${name}`);
+}
+const constLine = name => { const m = source.match(new RegExp(`^const ${name} = .*$`, 'm')); assert.ok(m, `const ${name} is missing`); return m[0]; };
+const collectSource = ['PACK_CHANGE_DETAIL_LIMIT', 'PACK_CHANGE_DETAIL_REGION_LIMIT', 'PACK_CHANGE_DETAIL_BYTES_LIMIT'].map(constLine).join('\n') + '\n'
+  + ['diffSheetPageCount', 'diffDetailPath', 'packChangeDetailRange', 'packChangeDetailTargets', 'packChangeDetailGroupKey', 'packChangeDetailMatchesRow',
+    'packChangeDetailPage', 'packChangeDetailEntry', 'packChangeDetailsWithinBudget', 'collectPackChangeReportDetails'].map(extractFunctionWithParams).join('\n');
+function makeCollectContext(extra = {}) {
+  const ctx = browserContext({ TextEncoder, ...extra });
+  vm.runInContext(stubs + collectSource + `
+function computeDiffPageResult(){throw new Error('the real computation must not run in this test');}
+function fetchDiffDetailResponse(path,workbookId){detailRequests.push({path,workbookId});return Promise.resolve({detail:__detailFor(path)});}
+function createDiffAnalysisSession(){sessions.push('open');return {analyze(){},close(){sessions.push('close');}};}
+function newDiffComputeSource(options){return {...options,documentCache:new Map()};}
+`, Object.assign(ctx, { detailRequests: [], sessions: [] }));
+  return ctx;
+}
+const cmpFor = (from, to) => ({ scope: 'history', baselineSnapshotId: from[0], baselineVersionId: from[1], currentSnapshotId: to[0], currentVersionId: to[1] });
+const changedRow = (extra = {}) => ({ rowKey: 'item:A#1', kinds: ['content'], detailAvailable: true, sourceId: 'wb_a', sheetName: 'S1',
+  toPage: 12, fromPage: 10, toSourcePageNumber: 1, fromSourcePageNumber: 1,
+  fromSnapshotId: 's1', fromVersionId: 'v1', toSnapshotId: 's2', toVersionId: 'v2', ...extra });
+const readyDetail = (sheets, cmp = cmpFor(['s1', 'v1'], ['s2', 'v2'])) => ({ status: 'ready', comparison: cmp, sheets });
+{
+  const ctx = makeCollectContext();
+  // 版は履歴の2版と両方そろったときだけ送る。
+  assert.equal(ctx.diffDetailPath('wb_a', { fromSnapshotId: 's1', toSnapshotId: 's2', fromVersionId: 'v1', toVersionId: 'v2' }),
+    '/api/history/diff-detail?workbookId=wb_a&fromSnapshotId=s1&toSnapshotId=s2&fromVersionId=v1&toVersionId=v2');
+  assert.equal(ctx.diffDetailPath('wb_a', { fromSnapshotId: 's1', toSnapshotId: 's2', fromVersionId: 'v1' }), '/api/history/diff-detail?workbookId=wb_a&fromSnapshotId=s1&toSnapshotId=s2');
+  assert.equal(ctx.diffDetailPath('wb_a', { fromVersionId: 'v1', toVersionId: 'v2' }), '/api/history/diff-detail?workbookId=wb_a');
+
+  // 対象: 内容が変わった（かもしれない）行で、くわしく見られる行だけ。増えた・なくなった・ずれただけは送らない。
+  const rows = [
+    changedRow(), changedRow({ rowKey: 'item:B#1', kinds: ['maybe-content', 'moved'] }),
+    changedRow({ rowKey: 'item:C#1', kinds: ['added'], detailAvailable: false }),
+    changedRow({ rowKey: 'item:D#1', kinds: ['removed'], detailAvailable: false }),
+    changedRow({ rowKey: 'item:E#1', kinds: ['moved'] }),
+    changedRow({ rowKey: 'item:F#1', kinds: ['content'], detailAvailable: false }),
+    changedRow({ rowKey: 'item:G#1', kinds: ['content'], toVersionId: '' }),
+  ];
+  assert.equal(JSON.stringify(ctx.packChangeDetailTargets({ pages: rows }).map(r => r.rowKey)), JSON.stringify(['item:A#1', 'item:B#1']));
+  // 上限は PACK_CHANGE_DETAIL_LIMIT（200）件。
+  const many = Array.from({ length: 250 }, (_, i) => changedRow({ rowKey: `item:R${i}#1` }));
+  assert.equal(ctx.packChangeDetailTargets({ pages: many }).length, 200);
+
+  // 行 → シート・ページ: シートは今回の名前、ページは原稿の変換PDFの中のページ番号（pages[].afterPageNumber）で引く。
+  // 提出用PDFの出力ページ番号（toPage）で引くと別のページになる。
+  const multi = readyDetail([
+    { sheetKey: 'k0', afterSheetName: 'S0', beforeSheetName: 'S0', pages: [{ beforePageNumber: 1, afterPageNumber: 1 }] },
+    { sheetKey: 'k1', afterSheetName: 'S1', beforeSheetName: 'S1', pages: [
+      { beforePageNumber: 1, afterPageNumber: 1, comparisonKind: 'unchanged' },
+      { beforePageNumber: 0, afterPageNumber: 2, comparisonKind: 'added' },
+      { beforePageNumber: 2, afterPageNumber: 3, comparisonKind: 'modified' }] },
+  ]);
+  let found = ctx.packChangeDetailPage(multi, changedRow({ toSourcePageNumber: 3, toPage: 2 }));
+  assert.equal(found.sheet.sheetKey, 'k1'); assert.equal(found.pageIndex, 2, 'the page is looked up by its page number inside the source PDF');
+  assert.equal(ctx.packChangeDetailPage(multi, changedRow({ toSourcePageNumber: 9 })), null);
+  assert.equal(ctx.packChangeDetailPage(multi, changedRow({ sheetName: 'nope' })), null);
+  // 前回の名前でも引ける。対応表の無いシートはページ番号どおり。
+  const renamedSheet = readyDetail([{ sheetKey: 'k2', afterSheetName: 'S1-new', beforeSheetName: 'S1', pageCount: 2, beforePages: 2, afterPages: 2 }]);
+  found = ctx.packChangeDetailPage(renamedSheet, changedRow({ toSourcePageNumber: 2 }));
+  assert.equal(found.sheet.sheetKey, 'k2'); assert.equal(found.pageIndex, 1);
+
+  // 比較情報の版が行の版と違えば使わない（提出用PDFに入っていない描き直しを変更点にしない）。
+  assert.equal(ctx.packChangeDetailMatchesRow(multi, changedRow()), true);
+  assert.equal(ctx.packChangeDetailMatchesRow(readyDetail([], cmpFor(['s1', 'v1'], ['s2', 'v3'])), changedRow()), false);
+  assert.equal(ctx.packChangeDetailMatchesRow({ ...multi, status: 'unavailable' }, changedRow()), false);
+
+  // 送る形: 座標は 0〜1 に収め、種類は4つだけ、枠は30件まで（regionCount は元の数）。
+  const page = { beforePageNumber: 2, afterPageNumber: 3, width: 600, height: 400, status: 'ready', changedRatio: .02,
+    regions: Array.from({ length: 35 }, (_, i) => ({ kind: i === 0 ? 'weird' : 'modified', x: -0.1, y: .5, width: 1.4, height: .1,
+      before: { x: .1, y: .2, width: .3, height: .4 }, beforeText: 'a', afterText: 'b' })) };
+  const entry = ctx.packChangeDetailEntry(changedRow(), multi.sheets[1], page);
+  assert.equal(entry.rowKey, 'item:A#1'); assert.equal(entry.fromVersionId, 'v1'); assert.equal(entry.toVersionId, 'v2');
+  assert.equal(entry.sheetName, 'S1'); assert.equal(entry.beforePageNumber, 2); assert.equal(entry.afterPageNumber, 3);
+  assert.equal(entry.regions.length, 30); assert.equal(entry.regionCount, 35);
+  assert.equal(entry.regions[0].kind, 'unknown');
+  assert.equal(JSON.stringify(entry.regions[0].before), JSON.stringify({ x: .1, y: .2, width: .3, height: .4 }));
+  assert.equal(JSON.stringify(entry.regions[0].after), JSON.stringify({ x: 0, y: .5, width: 1, height: .1 }), 'a box without side geometry is clamped to the page');
+  assert.equal(entry.regions[0].beforeText, 'a'); assert.equal(entry.regions[0].afterText, 'b');
+
+  // 大きさの上限: 入りきらない行は外す。
+  const big = { rowKey: 'big', regions: [{ beforeText: 'x'.repeat(5000) }] };
+  const small = { rowKey: 'small', regions: [] };
+  assert.equal(JSON.stringify(ctx.packChangeDetailsWithinBudget([big, small], 1000).map(e => e.rowKey)), JSON.stringify(['small']));
+}
+{
+  // 全体の流れ: 原稿ごとに比較情報を1回だけ（行の版を指定して）取り、行ごとに計算する。
+  const details = {
+    wb_a: readyDetail([{ sheetKey: 'k1', afterSheetName: 'S1', pages: [{ beforePageNumber: 1, afterPageNumber: 1 }, { beforePageNumber: 2, afterPageNumber: 2 }] }]),
+    // 版が違う比較が返ってきた原稿は使わない。
+    wb_b: readyDetail([{ sheetKey: 'k1', afterSheetName: 'S1', pages: [{ beforePageNumber: 1, afterPageNumber: 1 }] }], cmpFor(['s1', 'v1'], ['s2', 'v9'])),
+  };
+  const ctx = makeCollectContext({ __detailFor: path => details[new URLSearchParams(path.split('?')[1]).get('workbookId')] });
+  const computeCalls = [];
+  const results = new Map([[1, { page: { beforePageNumber: 1, afterPageNumber: 1, width: 600, height: 400, status: 'ready', changedRatio: .01, regions: [{ kind: 'modified', x: .1, y: .1, width: .2, height: .05, beforeText: '100', afterText: '110' }] } }]]);
+  ctx.computeDiffPageResult = async (sheet, pageIndex, options) => {
+    computeCalls.push({ sheet: sheet.sheetKey, pageIndex, source: options.source });
+    if (pageIndex === 1) return { page: { analysisFailed: true, regions: [] } };
+    return results.get(pageIndex + 1);
+  };
+  const progress = [];
+  const changes = { pages: [
+    changedRow(),
+    changedRow({ rowKey: 'item:A#2', toSourcePageNumber: 2 }),
+    changedRow({ rowKey: 'item:B#1', sourceId: 'wb_b' }),
+    changedRow({ rowKey: 'item:C#1', kinds: ['added'], detailAvailable: false }),
+  ] };
+  // compute は既定（実物の名前）を使わせるため、ctx に差し替えた関数を compute として渡す。
+  const collected = await ctx.collectPackChangeReportDetails(changes, p => progress.push(`${p.done}/${p.total}`), { compute: ctx.computeDiffPageResult });
+  assert.equal(ctx.detailRequests.length, 2, 'the comparison info is fetched once per source');
+  assert.match(ctx.detailRequests[0].path, /fromVersionId=v1&toVersionId=v2/, 'the comparison info is requested for the exact archived versions');
+  assert.equal(computeCalls.length, 2, 'rows whose comparison uses other versions are not computed');
+  assert.equal(computeCalls[0].source.workbookId, 'wb_a');
+  assert.equal(JSON.stringify(computeCalls[0].source.comparison), JSON.stringify(details.wb_a.comparison), 'the computation reads the exact versions');
+  assert.equal(JSON.stringify(collected.map(e => e.rowKey)), JSON.stringify(['item:A#1']), 'failed computations are not sent');
+  assert.equal(collected[0].regions[0].afterText, '110');
+  assert.equal(JSON.stringify(progress), JSON.stringify(['0/3', '1/3', '2/3', '3/3']));
+  assert.equal(JSON.stringify(ctx.sessions), JSON.stringify(['open', 'close']), 'the separate diff worker is closed after collecting');
+
+  // 計算が例外を投げても、ほかの行は続ける。
+  const throwing = await ctx.collectPackChangeReportDetails({ pages: [changedRow({ rowKey: 'x#1', toSourcePageNumber: 2 }), changedRow()] }, null,
+    { compute: async (sheet, pageIndex) => { if (pageIndex === 1) throw new Error('boom'); return results.get(1); } });
+  assert.equal(JSON.stringify(throwing.map(e => e.rowKey)), JSON.stringify(['item:A#1']));
+
+  // 途中で組み合わせを切り替えたら（isStale）、何も返さない。
+  let stale = false;
+  const staleResult = await ctx.collectPackChangeReportDetails(changes, null, { isStale: () => stale, compute: async () => { stale = true; return results.get(1); } });
+  assert.equal(staleResult, null, 'a stale collection must not send anything');
+  assert.equal(ctx.sessions.at(-1), 'close');
 }
 
 console.log('pack change view regression ok');

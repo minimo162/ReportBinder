@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v215', 'style.css?v=20261030_v131']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v216', 'style.css?v=20261030_v131']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v215' not in html:
+if 'app.js?v=20261030_v216' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v215' not in html:
+if 'app.js?v=20261030_v216' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3472,5 +3472,81 @@ for name in ['publishFinalVolume', 'publishAllFinalVolumes']:
     _body = _pack_js.split(f'async function {name}(', 1)[1].split('\nasync function ', 1)[0]
     if 'preparePublishChangeReports(' not in _body or 'includeChangeReports' not in _body:
         raise SystemExit(f'{name} must ask about and send includeChangeReports')
+
+# 「くわしく見る」の計算を画面から切り離し、変更点PDF用に集める（PR-B1）------------------------
+# 振る舞い（buildDiffBrowserPage と同じ結果・古くなったら捨てる・行 → シート・ページの引き方・200件の上限・
+# 版の固定）は diff-regression.mjs・pack-change-view-regression.mjs・history-compare-review-regression.mjs・
+# pack-change-selfcheck.ps1 が見る。ここでは計算が画面に触らないこと、版を別の版に代えないことを見る。
+def _js_function(name):
+    marker = f'async function {name}(' if f'async function {name}(' in _pack_js else f'function {name}('
+    if marker not in _pack_js: raise SystemExit(f'app.js function is missing: {name}')
+    return re.split(r'\n(?:async )?function ', _pack_js.split(marker, 1)[1], maxsplit=1)[0]
+_compute_page = _js_function('computeDiffPageResult')
+for needed in ['isStale()', 'onProgress', 'source.analyze(', "renderDiffPdfPage('before',sheet,beforePageNumber,isStale,source)",
+               "extractDiffPdfDocumentTextPages('before',sheet,source)", 'selectDiffSemanticResult(', 'analysisFailed']:
+    if needed not in _compute_page:
+        raise SystemExit(f'the detail computation must take its inputs from the caller: {needed}')
+for forbidden in ['$(', 'setDiffBrowserProgress', 'diffBrowserRenderSerial', 'diffViewState', 'diffBrowserPageCache', 'document.getElementById']:
+    if forbidden in _compute_page:
+        raise SystemExit(f'the detail computation must not touch the diff screen: {forbidden}')
+_build_page = _js_function('buildDiffBrowserPage')
+if 'computeDiffPageResult(' not in _build_page or 'serial!==diffBrowserRenderSerial' not in _build_page or 'setDiffBrowserProgress' not in _build_page:
+    raise SystemExit('buildDiffBrowserPage must only wrap computeDiffPageResult with the screen serial and progress band')
+for name in ['renderDiffPdfPage', 'extractDiffPdfTextItems']:
+    if 'diffBrowserRenderSerial' in _js_function(name):
+        raise SystemExit(f'{name} must use the caller isStale(), not the diff screen serial')
+for needed in ['beforeText:diffRegionText(pair.before?.text)', 'beforeText:diffRegionText(a.text),afterText:diffRegionText(b.text)', 'const DIFF_REGION_TEXT_LIMIT = 200;']:
+    if needed not in _pack_js:
+        raise SystemExit(f'diff regions must carry the changed text for the change report: {needed}')
+_analysis_session = _js_function('createDiffAnalysisSession')
+if "new Worker(new URL('diff-worker.js?v=20260808_v23'" not in _analysis_session or 'diffAnalysisPending' in _analysis_session:
+    raise SystemExit('the change report collection must use its own diff worker, not the diff screen one')
+_collect = _js_function('collectPackChangeReportDetails')
+for needed in ['packChangeDetailTargets(changes)', 'packChangeDetailMatchesRow(detail,rows[0])', 'packChangeDetailPage(detail,row)',
+               'createDiffAnalysisSession()', 'session?.close()', 'diffDetailPath(row.sourceId,packChangeDetailRange(row))',
+               '!result.page.analysisFailed', 'packChangeDetailsWithinBudget(details)', 'return null']:
+    if needed not in _collect:
+        raise SystemExit(f'the change report collection is missing a safeguard: {needed}')
+if 'toSourcePageNumber' not in _js_function('packChangeDetailPage') or 'toPage' in _js_function('packChangeDetailPage'):
+    raise SystemExit('rows must be matched to pages by their page number inside the source PDF, not the output page number')
+if 'PACK_CHANGE_DETAIL_LIMIT' not in _js_function('packChangeDetailTargets') or 'const PACK_CHANGE_DETAIL_LIMIT = 200;' not in _pack_js:
+    raise SystemExit('the change report collection must stop at 200 pages')
+if not re.search(r'const PACK_CHANGE_DETAIL_BYTES_LIMIT = (\d+);', _pack_js) or int(re.search(r'const PACK_CHANGE_DETAIL_BYTES_LIMIT = (\d+);', _pack_js).group(1)) >= 1048576:
+    raise SystemExit('the collected details must stay below the 1MB request body limit of the server')
+_create_report = _js_function('createPackChangeReport')
+if 'collectPackChangeReportDetails(packChangeState.changes' not in _create_report or 'isStale:stale' not in _create_report or 'body:{...body,details}' not in _create_report:
+    raise SystemExit('the change report button must collect details for the shown pair and drop them when it changes')
+if _create_report.find('collectPackChangeReportDetails(') > _create_report.find("'/api/v2/outputs/changes/report'"):
+    raise SystemExit('details must be collected before the change report job starts')
+if 'collectPackChangeReportDetails(item.changes' not in _js_function('createPublishChangeReports') or '{...body,details}' not in _js_function('createPublishChangeReports'):
+    raise SystemExit('the shared copy flow must collect details like the change report button')
+for needed in ['fromVersionId', 'toVersionId']:
+    if needed not in _js_function('packChangeDetailRange') or needed not in _js_function('diffDetailPath'):
+        raise SystemExit(f'the pack change detail must pin the archived versions: {needed}')
+if 'packChangeDetailRange(row)' not in _js_function('openPackChangeDetail'):
+    raise SystemExit('「くわしく見る」 from the pack changes must open the archived versions')
+if 'fromVersionId:diffViewState.fromVersionId' not in _js_function('toggleDiffSheetReviewed'):
+    raise SystemExit('saving a review must use the same pinned versions as the shown comparison')
+_resolve_version = _publish_server_function('Resolve-DiffHistoryVersionId')
+for needed in ['Get-PreferredHistoryRenderVersion', 'Get-RenderVersionIds', 'Get-HistoryRenderVersionAvailability', "return ''"]:
+    if needed not in _resolve_version:
+        raise SystemExit(f'a requested version must be used exactly or not at all: {needed}')
+if _resolve_version.find('Get-PreferredHistoryRenderVersion') > _resolve_version.find('Assert-SafeStorageSegment $RequestedVersionId'):
+    raise SystemExit('the newest version may be used only when no version was requested')
+_diff_context_b1 = _publish_server_function('Get-DiffDetailContext')
+if _diff_context_b1.count('Resolve-DiffHistoryVersionId') != 2 or 'Get-PreferredHistoryRenderVersion' in _diff_context_b1:
+    raise SystemExit('Get-DiffDetailContext must resolve both versions through Resolve-DiffHistoryVersionId')
+if 'Resolve-DiffHistoryVersionId' not in _publish_server_function('Get-LocalDiffDetailCacheIdentity'):
+    raise SystemExit('the local diff detail cache must be keyed by the same exact versions')
+_diff_route = server.split("$path -eq '/api/history/diff-detail') {", 1)[1].split('if ($method', 1)[0]
+for needed in ["QueryString['fromVersionId']", "QueryString['toVersionId']", 'Get-DiffDetail $language $wbId $fromId $toId $fromVersion $toVersion']:
+    if needed not in _diff_route:
+        raise SystemExit(f'GET /api/history/diff-detail must accept the exact versions: {needed}')
+_page_maps = _publish_server_function('Compare-PackArchivePageMaps')
+for needed in ["rowKey = ([string]$k + '#' + [string]($i + 1))", 'rowKey = [string]$pair.rowKey', 'toSourcePageNumber = ', 'fromSourcePageNumber = ']:
+    if needed not in _page_maps:
+        raise SystemExit(f'pack change rows must carry a stable key and source page numbers: {needed}')
+if '$Script:PackChangeAlgorithmVersion = 2' not in server:
+    raise SystemExit('PackChangeAlgorithmVersion must be raised so cached summaries without row keys are rebuilt')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

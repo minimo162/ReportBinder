@@ -155,7 +155,7 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 
 ### 差分レビュー状態
 
-`POST /api/history/diff-review`は、表示中の比較に含まれる1つのページ項目を確認済み・未確認へ切り替える。`workbookId`、任意比較の場合は`fromSnapshotId`と`toSnapshotId`、画面が取得した`baselineVersionId`と`currentVersionId`、`sheetKey`、`confirmed`を送る。確認状態は利用者のローカル設定へ保存され、snapshot、render version、差分アルゴリズム版のいずれかが変わった比較へは引き継がれない。
+`POST /api/history/diff-review`は、表示中の比較に含まれる1つのページ項目を確認済み・未確認へ切り替える。`workbookId`、任意比較の場合は`fromSnapshotId`と`toSnapshotId`（版を指定して開いた比較なら`fromVersionId`と`toVersionId`も）、画面が取得した`baselineVersionId`と`currentVersionId`、`sheetKey`、`confirmed`を送る。確認状態は利用者のローカル設定へ保存され、snapshot、render version、差分アルゴリズム版のいずれかが変わった比較へは引き継がれない。
 
 ### 資料パックの提出・承認・監査履歴
 
@@ -630,7 +630,18 @@ volumeとcategoryは必須です。
 ```text
 /api/history/diff-detail?workbookId=wb_...&token=...
 /api/history/diff-detail?workbookId=wb_...&fromSnapshotId=...&toSnapshotId=...&token=...
+/api/history/diff-detail?workbookId=wb_...&fromSnapshotId=...&toSnapshotId=...&fromVersionId=...&toVersionId=...&token=...
 ```
+
+`fromVersionId`と`toVersionId`（任意。両方そろえて、`fromSnapshotId`・`toSnapshotId`と一緒に指定する）は、比べる描画の版です。
+指定すると、その版どうしだけを比べ、別の版には代えません（その snapshot に存在しない版、画像ハッシュと
+変換PDFがそろっていない版なら`status: "unavailable"`）。省略時は今までどおり、それぞれの snapshot の
+いちばん新しい使える版を使います。提出用PDF一式の変更点から開く「くわしく見る」は、アーカイブの
+`metadata.sourceWorkbooks[].versionId`（提出用PDFに実際に入った版）を指定し、同じ snapshot を後で
+描き直した版と比べないようにします。版を指定したときは、同じ snapshot の別の版どうしも比べられます。
+片方だけの指定や、履歴版なしの版の指定は 400 です。応答の`comparison.baselineVersionId`・
+`comparison.currentVersionId`は、実際に比べた版です。`POST /api/history/diff-review`も、同じ指定を
+本文の`fromVersionId`・`toVersionId`で受け付けます。
 
 `status`は`not-generated`、`generating`、`ready`、`unavailable`、`failed`です。
 領域座標は0～1の正規化値で、各領域は`modified`、`added`、`removed`のいずれかです。
@@ -794,7 +805,7 @@ POST  /api/v2/outputs/changes/report/file
 | `hasSides` | 両方の版に頁・左右の記録（`physicalPages`）があり、左右の入れ替わりを比べたか |
 | `complete` | 見た目のハッシュがそろわず判定を保留したページ（`maybe-content`・`unavailable`）が無いか |
 | `counts` | `content`・`sameLook`・`maybeContent`・`unavailable`・`added`・`removed`・`moved`・`shifted`（`moved`のうち前のページの増減でずれただけのもの）・`side`・`renamed`・`unchanged`・`changed`（変わったページの数。`unchanged`と`sameLook`だけのページは数えない）・`partCountChanged`（ページ数が変わった原稿の数）・`total` |
-| `pages[]` | 今回のページ番号順（なくなったページは、前回その直前にあったページの後ろ）。`toPage`・`toSide`・`toSpreadIndex`・`fromPage`・`fromSide`・`fromSpreadIndex`・`itemId`・`pageId`・`sourceId`・`sourceName`・`title`・`fromTitle`・`sheetKey`（単位の`sourceKey`。例`worksheet:売上`）・`sheetName`（原稿単位の比較でのシート名）・`pagePartIndex`・`fromPartCount`・`toPartCount`・`partCountChanged`・`kinds[]`・`shiftOnly`・`changedRatio`/`regionCount`（画像の比較は行わないため常に`null`）・`fromSnapshotId`/`fromVersionId`・`toSnapshotId`/`toVersionId`・`detailAvailable`（同じ原稿の別の版どうしで、原稿単位の比較を開ける）・`message` |
+| `pages[]` | 今回のページ番号順（なくなったページは、前回その直前にあったページの後ろ）。`rowKey`（行の安定したキー。`<項目のキー>#<項目内の順番>`、例`item:it_1#2`。出力ページ番号を含まないので、前のページの増減では変わらない）・`toPage`・`toSide`・`toSpreadIndex`・`fromPage`・`fromSide`・`fromSpreadIndex`・`toSourcePageNumber`/`fromSourcePageNumber`（原稿の変換PDFの中で何ページ目か。`GET /api/history/diff-detail`の`pages[].afterPageNumber`／`beforePageNumber`と同じ数え方。無い側は`null`）・`itemId`・`pageId`・`sourceId`・`sourceName`・`title`・`fromTitle`・`sheetKey`（単位の`sourceKey`。例`worksheet:売上`）・`sheetName`（原稿単位の比較でのシート名）・`pagePartIndex`・`fromPartCount`・`toPartCount`・`partCountChanged`・`kinds[]`・`shiftOnly`・`changedRatio`/`regionCount`（画像の比較は行わないため常に`null`）・`fromSnapshotId`/`fromVersionId`・`toSnapshotId`/`toVersionId`・`detailAvailable`（同じ原稿の別の版どうしで、原稿単位の比較を開ける）・`message` |
 | `notes[]` | `{ code, message }`。上記のほか`not-latest`・`no-page-map`（古い形式の版で左右を比べていない）・`no-changes`・`some-unavailable` |
 | `report` | 変更点PDF（`{ exists, reportId, fileName, createdAt, attachable, publishable, reason }`）。`status`が`ready`のときだけ調べ、`exists`は作成済みで記録と中身が合うとき true。`attachable`はこの組み合わせが「前回コピーした版 → 今の提出用PDF」（共有コピーへ同梱できる組み合わせ）のとき true、`publishable`は作成済みで、今コピーすれば同梱されるとき true（コピーのときと同じ`Resolve-PublishableChangeReport`で決める）。`reason`は`not-created`（まだ作っていない）・`outdated`（作ったものが今の比べた結果や今の提出用PDFと合わない）・`publishable`（作成済みで同梱できる）・`not-attachable`（作成済み。好きな2回の組み合わせや、今の提出用PDFでない版との組み合わせなので同梱しない）・`not-available`（比べられない）。詳しくは「変更点PDF」 |
 
@@ -802,9 +813,9 @@ POST  /api/v2/outputs/changes/report/file
 
 ページの対応は項目（`itemId`、無ければ`pageId`）ごとに、`pagePartIndex`の小さい方から順に取ります。原稿のページ数が変わったときは余りを`added`／`removed`にします。原稿の版（`metadata.sourceWorkbooks`の`snapshotId`・`versionId`）とページの位置が同じページは、ハッシュを見ずに内容が同じとみなします。頁・左右・台紙はアーカイブに記録された値をそのまま返し、数え直しません。`physicalPages`の無い古い版は`pages[]`の`sourcePageStart`〜`sourcePageEnd`から出力ページ番号だけを数え、左右・台紙は空（推定しない）にします。
 
-画面での使い方: 提出用PDF画面の出力先カードの「前回コピーしたときからの変更点を見る」は`fromBuildId`・`toBuildId`を付けずに呼び（既定の組み合わせ）、保存済み出力の「今の版と比べる」は`fromBuildId`だけ、変更点の画面の「ほかの版と比べる」は両方を付けて呼びます。画面は`pages[]`の`toPage`/`toSide`/`fromPage`/`fromSide`をそのまま表示し、左右が空の行で左右を補いません。「くわしく見る」は`detailAvailable`の行だけで、`GET /api/history/diff-detail?workbookId={sourceId}&fromSnapshotId={fromSnapshotId}&toSnapshotId={toSnapshotId}`（原稿単位の比較）を開きます。組み合わせを切り替えた後に届いた前の応答は表示に使いません。
+画面での使い方: 提出用PDF画面の出力先カードの「前回コピーしたときからの変更点を見る」は`fromBuildId`・`toBuildId`を付けずに呼び（既定の組み合わせ）、保存済み出力の「今の版と比べる」は`fromBuildId`だけ、変更点の画面の「ほかの版と比べる」は両方を付けて呼びます。画面は`pages[]`の`toPage`/`toSide`/`fromPage`/`fromSide`をそのまま表示し、左右が空の行で左右を補いません。「くわしく見る」は`detailAvailable`の行だけで、`GET /api/history/diff-detail?workbookId={sourceId}&fromSnapshotId={fromSnapshotId}&toSnapshotId={toSnapshotId}&fromVersionId={fromVersionId}&toVersionId={toVersionId}`（原稿単位の比較。提出用PDFに入った版どうし）を開きます。組み合わせを切り替えた後に届いた前の応答は表示に使いません。
 
-計算結果は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/summary.json`に覚え、`complete`が true で、両方の`outputPdfSha256`が一致し、計算の版（`algorithmVersion`）が同じときだけ使い回します。見た目のハッシュがまだ無い結果は、解析が済むと変わるため使い回しません。
+計算結果は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/summary.json`に覚え、`complete`が true で、両方の`outputPdfSha256`が一致し、計算の版（`algorithmVersion`。`rowKey`・`toSourcePageNumber`・`fromSourcePageNumber`を足したので 2）が同じときだけ使い回します。見た目のハッシュがまだ無い結果は、解析が済むと変わるため使い回しません。
 
 ### 変更点PDF（`POST /api/v2/outputs/changes/report`）
 
@@ -819,13 +830,33 @@ POST  /api/v2/outputs/changes/report/file
 
 | メソッド・パス | 内容 |
 | --- | --- |
-| `POST /api/v2/outputs/changes/report` | 本文`{ packId, targetId, fromBuildId, toBuildId }`（両方必須。画面に出ている`changes.from.buildId`・`changes.to.buildId`）。比べられない組み合わせ・組み込み一式・片方の版の省略は 400。作成済みなら作り直さず`{ jobType: "change-report", jobId: "", status: "completed", reportReady: true, report }`を返します。同じ組み合わせの作成中のジョブがあればそれに合流し（`joinedExistingReportJob: true`）、無ければ子プロセス（`server.ps1 -ChangeReportJobPath`）を起動してジョブ（`jobType: "change-report"`）を返します。応答は`{ ok, apiVersion: 2, job }` |
+| `POST /api/v2/outputs/changes/report` | 本文`{ packId, targetId, fromBuildId, toBuildId, details? }`（`fromBuildId`・`toBuildId`は両方必須。画面に出ている`changes.from.buildId`・`changes.to.buildId`）。`details`は画面が集めた「くわしく見る」の結果（下記）で、サーバーはまだ読みません。比べられない組み合わせ・組み込み一式・片方の版の省略は 400。作成済みなら作り直さず`{ jobType: "change-report", jobId: "", status: "completed", reportReady: true, report }`を返します。同じ組み合わせの作成中のジョブがあればそれに合流し（`joinedExistingReportJob: true`）、無ければ子プロセス（`server.ps1 -ChangeReportJobPath`）を起動してジョブ（`jobType: "change-report"`）を返します。応答は`{ ok, apiVersion: 2, job }` |
 | `GET /api/v2/outputs/changes/report/status?jobId={jobId}` | ジョブの状態（`Read-RenderJobStatus`）。`status`（`queued`・`launching`・`running`・`completed`・`failed`）・`percent`・`message`。完了時は`report`（上の`report`と同じ形）、失敗時は`code`（`edge-missing`＝Edge が見つからない、`timeout`＝時間切れ、`no-pdf`＝PDF ができなかった）と`errors[]`（`error`・`code`・`detail`・`edgeLog`＝Edge の出力。診断用） |
 | `POST /api/v2/outputs/changes/report/file` | 本文`{ packId, targetId, fromBuildId, toBuildId, action }`。`action: "open"`（既定）は PDF そのもの（`application/pdf`）を返し、`action: "reveal"`は保存先フォルダーをエクスプローラーで開いて PDF を選択状態にします（応答`{ ok, apiVersion: 2, path }`）。`meta.json`の`reportSha256`と`report.pdf`の中身が合わなければ開きません |
 
 保存先は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/`（`report.pdf`・`report.html`・`meta.json`・`summary.json`）です。ローカルの出力フォルダーにはコピーしません（提出用PDFと取り違えないため）。`report.pdf`は一時名で書いてから名前を変え、`meta.json`（`reportVersion`・`fromBuildId`・`toBuildId`・`fromOutputPdfSha256`・`toOutputPdfSha256`・`reportSha256`・`complete`・`changedCount`・`fileName`・`createdAt`）を最後に書きます。作成済み（`report.exists`）とみなすのは、`meta.json`の両方の`outputPdfSha256`が比べた2つの版と同じで、`reportSha256`が`report.pdf`の中身と合い、作成の版（`reportVersion`）が同じときだけです。見た目のハッシュがそろわないうち（`complete: false`）に作ったものは、そろった後は`outdated`です。`fileName`は`<提出用PDFのファイル名（拡張子なし）>_変更点.pdf`で、共有用フォルダーへ同梱するときの名前です。
 
 画面での使い方: 変更点の画面の「変更点をPDFにする」で作成を始め、1秒ごとに状態を読んで進み具合を出します。終わると「開く」（別タブ）と「フォルダーを開く」が押せます。作成中に組み合わせを切り替えたり画面を閉じたりしたら、そのジョブの状態では画面を書き換えません（ジョブはサーバーで最後まで進み、同じ組み合わせでもう一度押すと合流します）。
+
+`details`（「くわしく見る」の結果）: 作成を始める前に、画面は`pages[]`のうち`kinds`に`content`か`maybe-content`を含み、`detailAvailable`で版（`fromVersionId`・`toVersionId`）と`toSourcePageNumber`のある行を、先頭から最大 200 件選びます。原稿ごとに`GET /api/history/diff-detail`を行の版を指定して1回だけ読み、シート（今回の`sheetName`。無ければ前回の名前）とページ（`toSourcePageNumber`＝`pages[].afterPageNumber`。出力ページ番号では引かない）を引いて、差分画面と同じ計算（PDF.js の描画 → `diff-worker.js`の画素比較 → PDF.js の文字照合）を回します。進み具合は変更点PDFの欄（共有コピーの流れでは通知）に「変わったページを比べています（n / N ページ）」と出します。共有コピーの前に変更点PDFを作るときも同じです。1件の形は次のとおりです。
+
+```json
+{
+  "rowKey": "item:it_1#2", "fromVersionId": "v_...", "toVersionId": "v_...", "sheetName": "売上",
+  "beforePageNumber": 2, "afterPageNumber": 2, "width": 1240, "height": 1754,
+  "status": "ready", "changedRatio": 0.012, "regionCount": 3,
+  "regions": [
+    { "kind": "modified", "before": { "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.02 }, "after": { "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.02 },
+      "beforeText": "1,234", "afterText": "1,240" }
+  ]
+}
+```
+
+- 座標は 0〜1 の割合で、前後のページのうち大きい方の寸法（左上を合わせる）に対する値です。`kind`は`modified`・`added`・`removed`・`unknown`だけです。
+- `beforeText`・`afterText`は、PDF の文字から取れた変更前後の文字（それぞれ 200 字まで）です。取れないときは空です。原稿の中身そのものなので、使う側で必ずエスケープします。
+- 1件の`regions`は 30 件まで（`regionCount`は切る前の数）、`details`全体は UTF-8 で 768KB までに収め、入りきらない行は送りません（要求本文の上限 1MB を超えないため）。
+- 比較情報が取れない・行の版と違う版の比較が返った・計算に失敗した行は送りません。集めている間に組み合わせを切り替えたり閉じたりしたら、何も送らず作成も始めません。集めること自体に失敗しても、`details: []`で作成は続けます。
+- 計算は差分画面とは別の Worker と PDF のキャッシュで行うので、集めている間に差分画面を開いたり閉じたりしても止まりません。
 
 ### 変更点PDFの共有コピーへの同梱（`includeChangeReports`）
 
