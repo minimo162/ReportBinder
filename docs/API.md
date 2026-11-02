@@ -793,6 +793,8 @@ GET   /api/v2/outputs/changes?packId=pack_...&targetId=main[&fromBuildId=...&toB
 
 ページの対応は項目（`itemId`、無ければ`pageId`）ごとに、`pagePartIndex`の小さい方から順に取ります。原稿のページ数が変わったときは余りを`added`／`removed`にします。原稿の版（`metadata.sourceWorkbooks`の`snapshotId`・`versionId`）とページの位置が同じページは、ハッシュを見ずに内容が同じとみなします。頁・左右・台紙はアーカイブに記録された値をそのまま返し、数え直しません。`physicalPages`の無い古い版は`pages[]`の`sourcePageStart`〜`sourcePageEnd`から出力ページ番号だけを数え、左右・台紙は空（推定しない）にします。
 
+画面での使い方: 提出用PDF画面の出力先カードの「前回コピーしたときからの変更点を見る」は`fromBuildId`・`toBuildId`を付けずに呼び（既定の組み合わせ）、保存済み出力の「今の版と比べる」は`fromBuildId`だけ、変更点の画面の「ほかの版と比べる」は両方を付けて呼びます。画面は`pages[]`の`toPage`/`toSide`/`fromPage`/`fromSide`をそのまま表示し、左右が空の行で左右を補いません。「くわしく見る」は`detailAvailable`の行だけで、`GET /api/history/diff-detail?workbookId={sourceId}&fromSnapshotId={fromSnapshotId}&toSnapshotId={toSnapshotId}`（原稿単位の比較）を開きます。組み合わせを切り替えた後に届いた前の応答は表示に使いません。
+
 計算結果は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/summary.json`に覚え、`complete`が true で、両方の`outputPdfSha256`が一致し、計算の版（`algorithmVersion`）が同じときだけ使い回します。見た目のハッシュがまだ無い結果は、解析が済むと変わるため使い回しません。
 
 ## 自動PDF作成

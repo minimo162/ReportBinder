@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/history-compare-review-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/history-compare-review-regression.mjs','tests/pack-change-view-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -1670,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v211', 'style.css?v=20261030_v127']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v212', 'style.css?v=20261030_v128']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1724,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v211' not in html:
+if 'app.js?v=20261030_v212' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1750,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v211' not in html:
+if 'app.js?v=20261030_v212' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3321,5 +3321,30 @@ _readiness_route = server.split("$path -eq '/api/v2/outputs/readiness'", 1)[1].s
 for needed in ['try {', '} catch {', 'readinessError=$true', "code='readiness-failed'"]:
     if needed not in _readiness_route:
         raise SystemExit(f'outputs readiness must isolate per-target failures: {needed}')
+
+# 提出用PDF一式の変更点の画面（PR3）------------------------------------------------
+# 古い応答で新しい比較を上書きしない・「くわしく見る」が正しい版で原稿単位の比較を開く・
+# 頁と左右はサーバーの値だけで出す、を実物の関数で確かめる。
+pack_change_view_regression = subprocess.run([_node, str(root / 'tests/pack-change-view-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
+if pack_change_view_regression.returncode != 0:
+    raise SystemExit('pack change view regression failed: ' + (pack_change_view_regression.stdout + pack_change_view_regression.stderr).strip())
+_pack_js = (root/'app/web/app.js').read_text(encoding='utf-8-sig')
+for needed in ['id="pack-change-modal"', 'id="pack-change-list"', 'id="pack-change-summary"', 'id="pack-change-from"', 'id="pack-change-to"', 'id="pack-change-compare"']:
+    if needed not in html:
+        raise SystemExit(f'pack change modal markup is missing: {needed}')
+for needed in ['data-final-changes', 'data-final-changes-note', 'data-archive-compare', "/api/v2/outputs/changes?"]:
+    if needed not in _pack_js:
+        raise SystemExit(f'pack change entry points are missing: {needed}')
+_pack_load = _pack_js.split('async function loadPackChanges(', 1)[1].split('\nfunction ', 1)[0]
+for needed in ['++packChangeOpenSerial', 'serial!==packChangeOpenSerial', 'packChangeState.requestPath!==requestPath', 'if(stale())return;\n    renderPackChanges(', 'if(stale())return;renderPackChangeError(']:
+    if needed not in _pack_load:
+        raise SystemExit(f'pack change view must ignore stale responses: {needed}')
+_pack_page_label = _pack_js.split('function packChangePageLabel(', 1)[1].split('\n}', 1)[0]
+if '%2' in _pack_page_label or 'spreadIndex' in _pack_page_label:
+    raise SystemExit('pack change view must show recorded sides only (no client-side side inference)')
+# 差分詳細（z-index 110）は変更点の画面（.modal 100）の上に開く。Escape も上から閉じる。
+_escape = _pack_js.split("if(e.key==='Escape'){\n", 1)[1].split('return;\n  }', 1)[0]
+if _escape.find('closeDiffDetail()') < 0 or _escape.find('closePackChanges()') < _escape.find('closeDiffDetail()'):
+    raise SystemExit('Escape must close the diff detail before the pack change modal')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))
