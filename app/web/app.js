@@ -185,6 +185,14 @@ const DIFF_DETAIL_CACHE_LIMIT = 12;
 // 行構造の比較に渡すテキスト項目数の上限。巻全体を平坦化した配列も通るため、
 // 上限が無いとページ数×1ページの項目数だけ膨らんで実用時間を超える。
 const DIFF_TEXT_ROW_ITEM_LIMIT = 4000;
+// 枠に添える変更前後の文字（変更点PDF用）の長さの上限。原稿の中身そのものなので必要な分だけ持つ。
+const DIFF_REGION_TEXT_LIMIT = 200;
+// 変更点PDF用に「くわしく見る」の計算を回すページ数の上限。
+const PACK_CHANGE_DETAIL_LIMIT = 200;
+// 1行に載せる枠の数と、送る details 全体の大きさ（UTF-8）の上限。サーバーは 1MB を超える要求本文を
+// 受け付けないので、それより小さく収める。収まらない行は送らない（サーバーが埋める）。
+const PACK_CHANGE_DETAIL_REGION_LIMIT = 30;
+const PACK_CHANGE_DETAIL_BYTES_LIMIT = 786432;
 const DIFF_DETAIL_TIMEOUT_MS = 15000;
 const SNAPSHOT_HISTORY_CACHE_MS = 60000;
 let historyPanelsInitialized = false;
@@ -196,6 +204,9 @@ const diffViewState = {
   workbookId: '',
   fromSnapshotId: '',
   toSnapshotId: '',
+  // 版の指定（任意）。提出用PDF一式の変更点から開いたときは、提出用PDFに入った版どうしで比べる。
+  fromVersionId: '',
+  toVersionId: '',
   detail: null,
   selectedSheetKey: '',
   pageIndex: 0,
@@ -3287,9 +3298,20 @@ function ensureDiffPdfJs(){
   })().catch(error=>{diffPdfJsPromise=null;throw error;});
   return diffPdfJsPromise;
 }
+function diffComputeIdentity(workbookId,cmp){
+  return [String(workbookId||''),cmp?.scope||'automatic',cmp?.baselineSnapshotId||'',cmp?.baselineVersionId||'',cmp?.currentSnapshotId||'',cmp?.currentVersionId||''].join('|');
+}
 function diffComparisonIdentity(){
-  const cmp=diffViewState.detail?.comparison||{};
-  return [diffViewState.workbookId,cmp.scope||'automatic',cmp.baselineSnapshotId||'',cmp.baselineVersionId||'',cmp.currentSnapshotId||'',cmp.currentVersionId||''].join('|');
+  return diffComputeIdentity(diffViewState.workbookId,diffViewState.detail?.comparison||{});
+}
+// 「くわしく見る」の1ページの計算が読むもの（どの原稿のどの2版か、PDF・文字のキャッシュ、描画中の
+// タスク、画素比較）。画面は差分画面の状態とキャッシュを使い、変更点PDF用の収集は自分専用のものを使う
+// （差分画面を開き直す・閉じるときの後片付けで、収集中の計算が止まらないように）。
+function newDiffComputeSource({workbookId,comparison,documentCache,textDocumentCache,renderTasks,analyze}={}){
+  return {workbookId:String(workbookId||''),comparison:comparison||{},documentCache:documentCache||new Map(),textDocumentCache:textDocumentCache||new Map(),renderTasks:renderTasks||new Set(),analyze:analyze||analyzeDiffCanvases};
+}
+function diffViewComputeSource(){
+  return newDiffComputeSource({workbookId:diffViewState.workbookId,comparison:diffViewState.detail?.comparison||{},documentCache:diffPdfDocumentCache,textDocumentCache:diffPdfTextDocumentCache,renderTasks:diffActiveRenderTasks});
 }
 function diffSheetPageCount(sheet){
   return Math.max(0,Number(sheet?.pageCount||0),Number(sheet?.beforePages||0),Number(sheet?.afterPages||0),asArray(sheet?.pages).length);
@@ -3313,26 +3335,26 @@ function diffCurrentPage(){
   const sheet=diffCurrentSheet();
   return sheet?(diffBrowserPageCache.get(diffBrowserPageKey(sheet,diffViewState.pageIndex))?.page||null):null;
 }
-function diffPdfDocumentKey(side,sheet){
-  return `${diffComparisonIdentity()}|${side}|${String(sheet?.sheetKey||'')}`;
+function diffPdfDocumentKey(side,sheet,source=diffViewComputeSource()){
+  return `${diffComputeIdentity(source.workbookId,source.comparison)}|${side}|${String(sheet?.sheetKey||'')}`;
 }
-function diffHistoryPdfParams(side,sheet){
-  const cmp=diffViewState.detail?.comparison||{};
+function diffHistoryPdfParams(side,sheet,source=diffViewComputeSource()){
+  const cmp=source.comparison||{};
   const before=side==='before';
   const sideName=before?String(sheet?.beforeSheetName||sheet?.sheetName||''):String(sheet?.afterSheetName||sheet?.sheetName||'');
-  return {workbookId:diffViewState.workbookId,snapshotId:String(before?cmp.baselineSnapshotId||'':cmp.currentSnapshotId||''),versionId:String(before?cmp.baselineVersionId||'':cmp.currentVersionId||''),sheetName:sideName};
+  return {workbookId:source.workbookId,snapshotId:String(before?cmp.baselineSnapshotId||'':cmp.currentSnapshotId||''),versionId:String(before?cmp.baselineVersionId||'':cmp.currentVersionId||''),sheetName:sideName};
 }
-async function fetchDiffPdfDocument(side,sheet){
-  const key=diffPdfDocumentKey(side,sheet);
-  if(diffPdfDocumentCache.has(key)){
-    const cached=diffPdfDocumentCache.get(key);
-    diffPdfDocumentCache.delete(key);diffPdfDocumentCache.set(key,cached);
+async function fetchDiffPdfDocument(side,sheet,source=diffViewComputeSource()){
+  const cache=source.documentCache,key=diffPdfDocumentKey(side,sheet,source);
+  if(cache.has(key)){
+    const cached=cache.get(key);
+    cache.delete(key);cache.set(key,cached);
     return cached;
   }
   const promise=(async()=>{
     const lib=await ensureDiffPdfJs();
     const loadingTask=lib.getDocument({
-      url:apiUrl('/api/history/content-pdf',diffHistoryPdfParams(side,sheet)),
+      url:apiUrl('/api/history/content-pdf',diffHistoryPdfParams(side,sheet,source)),
       httpHeaders:{'X-ReportBinder-Token':token,'Accept':'application/pdf'},
       disableRange:false,
       disableStream:false
@@ -3340,15 +3362,15 @@ async function fetchDiffPdfDocument(side,sheet){
     try{return await loadingTask.promise;}
     catch(error){throw new Error('PDFを取得できませんでした。'+String(error?.message||''));}
   })();
-  diffPdfDocumentCache.set(key,promise);
-  while(diffPdfDocumentCache.size>DIFF_PDF_CACHE_LIMIT){
-    const oldest=diffPdfDocumentCache.keys().next().value;
+  cache.set(key,promise);
+  while(cache.size>DIFF_PDF_CACHE_LIMIT){
+    const oldest=cache.keys().next().value;
     if(oldest===key)break;
-    const oldPromise=diffPdfDocumentCache.get(oldest);
-    diffPdfDocumentCache.delete(oldest);
+    const oldPromise=cache.get(oldest);
+    cache.delete(oldest);
     Promise.resolve(oldPromise).then(doc=>doc?.destroy?.()).catch(()=>{});
   }
-  try{return await promise;}catch(error){diffPdfDocumentCache.delete(key);throw error;}
+  try{return await promise;}catch(error){cache.delete(key);throw error;}
 }
 
 function beginDiffBrowserRender(){
@@ -3377,19 +3399,20 @@ function createWhiteDiffCanvas(width,height){
   context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);
   return canvas;
 }
-async function renderDiffPdfPage(side,sheet,pageNumber,serial){
+// isStale() が true になったら（表示するページを切り替えた・収集を打ち切ったなど）結果を捨てる。
+async function renderDiffPdfPage(side,sheet,pageNumber,isStale,source=diffViewComputeSource()){
   const configuredPages=Number(side==='before'?sheet?.beforePages||0:sheet?.afterPages||0);
   if(configuredPages>0&&pageNumber>configuredPages)return null;
-  const doc=await fetchDiffPdfDocument(side,sheet);
-  if(serial!==diffBrowserRenderSerial||pageNumber>doc.numPages)return null;
+  const doc=await fetchDiffPdfDocument(side,sheet,source);
+  if(isStale()||pageNumber>doc.numPages)return null;
   const page=await doc.getPage(pageNumber);
-  if(serial!==diffBrowserRenderSerial)return null;
+  if(isStale())return null;
   const viewport=page.getViewport({scale:DIFF_RENDER_SCALE});
   const canvas=createWhiteDiffCanvas(Math.ceil(viewport.width),Math.ceil(viewport.height));
   const task=page.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport,background:'rgb(255,255,255)'});
-  diffActiveRenderTasks.add(task);
-  try{await task.promise;}finally{diffActiveRenderTasks.delete(task);}
-  return serial===diffBrowserRenderSerial?{canvas,page,viewport}:null;
+  source.renderTasks.add(task);
+  try{await task.promise;}finally{source.renderTasks.delete(task);}
+  return isStale()?null:{canvas,page,viewport};
 }
 function normalizeDiffPdfText(value){
   return String(value||'').normalize('NFKC').replace(/\s+/g,' ').trim();
@@ -3403,26 +3426,26 @@ function mapDiffPdfTextContentItems(content,viewport){
     return {text,x:Number(point[0]||0),y:Number(point[1]||0)-height,width:Math.max(1,Math.abs(Number(item.width||0))*scale),height};
   }).filter(Boolean);
 }
-async function extractDiffPdfTextItems(rendered,serial){
+async function extractDiffPdfTextItems(rendered,isStale){
   if(!rendered?.page||!rendered?.viewport)return [];
   const content=await rendered.page.getTextContent();
-  if(serial!==diffBrowserRenderSerial)return [];
+  if(isStale())return [];
   return mapDiffPdfTextContentItems(content,rendered.viewport);
 }
-async function extractDiffPdfDocumentTextPages(side,sheet){
-  const key=`${diffPdfDocumentKey(side,sheet)}|text-v1`;
-  if(diffPdfTextDocumentCache.has(key))return diffPdfTextDocumentCache.get(key);
+async function extractDiffPdfDocumentTextPages(side,sheet,source=diffViewComputeSource()){
+  const cache=source.textDocumentCache,key=`${diffPdfDocumentKey(side,sheet,source)}|text-v1`;
+  if(cache.has(key))return cache.get(key);
   const promise=(async()=>{
-    const doc=await fetchDiffPdfDocument(side,sheet),pages=[];
+    const doc=await fetchDiffPdfDocument(side,sheet,source),pages=[];
     for(let pageNumber=1;pageNumber<=doc.numPages;pageNumber++){
       const page=await doc.getPage(pageNumber),viewport=page.getViewport({scale:DIFF_RENDER_SCALE});
       pages.push(mapDiffPdfTextContentItems(await page.getTextContent(),viewport));
     }
     return pages;
   })();
-  diffPdfTextDocumentCache.set(key,promise);
-  while(diffPdfTextDocumentCache.size>DIFF_PDF_CACHE_LIMIT)diffPdfTextDocumentCache.delete(diffPdfTextDocumentCache.keys().next().value);
-  try{return await promise;}catch(error){diffPdfTextDocumentCache.delete(key);throw error;}
+  cache.set(key,promise);
+  while(cache.size>DIFF_PDF_CACHE_LIMIT)cache.delete(cache.keys().next().value);
+  try{return await promise;}catch(error){cache.delete(key);throw error;}
 }
 function diffPdfNumericFragments(value){
   const text=normalizeDiffPdfText(value),pattern=/[△▲▼+\-−]?\(?\d[\d,]*(?:\.\d+)?(?:[%％])?\)?/g,fragments=[];
@@ -3772,7 +3795,8 @@ function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
     const beforeBox=diffPdfTextPixelBox([pair.before],4,width,height),afterBox=diffPdfTextPixelBox([pair.after],4,width,height);
     const combined=diffPdfTextPixelBox([pair.before,pair.after],4,width,height);
     if(!combined)continue;
-    regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||afterBox||combined,after:afterBox||beforeBox||combined,confidence:1,pixelCount:0,source:'pdf-text'});
+    regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||afterBox||combined,after:afterBox||beforeBox||combined,confidence:1,pixelCount:0,source:'pdf-text',
+      beforeText:diffRegionText(pair.before?.text),afterText:diffRegionText(pair.after?.text)});
   }
   const sameNonNumericContent=diffPdfTextTemplatesMatch(beforeItems,afterItems)||
     diffPdfNonNumericFingerprint(beforeItems)===diffPdfNonNumericFingerprint(afterItems);
@@ -3781,6 +3805,10 @@ function buildNumericTextDiffResult(beforeItems,afterItems,width,height){
 }
 function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
   return buildNumericTextDiffResult(beforeItems,afterItems,width,height).regions;
+}
+// 枠に添える変更前後の文字。表示には使わず、変更点PDF用に集めるときだけ読む。
+function diffRegionText(value){
+  return normalizeDiffPdfText(value).slice(0,DIFF_REGION_TEXT_LIMIT);
 }
 function diffPdfTextItemDistance(before,after,width,height){
   const beforeX=Number(before.x||0)+Number(before.width||0)/2,afterX=Number(after.x||0)+Number(after.width||0)/2;
@@ -3820,13 +3848,13 @@ function buildTextFragmentDiffResult(beforeItems,afterItems,width,height){
     pairedBefore[candidate.beforeIndex]=1;pairedAfter[candidate.afterIndex]=1;
     const a=unmatchedBefore[candidate.beforeIndex].item,b=unmatchedAfter[candidate.afterIndex].item;
     const beforeBox=diffPdfTextPixelBox([a],4,width,height),afterBox=diffPdfTextPixelBox([b],4,width,height),combined=diffPdfTextBoxUnion([beforeBox,afterBox]);
-    if(combined)regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||combined,after:afterBox||combined,confidence:1,pixelCount:0,source:'pdf-fragment'});
+    if(combined)regions.push({regionId:'',kind:'modified',...combined,before:beforeBox||combined,after:afterBox||combined,confidence:1,pixelCount:0,source:'pdf-fragment',beforeText:diffRegionText(a.text),afterText:diffRegionText(b.text)});
   }
   for(let index=0;index<unmatchedBefore.length;index++)if(!pairedBefore[index]){
-    const box=diffPdfTextPixelBox([unmatchedBefore[index].item],4,width,height);if(box)regions.push({regionId:'',kind:'removed',...box,before:box,after:box,confidence:1,pixelCount:0,source:'pdf-fragment'});
+    const item=unmatchedBefore[index].item,box=diffPdfTextPixelBox([item],4,width,height);if(box)regions.push({regionId:'',kind:'removed',...box,before:box,after:box,confidence:1,pixelCount:0,source:'pdf-fragment',beforeText:diffRegionText(item.text),afterText:''});
   }
   for(let index=0;index<unmatchedAfter.length;index++)if(!pairedAfter[index]){
-    const box=diffPdfTextPixelBox([unmatchedAfter[index].item],4,width,height);if(box)regions.push({regionId:'',kind:'added',...box,before:box,after:box,confidence:1,pixelCount:0,source:'pdf-fragment'});
+    const item=unmatchedAfter[index].item,box=diffPdfTextPixelBox([item],4,width,height);if(box)regions.push({regionId:'',kind:'added',...box,before:box,after:box,confidence:1,pixelCount:0,source:'pdf-fragment',beforeText:'',afterText:diffRegionText(item.text)});
   }
   return {regions,confident:regions.length>0&&regions.length<=12};
 }
@@ -3935,6 +3963,38 @@ function analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height){
     catch(error){diffAnalysisPending.delete(id);reject(error);}
   });
 }
+// 差分画面とは別の Worker で画素比較する（変更点PDF用の収集）。差分画面の clearDiffBrowserResources が
+// 待ち中の解析を打ち切っても、収集中の計算は巻き込まれない。使い終わったら close() で Worker を止める。
+function createDiffAnalysisSession(){
+  let worker=null,serial=0;
+  const pending=new Map();
+  const fail=error=>{
+    for(const item of pending.values())item.reject(error);
+    pending.clear();
+    if(worker){try{worker.terminate();}catch{}worker=null;}
+  };
+  const analyze=(beforeCanvas,afterCanvas,width,height)=>{
+    const before=beforeCanvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,width,height);
+    const after=afterCanvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,width,height);
+    const id=++serial;
+    return new Promise((resolve,reject)=>{
+      pending.set(id,{resolve,reject});
+      try{
+        if(!worker){
+          worker=new Worker(new URL('diff-worker.js?v=20260808_v23',location.href));
+          worker.onmessage=event=>{
+            const payload=event.data||{},item=pending.get(payload.id);if(!item)return;
+            pending.delete(payload.id);
+            if(payload.error)item.reject(new Error(payload.error));else item.resolve(payload);
+          };
+          worker.onerror=event=>fail(new Error(event.message||'ブラウザ内の差分解析に失敗しました。'));
+        }
+        worker.postMessage({id,width,height,before:before.data.buffer,after:after.data.buffer},[before.data.buffer,after.data.buffer]);
+      }catch(error){pending.delete(id);reject(error);}
+    });
+  };
+  return {analyze,close:()=>fail(new Error('変更点の比較を終えました。'))};
+}
 function fullDiffRegion(kind,width,height){
   const inset=Math.max(6,Math.floor(Math.min(width,height)/250));
   return {regionId:'browser-r0001',kind,x:inset/width,y:inset/height,width:Math.max(1,width-inset*2)/width,height:Math.max(1,height-inset*2)/height,confidence:1,pixelCount:width*height};
@@ -3963,15 +4023,19 @@ function clearDiffBrowserResources(dropDocuments=false){
   diffBrowserPageCache.clear();setDiffBrowserProgress(false);
   for(const id of ['diff-before-base','diff-after-underlay','diff-after-base'])clearDiffCanvas(id);
 }
-async function buildDiffBrowserPage(sheet,pageIndex,serial){
+// 「くわしく見る」の1ページの計算（PDF.js の描画 → diff-worker.js の画素比較 → PDF.js の文字照合）。
+// 画面には触らない。進み具合は onProgress(message,percent) で返し、isStale() が true になったら null を返す。
+// 差分画面（buildDiffBrowserPage）と変更点PDF用の収集（collectPackChangeReportDetails）が同じ計算を使う。
+async function computeDiffPageResult(sheet,pageIndex,{isStale=()=>false,onProgress=null,source=diffViewComputeSource()}={}){
+  const progress=(message,percent)=>{if(onProgress)onProgress(message,percent);};
   const pageNumber=pageIndex+1,mappedPage=asArray(sheet?.pages)[pageIndex]||null,kind=String(mappedPage?.comparisonKind||sheet?.kind||'modified');
   const beforePageNumber=mappedPage&&Object.hasOwn(mappedPage,'beforePageNumber')?Number(mappedPage.beforePageNumber||0):pageNumber;
   const afterPageNumber=mappedPage&&Object.hasOwn(mappedPage,'afterPageNumber')?Number(mappedPage.afterPageNumber||0):pageNumber;
   const needBefore=kind!=='added'&&beforePageNumber>0&&beforePageNumber<=Math.max(Number(sheet?.beforePages||0),1);
   const needAfter=kind!=='removed'&&afterPageNumber>0&&afterPageNumber<=Math.max(Number(sheet?.afterPages||0),1);
-  setDiffBrowserProgress(true,'PDFを表示用に描画しています。',25);
-  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,beforePageNumber,serial):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,afterPageNumber,serial):Promise.resolve(null)]);
-  if(serial!==diffBrowserRenderSerial)return null;
+  progress('PDFを表示用に描画しています。',25);
+  const [beforeRaw,afterRaw]=await Promise.all([needBefore?renderDiffPdfPage('before',sheet,beforePageNumber,isStale,source):Promise.resolve(null),needAfter?renderDiffPdfPage('after',sheet,afterPageNumber,isStale,source):Promise.resolve(null)]);
+  if(isStale())return null;
   const width=Math.max(beforeRaw?.canvas?.width||0,afterRaw?.canvas?.width||0),height=Math.max(beforeRaw?.canvas?.height||0,afterRaw?.canvas?.height||0);
   if(!width||!height)throw new Error('表示できるPDFページがありません。');
   const normalizeCanvas=rendered=>{
@@ -3984,27 +4048,27 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
   // 通常は前後PDFが同じ寸法なので、描画済みCanvasをそのまま解析・表示し、
   // 同じ全面Canvasの再作成とdrawImageを2回分省略する。
   const beforeCanvas=normalizeCanvas(beforeRaw),afterCanvas=normalizeCanvas(afterRaw);
-  let regions=[],status='ready',message=String(mappedPage?.mappingMessage||''),analysis=null,noiseSuppressed=false;
+  let regions=[],status='ready',message=String(mappedPage?.mappingMessage||''),analysis=null,noiseSuppressed=false,analysisFailed=false;
   const exactSame=kind==='unchanged'||(!mappedPage&&asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber));
   if(kind==='added')regions=[fullDiffRegion('added',width,height)];
   else if(kind==='removed')regions=[fullDiffRegion('removed',width,height)];
   else if(kind==='unknown'){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=message||'信頼できる差分領域を判定できません。';}
   else if(kind!=='unchanged'&&!exactSame){
-    setDiffBrowserProgress(true,'表示ページの違いを解析しています。',70);
+    progress('表示ページの違いを解析しています。',70);
     try{
       // 画像側が位置ずれを差分として拾っても数値照合を省略しない。PDF文字抽出は
       // ワーカー解析と並行して開始し、変更ページの待ち時間増加を抑える。
       const textPromise=beforeRaw&&afterRaw
-        ?Promise.all([extractDiffPdfTextItems(beforeRaw,serial),extractDiffPdfTextItems(afterRaw,serial)]).catch(()=>null)
+        ?Promise.all([extractDiffPdfTextItems(beforeRaw,isStale),extractDiffPdfTextItems(afterRaw,isStale)]).catch(()=>null)
         :Promise.resolve(null);
       const documentTextPromise=beforeRaw&&afterRaw&&diffSheetPageCount(sheet)>1
-        ?Promise.all([extractDiffPdfDocumentTextPages('before',sheet),extractDiffPdfDocumentTextPages('after',sheet)]).catch(()=>null)
+        ?Promise.all([extractDiffPdfDocumentTextPages('before',sheet,source),extractDiffPdfDocumentTextPages('after',sheet,source)]).catch(()=>null)
         :Promise.resolve(null);
-      analysis=await analyzeDiffCanvases(beforeCanvas,afterCanvas,width,height);if(serial!==diffBrowserRenderSerial)return null;regions=asArray(analysis.regions);
-      setDiffBrowserProgress(true,'PDF内の文字を照合しています。',85);
+      analysis=await source.analyze(beforeCanvas,afterCanvas,width,height);if(isStale())return null;regions=asArray(analysis.regions);
+      progress('PDF内の文字を照合しています。',85);
       const textPair=await textPromise;
       const documentTextPair=await documentTextPromise;
-      if(serial!==diffBrowserRenderSerial)return null;
+      if(isStale())return null;
       if(textPair){
         const documentRowDiff=documentTextPair?buildDocumentTextRowStructureDiffResult(documentTextPair[0],documentTextPair[1],width,height,beforePageNumber,afterPageNumber):null;
         const semantic=selectDiffSemanticResult(textPair[0],textPair[1],width,height,analysis,regions,documentRowDiff);
@@ -4017,10 +4081,15 @@ async function buildDiffBrowserPage(sheet,pageIndex,serial){
       }
       if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
     }
-    catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);}
+    catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);analysisFailed=true;}
   }else if(kind==='modified'&&exactSame)message='このページに変更はありません。同じ原稿内の別ページに変更があります。';
-  const page={pageNumber,beforePageNumber:needBefore?beforePageNumber:0,afterPageNumber:needAfter?afterPageNumber:0,comparisonKind:kind,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.canvas.width!==afterRaw.canvas.width||beforeRaw.canvas.height!==afterRaw.canvas.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,regions};
+  const page={pageNumber,beforePageNumber:needBefore?beforePageNumber:0,afterPageNumber:needAfter?afterPageNumber:0,comparisonKind:kind,width,height,pageSizeChanged:!!beforeRaw&&!!afterRaw&&(beforeRaw.canvas.width!==afterRaw.canvas.width||beforeRaw.canvas.height!==afterRaw.canvas.height),status,message,confidence:status==='unknown'?0:1,changedRatio:Number(analysis?.changedRatio||0),regionCount:regions.length,alignmentAdjusted:!!analysis?.alignmentAdjusted,analysisFailed,regions};
   return {sheetKey:String(sheet?.sheetKey||''),pageIndex,page,beforeCanvas,afterCanvas};
+}
+// 差分画面の1ページ。計算は computeDiffPageResult に任せ、ここは表示の通し番号と進み具合の帯だけを受け持つ。
+async function buildDiffBrowserPage(sheet,pageIndex,serial){
+  const isStale=()=>serial!==diffBrowserRenderSerial;
+  return computeDiffPageResult(sheet,pageIndex,{isStale,onProgress:(message,percent)=>{if(!isStale())setDiffBrowserProgress(true,message,percent);},source:diffViewComputeSource()});
 }
 function paintDiffBrowserPage(result){
   if(!result)return;
@@ -4034,13 +4103,20 @@ function paintDiffBrowserPage(result){
   setDiffPaneEmpty('after',page.comparisonKind==='removed'?'現在版では削除されています':'');
   applyDiffHighlightSettings();applyDiffMode();updateDiffStageScale();
 }
-function diffDetailRequestPath(){
-  const params=new URLSearchParams({workbookId:diffViewState.workbookId});
-  if(diffViewState.fromSnapshotId&&diffViewState.toSnapshotId){
-    params.set('fromSnapshotId',diffViewState.fromSnapshotId);
-    params.set('toSnapshotId',diffViewState.toSnapshotId);
+// 版（fromVersionId／toVersionId）は履歴の2版と両方そろったときだけ送る。送るとサーバーはその版どうしだけを比べる。
+function diffDetailPath(workbookId,range={}){
+  const params=new URLSearchParams({workbookId:String(workbookId||'')});
+  const fromSnapshotId=String(range?.fromSnapshotId||''),toSnapshotId=String(range?.toSnapshotId||'');
+  if(fromSnapshotId&&toSnapshotId){
+    params.set('fromSnapshotId',fromSnapshotId);
+    params.set('toSnapshotId',toSnapshotId);
+    const fromVersionId=String(range?.fromVersionId||''),toVersionId=String(range?.toVersionId||'');
+    if(fromVersionId&&toVersionId){params.set('fromVersionId',fromVersionId);params.set('toVersionId',toVersionId);}
   }
   return `/api/history/diff-detail?${params.toString()}`;
+}
+function diffDetailRequestPath(){
+  return diffDetailPath(diffViewState.workbookId,diffViewState);
 }
 function prefetchAutomaticDiffDetail(workbookId){
   const id=String(workbookId||'');if(!id)return;
@@ -4174,6 +4250,7 @@ async function toggleDiffSheetReviewed(button=$('diff-confirm-sheet')){
   await runBusy(button,async()=>{
     const response=await api('/api/history/diff-review',{method:'POST',body:{
       workbookId:diffViewState.workbookId,fromSnapshotId:diffViewState.fromSnapshotId,toSnapshotId:diffViewState.toSnapshotId,
+      fromVersionId:diffViewState.fromVersionId,toVersionId:diffViewState.toVersionId,
       baselineVersionId:String(cmp.baselineVersionId||''),currentVersionId:String(cmp.currentVersionId||''),sheetKey:String(sheet.sheetKey||''),confirmed
     }});
     diffDetailResponseCache.clear();
@@ -4394,6 +4471,7 @@ async function openDiffDetail(workbookId,opener,historyRange=null){
   const serial=++diffDetailOpenSerial;
   diffReturnFocus=opener||document.activeElement;clearDiffBrowserResources();
   diffViewState.workbookId=id;diffViewState.fromSnapshotId=String(historyRange?.fromSnapshotId||'');diffViewState.toSnapshotId=String(historyRange?.toSnapshotId||'');
+  diffViewState.fromVersionId=String(historyRange?.fromVersionId||'');diffViewState.toVersionId=String(historyRange?.toVersionId||'');
   diffViewState.detail=null;diffViewState.selectedSheetKey='';diffViewState.pageIndex=0;diffViewState.regionIndex=-1;diffViewState.filter='all';diffViewState.unreviewedOnly=false;diffViewState.mode='side';diffViewState.mobileTab='before';
   if($('diff-unreviewed-only'))$('diff-unreviewed-only').checked=false;
   if($('diff-export-summary'))$('diff-export-summary').disabled=true;
@@ -6831,7 +6909,10 @@ async function createPublishChangeReports(plan){
     const body=packChangeReportBody(item.changes,activePackId,item.targetId);
     if(!body){failed.push({label:item.label,message:'比べる2つの版が分かりません。'});continue;}
     try{
-      const job=await runPackChangeReportJob(body,progress=>showMessage('','変更点PDFを作っています',`${item.label}の変更点PDF：${String(progress?.message||'')}（${Math.max(0,Math.min(100,Number(progress?.percent||0)))}%）`,null,[],0));
+      // 画面の「変更点をPDFにする」と同じく、先に「くわしく見る」の結果を集めて送る。
+      let details=[];
+      try{details=await collectPackChangeReportDetails(item.changes,({done,total})=>{if(total)showMessage('','変更点PDFを作っています',`${item.label}の変更点PDF：変わったページを比べています（${done} / ${total}ページ）`,null,[],0);})||[];}catch{details=[];}
+      const job=await runPackChangeReportJob({...body,details},progress=>showMessage('','変更点PDFを作っています',`${item.label}の変更点PDF：${String(progress?.message||'')}（${Math.max(0,Math.min(100,Number(progress?.percent||0)))}%）`,null,[],0));
       if(String(job?.status||'')!=='completed')failed.push({label:item.label,message:String(job?.message||'変更点PDFを作れませんでした。')});
     }catch(e){failed.push({label:item.label,message:userFriendlyError(e.message)});}
   }
@@ -7588,10 +7669,14 @@ function closePackChanges(){
   const focus=packChangeReturnFocus;packChangeReturnFocus=null;
   if(focus?.isConnected&&typeof focus.focus==='function')focus.focus();
 }
-// 「くわしく見る」: 原稿単位の比較画面を、その原稿の前回の版→今回の版で開く。
+// 「くわしく見る」: 原稿単位の比較画面を、その原稿の前回の版→今回の版で開く。版は提出用PDFに
+// 実際に入った版（アーカイブの記録）で固定する。同じ snapshot を後で描き直した新しい版には代えない。
+function packChangeDetailRange(row){
+  return {fromSnapshotId:String(row?.fromSnapshotId||''),toSnapshotId:String(row?.toSnapshotId||''),fromVersionId:String(row?.fromVersionId||''),toVersionId:String(row?.toVersionId||'')};
+}
 function openPackChangeDetail(row,opener){
   if(!row?.detailAvailable||!row?.sourceId)return;
-  return openDiffDetail(String(row.sourceId),opener,{fromSnapshotId:String(row.fromSnapshotId||''),toSnapshotId:String(row.toSnapshotId||'')});
+  return openDiffDetail(String(row.sourceId),opener,packChangeDetailRange(row));
 }
 function comparePackChangeVersions(){
   const from=String($('pack-change-from')?.value||''),to=String($('pack-change-to')?.value||'');
@@ -7609,6 +7694,115 @@ function packChangeReportBody(changes,packId,targetId){
   const fromBuildId=String(changes?.from?.buildId||''),toBuildId=String(changes?.to?.buildId||'');
   if(String(changes?.status||'')!=='ready'||!fromBuildId||!toBuildId||!packId||!targetId)return null;
   return {packId:String(packId),targetId:String(targetId),fromBuildId,toBuildId};
+}
+
+// ---- 変更点PDF用に「くわしく見る」の結果を集める ----
+// 内容が変わった（かもしれない）行だけ、差分画面と同じ計算（computeDiffPageResult）を回し、枠と変更前後の
+// 文字を集める。版は行の記録（提出用PDFに入った版）で固定する。上限は PACK_CHANGE_DETAIL_LIMIT 件。
+function packChangeDetailTargets(changes,limit=PACK_CHANGE_DETAIL_LIMIT){
+  return asArray(changes?.pages).filter(row=>{
+    const kinds=asArray(row?.kinds);
+    return (kinds.includes('content')||kinds.includes('maybe-content'))&&!!row?.detailAvailable&&!!row?.sourceId&&!!row?.rowKey&&
+      !!row?.fromVersionId&&!!row?.toVersionId&&Number(row?.toSourcePageNumber||0)>0;
+  }).slice(0,Math.max(0,Number(limit)||0));
+}
+function packChangeDetailGroupKey(row){
+  return [row?.sourceId,row?.fromSnapshotId,row?.fromVersionId,row?.toSnapshotId,row?.toVersionId].map(value=>String(value||'')).join('|');
+}
+// 原稿単位の比較（diff-detail）が、行の版どうしのものか。別の版の比較なら使わない。
+function packChangeDetailMatchesRow(detail,row){
+  const cmp=detail?.comparison||{};
+  return String(detail?.status||'')==='ready'&&
+    String(cmp.baselineSnapshotId||'')===String(row?.fromSnapshotId||'')&&String(cmp.baselineVersionId||'')===String(row?.fromVersionId||'')&&
+    String(cmp.currentSnapshotId||'')===String(row?.toSnapshotId||'')&&String(cmp.currentVersionId||'')===String(row?.toVersionId||'');
+}
+// 行 → 原稿単位の比較のシートとページ。シートは今回の名前（無ければ前回の名前）で、ページは
+// 原稿の変換PDFの中のページ番号（行の toSourcePageNumber ＝ pages[].afterPageNumber）で引く。
+// 提出用PDFの出力ページ番号では引かない。
+function packChangeDetailPage(detail,row){
+  const sheetName=String(row?.sheetName||''),sourcePage=Number(row?.toSourcePageNumber||0);
+  if(!sheetName||sourcePage<=0)return null;
+  const sheets=asArray(detail?.sheets);
+  const sheet=sheets.find(s=>String(s?.afterSheetName||s?.sheetName||'')===sheetName)||sheets.find(s=>String(s?.beforeSheetName||'')===sheetName);
+  if(!sheet)return null;
+  const pages=asArray(sheet.pages);
+  if(pages.length){
+    const pageIndex=pages.findIndex(page=>Number(page?.afterPageNumber||0)===sourcePage);
+    return pageIndex>=0?{sheet,pageIndex}:null;
+  }
+  return sourcePage<=diffSheetPageCount(sheet)?{sheet,pageIndex:sourcePage-1}:null;
+}
+// 送る形。座標は 0〜1（左上を合わせた、前後のうち大きい方の寸法に対する割合）。
+function packChangeDetailEntry(row,sheet,page){
+  const round=value=>Math.round(Math.max(0,Math.min(1,Number(value)||0))*100000)/100000;
+  const box=geometry=>({x:round(geometry?.x),y:round(geometry?.y),width:round(geometry?.width),height:round(geometry?.height)});
+  const kinds=['modified','added','removed','unknown'];
+  return {
+    rowKey:String(row.rowKey),fromVersionId:String(row.fromVersionId||''),toVersionId:String(row.toVersionId||''),
+    sheetName:String(sheet?.afterSheetName||sheet?.sheetName||row.sheetName||''),
+    beforePageNumber:Number(page.beforePageNumber||0),afterPageNumber:Number(page.afterPageNumber||0),
+    width:Number(page.width||0),height:Number(page.height||0),status:String(page.status||''),changedRatio:Number(page.changedRatio||0),
+    // 枠は最初の PACK_CHANGE_DETAIL_REGION_LIMIT 件まで。regionCount は切る前の数。
+    regionCount:asArray(page.regions).length,
+    regions:asArray(page.regions).slice(0,PACK_CHANGE_DETAIL_REGION_LIMIT).map(region=>({
+      kind:kinds.includes(String(region?.kind||''))?String(region.kind):'unknown',
+      before:box(region?.before||region),after:box(region?.after||region),
+      beforeText:String(region?.beforeText||''),afterText:String(region?.afterText||'')
+    }))
+  };
+}
+// 送る大きさを上限までに収める（前から順に入れ、入りきらない行は外す）。
+function packChangeDetailsWithinBudget(details,maxBytes=PACK_CHANGE_DETAIL_BYTES_LIMIT){
+  const encoder=new TextEncoder(),kept=[];let used=2;
+  for(const entry of asArray(details)){
+    const size=encoder.encode(JSON.stringify(entry)).length+1;
+    if(used+size>maxBytes)continue;
+    used+=size;kept.push(entry);
+  }
+  return kept;
+}
+// 集めた結果の配列を返す。isStale() が true になったら（比べる組み合わせを切り替えた・閉じた）null を返し、何も送らない。
+// 比較情報を取れない・計算に失敗した行は入れない（その行はサーバーが予備の方法で埋める）。
+async function collectPackChangeReportDetails(changes,onProgress=null,{isStale=()=>false,fetchDetail=null,compute=computeDiffPageResult,createSource=null}={}){
+  const targets=packChangeDetailTargets(changes);
+  const groups=new Map();
+  for(const row of targets){
+    const key=packChangeDetailGroupKey(row);
+    if(!groups.has(key))groups.set(key,[]);
+    groups.get(key).push(row);
+  }
+  const session=createSource?null:createDiffAnalysisSession();
+  const loadDetail=fetchDetail||(async row=>(await fetchDiffDetailResponse(diffDetailPath(row.sourceId,packChangeDetailRange(row)),String(row.sourceId)))?.detail||null);
+  const details=[];let done=0;
+  const report=()=>{if(onProgress&&!isStale())onProgress({done,total:targets.length});};
+  report();
+  try{
+    for(const rows of groups.values()){
+      if(isStale())return null;
+      let detail=null;
+      try{detail=await loadDetail(rows[0]);}catch{detail=null;}
+      if(isStale())return null;
+      const usable=packChangeDetailMatchesRow(detail,rows[0]);
+      const source=!usable?null:(createSource?createSource(String(rows[0].sourceId),detail.comparison):newDiffComputeSource({workbookId:String(rows[0].sourceId),comparison:detail.comparison,analyze:session.analyze}));
+      try{
+        for(const row of rows){
+          const found=usable?packChangeDetailPage(detail,row):null;
+          if(found){
+            try{
+              const result=await compute(found.sheet,found.pageIndex,{isStale,source});
+              if(isStale())return null;
+              if(result?.page&&!result.page.analysisFailed)details.push(packChangeDetailEntry(row,found.sheet,result.page));
+            }catch{}
+          }
+          done++;report();
+        }
+      }finally{
+        // 原稿ごとに開いたPDFを閉じる（差分画面のキャッシュとは別なので、表示中の比較には触らない）。
+        if(source?.documentCache)for(const promise of source.documentCache.values())Promise.resolve(promise).then(doc=>doc?.destroy?.()).catch(()=>{});
+      }
+    }
+  }finally{session?.close();}
+  return isStale()?null:packChangeDetailsWithinBudget(details);
 }
 // 作った変更点PDFを共有用フォルダーへ同梱できるか（サーバーの report.attachable・publishable）。
 // 同梱できるのは「前回コピーした版 → 今の提出用PDF」の組み合わせで作ったものだけ。
@@ -7656,7 +7850,18 @@ async function createPackChangeReport(){
   packChangeReportJob={status:'queued',percent:0,message:'変更点PDFを準備しています。'};
   renderPackChangeReport();
   try{
-    const started=await api('/api/v2/outputs/changes/report',{method:'POST',body});
+    // 先に、内容が変わったページの「くわしく見る」の結果を集める（進み具合は変更点PDFの欄に出す）。
+    // 集められなくても作成は止めない（その行はサーバーが埋める）。組み合わせを切り替えたら何も送らない。
+    let details=[];
+    try{
+      details=await collectPackChangeReportDetails(packChangeState.changes,({done,total})=>{
+        if(!total)return;
+        packChangeReportJob={status:'collecting',percent:Math.round(done*100/total),message:`変わったページを比べています（${done} / ${total}ページ）`};
+        renderPackChangeReport();
+      },{isStale:stale});
+    }catch{details=[];}
+    if(stale()||!details)return;
+    const started=await api('/api/v2/outputs/changes/report',{method:'POST',body:{...body,details}});
     if(stale())return;
     let job=started?.job||{};
     const jobId=String(job.jobId||'');

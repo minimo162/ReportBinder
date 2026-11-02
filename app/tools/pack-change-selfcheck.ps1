@@ -137,6 +137,22 @@ Assert-ChangeTest ([bool]$detailRow.detailAvailable -and [string]$detailRow.from
 Assert-ChangeTest (-not [bool](Get-RowAt $grow 4).detailAvailable) 'An added page offered a source-level comparison.'
 Assert-ChangeTest (-not [bool](Get-RowAt $same 1).detailAvailable) 'A page whose source did not change offered a source-level comparison.'
 
+# ---- 行の安定したキーと、原稿の変換PDFの中のページ番号 --------------------------------
+# 変更点PDF用に「くわしく見る」の結果を行へ結び付ける。キーに出力ページ番号を使うと、前に1ページ
+# 増えただけで後ろの行のキーが変わって落ちる。原稿内のページ番号に pagePartIndex を使うと、
+# 原稿の途中のページから載せた項目（Start=3）で落ちる。
+Assert-ChangeTest ([string](Get-RowAt $grow 2).rowKey -eq 'item:A#2' -and [int](Get-RowAt $grow 2).toSourcePageNumber -eq 2 -and [int](Get-RowAt $grow 2).fromSourcePageNumber -eq 2) 'The row key or the source page numbers of a changed page are wrong.'
+Assert-ChangeTest ([string](Get-RowAt $grow 4).rowKey -eq 'item:A#4' -and [int](Get-RowAt $grow 4).toSourcePageNumber -eq 4 -and $null -eq (Get-RowAt $grow 4).fromSourcePageNumber) 'An added page must have no previous source page number.'
+Assert-ChangeTest ([string](Get-RowAt $same 3).rowKey -eq 'item:B#2' -and [string](Get-RowAt $ins 4).rowKey -eq 'item:B#2') 'A page pushed back by an insertion must keep its row key.'
+$removedRow = @($rem.pages | Where-Object { $null -eq $_.toPage })[0]
+Assert-ChangeTest ([string]$removedRow.rowKey -eq 'item:B#1' -and $null -eq $removedRow.toSourcePageNumber -and [int]$removedRow.fromSourcePageNumber -eq 1) 'A removed page must keep its previous source page number only.'
+Assert-ChangeTest (@($ins.pages | ForEach-Object { [string]$_.rowKey } | Select-Object -Unique).Count -eq @($ins.pages).Count) 'Row keys must be unique.'
+$offset = Compare-PackArchivePageMaps (New-TestManifest @((New-TestItem 'A' 2 'wb_a' '' '' 3))) (New-TestMetadata @{ wb_a = 's1|v1' }) (New-TestManifest @((New-TestItem 'A' 2 'wb_a' '' '' 3))) (New-TestMetadata @{ wb_a = 's2|v2' }) @{}
+Assert-ChangeTest ([int](Get-RowAt $offset 2).toSourcePageNumber -eq 4 -and [int](Get-RowAt $offset 2).fromSourcePageNumber -eq 4 -and [string](Get-RowAt $offset 2).rowKey -eq 'item:A#2') 'The source page number must be the page inside the source PDF, not the part index.'
+$legacyOffset = Compare-PackArchivePageMaps (New-TestManifest @((New-TestItem 'A' 2 'wb_a' '' '' 3)) $false) (New-TestMetadata $v1) (New-TestManifest @((New-TestItem 'A' 2 'wb_a' '' '' 3)) $false) (New-TestMetadata $v1) @{}
+Assert-ChangeTest ([int](Get-RowAt $legacyOffset 1).toSourcePageNumber -eq 3 -and [string](Get-RowAt $legacyOffset 1).rowKey -eq 'item:A#1') 'An old archive must count source page numbers from pages[].'
+Assert-ChangeTest ([int]$grow.algorithmVersion -eq 2) 'The page comparison version was not raised, so old summary.json files without row keys would be reused.'
+
 # ---- 比べる元の版の記録が消えている ---------------------------------------------
 $gone = @{}
 $gone[(Get-PackChangeVersionKey 'wb_a' 's1' 'v1')] = 'missing'
