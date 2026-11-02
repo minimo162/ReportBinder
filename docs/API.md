@@ -60,8 +60,8 @@ V4の`/api/submission-files`、`/api/workbooks/register*`、`/api/workbooks/rend
 - `POST /api/v2/outputs/build`: 資料パックの提出用PDFを出力するジョブを開始し、`job`（`jobId`・`status`・`total`）を返す。HTTPサーバーはリクエストを直列に処理するため、出力を要求の中で完結させると進捗ポーリングも中止も受け付けられない。実処理は子プロセスで走る
 - `GET /api/v2/outputs/build/status?jobId={jobId}`: 出力ジョブの進捗（`percent`・`completed`/`total`・`phase`・`currentTargetName`）と結果（`built`・`skipped`・`errors`）を返す
 - `POST /api/v2/outputs/build/cancel`: 出力ジョブの中止を要求する。作成中の1冊は書き上げてから停止し、残りの出力先は作成しない
-- `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する。出力を確定したときにPDFのサイズ・更新日時・SHA-256を`outputIntegrity`として記録し、発行の前にハッシュを、共有側へコピーした後にもハッシュを照合する。出力後に変更・上書きされたPDF、記録の無い（以前の版で出力した）PDFは発行せず、再出力を求める。readinessはサイズと更新日時が記録と違えば`needs-rebuild`（`staleReasons[].type`=`output-changed`）を返す。提出用PDFの出力ジョブの実行中は拒否し、出力と同じロックを持ってコピーする（`publish-all`も同じ）
-- `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`・`buildId`（コピーした出力のアーカイブ。組み込み一式は空）・`sha256`を返す
+- `POST /api/v2/outputs/publish`: 最新の提出用PDFを共有発行する。出力を確定したときにPDFのサイズ・更新日時・SHA-256を`outputIntegrity`として記録し、発行の前にハッシュを、共有側へコピーした後にもハッシュを照合する。出力後に変更・上書きされたPDF、記録の無い（以前の版で出力した）PDFは発行せず、再出力を求める。readinessはサイズと更新日時が記録と違えば`needs-rebuild`（`staleReasons[].type`=`output-changed`）を返す。提出用PDFの出力ジョブの実行中は拒否し、出力と同じロックを持ってコピーする（`publish-all`も同じ）。本文に`includeChangeReports: true`を付けると、前回コピーした版から今の提出用PDFまでの変更点PDFを同じ発行フォルダーへ入れる（省略時は false で、今までどおり提出用PDFだけ）。詳しくは「変更点PDFの共有コピーへの同梱」
+- `POST /api/v2/outputs/publish-all`: ページの入っている出力先（本体・補足など）の最新の提出用PDFを、1つの発行フォルダーへまとめて共有発行する。1冊でも最新でなければ何もコピーしない。応答の`files`に各PDFの`targetId`・`fileName`・`sharedPath`・`buildId`（コピーした出力のアーカイブ。組み込み一式は空）・`sha256`・`changeReport`（同梱した変更点PDF。無ければ null）を返す。本文の`includeChangeReports`は`publish`と同じ
 - `GET /api/v2/outputs/archives?packId={packId}`: 自動保存された最終出力を返す。各行に`publishedAt`・`folderName`（その版を最後に共有用フォルダーへコピーした日時と発行フォルダー名。コピーしていなければ空）、`isLastPublished`（その出力先で最後にコピーした版）、`isCurrent`（今の提出用PDF。出力状態の`buildId`と`outputIntegrity.sha256`がアーカイブと一致し、出力フォルダーのPDFが出力後に変わっていないときだけ true）、`hasPageMap`（manifest に頁・左右の記録`physicalPages`がある）を含む
 - `GET /api/v2/outputs/changes?packId={packId}&targetId={targetId}[&fromBuildId=&toBuildId=]`: 出力先ごとに、前回共有用フォルダーへコピーした版（無ければ1つ前の出力）と今の提出用PDFの違いを、ページ番号・左右つきで返す。詳しくは「出力先ごとの変更点」
 - `POST /api/v2/outputs/changes/report`: 変更点を確認用のPDF（変更点PDF）にするジョブを始める（Edge のヘッドレス印刷）。`GET /api/v2/outputs/changes/report/status?jobId=`で状態を読み、`POST /api/v2/outputs/changes/report/file`で開く／保存先フォルダーを開く。詳しくは「変更点PDF」
@@ -763,7 +763,7 @@ POST  /api/v2/outputs/changes/report/file
 
 最終PDFの作成時には、PDF、manifest、SHA-256、使用した原稿版と変換環境を`exports/archive/<packId>/...`へ保存します。`GET /api/v2/outputs/archives`は新しい順にアーカイブ情報を返します。
 
-共有発行のたびに、出力先ごとの発行記録を`exports/publish-records/<packId>/<volume>/<時刻ID>.json`へ1件ずつ書きます（組み込み一式は`<packId>`の代わりに`ecm`など）。中身は`final.published`と同じ項目（`packId`・`targetId`・`volume`・`buildId`・`sha256`・`fileName`・`folderName`・`sharedFolder`・`destination`・`publishedAt`・`userName`ほか）です。「前回コピーした版」（`Get-LastPublishedBuildId`）は、その出力先のいちばん新しい記録の`buildId`で、古い記録へはさかのぼりません。履歴イベントの書き込み（`Write-HistoryEvent`）は廃止済みで何も書かないため、この記録が唯一の手がかりです。記録を書けなかったときもコピー自体は成功として返し、`publishRecordError`に理由を入れます。
+共有発行のたびに、出力先ごとの発行記録を`exports/publish-records/<packId>/<volume>/<時刻ID>.json`へ1件ずつ書きます（組み込み一式は`<packId>`の代わりに`ecm`など）。中身は`final.published`と同じ項目（`packId`・`targetId`・`volume`・`buildId`・`sha256`・`fileName`・`folderName`・`sharedFolder`・`destination`・`publishedAt`・`userName`・`changeReport`（同梱した変更点PDFの`fromBuildId`・`toBuildId`・`fileName`・`destination`・`sha256`。無ければ null）ほか）です。「前回コピーした版」（`Get-LastPublishedBuildId`）は、その出力先のいちばん新しい記録の`buildId`で、古い記録へはさかのぼりません。履歴イベントの書き込み（`Write-HistoryEvent`）は廃止済みで何も書かないため、この記録が唯一の手がかりです。記録を書けなかったときもコピー自体は成功として返し、`publishRecordError`に理由を入れます。
 
 サーバー内部の`Get-FinalArchiveRecord`はアーカイブ1件を読み、`sha256.txt`・`metadata.json`の`outputPdfSha256`・`final.pdf`の実際のハッシュが一致しないもの（すり替えられた版）は読みません。`buildId`・`volume`は`Assert-SafeStorageSegment`で確かめます。
 
@@ -791,7 +791,7 @@ POST  /api/v2/outputs/changes/report/file
 | `counts` | `content`・`sameLook`・`maybeContent`・`unavailable`・`added`・`removed`・`moved`・`shifted`（`moved`のうち前のページの増減でずれただけのもの）・`side`・`renamed`・`unchanged`・`changed`（変わったページの数。`unchanged`と`sameLook`だけのページは数えない）・`partCountChanged`（ページ数が変わった原稿の数）・`total` |
 | `pages[]` | 今回のページ番号順（なくなったページは、前回その直前にあったページの後ろ）。`toPage`・`toSide`・`toSpreadIndex`・`fromPage`・`fromSide`・`fromSpreadIndex`・`itemId`・`pageId`・`sourceId`・`sourceName`・`title`・`fromTitle`・`sheetKey`（単位の`sourceKey`。例`worksheet:売上`）・`sheetName`（原稿単位の比較でのシート名）・`pagePartIndex`・`fromPartCount`・`toPartCount`・`partCountChanged`・`kinds[]`・`shiftOnly`・`changedRatio`/`regionCount`（画像の比較は行わないため常に`null`）・`fromSnapshotId`/`fromVersionId`・`toSnapshotId`/`toVersionId`・`detailAvailable`（同じ原稿の別の版どうしで、原稿単位の比較を開ける）・`message` |
 | `notes[]` | `{ code, message }`。上記のほか`not-latest`・`no-page-map`（古い形式の版で左右を比べていない）・`no-changes`・`some-unavailable` |
-| `report` | 変更点PDF（`{ exists, reportId, fileName, createdAt, publishable, reason }`）。`status`が`ready`のときだけ調べ、`exists`は作成済みで記録と中身が合うとき true。`reason`は`not-created`（まだ作っていない）・`outdated`（作ったものが今の比べた結果と合わない）・`copy-not-available`（作成済み。共有用フォルダーへの同梱はまだ未対応）・`not-available`（比べられない）。`publishable`は常に false。詳しくは「変更点PDF」 |
+| `report` | 変更点PDF（`{ exists, reportId, fileName, createdAt, attachable, publishable, reason }`）。`status`が`ready`のときだけ調べ、`exists`は作成済みで記録と中身が合うとき true。`attachable`はこの組み合わせが「前回コピーした版 → 今の提出用PDF」（共有コピーへ同梱できる組み合わせ）のとき true、`publishable`は作成済みで、今コピーすれば同梱されるとき true（コピーのときと同じ`Resolve-PublishableChangeReport`で決める）。`reason`は`not-created`（まだ作っていない）・`outdated`（作ったものが今の比べた結果や今の提出用PDFと合わない）・`publishable`（作成済みで同梱できる）・`not-attachable`（作成済み。好きな2回の組み合わせや、今の提出用PDFでない版との組み合わせなので同梱しない）・`not-available`（比べられない）。詳しくは「変更点PDF」 |
 
 `kinds[]`の値: `content`（原稿の版が違い、ページの見た目のハッシュも違う）、`same-look`（版は違うがハッシュが同じ）、`maybe-content`（版が違いハッシュが取れない）、`unavailable`（比べる版の記録が消えている）、`added`、`removed`、`moved`（出力ページ番号が違う）、`side`（記録された左右が違う）、`renamed`（ページ名が違う）、`unchanged`。
 
@@ -818,9 +818,27 @@ POST  /api/v2/outputs/changes/report/file
 | `GET /api/v2/outputs/changes/report/status?jobId={jobId}` | ジョブの状態（`Read-RenderJobStatus`）。`status`（`queued`・`launching`・`running`・`completed`・`failed`）・`percent`・`message`。完了時は`report`（上の`report`と同じ形）、失敗時は`code`（`edge-missing`＝Edge が見つからない、`timeout`＝時間切れ、`no-pdf`＝PDF ができなかった）と`errors[]`（`error`・`code`・`detail`・`edgeLog`＝Edge の出力。診断用） |
 | `POST /api/v2/outputs/changes/report/file` | 本文`{ packId, targetId, fromBuildId, toBuildId, action }`。`action: "open"`（既定）は PDF そのもの（`application/pdf`）を返し、`action: "reveal"`は保存先フォルダーをエクスプローラーで開いて PDF を選択状態にします（応答`{ ok, apiVersion: 2, path }`）。`meta.json`の`reportSha256`と`report.pdf`の中身が合わなければ開きません |
 
-保存先は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/`（`report.pdf`・`report.html`・`meta.json`・`summary.json`）です。ローカルの出力フォルダーにはコピーしません（提出用PDFと取り違えないため）。`report.pdf`は一時名で書いてから名前を変え、`meta.json`（`reportVersion`・`fromBuildId`・`toBuildId`・`fromOutputPdfSha256`・`toOutputPdfSha256`・`reportSha256`・`complete`・`changedCount`・`fileName`・`createdAt`）を最後に書きます。作成済み（`report.exists`）とみなすのは、`meta.json`の両方の`outputPdfSha256`が比べた2つの版と同じで、`reportSha256`が`report.pdf`の中身と合い、作成の版（`reportVersion`）が同じときだけです。見た目のハッシュがそろわないうち（`complete: false`）に作ったものは、そろった後は`outdated`です。`fileName`は`<提出用PDFのファイル名（拡張子なし）>_変更点.pdf`で、共有用フォルダーへ同梱するときの名前です（同梱は後の版で足します）。
+保存先は`exports/change-reports/<packId>/<targetId>/<fromBuildId>__<toBuildId>/`（`report.pdf`・`report.html`・`meta.json`・`summary.json`）です。ローカルの出力フォルダーにはコピーしません（提出用PDFと取り違えないため）。`report.pdf`は一時名で書いてから名前を変え、`meta.json`（`reportVersion`・`fromBuildId`・`toBuildId`・`fromOutputPdfSha256`・`toOutputPdfSha256`・`reportSha256`・`complete`・`changedCount`・`fileName`・`createdAt`）を最後に書きます。作成済み（`report.exists`）とみなすのは、`meta.json`の両方の`outputPdfSha256`が比べた2つの版と同じで、`reportSha256`が`report.pdf`の中身と合い、作成の版（`reportVersion`）が同じときだけです。見た目のハッシュがそろわないうち（`complete: false`）に作ったものは、そろった後は`outdated`です。`fileName`は`<提出用PDFのファイル名（拡張子なし）>_変更点.pdf`で、共有用フォルダーへ同梱するときの名前です。
 
 画面での使い方: 変更点の画面の「変更点をPDFにする」で作成を始め、1秒ごとに状態を読んで進み具合を出します。終わると「開く」（別タブ）と「フォルダーを開く」が押せます。作成中に組み合わせを切り替えたり画面を閉じたりしたら、そのジョブの状態では画面を書き換えません（ジョブはサーバーで最後まで進み、同じ組み合わせでもう一度押すと合流します）。
+
+### 変更点PDFの共有コピーへの同梱（`includeChangeReports`）
+
+`POST /api/v2/outputs/publish`・`publish-all`の本文に`includeChangeReports: true`を付けると、出力先ごとに変更点PDFを提出用PDFと同じ発行フォルダーへ入れます（名前は`<提出用PDFのファイル名（拡張子なし）>_変更点.pdf`）。発行の経路は1本のままで、作業用の隠しフォルダーでコピーとハッシュの照合をしてから名前を一度だけ切り替え、発行フォルダーと中のファイル（変更点PDFも）の隠し属性を外します。出力と同じロックを持っている間に変更点PDFを作ることはしません（作成済みのものだけを付けます）。
+
+同梱するのは、次をすべて満たすときだけです（`Resolve-PublishableChangeReport`）。
+
+1. 変更点PDFの比べる先（`toBuildId`）が、その出力先の今の`buildId`と同じ
+2. `meta.json`の`toOutputPdfSha256`が、今の提出用PDFの`outputIntegrity.sha256`と同じ
+3. 比べる元（`fromBuildId`）が「前回コピーした版」（`Get-LastPublishedBuildId`）と同じ。好きな2回で作ったものは付けません（受け取った人が「前回の提出からの変更」と読むため）
+4. `report.pdf`の中身が`meta.json`の`reportSha256`と同じで、作成の版（`reportVersion`）も同じ。場所は`exports/change-reports`の下だけ
+
+- 提出用PDFの確認（最新か・ハッシュが合うか・ファイル名の重複）はすべて先に行い、1冊でも通らなければ変更点PDFも含めて何もコピーしません。変更点PDFの名前が別の提出用PDFと重なるときも何もコピーしません。
+- 条件に合わない出力先は変更点PDFを付けずに提出用PDFだけをコピーし、応答の`changeReportsSkipped[]`（`targetId`・`targetName`・`reason`・`message`）に理由を返します。`reason`は`not-published`（まだコピーしたことがない）・`same-as-published`（前回コピーしてから出力し直していない）・`no-build`（保存済み出力の記録が無い）・`not-created`（まだ作っていない）・`outdated`（作り直すとコピーできる）・`outside`（場所が不正）。
+- 応答の`changeReports[]`に同梱したもの（`targetId`・`targetName`・`fileName`・`sharedPath`・`fromBuildId`・`toBuildId`・`sha256`）、`files[].changeReport`にも同じ内容を返します。履歴イベントは`final.published`に`changeReport`を足し、同梱した変更点PDFごとに`final.change-report.published`を書きます（`Write-HistoryEvent`は今は何も書きません。発行記録の`changeReport`に残ります）。
+- 見た目のハッシュがそろわないうちに作ったもの（`complete: false`）も、4つの条件を満たせば付けます（同じ2つの版の比較です）。画面では、そろった後は作り直してからコピーします。
+
+画面での使い方: 「共有用フォルダーにコピー」・「まとめて共有用フォルダーにコピー」を押すと、出力先ごとに`GET /api/v2/outputs/changes`（既定の組み合わせ）を読み、`report.attachable`の出力先があれば確認画面に「変更点PDFもいっしょにコピーする」（最初からチェックあり）を出します。まだ作っていない（`publishable`が false）ものがあれば、ボタンが「変更点PDFを作ってからコピーする」になり、先に変更点PDFを作ってからコピーします。作れなかったときは何もコピーせず、チェックを外せば提出用PDFだけをコピーできると伝えます。付けられるものが無い出力先だけなら、今までどおり確認なしでコピーします。組み込み一式は対象外です。
 
 ## 自動PDF作成
 

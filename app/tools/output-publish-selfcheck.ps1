@@ -650,6 +650,159 @@ Assert-OutputTest ($null -eq (Get-FinalArchiveRecord 'ja' $recordId 'ja-main' 'm
 Assert-Throws { Get-FinalArchiveRecord 'ja' $recordId 'ja-main' '..\other' } '不正' 'A buildId with a path separator was accepted.'
 Assert-Throws { Get-FinalArchiveRecord 'ja' $recordId '..' $firstBuild } '不正' 'A volume with dot traversal was accepted.'
 
+# ---- 変更点PDFの同梱（includeChangeReports / Resolve-PublishableChangeReport） ---------------
+# 変更点PDFは Edge で作る代わりに、作成ジョブ（Invoke-PackChangeReportJobCore）が書くのと同じ
+# report.pdf と meta.json を直接置く。同梱してよいのは §7.2 の4条件をすべて満たすものだけ。
+$attachPack = New-DocumentPack 'ja' ([pscustomobject]@{ displayName='同梱の一式' })
+$attachId = [string]$attachPack.packId
+Add-TestPages $attachId @('ja-main','ja-appendix')
+function Set-AttachBuild([string]$Volume, [string]$Content) {
+    $path = Set-BuiltOutput $attachId $Volume $Content
+    $buildId = New-RbId
+    [void](Update-StructureLocked 'ja' { param($st) Set-NoteProperty (Get-PackOutputState $st 'ja' $attachId $Volume $true) 'buildId' $buildId; return $null })
+    $manifest = [ordered]@{ schemaVersion=3; packId=$attachId; targetId=(Get-TargetIdFromLegacyVolume $Volume); volume=$Volume; physicalPages=@([ordered]@{ outputPageNumber=1; side='right'; spreadIndex=0; itemId='item-1'; pagePartIndex=0; pagePartCount=1 }); pages=@() }
+    [void](New-FinalArchive 'ja' $attachId $Volume $buildId $path $manifest ([ordered]@{ sourceWorkbooks=@(); pages=@(1) }))
+    # 発行の記録の名前はミリ秒までの時刻。同じ時刻にならないよう少し待つ。
+    Start-Sleep -Milliseconds 20
+    return $buildId
+}
+function Get-AttachSha([string]$Volume) {
+    return Normalize-FileHash ([string](Get-DataProperty (Get-DataProperty (Get-PackOutputState (Get-Structure 'ja') 'ja' $attachId $Volume $false) 'outputIntegrity' $null) 'sha256' ''))
+}
+function Set-TestChangeReport([string]$TargetId, [string]$FromBuildId, [string]$ToBuildId, [string]$ToSha, [string]$Content = '%PDF-change-report') {
+    $dir = Get-PackChangeReportDir 'ja' $attachId $TargetId $FromBuildId $ToBuildId
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $pdf = Join-Path $dir 'report.pdf'
+    [IO.File]::WriteAllText($pdf, $Content)
+    Write-JsonFile (Join-Path $dir 'meta.json') ([ordered]@{
+        schemaVersion = 1; reportVersion = $Script:PackChangeReportVersion; packId = $attachId; targetId = $TargetId
+        fromBuildId = $FromBuildId; toBuildId = $ToBuildId; fromOutputPdfSha256 = ('A' * 64); toOutputPdfSha256 = $ToSha
+        reportSha256 = (Normalize-FileHash (New-Sha256 $pdf)); complete = $true; changedCount = 1; fileName = 'x_変更点.pdf'; createdAt = (New-NowIso)
+    })
+    return $dir
+}
+# 発行フォルダーの中身の名前を、並べて1つの文字列にする（比べやすくするため）。
+function Get-FolderNames([string]$Folder) { return ((@(Get-ChildItem -LiteralPath $Folder -Force | ForEach-Object { $_.Name } | Sort-Object)) -join '|') }
+function Join-ExpectedNames([string[]]$Names) { return ((@($Names | Sort-Object)) -join '|') }
+$mainName = [IO.Path]::GetFileName((Get-PlannedOutputPath $attachId 'ja-main'))
+$reportName = [IO.Path]::GetFileNameWithoutExtension($mainName) + '_変更点.pdf'
+# 発行のイベントを記録する（Write-HistoryEvent は何も書かない）。
+$Script:PublishEvents = New-Object System.Collections.ArrayList
+function Write-HistoryEvent([string]$Language, [string]$Type, $Data) { [void]$Script:PublishEvents.Add([pscustomobject]@{ type = $Type; data = $Data }) }
+
+$attach1 = Set-AttachBuild 'ja-main' '%PDF-attach-1'
+# はじめてのコピー: 前回コピーした版が無いので付けない（コピーは止めない）。
+$firstAttach = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId $true
+Assert-OutputTest ((Get-FolderNames ([string]$firstAttach.sharedFolder)) -eq $mainName) "The first copy included something besides the submission PDF: $(Get-FolderNames ([string]$firstAttach.sharedFolder))"
+Assert-OutputTest (@($firstAttach.changeReports).Count -eq 0 -and [string]@($firstAttach.changeReportsSkipped)[0].reason -eq 'not-published') 'The first copy did not explain why no change report was attached.'
+
+# 前回コピーした版 → 今の版で作った変更点PDFは、同じ発行フォルダーへ提出用PDFと一緒に入る。
+$attach2 = Set-AttachBuild 'ja-main' '%PDF-attach-2'
+$report12 = Set-TestChangeReport 'main' $attach1 $attach2 (Get-AttachSha 'ja-main')
+$check12 = Resolve-PublishableChangeReport 'ja' $attachId 'main' $attach2 (Get-AttachSha 'ja-main') $mainName
+Assert-OutputTest ([bool]$check12.ok -and [string]$check12.fileName -eq $reportName -and [string]$check12.fromBuildId -eq $attach1) "A valid change report was not publishable: $($check12.reason) $($check12.message)"
+# 省略時（古い画面）は今までどおり提出用PDFだけ。
+$Script:ClearedPaths = @()
+function Clear-PublishHiddenAttribute([string]$Path) { $Script:ClearedPaths += [IO.Path]::GetFullPath($Path); return (& $realClearHidden $Path) }
+$Script:PublishEvents.Clear()
+$withReport = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId $true
+$withDir = [string]$withReport.sharedFolder
+Assert-OutputTest ((Get-FolderNames $withDir) -eq (Join-ExpectedNames @($mainName, $reportName))) "The change report was not copied next to the submission PDF: $(Get-FolderNames $withDir)"
+$sharedReport = Join-Path $withDir $reportName
+Assert-OutputTest ((New-Sha256 $sharedReport) -eq (New-Sha256 (Join-Path $report12 'report.pdf'))) 'The shared change report differs from the made one.'
+Assert-OutputTest (@($withReport.changeReports).Count -eq 1 -and [string]@($withReport.changeReports)[0].fromBuildId -eq $attach1 -and [string]@($withReport.changeReports)[0].sharedPath -eq $sharedReport) 'The publish result does not describe the attached change report.'
+Assert-OutputTest ([string]@($withReport.files)[0].changeReport.fileName -eq $reportName -and [string]@($withReport.files)[0].buildId -eq $attach2) 'The submission entry does not point at its change report.'
+# 作業用フォルダーの隠し属性を、変更点PDFにも残さない。
+Assert-OutputTest ($Script:ClearedPaths -contains [IO.Path]::GetFullPath($sharedReport)) 'The hidden attribute was not cleared on the shared change report.'
+if ($onWindows) { Assert-OutputTest (((Get-Item -LiteralPath $sharedReport -Force).Attributes -band [IO.FileAttributes]::Hidden) -eq 0) 'The shared change report is hidden.' }
+Set-Item Function:\Clear-PublishHiddenAttribute $realClearHidden
+# final.published に buildId・sha256・changeReport、変更点PDFごとに final.change-report.published。
+$publishedEvents = @($Script:PublishEvents | Where-Object { $_.type -eq 'final.published' })
+$reportEvents = @($Script:PublishEvents | Where-Object { $_.type -eq 'final.change-report.published' })
+Assert-OutputTest ($publishedEvents.Count -eq 1 -and [string]$publishedEvents[0].data.buildId -eq $attach2 -and [string]$publishedEvents[0].data.changeReport.fromBuildId -eq $attach1 -and [string]$publishedEvents[0].data.changeReport.destination -eq $sharedReport) 'final.published does not record the attached change report.'
+Assert-OutputTest ($reportEvents.Count -eq 1 -and [string]$reportEvents[0].data.fileName -eq $reportName -and [string]$reportEvents[0].data.toBuildId -eq $attach2) 'final.change-report.published was not written for the attached change report.'
+$attachRecord = @(Get-PublishRecords 'ja' $attachId 'ja-main' 1)[0]
+Assert-OutputTest ([string]$attachRecord.changeReport.fileName -eq $reportName) 'The publish record does not keep the attached change report.'
+
+# 省略時（includeChangeReports なし）は提出用PDFだけ。
+$attach3 = Set-AttachBuild 'ja-main' '%PDF-attach-3'
+[void](Set-TestChangeReport 'main' $attach2 $attach3 (Get-AttachSha 'ja-main'))
+$withoutFlag = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId
+Assert-OutputTest ((Get-FolderNames ([string]$withoutFlag.sharedFolder)) -eq $mainName -and @($withoutFlag.changeReports).Count -eq 0) 'A change report was copied although it was not asked for.'
+
+# 条件1: 古い toBuildId（出力し直す前の版）の変更点PDFは付けない。
+$attach4 = Set-AttachBuild 'ja-main' '%PDF-attach-4'
+[void](Set-TestChangeReport 'main' $attach3 $attach4 (Get-AttachSha 'ja-main'))
+$attach5 = Set-AttachBuild 'ja-main' '%PDF-attach-5'
+# 条件3: 比べる元が前回コピーした版でない組み合わせ（好きな2回）で作ったものも付けない。
+[void](Set-TestChangeReport 'main' $attach4 $attach5 (Get-AttachSha 'ja-main'))
+Assert-OutputTest ((Get-LastPublishedBuildId 'ja' $attachId 'main') -eq $attach3) 'The last copy is not the third output; the stale-report cases are not exercised.'
+$staleCheck = Resolve-PublishableChangeReport 'ja' $attachId 'main' $attach5 (Get-AttachSha 'ja-main') $mainName
+Assert-OutputTest (-not [bool]$staleCheck.ok -and [string]$staleCheck.reason -eq 'not-created') "A report for an older output or another pair was publishable: $($staleCheck.reason)"
+$staleCopy = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId $true
+Assert-OutputTest ((Get-FolderNames ([string]$staleCopy.sharedFolder)) -eq $mainName) "A change report for an older output or another pair was copied: $(Get-FolderNames ([string]$staleCopy.sharedFolder))"
+Assert-OutputTest ([string]@($staleCopy.changeReportsSkipped)[0].reason -eq 'not-created') 'Skipping the stale change report was not explained.'
+# 同じ組み合わせのフォルダーでも、記録の toBuildId・fromBuildId が違えば付けない。
+$attach6 = Set-AttachBuild 'ja-main' '%PDF-attach-6'
+$report56 = Set-TestChangeReport 'main' $attach5 $attach6 (Get-AttachSha 'ja-main')
+$meta56Path = Join-Path $report56 'meta.json'
+$meta56 = Read-JsonFile $meta56Path $null
+foreach ($field in @('toBuildId', 'fromBuildId')) {
+    $original = [string]$meta56.$field
+    $meta56.$field = $attach4
+    Write-JsonFile $meta56Path $meta56
+    $mismatch = Resolve-PublishableChangeReport 'ja' $attachId 'main' $attach6 (Get-AttachSha 'ja-main') $mainName
+    Assert-OutputTest (-not [bool]$mismatch.ok -and [string]$mismatch.reason -eq 'outdated') "A change report recorded for another $field was publishable."
+    $meta56.$field = $original
+    Write-JsonFile $meta56Path $meta56
+}
+# 条件2: 別の提出用PDF（toOutputPdfSha256 が今の outputIntegrity.sha256 と違う）についてのものは付けない。
+$otherSha = Resolve-PublishableChangeReport 'ja' $attachId 'main' $attach6 ('0' * 64) $mainName
+Assert-OutputTest (-not [bool]$otherSha.ok -and [string]$otherSha.reason -eq 'outdated') 'A change report about another submission PDF was publishable.'
+# 条件4: report.pdf を作った後に（サイズも更新日時も同じまま）差し替えたものは付けない。
+$pdf56 = Join-Path $report56 'report.pdf'
+$pdf56Stamp = (Get-Item -LiteralPath $pdf56).LastWriteTimeUtc
+[IO.File]::WriteAllText($pdf56, '%PDF-CHANGE-REPORT')
+(Get-Item -LiteralPath $pdf56).LastWriteTimeUtc = $pdf56Stamp
+$swapped = Resolve-PublishableChangeReport 'ja' $attachId 'main' $attach6 (Get-AttachSha 'ja-main') $mainName
+Assert-OutputTest (-not [bool]$swapped.ok -and [string]$swapped.reason -eq 'outdated') 'A swapped change report was publishable.'
+[IO.File]::WriteAllText($pdf56, '%PDF-change-report')
+Assert-OutputTest ([bool](Resolve-PublishableChangeReport 'ja' $attachId 'main' $attach6 (Get-AttachSha 'ja-main') $mainName).ok) 'Restoring the change report did not make it publishable again.'
+
+# 提出用PDFが手で差し替えられていたら（M-2）、変更点PDFも含めて何もコピーしない。
+$sharedBefore = @(Get-SharedEntries)
+$attachMainPdf = Get-PlannedOutputPath $attachId 'ja-main'
+$attachStamp = (Get-Item -LiteralPath $attachMainPdf).LastWriteTimeUtc
+[IO.File]::WriteAllText($attachMainPdf, '%PDF-ATTACH-6')
+(Get-Item -LiteralPath $attachMainPdf).LastWriteTimeUtc = $attachStamp
+Assert-Throws { Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId $true } '中身' 'A replaced submission PDF was published together with its change report.'
+Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|')) 'A rejected publish with a change report still created something in the shared folder.'
+[IO.File]::WriteAllText($attachMainPdf, '%PDF-attach-6')
+(Get-Item -LiteralPath $attachMainPdf).LastWriteTimeUtc = $attachStamp
+# 共有側でのコピーが作った変更点PDFと一致しなければ、何も残さず失敗にする。
+function Copy-Item {
+    param([string]$LiteralPath, [string]$Destination, [switch]$Force)
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force
+    if ($Destination -like '*_変更点.pdf') { [IO.File]::AppendAllText($Destination, 'cut') }
+}
+Assert-Throws { Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId $true } '変更点PDF' 'A change report that did not copy intact was published.'
+Remove-Item Function:\Copy-Item
+Assert-OutputTest ((@(Get-SharedEntries) -join '|') -eq ($sharedBefore -join '|')) 'A failed change report copy left something in the shared folder.'
+
+# まとめてコピー: 付けられる出力先だけ付け、はじめての出力先は理由を返す（コピーは止めない）。
+[void](Set-AttachBuild 'ja-appendix' '%PDF-attach-appendix-1')
+$Script:PublishEvents.Clear()
+$allAttach = Publish-DocumentPackAllPdfsToShared 'ja' $attachId $true
+$appendixName = [IO.Path]::GetFileName((Get-PlannedOutputPath $attachId 'ja-appendix'))
+Assert-OutputTest ((Get-FolderNames ([string]$allAttach.sharedFolder)) -eq (Join-ExpectedNames @($mainName, $reportName, $appendixName))) "publish-all did not attach exactly the publishable change report: $(Get-FolderNames ([string]$allAttach.sharedFolder))"
+Assert-OutputTest (@($allAttach.changeReportsSkipped).Count -eq 1 -and [string]@($allAttach.changeReportsSkipped)[0].targetId -eq 'appendix' -and [string]@($allAttach.changeReportsSkipped)[0].reason -eq 'not-published') 'publish-all did not explain the target without a change report.'
+Assert-OutputTest (@($Script:PublishEvents | Where-Object { $_.type -eq 'final.change-report.published' }).Count -eq 1) 'publish-all wrote a change report event for a target without one.'
+# 同じ版をもう一度コピーしても（前回コピーした版＝今の版）、変更点PDFは付けない。
+$again = Publish-DocumentPackPdfToShared 'ja' @('ja-main') $attachId $true
+Assert-OutputTest ((Get-FolderNames ([string]$again.sharedFolder)) -eq $mainName -and [string]@($again.changeReportsSkipped)[0].reason -eq 'same-as-published') 'Copying the same version again attached a change report.'
+# 保存済み出力の記録（buildId）が無い出力（組み込み一式など）には付けない。
+Assert-OutputTest ([string](Resolve-PublishableChangeReport 'ja' $attachId 'main' '' (Get-AttachSha 'ja-main') $mainName).reason -eq 'no-build') 'An output without a buildId was considered for a change report.'
+
 Write-Output 'output-publish selfcheck ok'
 '@
     $script = [scriptblock]::Create($definitions + [Environment]::NewLine + $testBody)

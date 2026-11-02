@@ -1671,7 +1671,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v213', 'style.css?v=20261030_v129']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v214', 'style.css?v=20261030_v130']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1725,7 +1725,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v213' not in html:
+if 'app.js?v=20261030_v214' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1751,7 +1751,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v213' not in html:
+if 'app.js?v=20261030_v214' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3406,5 +3406,47 @@ for needed in ["'/api/v2/outputs/changes/report'", '/api/v2/outputs/changes/repo
         raise SystemExit(f'the change report button must follow the shown pair and ignore stale jobs: {needed}')
 if "path === '/api/v2/outputs/changes/report/file'" not in _pack_js:
     raise SystemExit('the change report must be opened with a POST like the submission PDF')
+
+# 提出用PDF一式の変更点PDFの共有コピーへの同梱（PR5）---------------------------------------
+# 振る舞い（§7.2 の4条件、M-2 で何もコピーしないこと、隠し属性、イベント）は
+# output-publish-selfcheck.ps1 と pack-change-selfcheck.ps1、画面は pack-change-view-regression.mjs が見る。
+# ここでは経路が1本のままであること、同梱を既定で行わないこと、コピーの中で作らないことを見る。
+_publish_locked = _publish_server_function('Publish-DocumentPackPdfToSharedLocked')
+for needed in ['[bool]$IncludeChangeReports = $false', 'Resolve-PublishableChangeReport', "kind = 'change-report'", "kind = 'submission'",
+               "'final.change-report.published'", 'changeReport = $changeReportInfo', 'changeReportsSkipped', '$usedFileNames.ContainsKey($reportFileName']:
+    if needed not in _publish_locked:
+        raise SystemExit(f'the shared copy must attach change reports through the one publish path: {needed}')
+for forbidden in ['Start-PackChangeReportJob', 'Invoke-PackChangeReportJobCore', 'Invoke-EdgePrintToPdf', 'New-PackChangeReportHtml']:
+    if forbidden in _publish_locked:
+        raise SystemExit(f'the shared copy must not make change reports while holding the output lock: {forbidden}')
+# 変更点PDFは提出用PDFの確認がすべて通った後で足す。
+if _publish_locked.find('Resolve-PublishableChangeReport') < _publish_locked.find('Get-OutputPdfIntegrityProblem'):
+    raise SystemExit('change reports must be attached only after every submission PDF passed its checks')
+if "Where-Object { [string]$_.kind -eq 'submission' }" not in _publish_locked:
+    raise SystemExit('publish events and records must be written per submission PDF, not per attachment')
+for name in ['Publish-DocumentPackPdfToShared', 'Publish-DocumentPackAllPdfsToShared']:
+    if '[bool]$IncludeChangeReports = $false' not in _publish_server_function(name):
+        raise SystemExit(f'{name} must default to not attaching change reports')
+_publishable = _publish_server_function('Resolve-PublishableChangeReport')
+for needed in ['Get-LastPublishedBuildId', "'toBuildId'", "'fromBuildId'", "'toOutputPdfSha256'", "'reportSha256'", 'New-Sha256', 'PackChangeReportVersion', "'exports\\change-reports'", 'StartsWith($root']:
+    if needed not in _publishable:
+        raise SystemExit(f'a change report must meet every copy condition: {needed}')
+for route in ["$path -eq '/api/v2/outputs/publish')", "$path -eq '/api/v2/outputs/publish-all')"]:
+    _route = server.split(route + ' {', 1)[1].split('if ($method', 1)[0]
+    if "(Get-DataProperty $body 'includeChangeReports' $false) -eq $true" not in _route or '$includeChangeReports' not in _route:
+        raise SystemExit(f'{route} must read includeChangeReports (default false)')
+if 'Resolve-PublishableChangeReport' not in _publish_server_function('Get-PackChangeSummary') or "'not-attachable'" not in _publish_server_function('Get-PackChangeSummary'):
+    raise SystemExit('the changes response must say whether the report can be copied, with the same check as the copy')
+for needed in ['id="confirm-check-wrap"', 'id="confirm-check"', 'id="confirm-check-label"']:
+    if needed not in html:
+        raise SystemExit(f'the copy confirmation is missing the change report box: {needed}')
+_confirm_publish = _pack_js.split('async function confirmPublishChangeReports(', 1)[1].split('\nasync function ', 1)[0]
+for needed in ["'変更点PDFもいっしょにコピーする'", 'checked:true', "'変更点PDFを作ってからコピーする'", 'confirmCheckState()']:
+    if needed not in _confirm_publish:
+        raise SystemExit(f'the copy confirmation must offer the change report checked by default: {needed}')
+for name in ['publishFinalVolume', 'publishAllFinalVolumes']:
+    _body = _pack_js.split(f'async function {name}(', 1)[1].split('\nasync function ', 1)[0]
+    if 'preparePublishChangeReports(' not in _body or 'includeChangeReports' not in _body:
+        raise SystemExit(f'{name} must ask about and send includeChangeReports')
 
 print('selfcheck ok' + (' (static only)' if STATIC_ONLY else ''))

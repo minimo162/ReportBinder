@@ -262,6 +262,8 @@ Assert-ChangeTest ([string]$sincePublish.from.buildId -eq $build2 -and [string]$
 Assert-ChangeTest ([int]$sincePublish.counts.added -eq 1 -and [int]$sincePublish.counts.side -eq 2 -and [int]$sincePublish.counts.content -eq 0) "The changes since the last copy are wrong: $($sincePublish.counts | ConvertTo-Json -Compress)"
 Assert-ChangeTest ([string]$sincePublish.from.publishedAt -eq [string]$publish.publishedAt -and -not [bool]$sincePublish.from.isCurrent -and [bool]$sincePublish.to.isCurrent) 'The from/to bands do not say which was copied and which is current.'
 Assert-ChangeTest ([string]$sincePublish.report.reason -eq 'not-created' -and -not [bool]$sincePublish.report.exists -and -not [bool]$sincePublish.report.publishable) 'A change report was reported as made (or copyable) before it was made.'
+# 「前回コピーした版 → 今の提出用PDF」の組み合わせは、作れば共有コピーへ同梱できる。
+Assert-ChangeTest ([bool]$sincePublish.report.attachable) 'The last-copy → current pair was not offered for the shared copy.'
 
 # 好きな2回: 新しい→古いの順に選んでも、古い→新しいに入れ替えて比べる。
 $picked = Get-PackChangeSummary 'ja' $packId 'main' $build4 $build1
@@ -418,7 +420,8 @@ Assert-ChangeTest ($reportDir.StartsWith((Join-Path (Get-WorkspacePath 'ja') 'ex
 Assert-ChangeTest (@(Get-ChildItem -LiteralPath $outputDir -Filter '*変更点*' -ErrorAction SilentlyContinue).Count -eq 0) 'The change report was copied into the local output folder.'
 $reportSummary = Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4
 Assert-ChangeTest ([int]$Script:EdgeCalls[$Script:EdgeCalls.Count - 1].timeout -eq (Get-PackChangeReportTimeoutSeconds @($reportSummary.pages).Count)) 'The report job did not use the proportional timeout.'
-Assert-ChangeTest ([bool]$reportSummary.report.exists -and [string]$reportSummary.report.reason -eq 'copy-not-available' -and -not [bool]$reportSummary.report.publishable -and [string]$reportSummary.report.reportId -eq ($build3 + '__' + $build4)) "The changes response does not describe the made report: $($reportSummary.report | ConvertTo-Json -Compress)"
+# 好きな2回（比べる元が前回コピーした版でない）で作ったものは、作成済みでも共有コピーへは付けない。
+Assert-ChangeTest ([bool]$reportSummary.report.exists -and [string]$reportSummary.report.reason -eq 'not-attachable' -and -not [bool]$reportSummary.report.attachable -and -not [bool]$reportSummary.report.publishable -and [string]$reportSummary.report.reportId -eq ($build3 + '__' + $build4)) "The changes response does not describe the made report: $($reportSummary.report | ConvertTo-Json -Compress)"
 Assert-ChangeTest ([string]$reportSummary.report.fileName -eq ([IO.Path]::GetFileNameWithoutExtension([string]$reportSummary.to.outputFileName) + '_変更点.pdf')) 'The report file name does not follow the submission PDF.'
 # 作成済みなら作り直さない（子プロセスを起動しない）。2つの版の指定は必須。
 $again = Start-PackChangeReportJob 'ja' $packId 'main' $build3 $build4
@@ -447,6 +450,24 @@ Assert-Throws { Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4
 # 作り直すと、置き換えた report.pdf と meta.json がそろう。
 Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build3; toBuildId = $build4; statusPath = $reportStatusPath })
 Assert-ChangeTest ([bool](Get-PackChangeSummary 'ja' $packId 'main' $build3 $build4).report.exists) 'Re-making a tampered report did not replace it.'
+
+# 共有コピーへの同梱: 既定の組み合わせ（前回コピーした2回目 → 今の6回目）で作ったものだけ publishable。
+# 画面の「いっしょにコピーできる」は、コピーのときと同じ Resolve-PublishableChangeReport で決める。
+Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build2; toBuildId = $build6; statusPath = $reportStatusPath })
+$attachSummary = Get-PackChangeSummary 'ja' $packId 'main'
+Assert-ChangeTest ([string]$attachSummary.from.buildId -eq $build2 -and [string]$attachSummary.to.buildId -eq $build6 -and [bool]$attachSummary.report.exists) "The default pair report was not made: $($attachSummary.report | ConvertTo-Json -Compress)"
+Assert-ChangeTest ([bool]$attachSummary.report.attachable -and [bool]$attachSummary.report.publishable -and [string]$attachSummary.report.reason -eq 'publishable') "A made last-copy → current report was not offered for the shared copy: $($attachSummary.report | ConvertTo-Json -Compress)"
+$attachCheck = Resolve-PublishableChangeReport 'ja' $packId 'main' $build6 ([string]$attachSummary.to.outputPdfSha256) ([string]$attachSummary.to.outputFileName)
+Assert-ChangeTest ([bool]$attachCheck.ok -and [string]$attachCheck.fromBuildId -eq $build2 -and [string]$attachCheck.sourceFull -eq (Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build2 $build6) 'report.pdf')) 'The publish check disagrees with the changes response.'
+# 今の提出用PDFが出力の後に変わったら、同じ組み合わせでも同梱できると言わない。
+$currentOutput = Get-PlannedOutputPath 'ja-main'
+$currentOriginal = [IO.File]::ReadAllText($currentOutput)
+$currentStamp = (Get-Item -LiteralPath $currentOutput).LastWriteTimeUtc
+[IO.File]::AppendAllText($currentOutput, 'edited')
+$editedSummary = Get-PackChangeSummary 'ja' $packId 'main' $build2 $build6
+Assert-ChangeTest (-not [bool]$editedSummary.report.attachable -and -not [bool]$editedSummary.report.publishable) 'A report was offered for the shared copy after the submission PDF was edited.'
+[IO.File]::WriteAllText($currentOutput, $currentOriginal)
+(Get-Item -LiteralPath $currentOutput).LastWriteTimeUtc = $currentStamp
 
 # Edge が時間切れ・PDF を書かないときは、ジョブを失敗にして理由を残す。作成済みの記録は書かない。
 foreach ($case in @(@('timeout','時間内'), @('blocked','ヘッドレス印刷'))) {

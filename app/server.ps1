@@ -9577,7 +9577,10 @@ function Get-SafePublishPackName([string]$DisplayName) {
 # 読み込みが出力側の置き換えを共有違反で失敗させる。実行中の出力ジョブがあれば断り、
 # 出力と同じロック（組み込み一式は final-build_*、カスタム一式は出力先ごとの pack-output_*）
 # を持ったまま、最新かどうかの確認からコピーまでを行う。
-function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
+# $IncludeChangeReports を付けると、出力先ごとに「前回コピーした版 → 今の提出用PDF」の
+# 変更点PDF（Resolve-PublishableChangeReport の条件を満たすものだけ）を同じ発行フォルダーへ入れる。
+# 変更点PDFはここでは作らない（作成には時間がかかり、その間ずっと出力のロックを持つことになるため）。
+function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory, [bool]$IncludeChangeReports = $false) {
     if ($null -ne (Get-ActiveFinalJobStatus $Language)) {
         throw '提出用PDFを出力中のため、共有用フォルダーにコピーしていません。出力が終わってから、もう一度コピーしてください。'
     }
@@ -9592,7 +9595,7 @@ function Publish-DocumentPackPdfToShared([string]$Language, [string[]]$Volumes, 
             $lockPaths += Join-Path $workspace ("locks\pack-output_{0}_{1}.lock" -f ([string]$scope.packId), (Get-TargetIdFromLegacyVolume $volume))
         }
     }
-    return Invoke-WithPublishLocks $lockPaths { Publish-DocumentPackPdfToSharedLocked $Language $Volumes ([string]$scope.packId) }
+    return Invoke-WithPublishLocks $lockPaths { Publish-DocumentPackPdfToSharedLocked $Language $Volumes ([string]$scope.packId) $IncludeChangeReports }
 }
 
 # 共有用フォルダーに残った発行の作業用フォルダー（.publishing-*）を消す。消すのは、
@@ -9633,7 +9636,7 @@ function Invoke-WithPublishLocks([string[]]$PublishLockPaths, [scriptblock]$Publ
     return Invoke-WithLock ([string]@($PublishLockPaths)[0]) { Invoke-WithPublishLocks $publishRemainingLocks $PublishAction }
 }
 
-function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory) {
+function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Volumes, [string]$PackIdOrCategory, [bool]$IncludeChangeReports = $false) {
     $paths = Get-Paths
     $structure = Get-Structure $Language
     $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
@@ -9685,7 +9688,29 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
         $usedFileNames[$fileName.ToLowerInvariant()] = $targetName
         # どの出力（アーカイブの buildId）をコピーしたかを残す。組み込み一式は buildId を持たない。
         $buildId = [string](Get-DataProperty $outputState 'buildId' '')
-        $entries += [pscustomobject][ordered]@{ volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName; sha256 = $expectedHash; buildId = $buildId }
+        $entries += [pscustomobject][ordered]@{ kind = 'submission'; volume = $Volume; targetId = $targetId; targetName = $targetName; sourceFull = $sourceFull; fileName = $fileName; sha256 = $expectedHash; buildId = $buildId; changeReport = $null }
+    }
+
+    # 変更点PDFは、すべての提出用PDFの確認が通った後で足す（提出用PDFが1冊でも駄目なら何もコピーしない）。
+    # 出力フォルダーの外にあるかの確認は提出用PDFだけ。変更点PDFは exports\change-reports の下に
+    # あることを Resolve-PublishableChangeReport で確かめる。条件に合わない出力先は付けずに理由を返す。
+    $changeReportsSkipped = @()
+    if ($IncludeChangeReports -and -not [bool]$scope.builtIn) {
+        foreach ($entry in @($entries)) {
+            $attachment = Resolve-PublishableChangeReport $Language $packId ([string]$entry.targetId) ([string]$entry.buildId) ([string]$entry.sha256) ([string]$entry.fileName)
+            if (-not [bool]$attachment.ok) {
+                $changeReportsSkipped += [ordered]@{ targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; reason = [string]$attachment.reason; message = [string]$attachment.message }
+                continue
+            }
+            $reportFileName = [string]$attachment.fileName
+            if ($usedFileNames.ContainsKey($reportFileName.ToLowerInvariant())) {
+                throw ("「{0}」の変更点PDFの名前（{1}）が、「{2}」の提出用PDFと同じです。出力ファイル名を変えて出力し直してから、共有用フォルダーにコピーしてください。" -f [string]$entry.targetName, $reportFileName, [string]$usedFileNames[$reportFileName.ToLowerInvariant()])
+            }
+            $usedFileNames[$reportFileName.ToLowerInvariant()] = [string]$entry.targetName
+            $reportEntry = [pscustomobject][ordered]@{ kind = 'change-report'; volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourceFull = [string]$attachment.sourceFull; fileName = $reportFileName; sha256 = [string]$attachment.sha256; buildId = [string]$entry.buildId; fromBuildId = [string]$attachment.fromBuildId }
+            $entry.changeReport = $reportEntry
+            $entries += $reportEntry
+        }
     }
 
     $submissionDir = [IO.Path]::GetFullPath([string]$paths.submissionDir)
@@ -9717,6 +9742,7 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
             Copy-Item -LiteralPath ([string]$entry.sourceFull) -Destination $stagedPdf -Force
             # サイズだけでは、コピー中に出力側が置き換えた場合や途中で切れた場合を見分けられない（L-2）。
             if ((Normalize-FileHash (New-Sha256 $stagedPdf)) -ne [string]$entry.sha256) {
+                if ([string]$entry.kind -eq 'change-report') { throw '共有用フォルダーへコピーした変更点PDFが、作った変更点PDFと一致しません。もう一度コピーしてください。' }
                 throw '共有用フォルダーへコピーしたPDFが、出力したPDFと一致しません。もう一度コピーしてください。'
             }
             # Copy-Item は元のPDFの属性も写す。PDFは改名の前から隠さない。
@@ -9747,8 +9773,19 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
     $publishedAt = New-NowIso
     $files = @()
     $publishRecordErrors = @()
-    foreach ($entry in $entries) {
+    $changeReports = @()
+    foreach ($entry in @($entries | Where-Object { [string]$_.kind -eq 'submission' })) {
         $destination = Join-Path $publishDir ([string]$entry.fileName)
+        $changeReportInfo = $null
+        if ($null -ne $entry.changeReport) {
+            $changeReportInfo = [ordered]@{
+                fromBuildId = [string]$entry.changeReport.fromBuildId
+                toBuildId = [string]$entry.buildId
+                fileName = [string]$entry.changeReport.fileName
+                destination = (Join-Path $publishDir ([string]$entry.changeReport.fileName))
+                sha256 = [string]$entry.changeReport.sha256
+            }
+        }
         $publishedEvent = [ordered]@{
             packId = $packId
             category = $cat
@@ -9764,14 +9801,29 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
             userName = $userName
             packName = $packName
             publishedAt = $publishedAt
+            changeReport = $changeReportInfo
         }
         Write-HistoryEvent $Language 'final.published' $publishedEvent
+        if ($null -ne $changeReportInfo) {
+            # タイムラインで提出用PDFのコピーと見分けられるよう、添付した変更点PDFごとに1件。
+            Write-HistoryEvent $Language 'final.change-report.published' ([ordered]@{
+                packId = $packId; category = $cat
+                targetId = [string]$entry.targetId; volume = [string]$entry.volume
+                fromBuildId = [string]$changeReportInfo.fromBuildId; toBuildId = [string]$changeReportInfo.toBuildId
+                sha256 = [string]$changeReportInfo.sha256
+                destination = [string]$changeReportInfo.destination
+                sharedFolder = $publishDir; folderName = $folderName
+                fileName = [string]$changeReportInfo.fileName
+                userName = $userName; publishedAt = $publishedAt
+            })
+            $changeReports += [ordered]@{ targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; fileName = [string]$changeReportInfo.fileName; sharedPath = [string]$changeReportInfo.destination; fromBuildId = [string]$changeReportInfo.fromBuildId; toBuildId = [string]$changeReportInfo.toBuildId; sha256 = [string]$changeReportInfo.sha256 }
+        }
         # Write-HistoryEvent は何も書かない（履歴タイムラインは廃止）。「前回コピーした版」を
         # 後から引けるよう、出力先ごとの発行記録を別に残す。コピーはもう終わっているので、
         # 記録に失敗してもコピーを失敗にはしない（次の比較が「1つ前の出力」になるだけ）。
         try { Write-PublishRecord $Language $packId ([string]$entry.volume) $publishedEvent }
         catch { $publishRecordErrors += ("{0}: {1}" -f [string]$entry.targetName, $_.Exception.Message) }
-        $files += [ordered]@{ volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourcePdf = [string]$entry.sourceFull; sharedPath = $destination; fileName = [string]$entry.fileName; buildId = [string]$entry.buildId; sha256 = [string]$entry.sha256 }
+        $files += [ordered]@{ volume = [string]$entry.volume; targetId = [string]$entry.targetId; targetName = [string]$entry.targetName; sourcePdf = [string]$entry.sourceFull; sharedPath = $destination; fileName = [string]$entry.fileName; buildId = [string]$entry.buildId; sha256 = [string]$entry.sha256; changeReport = $changeReportInfo }
     }
     # 1冊だけの呼び出し元は volume/sharedPath/fileName を読む。先頭の1冊で従来の形を保つ。
     $first = $files[0]
@@ -9786,6 +9838,8 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
         folderName = $folderName
         fileName = $first.fileName
         files = @($files)
+        changeReports = @($changeReports)
+        changeReportsSkipped = @($changeReportsSkipped)
         publishedBy = $userName
         packName = $packName
         publishedAt = $publishedAt
@@ -9795,7 +9849,7 @@ function Publish-DocumentPackPdfToSharedLocked([string]$Language, [string[]]$Vol
 
 # 提出用PDFの画面の「まとめて共有用フォルダーにコピー」。ページが入っている出力先を
 # すべて1つの発行フォルダーへ入れる。ページの無い任意の出力先（空の補足など）は対象外。
-function Publish-DocumentPackAllPdfsToShared([string]$Language, [string]$PackIdOrCategory) {
+function Publish-DocumentPackAllPdfsToShared([string]$Language, [string]$PackIdOrCategory, [bool]$IncludeChangeReports = $false) {
     $structure = Get-Structure $Language
     $scope = Resolve-DocumentPackScope $structure $PackIdOrCategory $false
     $volumes = @()
@@ -9805,7 +9859,7 @@ function Publish-DocumentPackAllPdfsToShared([string]$Language, [string]$PackIdO
         if ([int]$ready.pageCount -gt 0) { $volumes += $volume }
     }
     if ($volumes.Count -eq 0) { throw '共有発行できる提出用PDFがありません。先に提出用PDFを出力してください。' }
-    return Publish-DocumentPackPdfToShared $Language $volumes ([string]$scope.packId)
+    return Publish-DocumentPackPdfToShared $Language $volumes ([string]$scope.packId) $IncludeChangeReports
 }
 
 function Publish-FinalPdfToShared([string]$Language, [string]$Volume, [string]$Category) {
@@ -10111,12 +10165,15 @@ function Handle-Api($Context) {
             $publishScope = Resolve-DocumentPackScope $publishStructure $packId $false
             $targetId = Assert-PackTargetId $language $publishScope.pack $targetId
             $volume = Get-LegacyVolumeFromTargetId $language $targetId
-            $result = Publish-DocumentPackPdfToShared $language $volume $packId
+            # 省略時（古い画面からの呼び出し）は今までどおり提出用PDFだけ。true のときだけ同梱する。
+            $includeChangeReports = ((Get-DataProperty $body 'includeChangeReports' $false) -eq $true)
+            $result = Publish-DocumentPackPdfToShared $language $volume $packId $includeChangeReports
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result }); return
         }
         if ($method -eq 'POST' -and $path -eq '/api/v2/outputs/publish-all') {
             $body = Read-BodyJson $Context.Request
-            $result = Publish-DocumentPackAllPdfsToShared $language ([string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' '')))
+            $includeChangeReports = ((Get-DataProperty $body 'includeChangeReports' $false) -eq $true)
+            $result = Publish-DocumentPackAllPdfsToShared $language ([string](Get-DataProperty $body 'packId' (Get-DataProperty $body 'category' ''))) $includeChangeReports
             Write-JsonResponse $Context 200 ([ordered]@{ ok=$true; apiVersion=2; result=$result }); return
         }
         if ($method -eq 'GET' -and $path -eq '/api/v2/outputs/archives') {
@@ -14144,8 +14201,9 @@ function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$Targ
         pages = @()
         notes = @()
         # 変更点PDF。比べられた（status=ready）ときだけ Get-PackChangeReportState で埋める。
-        # 共有コピーへの同梱は後の版で足すので、publishable は常に false。
-        report = [ordered]@{ exists = $false; reportId = ''; fileName = ''; createdAt = ''; publishable = $false; reason = 'not-available' }
+        # attachable = この組み合わせが「前回コピーした版 → 今の提出用PDF」（共有コピーへ同梱できる組み合わせ）、
+        # publishable = 作成済みで、今コピーすれば同梱される（Resolve-PublishableChangeReport の条件を満たす）。
+        report = [ordered]@{ exists = $false; reportId = ''; fileName = ''; createdAt = ''; attachable = $false; publishable = $false; reason = 'not-available' }
     }
     if ([bool]$scope.builtIn) {
         $result.status = 'unsupported'
@@ -14248,6 +14306,19 @@ function Get-PackChangeSummary([string]$Language, [string]$PackId, [string]$Targ
     $result.notes = @($notes)
     try {
         $result.report = Get-PackChangeReportState $Language $packId $targetId ([string]$fromRecord.buildId) ([string]$toRecord.buildId) ([string]$fromRecord.outputPdfSha256) ([string]$toRecord.outputPdfSha256) ([bool]$result.complete) ([string]$toRecord.outputFileName)
+        # 同梱できるのは「前回コピーした版 → 今の提出用PDF」の組み合わせだけ（好きな2回は付けない）。
+        $lastPublished = Get-LastPublishedBuildId $Language $packId $targetId
+        $attachable = ([bool]$result.to.isCurrent -and -not [string]::IsNullOrWhiteSpace($lastPublished) -and [string]$fromRecord.buildId -eq $lastPublished)
+        $result.report.attachable = $attachable
+        if ([bool]$result.report.exists) {
+            if (-not $attachable) { $result.report.reason = 'not-attachable' }
+            else {
+                # コピーのときと同じ確認で決める（画面の「いっしょにコピーできる」とコピーの結果を食い違わせない）。
+                $publishCheck = Resolve-PublishableChangeReport $Language $packId $targetId ([string]$toRecord.buildId) ([string]$toRecord.outputPdfSha256) ([string]$toRecord.outputFileName)
+                $result.report.publishable = [bool]$publishCheck.ok
+                $result.report.reason = [string]$publishCheck.reason
+            }
+        }
     } catch { }
     return $result
 }
@@ -14594,10 +14665,11 @@ function Get-PackChangeReportFileName([string]$OutputFileName) {
 # 作った変更点PDFの状態。meta.json の記録と report.pdf の中身が合い、同じ2つの版
 # （outputPdfSha256）についてのもので、作成の版が同じときだけ「作成済み」。見た目のハッシュが
 # そろわないうちに作ったものは、そろった後には古い（一覧の中身が変わる）。
-# 共有用フォルダーへの同梱（publishable）は後の版で足すので、今は常に false。
+# 共有用フォルダーへ同梱できるか（attachable・publishable）は、Get-PackChangeSummary が
+# Resolve-PublishableChangeReport で決める。ここでは作成済みかどうかだけ。
 function Get-PackChangeReportState([string]$Language, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId, [string]$FromOutputPdfSha256, [string]$ToOutputPdfSha256, [bool]$Complete, [string]$OutputFileName = '') {
     $reportId = ([string]$FromBuildId + '__' + [string]$ToBuildId)
-    $state = [ordered]@{ exists = $false; reportId = $reportId; fileName = (Get-PackChangeReportFileName $OutputFileName); createdAt = ''; publishable = $false; reason = 'not-created' }
+    $state = [ordered]@{ exists = $false; reportId = $reportId; fileName = (Get-PackChangeReportFileName $OutputFileName); createdAt = ''; attachable = $false; publishable = $false; reason = 'not-created' }
     $dir = Get-PackChangeReportDir $Language $PackId $TargetId $FromBuildId $ToBuildId
     $metaPath = Join-Path $dir 'meta.json'
     $pdfPath = Join-Path $dir 'report.pdf'
@@ -14617,8 +14689,70 @@ function Get-PackChangeReportState([string]$Language, [string]$PackId, [string]$
     if (-not $valid) { $state.reason = 'outdated'; return $state }
     $state.exists = $true
     $state.createdAt = [string](Get-DataProperty $meta 'createdAt' '')
-    $state.reason = 'copy-not-available'
+    $state.reason = 'created'
     return $state
+}
+
+# 共有用フォルダーへ提出用PDFといっしょにコピーしてよい変更点PDF（§7.2）。すべて満たすときだけ ok:
+#   1. 変更点PDFの比べる先（toBuildId）が、その出力先の今の buildId と同じ
+#   2. 記録した toOutputPdfSha256 が、今の提出用PDFの outputIntegrity.sha256 と同じ
+#   3. 比べる元（fromBuildId）が「前回コピーした版」と同じ（好きな2回で作ったものは付けない。
+#      受け取った人は「前回の提出からの変更」と読むため）
+#   4. report.pdf の中身が meta.json の reportSha256 と同じ（作成の版も同じ）
+# 探すのは「前回コピーした版 → 今の版」のフォルダーだけで、exports\change-reports の外は見ない。
+# 提出用PDFの確認（最新か・ハッシュが合うか）は呼び出し元が先に済ませる。
+function Resolve-PublishableChangeReport([string]$Language, [string]$PackId, [string]$TargetId, [string]$CurrentBuildId, [string]$CurrentSha256, [string]$OutputFileName) {
+    $result = [pscustomobject][ordered]@{ ok = $false; reason = ''; message = ''; fromBuildId = ''; toBuildId = [string]$CurrentBuildId; sourceFull = ''; fileName = (Get-PackChangeReportFileName $OutputFileName); sha256 = '' }
+    if ([string]::IsNullOrWhiteSpace($CurrentBuildId)) {
+        $result.reason = 'no-build'; $result.message = '今の提出用PDFに保存済み出力の記録が無いため、変更点PDFは付けません。'
+        return $result
+    }
+    $lastPublished = Get-LastPublishedBuildId $Language $PackId $TargetId
+    if ([string]::IsNullOrWhiteSpace($lastPublished)) {
+        $result.reason = 'not-published'; $result.message = 'まだ共有用フォルダーにコピーしたことがないため、変更点PDFは付けません。'
+        return $result
+    }
+    if ($lastPublished -eq [string]$CurrentBuildId) {
+        $result.reason = 'same-as-published'; $result.message = '前回コピーしてから出力し直していないため、変更点PDFは付けません。'
+        return $result
+    }
+    $result.fromBuildId = $lastPublished
+    $dir = ''
+    try { $dir = [IO.Path]::GetFullPath((Get-PackChangeReportDir $Language $PackId $TargetId $lastPublished ([string]$CurrentBuildId))) } catch { $dir = '' }
+    $root = [IO.Path]::GetFullPath((Join-Path (Get-WorkspacePath $Language) 'exports\change-reports'))
+    if (-not $root.EndsWith([IO.Path]::DirectorySeparatorChar)) { $root += [IO.Path]::DirectorySeparatorChar }
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not $dir.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        $result.reason = 'outside'; $result.message = '変更点PDFの場所が不正なため、付けません。'
+        return $result
+    }
+    $pdfPath = Join-Path $dir 'report.pdf'
+    $meta = Read-JsonFile (Join-Path $dir 'meta.json') $null
+    if ($null -eq $meta -or -not (Test-Path -LiteralPath $pdfPath -PathType Leaf)) {
+        $result.reason = 'not-created'; $result.message = '前回コピーした版から今の提出用PDFまでの変更点PDFを、まだ作っていません。'
+        return $result
+    }
+    $outdatedMessage = '変更点PDFは、今の提出用PDFに合わせて作り直すとコピーできます。'
+    if ([int](Get-DataProperty $meta 'reportVersion' 0) -ne [int]$Script:PackChangeReportVersion -or
+        [string](Get-DataProperty $meta 'toBuildId' '') -ne [string]$CurrentBuildId -or
+        [string](Get-DataProperty $meta 'fromBuildId' '') -ne $lastPublished) {
+        $result.reason = 'outdated'; $result.message = $outdatedMessage
+        return $result
+    }
+    $expectedSha = Normalize-FileHash $CurrentSha256
+    if ([string]::IsNullOrWhiteSpace($expectedSha) -or (Normalize-FileHash ([string](Get-DataProperty $meta 'toOutputPdfSha256' ''))) -ne $expectedSha) {
+        $result.reason = 'outdated'; $result.message = $outdatedMessage
+        return $result
+    }
+    $recorded = Normalize-FileHash ([string](Get-DataProperty $meta 'reportSha256' ''))
+    if ([string]::IsNullOrWhiteSpace($recorded) -or (Normalize-FileHash (New-Sha256 $pdfPath)) -ne $recorded) {
+        $result.reason = 'outdated'; $result.message = '変更点PDFが作ったときから変わっています。作り直すとコピーできます。'
+        return $result
+    }
+    $result.ok = $true
+    $result.reason = 'publishable'
+    $result.sourceFull = [string]$pdfPath
+    $result.sha256 = $recorded
+    return $result
 }
 
 function Get-PackChangeReportLockPath([string]$Language, [string]$Kind, [string]$PackId, [string]$TargetId, [string]$FromBuildId, [string]$ToBuildId) {
