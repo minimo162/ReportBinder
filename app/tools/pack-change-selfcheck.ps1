@@ -494,6 +494,38 @@ Assert-ChangeTest (-not $detailHtml.Contains('<script>alert(2)') -and $detailHtm
 Assert-ChangeTest (-not $detailHtml.Contains('くわしく見る') -and -not $detailHtml.Contains('line-clamp') -and -not $detailHtml.Contains('class="clip"')) 'The report still refers to the app or clips list cells.'
 Assert-ChangeTest ($detailHtml.Contains('p.3 から 2 ページ分')) 'The cover does not point to the detail pages.'
 
+# ---- 詳細ページの寸法（PR-A: 凡例は見出しの行、画像の枠は文字の一覧に合わせて 110〜158mm） ----
+Assert-ChangeTest ([int]$Script:PackChangeReportImageDpi -eq 120 -and [int]$Script:PackChangeReportVersion -eq 2) 'The detail pictures must be 120dpi without making existing reports outdated.'
+Assert-ChangeTest ([int]$pageA.before.width -eq 1000 -and [int]$pageA.before.height -eq 1400 -and [int]$pageA.after.width -eq 500 -and [int]$pageA.after.height -eq 700) 'The detail page must keep the picture size for the HTML.'
+# 見積もりの合計（印＋見出し＋左右の見出し＋画像の枠＋下の余白＋文字の一覧＋余裕）が本文 186mm を超えない。
+function Get-TestDetailTotal($Size) {
+    return [double]$Script:PackChangeReportMarkMm + [double]$Size.headingHeight + [double]$Script:PackChangeReportSideHeadMm + [double]$Size.picHeight + [double]$Script:PackChangeReportPairMarginMm + [double]$Size.firstBudget + [double]$Script:PackChangeReportDetailSlackMm
+}
+$sizeShort = Get-PackChangeReportDetailLayout 'x' @(10)
+Assert-ChangeTest ([Math]::Abs([double]$sizeShort.picHeight - 147.7) -lt 0.001 -and [Math]::Abs([double]$sizeShort.firstBudget - 10) -lt 0.001) "A short list must leave the rest of the page to the pictures: $($sizeShort | ConvertTo-Json -Compress)"
+$sizeEmpty = Get-PackChangeReportDetailLayout 'x' @()
+Assert-ChangeTest ([double]$sizeEmpty.picHeight -le [double]$Script:PackChangeReportPicMaxMm -and [double]$sizeEmpty.picHeight -gt 150) "Without a list the pictures must be as tall as the page allows: $($sizeEmpty.picHeight)"
+$sizeLong = Get-PackChangeReportDetailLayout ('長' * 400) @(1..40 | ForEach-Object { 5.3 })
+Assert-ChangeTest ([double]$sizeLong.picHeight -eq [double]$Script:PackChangeReportPicMinMm) "A long list must shrink the pictures to the minimum: $($sizeLong.picHeight)"
+foreach ($size in @($sizeShort, $sizeEmpty, $sizeLong, (Get-PackChangeReportDetailLayout ('長' * 120) @(30, 30)))) {
+    Assert-ChangeTest ((Get-TestDetailTotal $size) -le [double]$Script:PackChangeReportBodyHeightMm + 0.001) "A detail page is taller than the sheet: $(Get-TestDetailTotal $size)"
+    Assert-ChangeTest (([double]$Script:PackChangeReportMarkMm + [double]$size.headingHeight + [double]$size.moreBudget + [double]$Script:PackChangeReportDetailSlackMm) -le [double]$Script:PackChangeReportBodyHeightMm + 0.001) 'A continued detail page is taller than the sheet.'
+}
+# 縦長は高さで、横長は幅で決まる（左右1枚の枠は (273−5)/2＝134mm、線のぶん 1mm 引く）。
+$portraitMm = Get-PackChangeReportImageMm 1000 1400 157.7
+Assert-ChangeTest ([Math]::Abs([double]$portraitMm.height - 156.7) -lt 0.001 -and [Math]::Abs([double]$portraitMm.width - 111.9) -lt 0.001) "A portrait picture must fill the height: $($portraitMm | ConvertTo-Json -Compress)"
+$landscapeMm = Get-PackChangeReportImageMm 1400 1000 157.7
+Assert-ChangeTest ([Math]::Abs([double]$landscapeMm.width - 133) -lt 0.001 -and [Math]::Abs([double]$landscapeMm.height - 95) -lt 0.001) "A landscape picture must fill the width: $($landscapeMm | ConvertTo-Json -Compress)"
+Assert-ChangeTest ($null -eq (Get-PackChangeReportImageMm 0 1400 157.7)) 'A picture of unknown size must fall back to the CSS limits.'
+# HTML: 凡例は見出しの行、枠と画像の高さは見積もりと同じ値、手で書いた 96mm／95mm は無い。
+$layoutA = Get-PackChangeReportDetailLayout (Get-PackChangeReportDetailHeading $detailRows[0]) @(Get-PackChangeReportDetailLines $pageA | ForEach-Object { (Get-PackChangeReportLineCount ([string]$_.text) 78.0) * 4.7 + 0.6 })
+$imageAmm = Get-PackChangeReportImageMm 1000 1400 $layoutA.picHeight
+Assert-ChangeTest ($detailHtml.Contains('<div class="dhr"><h2 class="dh">今回 p.12（右）') -and $detailHtml.Contains('</h2><p class="legend">')) 'The legend must sit on the heading line.'
+Assert-ChangeTest ($detailHtml.Contains('<div class="pic" style="height:' + (Format-PackChangeReportMm $layoutA.picHeight) + '">')) "The picture frame height does not match the estimate: $($layoutA.picHeight)"
+Assert-ChangeTest ($detailHtml.Contains('<img src="img/i0000/0002-b.png" alt="" style="width:' + (Format-PackChangeReportMm $imageAmm.width) + ';height:' + (Format-PackChangeReportMm $imageAmm.height) + '">')) 'The picture size does not match the frame.'
+Assert-ChangeTest (-not $detailHtml.Contains('height:96mm') -and -not $detailHtml.Contains('max-height:95mm') -and $detailHtml.Contains('max-height:' + (Format-PackChangeReportMm ($Script:PackChangeReportPicMaxMm - 1.0)))) 'The CSS must use the shared sizes.'
+Assert-ChangeTest ($detailHtml.Contains('<div class="pic empty" style="height:')) 'A missing picture must keep the same frame height.'
+
 # 一覧のセルは3行で切らない。長い名前の行は高さを見積もってページを分け、名前はそのまま載せる。
 $longName = ('とても長い原稿名' * 25)
 $tallRows = @(for ($p = 1; $p -le 12; $p++) { New-TestReportRow $p $p @('content') $false 'right' 'right' $(if ($p -eq 1) { $longName } else { '売上.xlsx' }) })
@@ -540,9 +572,9 @@ Assert-ChangeTest ($null -eq (Get-PackChangeReportImageSides (New-TestDetailRow 
 $edgeArgs = @(Get-EdgePrintToPdfArguments 'C:\t\profile' 'C:\t\report.pdf' 'file:///C:/t/report.html')
 Assert-ChangeTest ($edgeArgs -contains '--headless' -and $edgeArgs -contains '--user-data-dir=C:\t\profile' -and $edgeArgs -contains '--no-pdf-header-footer' -and $edgeArgs -contains '--print-to-pdf=C:\t\report.pdf' -and $edgeArgs[-1] -eq 'file:///C:/t/report.html') "The Edge print arguments are wrong: $($edgeArgs -join ' ')"
 Assert-Throws { Get-EdgePrintToPdfArguments '' 'C:\t\report.pdf' 'file:///x' } 'プロファイル' 'Edge was allowed to print with the default profile.'
-# 待ち時間の上限は件数と詳細ページの画像の枚数に比例させ、最大10分。
-Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 0) -eq 60 -and (Get-PackChangeReportTimeoutSeconds 100) -eq 110 -and (Get-PackChangeReportTimeoutSeconds 2000) -eq 600) 'The report timeout is not proportional to the item count.'
-Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 100 40) -eq 170 -and (Get-PackChangeReportTimeoutSeconds 100 400) -eq 600) 'The report timeout does not count the detail pictures.'
+# 待ち時間の上限は件数と詳細ページの画像の枚数（120dpi で1枚 2.5 秒）に比例させ、最大15分。
+Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 0) -eq 60 -and (Get-PackChangeReportTimeoutSeconds 100) -eq 110 -and (Get-PackChangeReportTimeoutSeconds 2000) -eq 900) 'The report timeout is not proportional to the item count.'
+Assert-ChangeTest ((Get-PackChangeReportTimeoutSeconds 100 40) -eq 210 -and (Get-PackChangeReportTimeoutSeconds 100 300) -eq 860 -and (Get-PackChangeReportTimeoutSeconds 100 400) -eq 900) 'The report timeout does not count the detail pictures.'
 
 # Edge の代わりに、印刷を真似る偽物を使う（PDF を書く／時間切れ／PDF を書かずに正常終了）。
 $Script:EdgeCalls = New-Object System.Collections.ArrayList
@@ -601,7 +633,8 @@ $again = Start-PackChangeReportJob 'ja' $packId 'main' $build3 $build4
 Assert-ChangeTest ([string]$again.status -eq 'completed' -and [string]$again.jobId -eq '' -and [bool]$again.reportReady) 'A made report was made again.'
 Assert-Throws { Start-PackChangeReportJob 'ja' $packId 'main' '' $build4 } 'fromBuildId' 'A report was started without the versions shown on screen.'
 Assert-Throws { Start-PackChangeReportJob 'ja' 'ecm' 'main' 'b1' 'b2' } '組み込み' 'A report was started for a built-in pack.'
-Assert-ChangeTest ((Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4) -eq (Join-Path $reportDir 'report.pdf')) 'The made report cannot be opened.'
+# 実装は GetFullPath で返すので、比べる側もそろえる（一時フォルダーの 8.3 形式 RUNNER~1 などの違いを比べない）。
+Assert-ChangeTest ((Resolve-PackChangeReportFile 'ja' $packId 'main' $build3 $build4) -eq [IO.Path]::GetFullPath((Join-Path $reportDir 'report.pdf'))) 'The made report cannot be opened.'
 Assert-Throws { Resolve-PackChangeReportFile 'ja' $packId 'main' '..\x' $build4 } '不正' 'A report path outside exports\change-reports was accepted.'
 # 見た目のハッシュがそろう前に作ったものは、そろった後には古い（一覧の中身が変わる）。
 $metaPath = Join-Path $reportDir 'meta.json'
@@ -636,7 +669,7 @@ $attachSummary = Get-PackChangeSummary 'ja' $packId 'main'
 Assert-ChangeTest ([string]$attachSummary.from.buildId -eq $build2 -and [string]$attachSummary.to.buildId -eq $build6 -and [bool]$attachSummary.report.exists) "The default pair report was not made: $($attachSummary.report | ConvertTo-Json -Compress)"
 Assert-ChangeTest ([bool]$attachSummary.report.attachable -and [bool]$attachSummary.report.publishable -and [string]$attachSummary.report.reason -eq 'publishable') "A made last-copy → current report was not offered for the shared copy: $($attachSummary.report | ConvertTo-Json -Compress)"
 $attachCheck = Resolve-PublishableChangeReport 'ja' $packId 'main' $build6 ([string]$attachSummary.to.outputPdfSha256) ([string]$attachSummary.to.outputFileName)
-Assert-ChangeTest ([bool]$attachCheck.ok -and [string]$attachCheck.fromBuildId -eq $build2 -and [string]$attachCheck.sourceFull -eq (Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build2 $build6) 'report.pdf')) 'The publish check disagrees with the changes response.'
+Assert-ChangeTest ([bool]$attachCheck.ok -and [string]$attachCheck.fromBuildId -eq $build2 -and [string]$attachCheck.sourceFull -eq [IO.Path]::GetFullPath((Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build2 $build6) 'report.pdf'))) 'The publish check disagrees with the changes response.'
 # 今の提出用PDFが出力の後に変わったら、同じ組み合わせでも同梱できると言わない。
 $currentOutput = Get-PlannedOutputPath 'ja-main'
 $currentOriginal = [IO.File]::ReadAllText($currentOutput)
@@ -762,7 +795,8 @@ Assert-ChangeTest ([string]$forgedRun.meta.detailSource -eq 'server' -and -not $
 $Script:FakeBatchMode = 'throw'
 $failedImages = Invoke-DetailReportJob $jobDetails
 Assert-ChangeTest ([int]$failedImages.meta.detailPageCount -eq 0 -and [string]$failedImages.meta.detailSource -eq 'none' -and $failedImages.html.Contains('2 ページは画像を用意できなかったため')) 'A report without pictures did not explain the missing details.'
-Assert-ChangeTest (@($failedImages.status.warnings).Count -eq 1 -and [int]$Script:FakeLeaseReleased -eq 8) "The picture failure was not kept as a warning or the leases were not released: released=$($Script:FakeLeaseReleased)"
+# @($null).Count も 1 なので、件数だけでなく中身（code）も見る。
+Assert-ChangeTest (@($failedImages.status.warnings).Count -eq 1 -and [string]@($failedImages.status.warnings)[0].code -eq 'detail-images' -and [int]$Script:FakeLeaseReleased -eq 8) "The picture failure was not kept as a warning or the leases were not released: released=$($Script:FakeLeaseReleased)"
 $Script:FakeBatchMode = 'ok'
 
 # 版 1 の作成済みPDF（ページごとの詳細の無いもの）は、作り直すまで作成済みにしない。

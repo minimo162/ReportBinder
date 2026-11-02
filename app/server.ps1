@@ -14358,10 +14358,30 @@ $Script:PackChangeReportDetailLimit = 200
 $Script:PackChangeReportRegionLimit = 30
 $Script:PackChangeReportTextLimit = 200
 $Script:PackChangeReportDetailsMaxBytes = 2097152
-# 詳細ページの画像の解像度。差分画面用（DiffDetailDpi）より落とし、200ページ分でも印刷できる大きさにする。
-$Script:PackChangeReportImageDpi = 96
-# Edge の印刷の待ち時間の上限（件数に比例させた値もこれを超えない）。
-$Script:EdgePrintMaxTimeoutSeconds = 600
+# 詳細ページの画像の解像度。差分画面用（DiffDetailDpi）と同じ。高さ 158mm に A4 縦を置いて約 225dpi になり、
+# 印刷でも画面で 200% に拡大しても読める（96dpi の約 1.56 倍の画素）。
+$Script:PackChangeReportImageDpi = 120
+# 詳細ページの寸法（mm）。CSS と、ページ割りの見積もり（New-PackChangeReportHtml）の両方がここから作る。
+# 片方だけ直すと .sheet{overflow:hidden} で文字の一覧が黙って切れるので、数を手で書かない。
+# 本文は A4 横 297×209mm から .sheet の余白（上 9・下 14・左右 12）を引いた 273×186mm。
+$Script:PackChangeReportBodyWidthMm = 273.0
+$Script:PackChangeReportBodyHeightMm = 186.0
+# 上の印（「確認用 ／ 題名」）・左右の見出し・左右の間・画像の下の余白・見積もりの余裕。
+$Script:PackChangeReportMarkMm = 11.0
+$Script:PackChangeReportSideHeadMm = 5.0
+$Script:PackChangeReportPairGapMm = 5.0
+$Script:PackChangeReportPairMarginMm = 3.0
+$Script:PackChangeReportDetailSlackMm = 2.0
+# 見出しは凡例と同じ行（凡例は右端の決まった幅）。見出しの全角1文字の幅（11.5pt）・1行の高さ・下の余白。
+$Script:PackChangeReportLegendWidthMm = 60.0
+$Script:PackChangeReportHeadingCharMm = 4.1
+$Script:PackChangeReportHeadingLineMm = 5.3
+$Script:PackChangeReportHeadingMarginMm = 2.0
+# 画像の枠の高さ。文字の一覧が短ければ最大まで広げ、長ければ最小まで縮め、それでも入らない分は「続き」のページへ。
+$Script:PackChangeReportPicMaxMm = 158.0
+$Script:PackChangeReportPicMinMm = 110.0
+# Edge の印刷の待ち時間の上限（件数に比例させた値もこれを超えない）。120dpi の画像で印刷が遅くなるぶん 15 分に。
+$Script:EdgePrintMaxTimeoutSeconds = 900
 
 function ConvertTo-PackChangeHtmlText($Value) {
     # 原稿名・シート名・ページ名は利用者の入力。必ずエスケープする。
@@ -14756,8 +14776,9 @@ function New-PackChangeReportDetailPage($Target, $Detail, $Fallback, $BeforeImag
         if ($null -eq $BeforeImage) { [void]$notes.Add('前回のページの画像を用意できませんでした。') }
         if ($null -eq $AfterImage) { [void]$notes.Add('今回のページの画像を用意できませんでした。') }
     }
-    if ($null -ne $BeforeImage) { $page.before = [pscustomobject][ordered]@{ src = [string]$BeforeImage.src; boxes = @($beforeBoxes) } }
-    if ($null -ne $AfterImage) { $page.after = [pscustomobject][ordered]@{ src = [string]$AfterImage.src; boxes = @($afterBoxes) } }
+    # 画素の寸法は、HTML で画像を枠に収める大きさ（mm）を決めるのに使う（HTML の関数は画像を読まない）。
+    if ($null -ne $BeforeImage) { $page.before = [pscustomobject][ordered]@{ src = [string]$BeforeImage.src; width = [int](Get-DataProperty $BeforeImage 'width' 0); height = [int](Get-DataProperty $BeforeImage 'height' 0); boxes = @($beforeBoxes) } }
+    if ($null -ne $AfterImage) { $page.after = [pscustomobject][ordered]@{ src = [string]$AfterImage.src; width = [int](Get-DataProperty $AfterImage 'width' 0); height = [int](Get-DataProperty $AfterImage 'height' 0); boxes = @($afterBoxes) } }
     $page.regions = @($listed)
     $page.notes = @($notes)
     return $page
@@ -14813,7 +14834,10 @@ function Limit-PackChangeReportText([string]$Text, [double]$UnitsPerLine, [int]$
 # 高さ（mm）の列を、1ページ目は $FirstBudget、2ページ目からは $Budget に収まるように分ける。
 # $MaxPerPage が 0 より大きければ1ページの件数もそれまで。結果の pages は各ページの添字の配列。
 # 1ページ目に最初の1件も入らないときは、1ページ目を空にして次のページから載せる。
+# 高さの比較は 0.001mm の余裕を持たせる（引き算・足し算の丸め誤差で、ちょうど入る高さが
+# 25.299999… < 25.3 のようにはみ出したことになり、余計な「続き」のページができないように）。
 function Split-PackChangeReportPages($Heights, [double]$FirstBudget, [double]$Budget, [int]$MaxPerPage = 0) {
+    $tolerance = 0.001
     $pages = New-Object System.Collections.ArrayList
     $current = New-Object System.Collections.ArrayList
     $used = 0.0
@@ -14821,12 +14845,12 @@ function Split-PackChangeReportPages($Heights, [double]$FirstBudget, [double]$Bu
     $list = @($Heights)
     for ($i = 0; $i -lt $list.Count; $i++) {
         $height = [double]$list[$i]
-        if ($current.Count -eq 0 -and $pages.Count -eq 0 -and $height -gt $limit -and $limit -lt $Budget) {
+        if ($current.Count -eq 0 -and $pages.Count -eq 0 -and $height -gt ($limit + $tolerance) -and $limit -lt $Budget) {
             [void]$pages.Add(@())
             $limit = $Budget
             $used = 0.0
         }
-        $full = ($current.Count -gt 0 -and (($used + $height) -gt $limit -or ($MaxPerPage -gt 0 -and $current.Count -ge $MaxPerPage)))
+        $full = ($current.Count -gt 0 -and (($used + $height) -gt ($limit + $tolerance) -or ($MaxPerPage -gt 0 -and $current.Count -ge $MaxPerPage)))
         if ($full) {
             [void]$pages.Add(@($current.ToArray()))
             $current = New-Object System.Collections.ArrayList
@@ -14903,6 +14927,48 @@ function Format-PackChangeReportPercent([double]$Value) {
     return (([double]$Value * 100.0).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture) + '%')
 }
 
+function Format-PackChangeReportMm([double]$Value) {
+    return ([Math]::Round([double]$Value, 2).ToString('0.##', [Globalization.CultureInfo]::InvariantCulture) + 'mm')
+}
+
+# 左右の画像の枠1つの幅と、その中に置ける画像の幅（枠の線のぶん 1mm 引く）。
+function Get-PackChangeReportPicWidthMm {
+    return ([double]$Script:PackChangeReportBodyWidthMm - [double]$Script:PackChangeReportPairGapMm) / 2.0
+}
+
+# 詳細ページ1件の寸法（mm）。見出しの高さ、画像の枠の高さ（最小〜最大）、1ページ目と「続き」のページに
+# 文字の一覧を入れられる高さを返す。CSS（画像の枠の style）とページ割りの両方がこの結果を使う。
+# 文字の一覧が全部入る高さまで画像を広げ（最大 PackChangeReportPicMaxMm）、入らなければ最小まで縮める。
+function Get-PackChangeReportDetailLayout([string]$Heading, $LineHeights) {
+    $unitsPerLine = ([double]$Script:PackChangeReportBodyWidthMm - [double]$Script:PackChangeReportLegendWidthMm) / [double]$Script:PackChangeReportHeadingCharMm
+    $headingHeight = (Get-PackChangeReportLineCount $Heading $unitsPerLine) * [double]$Script:PackChangeReportHeadingLineMm + [double]$Script:PackChangeReportHeadingMarginMm
+    $top = [double]$Script:PackChangeReportBodyHeightMm - [double]$Script:PackChangeReportMarkMm - $headingHeight - [double]$Script:PackChangeReportDetailSlackMm
+    $linesTotal = 0.0
+    foreach ($lineHeight in @($LineHeights)) { $linesTotal += [double]$lineHeight }
+    # 画像の枠の上下（左右の見出し・画像の下の余白）を除いた、枠と文字の一覧で分け合う高さ。
+    $shared = $top - [double]$Script:PackChangeReportSideHeadMm - [double]$Script:PackChangeReportPairMarginMm
+    $picHeight = [Math]::Min([double]$Script:PackChangeReportPicMaxMm, [Math]::Max([double]$Script:PackChangeReportPicMinMm, $shared - $linesTotal))
+    # 0.1mm 単位に切り下げる（CSS に書く値と見積もりの値を同じにする）。
+    $picHeight = [Math]::Floor($picHeight * 10.0 + 0.000001) / 10.0
+    return [pscustomobject]@{
+        headingHeight = $headingHeight
+        picHeight = $picHeight
+        # 画像を広げたぶん、1ページ目の一覧の高さは残りの分だけ（足りなければ 0 で、一覧は続きのページから）。
+        firstBudget = [Math]::Max(0.0, $shared - $picHeight)
+        moreBudget = $top
+    }
+}
+
+# 画像を枠に収めたときの紙の上の寸法（mm）。縦横比を保ち、縦長は高さで、横長は幅で決まる。
+# 画素の寸法が分からなければ $null（CSS の max-width／max-height で収める）。
+function Get-PackChangeReportImageMm([double]$Width, [double]$Height, [double]$PicHeight) {
+    if ($Width -le 0 -or $Height -le 0) { return $null }
+    $maxWidth = (Get-PackChangeReportPicWidthMm) - 1.0
+    $maxHeight = [Math]::Max(1.0, $PicHeight - 1.0)
+    $scale = [Math]::Min($maxWidth / $Width, $maxHeight / $Height)
+    return [pscustomobject]@{ width = [Math]::Floor($Width * $scale * 10.0 + 0.000001) / 10.0; height = [Math]::Floor($Height * $scale * 10.0 + 0.000001) / 10.0 }
+}
+
 # 変更点PDFの HTML（§6.1 の 表紙・変更一覧・ページごとの詳細・全ページの「確認用」と「変更点 n / N」）。
 # 副作用なし（ファイルを読まない。画像の場所は $DetailPages の src のまま書く）。
 # $Summary は Get-PackChangeSummary の結果（status=ready）。$DetailPages は New-PackChangeReportDetailPage の結果の
@@ -14970,19 +15036,17 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
     $listPageCount = [int]$listSplit.pages.Count
 
     # ---- 詳細ページの割り付け（1件1ページ。文字の一覧が入りきらなければ「続き」のページを足す） ----
-    # 本文 186mm から、上の印 11mm・見出し・凡例 5mm・左右の画像 104mm を引いた残りに一覧を入れる。
+    # 寸法は Get-PackChangeReportDetailLayout（PackChangeReport*Mm の変数）で決め、画像の枠の高さも同じ値を CSS に書く。
     $detailLayouts = New-Object System.Collections.ArrayList
     $nextPage = 2 + $listPageCount
     foreach ($detailPage in $details) {
         $heading = Get-PackChangeReportDetailHeading $detailPage.row
-        $headingHeight = (Get-PackChangeReportLineCount $heading 64.0) * 5.3 + 2.0
         $detailLines = @(Get-PackChangeReportDetailLines $detailPage)
         $lineHeights = @($detailLines | ForEach-Object { (Get-PackChangeReportLineCount ([string]$_.text) 78.0) * 4.7 + 0.6 })
-        $firstBudget = [Math]::Max(10.0, 186.0 - 11.0 - $headingHeight - 5.0 - 104.0 - 2.0)
-        $moreBudget = 186.0 - 11.0 - $headingHeight - 2.0
-        $split = Split-PackChangeReportPages $lineHeights $firstBudget $moreBudget 0
+        $size = Get-PackChangeReportDetailLayout $heading $lineHeights
+        $split = Split-PackChangeReportPages $lineHeights $size.firstBudget $size.moreBudget 0
         $sheetCount = [Math]::Max(1, [int]$split.pages.Count)
-        [void]$detailLayouts.Add([pscustomobject]@{ page = $detailPage; heading = $heading; lines = $detailLines; split = $split.pages; sheets = $sheetCount; number = $nextPage })
+        [void]$detailLayouts.Add([pscustomobject]@{ page = $detailPage; heading = $heading; lines = $detailLines; split = $split.pages; sheets = $sheetCount; number = $nextPage; picHeight = [double]$size.picHeight })
         $nextPage += $sheetCount
     }
     $detailNumberByKey = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
@@ -15014,10 +15078,14 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
     [void]$sb.Append('table.list{width:100%;border-collapse:collapse;table-layout:fixed}.list th,.list td{border:0.3mm solid #d0d7de;padding:1mm 2mm;text-align:left;vertical-align:top;overflow-wrap:anywhere}.list th{background:#f6f8fa;font-size:9.5pt}')
     [void]$sb.Append('.list tr.r td{height:12.4mm;font-size:9pt;line-height:1.35}.list small{color:#57606a}.list tr.shift td{color:#57606a}')
     # 詳細ページ。枠の色はアプリの凡例（変更＝琥珀・追加＝青・削除＝赤の破線・不明＝灰の点線）と合わせ、色だけに頼らず番号と文字を付ける。
-    [void]$sb.Append('.dh{font-size:11.5pt;line-height:1.3;margin:0 0 2mm;overflow-wrap:anywhere}.legend{display:flex;flex-wrap:wrap;gap:4mm;font-size:8.5pt;color:#57606a;height:5mm;margin:0}.legend i{display:inline-block;width:4mm;height:2.6mm;border:0.5mm solid rgb(var(--c));margin-right:1mm;vertical-align:-0.2mm}')
-    [void]$sb.Append('.pair{display:flex;gap:5mm;margin-bottom:3mm}.side{flex:1;min-width:0}.side-h{font-size:9pt;font-weight:700;height:5mm;line-height:5mm;overflow:hidden;white-space:nowrap}')
-    [void]$sb.Append('.pic{box-sizing:border-box;height:96mm;border:0.3mm solid #d0d7de;background:#f6f8fa;display:flex;align-items:flex-start;justify-content:center;overflow:hidden}.pic.empty{align-items:center;color:#57606a;font-size:9.5pt}')
-    [void]$sb.Append('.frame{position:relative;display:inline-block;line-height:0}.frame img{display:block;max-width:133mm;max-height:95mm;width:auto;height:auto}')
+    # 寸法は PackChangeReport*Mm の変数から書く（ページ割りの見積もりと同じ値。数を手で書かない）。凡例は見出しの行の右端。
+    $mm = { param($Value) Format-PackChangeReportMm $Value }
+    $picWidth = Get-PackChangeReportPicWidthMm
+    [void]$sb.Append('.dhr{display:flex;align-items:flex-start;margin:0 0 ' + (& $mm $Script:PackChangeReportHeadingMarginMm) + '}')
+    [void]$sb.Append('.dh{flex:1 1 auto;min-width:0;font-size:11.5pt;line-height:' + (& $mm $Script:PackChangeReportHeadingLineMm) + ';margin:0;overflow-wrap:anywhere}.legend{flex:0 0 ' + (& $mm $Script:PackChangeReportLegendWidthMm) + ';display:flex;justify-content:flex-end;gap:3mm;white-space:nowrap;font-size:8.5pt;line-height:' + (& $mm $Script:PackChangeReportHeadingLineMm) + ';color:#57606a;margin:0}.legend i{display:inline-block;width:4mm;height:2.6mm;border:0.5mm solid rgb(var(--c));margin-right:1mm;vertical-align:-0.2mm}')
+    [void]$sb.Append('.pair{display:flex;gap:' + (& $mm $Script:PackChangeReportPairGapMm) + ';margin-bottom:' + (& $mm $Script:PackChangeReportPairMarginMm) + '}.side{flex:1;min-width:0}.side-h{font-size:9pt;font-weight:700;height:' + (& $mm $Script:PackChangeReportSideHeadMm) + ';line-height:' + (& $mm $Script:PackChangeReportSideHeadMm) + ';overflow:hidden;white-space:nowrap}')
+    [void]$sb.Append('.pic{box-sizing:border-box;height:' + (& $mm $Script:PackChangeReportPicMinMm) + ';border:0.3mm solid #d0d7de;background:#f6f8fa;display:flex;align-items:center;justify-content:center;overflow:hidden}.pic.empty{color:#57606a;font-size:9.5pt}')
+    [void]$sb.Append('.frame{position:relative;display:inline-block;line-height:0}.frame img{display:block;max-width:' + (& $mm ($picWidth - 1.0)) + ';max-height:' + (& $mm ($Script:PackChangeReportPicMaxMm - 1.0)) + ';width:auto;height:auto}')
     [void]$sb.Append('.box{position:absolute;box-sizing:border-box;border:0.6mm solid rgb(var(--c));background:rgba(var(--c),.12)}.tag{position:absolute;left:-0.6mm;top:-4.4mm;background:rgb(var(--c));color:#fff;font-size:8pt;font-weight:700;line-height:4.2mm;padding:0 1mm;white-space:nowrap;border-radius:0.6mm}.box.in .tag{top:0}')
     [void]$sb.Append('.modified{--c:155,95,0}.added{--c:28,103,190}.removed{--c:200,48,55}.unknown{--c:105,113,124}.box.removed,.legend .removed i{border-style:dashed}.box.unknown,.legend .unknown i{border-style:dotted}')
     [void]$sb.Append('.lines{margin:0;padding:0;list-style:none;font-size:9.5pt;line-height:1.4}.lines li{margin:0 0 0.6mm;overflow-wrap:anywhere}.lines li.note{color:#57606a}')
@@ -15129,9 +15197,11 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
             [void]$sb.Append($mark)
             $headingText = [string]$layout.heading
             if ($sheetIndex -gt 0) { $headingText += '（続き）' }
-            [void]$sb.Append('<h2 class="dh">' + (& $h $headingText) + '</h2>')
+            [void]$sb.Append('<div class="dhr"><h2 class="dh">' + (& $h $headingText) + '</h2>')
+            if ($sheetIndex -eq 0) { [void]$sb.Append($legend) }
+            [void]$sb.Append('</div>')
             if ($sheetIndex -eq 0) {
-                [void]$sb.Append($legend)
+                $picStyle = 'height:' + (Format-PackChangeReportMm ([double]$layout.picHeight))
                 [void]$sb.Append('<div class="pair">')
                 foreach ($sideName in @('before','after')) {
                     if ($sideName -eq 'before') {
@@ -15146,11 +15216,17 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
                         $emptyText = '画像を用意できませんでした'
                         if ([string]$detailPage.mode -eq 'added' -and $sideName -eq 'before') { $emptyText = '前回にはこのページがありません' }
                         if ([string]$detailPage.mode -eq 'removed' -and $sideName -eq 'after') { $emptyText = '今回はこのページがありません' }
-                        [void]$sb.Append('<div class="pic empty">' + (& $h $emptyText) + '</div></div>')
+                        [void]$sb.Append('<div class="pic empty" style="' + $picStyle + '">' + (& $h $emptyText) + '</div></div>')
                         continue
                     }
                     $boxes = @(Get-Array $image.boxes)
-                    [void]$sb.Append('<div class="pic"><div class="frame"><img src="' + (& $h ([string]$image.src)) + '" alt="">')
+                    $imageMm = Get-PackChangeReportImageMm ([double](Get-DataProperty $image 'width' 0)) ([double](Get-DataProperty $image 'height' 0)) ([double]$layout.picHeight)
+                    if ($null -ne $imageMm) {
+                        $imgStyle = 'width:' + (Format-PackChangeReportMm $imageMm.width) + ';height:' + (Format-PackChangeReportMm $imageMm.height)
+                    } else {
+                        $imgStyle = 'max-height:' + (Format-PackChangeReportMm ([double]$layout.picHeight - 1.0))
+                    }
+                    [void]$sb.Append('<div class="pic" style="' + $picStyle + '"><div class="frame"><img src="' + (& $h ([string]$image.src)) + '" alt="" style="' + $imgStyle + '">')
                     foreach ($box in $boxes) {
                         $kind = [string]$box.kind
                         if (@('modified','added','removed','unknown') -cnotcontains $kind) { $kind = 'unknown' }
@@ -15186,9 +15262,9 @@ function New-PackChangeReportHtml($Summary, [string]$PackName, [string]$TargetNa
 }
 
 # 変更点PDFを作る待ち時間の上限。件数と詳細ページの画像の枚数に比例させる
-# （60秒＋一覧の1件あたり0.5秒＋画像1枚あたり1.5秒、最大10分）。
+# （60秒＋一覧の1件あたり0.5秒＋画像1枚あたり2.5秒、最大15分）。画像1枚は 120dpi（96dpi の約 1.56 倍の画素）で見積もる。
 function Get-PackChangeReportTimeoutSeconds([int]$ItemCount, [int]$ImageCount = 0) {
-    $seconds = 60 + [int][Math]::Ceiling([Math]::Max(0, $ItemCount) * 0.5 + [Math]::Max(0, $ImageCount) * 1.5)
+    $seconds = 60 + [int][Math]::Ceiling([Math]::Max(0, $ItemCount) * 0.5 + [Math]::Max(0, $ImageCount) * 2.5)
     return [int][Math]::Min([int]$Script:EdgePrintMaxTimeoutSeconds, $seconds)
 }
 
