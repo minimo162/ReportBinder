@@ -259,8 +259,7 @@ for needed in ['buildRowDescriptors', 'alignRows', 'mappedRowY', 'ROW_ALIGNMENT_
     if needed not in _diff_worker: raise SystemExit(f'human-aligned browser diff worker missing: {needed}')
 if 'for(let dy=-4;dy<=4;dy++)' in _diff_worker:
     raise SystemExit('browser diff worker still uses fixed +/-4px-only alignment')
-for needed in ['analysis.alignmentAdjusted', 'changedRatio:Number(analysis?.changedRatio||0)',
-               '行・列の追加や幅・倍率による位置ずれを補正']:
+for needed in ['alignmentAdjusted:!!analysis?.alignmentAdjusted', 'changedRatio:Number(analysis?.changedRatio||0)']:
     if needed not in _appjs_early:
         raise SystemExit(f'human-aligned browser diff UI missing: {needed}')
 for forbidden in ['prepareDiffDetail(', "api('/api/history/diff/prepare'", '/api/history/diff-page']:
@@ -1671,7 +1670,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v214', 'style.css?v=20261030_v130']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v215', 'style.css?v=20261030_v131']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1725,7 +1724,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v214' not in html:
+if 'app.js?v=20261030_v215' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1751,7 +1750,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v214' not in html:
+if 'app.js?v=20261030_v215' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -2098,7 +2097,7 @@ if '<pre id="log" hidden></pre>' not in html:
 for needed in ['function preferredDiffPageIndex', 'unchangedPageNumbers',
                'preferredDiffPageIndex(sheet)', 'preferredDiffPageIndex(preferred)',
                'このページに変更はありません。同じ原稿内の別ページに変更があります。',
-               "if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified'", 'analysis.fallbackUsed']:
+               "if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified'", 'analysis?.fallbackUsed']:
     if needed not in appjs:
         raise SystemExit(f'visible modified-page highlight fallback missing: {needed}')
 for needed in ['function buildFallbackRegion', 'looseCounts', 'difference>8',
@@ -2121,8 +2120,7 @@ for needed in ['extractDiffPdfTextItems', 'buildNumericTextDiffResult',
                'diffPdfNonNumericFingerprint(beforeItems)===diffPdfNonNumericFingerprint(afterItems)',
                'isDiffNumericText', "source:'pdf-text'",
                'const textPromise=beforeRaw&&afterRaw', 'numericOnly',
-               'selectDiffSemanticResult', "mode:'numeric'", 'rowStructureAdjusted',
-               '数値が変わった箇所だけを強調しました。']:
+               'selectDiffSemanticResult', "mode:'numeric'", 'rowStructureAdjusted']:
     if needed not in appjs:
         raise SystemExit(f'PDF numeric-text diff supplement missing: {needed}')
 for forbidden in ['groupChangedDiffPdfText', 'diffPdfTextGroupHasNumericChange',
@@ -2140,7 +2138,7 @@ for needed in ['dedupeDiffPdfRowItems', 'groupDiffPdfTextRows', 'matchDiffPdfTex
                'const pageRowDiff=buildTextRowStructureDiffResult',
                'diffPdfTextItemsInBand', 'buildLocalizedTextRowStructureDiffResult', 'diffHasLocalizedRowSignal',
                'pageRowDiff.confident?pageRowDiff:buildLocalizedTextRowStructureDiffResult',
-               'rowDiff.confident&&diffHasLocalizedRowSignal', '追加・削除された行だけを強調しました。']:
+               'rowDiff.confident&&diffHasLocalizedRowSignal', "mode:'row'"]:
     if needed not in appjs:
         raise SystemExit(f'semantic PDF row localization missing: {needed}')
 for needed in ['rowStructureAdjusted', 'rowStructureRegions',
@@ -2209,9 +2207,35 @@ for needed in ['diffPdfTextLayoutFingerprint', 'diffRegionOverlapsPdfText',
                'shouldSuppressDiffRasterNoise', 'diffRegionOverlapsPdfText(region,beforeItems',
                'changedRatio>=.001', 'density<.035', 'changedRatio<.00055&&density<.12',
                'if(!regions.length&&!noiseSuppressed)',
-               '微小な画像描画ノイズを除外しました。']:
+               'このページに目に見える変更はありません。']:
     if needed not in appjs:
         raise SystemExit(f'identical-layout raster noise guard missing: {needed}')
+
+
+# 2026-11-02 diff screen: no calculation notes, message box never over the images
+explain_message=re.search(r"message\s*[:=]\s*'[^']*照合し", appjs)
+if explain_message:
+    raise SystemExit(f'diff calculation note must not be shown: {explain_message.group(0)}')
+for forbidden in ['最も可能性の高い箇所を強調しています', '位置ずれを補正して差分を絞り込みました',
+                  '微小な画像描画ノイズを除外しました', '改ページによる移動だけのため強調を省略しました']:
+    if forbidden in appjs:
+        raise SystemExit(f'diff calculation note must not be shown: {forbidden}')
+for needed in ["mode:'document-reflow',regions:[],suppressRaster:true,message:'このページの変更は別のページにあります（改ページで移動しただけです）。'",
+               'このページに変更はありません。同じ原稿内の別ページに変更があります。',
+               '変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。']:
+    if needed not in appjs:
+        raise SystemExit(f'diff state message must remain: {needed}')
+diff_state_rules=re.findall(r'\.diff-state-message\{([^}]*)\}', css)
+if not diff_state_rules or not any('position:static' in rule for rule in diff_state_rules):
+    raise SystemExit('diff state message must stay in normal flow')
+for rule in diff_state_rules:
+    for forbidden in ['position:absolute', 'position:fixed', 'inset:', 'z-index']:
+        if forbidden in rule:
+            raise SystemExit(f'diff state message must not overlay the PDF images: {forbidden}')
+for needed in ["assert.equal(semantic.message,''", 'must not show a calculation note over the diff',
+               "docReflowSemantic.mode,'document-reflow'"]:
+    if needed not in diff_regression:
+        raise SystemExit(f'diff calculation note regression missing: {needed}')
 
 
 # 2026-08-04 unrestricted worksheet names and assignment inbox -------------
