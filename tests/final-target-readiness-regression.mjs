@@ -305,7 +305,9 @@ const flush = () => new Promise(r => setTimeout(r, 0));
 // /api/state の finalReadiness は ecm/bod/dmm だけで、カスタム一式の readiness が消える。
 // readinessResponses: 呼ばれた順に返す readiness 応答（'error' は通信失敗）。
 // retryDelayMs: readiness-failed を取り直すまでの待ち時間（本物は1.2秒。テストでは短くする）。
-function stateHarness(readinessResponses = [], { retryDelayMs = 0 } = {}) {
+// initialReady: 差し替え前に持っていた readiness（既定は「最新」）。
+// onReadinessRequest: readiness を要求した時点で呼ぶ（その時点の state を調べる）。
+function stateHarness(readinessResponses = [], { retryDelayMs = 0, initialReady = { status: 'built', displayState: 'built' }, onReadinessRequest = null } = {}) {
   const pack = { packId: 'custom1' };
   const calls = [];
   const observed = [];
@@ -313,6 +315,7 @@ function stateHarness(readinessResponses = [], { retryDelayMs = 0 } = {}) {
   const api = url => {
     calls.push(url);
     if (url.includes('readiness')) {
+      onReadinessRequest?.();
       const next = queue.length ? queue.shift() : { targets: { 'ja-main': { status: 'built', displayState: 'built' } } };
       return next === 'error' ? Promise.reject(new Error('network')) : Promise.resolve(JSON.parse(JSON.stringify(next)));
     }
@@ -338,10 +341,15 @@ function stateHarness(readinessResponses = [], { retryDelayMs = 0 } = {}) {
     showMessage() {},
     $: () => null,
     asArray: value => (Array.isArray(value) ? value : value == null ? [] : [value]),
+    initialReady,
+    historyPanelsInitialized: false,
+    snapshotHistoryResponseCache: new Map(), diffDetailResponseCache: new Map(),
+    loadHistoryPanels() {},
+    userFriendlyError: message => String(message || ''),
   };
   const names = Object.keys(env);
   const factory = new Function(...names, [
-    'let state = { finalReadiness: { custom1: { volumes: { "ja-main": { status: "built", displayState: "built" } } } } }, finalPreflightCheckedAt = "";',
+    'let state = { finalReadiness: { custom1: { volumes: { "ja-main": JSON.parse(JSON.stringify(initialReady)) } } } }, finalPreflightCheckedAt = "";',
     'const finalReadinessInFlight = new Map();',
     `let finalReadinessRetryDelayMs = ${retryDelayMs};`,
     'let finalReadinessEpoch = 0, updateMonitorInFlight = false, renderJobActive = false, activeFinalJobId = "", lastUpdateScanAt = 0, packReviewState = null;',
@@ -358,7 +366,9 @@ function stateHarness(readinessResponses = [], { retryDelayMs = 0 } = {}) {
     'async ' + extractFunction('loadFinalReadiness'),
     'async ' + extractFunction('scanUpdatesSilently'),
     'async ' + extractFunction('performPackReviewAction'),
-    'return { scanUpdatesSilently, performPackReviewAction, loadFinalReadiness, advanceFinalReadinessEpoch, finalReadinessLoaded, volume: () => state.finalReadiness.custom1?.volumes?.["ja-main"] };',
+    extractFunction('stampFinalReadinessReceived'),
+    'async ' + extractFunction('refresh'),
+    'return { scanUpdatesSilently, performPackReviewAction, refresh, loadFinalReadiness, advanceFinalReadinessEpoch, finalReadinessLoaded, volume: () => state.finalReadiness.custom1?.volumes?.["ja-main"] };',
   ].join('\n'));
   return { calls, observed, logs, switchPack: id => { pack.packId = id; }, ...factory(...names.map(name => env[name])) };
 }
@@ -383,6 +393,41 @@ for (const name of ['scanUpdatesSilently', 'scanAndRefresh', 'performPackReviewA
   const body = extractFunction('refreshFinalPreflight');
   assert.ok(body.indexOf('advanceFinalReadinessEpoch()') < body.indexOf('normalizeStatePayload('));
   assert.ok(body.indexOf('await loadFinalPanels(') < body.indexOf('loadFiles('), '差し替えと readiness の取得の間に原稿一覧の読込を挟まない');
+}
+
+// ---- 普通の refresh（PDF作成・登録・解除のあと）: 引き継いだ古い readiness のまま描かない ----
+// 引き継ぎだけで読み直さないと、PDF作成前の blocker（stale-content）が残り、提出用PDFを開いた
+// 最初の描画で「出力先」が danger になってから、画面に入ったときの読込で直っていた。
+const staleBlocked = { status: 'not-built', displayState: 'blocked', canBuild: false, itemCount: 1, pageCount: 0, blockers: [{ code: 'stale-content', message: '元原稿が更新されています。先に変換PDFを作成してください。' }] };
+{
+  const h = stateHarness([], { initialReady: staleBlocked });
+  await h.refresh(); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 1, 'refresh は readiness を取り直す');
+  assert.ok(h.observed.length > 0, 'refresh は描き直す');
+  assert.ok(h.observed.every(ready => !ready.blockers?.length), '取り直す前の古い blocker で描かない');
+  assert.equal(h.volume().displayState, 'built', '取り直した状態で描く');
+  assert.ok(h.finalReadinessLoaded());
+}
+{
+  // 取り直しの間、ほかの描画には引き継いだ表示を見せる（0ページ・確認中に戻さない）。
+  let duringRequest = null;
+  const h = stateHarness([], { initialReady: staleBlocked, onReadinessRequest: () => { duringRequest = h.volume()?.displayState; } });
+  await h.refresh(); await flush();
+  assert.equal(duringRequest, 'blocked', '取り直しが届くまでは引き継いだ entry を残す');
+  assert.equal(h.volume().displayState, 'built');
+}
+{
+  // render:false の呼び出し元（出力完了）は自分で force の読込をするので、二重に取らない。
+  const h = stateHarness([], { initialReady: staleBlocked });
+  await h.refresh({ render: false }); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 0, 'render:false では取り直さない');
+  assert.equal(h.observed.length, 0);
+}
+{
+  const h = stateHarness([], { initialReady: staleBlocked });
+  await h.refresh({ authoritativeReadiness: true }); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 1, 'authoritative でも1回だけ取り直す');
+  assert.ok(h.observed.every(ready => !ready.blockers?.length));
 }
 
 // ---- readiness-failed が1回だけ返る: 1回だけ取り直し、その間 danger を描かない ----

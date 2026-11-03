@@ -1309,7 +1309,11 @@ async function refresh(options) {
     // Only conflict/restore/settings callers request an authoritative
     // readiness boundary.  Ordinary refresh keeps the previous card during
     // the state GET to avoid reintroducing a 0-page flash.
-    if(authoritativeReadiness)advanceFinalReadinessEpoch();
+    // 引き継いだ readiness は表示のつなぎで、読み直さないと古いまま残る。PDF作成・登録・解除のあとも
+    // 作成前の blocker（stale-content など）が残り、提出用PDFを開いた最初の描画だけ「出力先」が danger になっていた。
+    // 描く呼び出しでは、区切り番号を進めて取り直し、届いてから描く（render:false の呼び出し元は自分で取り直す）。
+    const revalidateReadiness=authoritativeReadiness||options.render!==false;
+    if(revalidateReadiness)advanceFinalReadinessEpoch();
     state = normalizeStatePayload(await api('/api/state'));
     const serverReadinessKeys=Object.keys(state?.finalReadiness||{});
     if (carriedReadiness) {
@@ -1322,7 +1326,7 @@ async function refresh(options) {
       state.finalReadiness = Object.assign({}, retained, state.finalReadiness || {});
     }
     serverReadinessKeys.forEach(key=>stampFinalReadinessReceived(key));
-    if(authoritativeReadiness) await loadFinalReadiness({render:false});
+    if(revalidateReadiness) await loadFinalReadiness({render:false});
     const reloadHistory = activeView === 'history' && historyPanelsInitialized;
     snapshotHistoryResponseCache.clear();
     diffDetailResponseCache.clear();
