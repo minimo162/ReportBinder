@@ -263,6 +263,31 @@ function Get-DiffPageMappings($BeforePages, $AfterPages, [string]$ItemKind, $Unc
     return @($reverse)
 }
 
+# 呼び出し側が比べるページの組（pagePairs: [{ beforePageNumber, afterPageNumber }]、片側は 0）を
+# 決めているときの対応付け。全ページの対応付け（Get-DiffPageMappings）を省き、その組だけを返す。
+# 変更点PDFは、行の組（前回 pN ↔ 今回 pM）がアーカイブで決まっているので、シートの全ページを
+# 見比べる必要が無い。範囲外・重複の組は捨てる。pagePairs が無い（$null）ときは $null を返す。
+function Get-RequestedPageMappings($Item, [int]$BeforeCount, [int]$AfterCount) {
+    $property = $Item.PSObject.Properties['pagePairs']
+    if ($null -eq $property -or $null -eq $property.Value) { return $null }
+    $mappings = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($pair in @($property.Value)) {
+        if ($null -eq $pair) { continue }
+        $beforeNumber = 0; $afterNumber = 0
+        try { $beforeNumber = [int]$pair.beforePageNumber; $afterNumber = [int]$pair.afterPageNumber } catch { continue }
+        $beforeIndex = $(if ($beforeNumber -ge 1 -and $beforeNumber -le $BeforeCount) { $beforeNumber - 1 } else { -1 })
+        $afterIndex = $(if ($afterNumber -ge 1 -and $afterNumber -le $AfterCount) { $afterNumber - 1 } else { -1 })
+        if ($beforeIndex -lt 0 -and $afterIndex -lt 0) { continue }
+        $key = [string]$beforeIndex + '|' + [string]$afterIndex
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $kind = $(if ($beforeIndex -lt 0) { 'added' } elseif ($afterIndex -lt 0) { 'removed' } else { 'modified' })
+        [void]$mappings.Add((New-DiffPageMapping $beforeIndex $afterIndex $kind 'requested-pair'))
+    }
+    return ,@($mappings)
+}
+
 try {
     $lines = @()
     $cachedPagesById = @{}
@@ -342,7 +367,10 @@ try {
             $afterPages = @($cached.after)
             if ($beforePages.Count -eq 0) { $beforePages = @(Get-RasterPages $itemRasterDir 'before') }
             if ($afterPages.Count -eq 0) { $afterPages = @(Get-RasterPages $itemRasterDir 'after') }
-            $pageMappings = @(Get-DiffPageMappings $beforePages $afterPages $kind $unchangedPageSet)
+            $requestedMappings = Get-RequestedPageMappings $item $beforePages.Count $afterPages.Count
+            $pairsRequested = ($null -ne $requestedMappings)
+            if ($pairsRequested) { $pageMappings = @($requestedMappings) }
+            else { $pageMappings = @(Get-DiffPageMappings $beforePages $afterPages $kind $unchangedPageSet) }
             if ($pageMappings.Count -eq 0) { throw '比較できるPDFページがありません。' }
             $outputDirectory = [IO.Path]::GetFullPath([string]$item.outputDirectory)
             if (-not (Test-Path -LiteralPath $outputDirectory)) { New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null }
@@ -357,8 +385,10 @@ try {
                 if ($pageKind -eq 'unchanged') { $unchangedPagesSkipped++ }
                 $pageNumber = $i + 1
                 $pageMappingByNumber[$pageNumber] = $mapping
-                $copyBefore = (-not $beforePersistent) -or [string]::IsNullOrWhiteSpace($beforeImage)
-                $copyAfter = (-not $afterPersistent) -or [string]::IsNullOrWhiteSpace($afterImage)
+                # 組を指定した呼び出し（変更点PDF）は、永続の画像フォルダーを読むだけにして、使う画像は
+                # 必ず outputDirectory へ複製する（呼び出し側はそこから相対パスで読む）。
+                $copyBefore = $pairsRequested -or (-not $beforePersistent) -or [string]::IsNullOrWhiteSpace($beforeImage)
+                $copyAfter = $pairsRequested -or (-not $afterPersistent) -or [string]::IsNullOrWhiteSpace($afterImage)
                 if ($beforePersistent -and -not [string]::IsNullOrWhiteSpace($beforeImage)) { $reusedRasterPageAssets++ }
                 if ($afterPersistent -and -not [string]::IsNullOrWhiteSpace($afterImage)) { $reusedRasterPageAssets++ }
                 $pageRequests.Add([ReportBinderDiffBatchPageRequest]@{

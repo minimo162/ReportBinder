@@ -15709,10 +15709,39 @@ function Get-PackChangeReportImageFile([string]$Directory, [string]$ItemId, [str
     return [pscustomobject][ordered]@{ src = ('img/' + $ItemId + '/' + $FileName); width = [int]$size.width; height = [int]$size.height }
 }
 
+# 版の見た目の解析（PdfPageAnalyzer）が保存したページ画像（raster-v1\<シート>\page-NNNN.png）を、
+# 詳細ページの画像の元に使えるか。使えるのは、解析の記録（visual-hashes.json）が今の詳細ページと同じ
+# 描き方（profileVersion）・解像度・色・PDFBox で作られ、そのシートが解析できていて、ページ数がわかるときだけ（記録は解析を
+# 終えてから書かれるので、画像はそろっている）。使えなければ $null（バッチが変換PDFから画像化する）。
+# 画像の枚数がページ数と合わないフォルダーは、バッチ側（Get-CachedRasterPages）が使わない。
+function Get-PackChangeReportRasterCache([string]$Language, $Side) {
+    if ($null -eq $Side) { return $null }
+    try {
+        $hashes = Get-VisualHashes $Language ([string]$Side.workbookId) ([string]$Side.snapshotId) ([string]$Side.versionId)
+        if ($null -eq $hashes) { return $null }
+        $hashProfile = Get-DataProperty $hashes 'visualHashProfile' $null
+        $current = Get-VisualHashProfile
+        if ($null -eq $hashProfile -or
+            (Get-IntDataProperty $hashProfile 'dpi' 0) -ne [int]$Script:PackChangeReportImageDpi -or
+            (Get-IntDataProperty $hashProfile 'profileVersion' 0) -ne [int]$current.profileVersion -or
+            [string](Get-DataProperty $hashProfile 'colorMode' '') -ne 'RGB' -or
+            [string](Get-DataProperty $hashProfile 'pdfBoxVersion' '') -ne [string]$current.pdfBoxVersion) { return $null }
+        $sheet = @(Get-Array (Get-DataProperty $hashes 'sheets' @()) | Where-Object { [string](Get-DataProperty $_ 'sheetName' '') -eq [string]$Side.sheetName } | Select-Object -First 1)
+        if ($sheet.Count -eq 0 -or [string](Get-DataProperty $sheet[0] 'status' '') -ne 'ok') { return $null }
+        $pageCount = Get-IntDataProperty $sheet[0] 'pageCount' 0
+        if ($pageCount -le 0) { return $null }
+        $directory = Get-RenderRasterSheetDir $Language ([string]$Side.workbookId) ([string]$Side.snapshotId) ([string]$Side.versionId) ([string]$Side.sheetName)
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return $null }
+        return [pscustomobject][ordered]@{ directory = $directory; pageCount = $pageCount }
+    } catch { return $null }
+}
+
 # 詳細ページの前回・今回の画像を、差分画面のサーバー側の画像化（Invoke-DiffImageBatchGeneration・
 # PdfBatchRasterizer）で作業フォルダーの img\ に作る。原稿の変換PDFは Resolve-DiffContentPdfPath で
 # アーカイブに記録された版を厳密に引く（別の版に代えない）。同じ原稿・シートの組み合わせは1件にまとめる。
 # あわせて、前後が両方あるページの画素比較の枠（予備。画面の結果が無い行に使う）も返す。
+# 比べるのは行の組（前回 pN ↔ 今回 pM。pagePairs）だけで、シートの全ページの対応付け・比較はしない。
+# 版の解析が保存したページ画像があれば、それを読んで画像化を省く（Get-PackChangeReportRasterCache）。
 # 返すのは rowKey → { before, after, fallback }（作れなかったものは $null）。失敗しても例外にしない
 # （画像の無い行は一覧だけになる）。lease は画像を作るあいだだけ持ち、作り終えたら外す（画像は複製済み）。
 function Invoke-PackChangeReportImages([string]$Language, $Targets, [string]$WorkDir, [string]$JobId) {
@@ -15755,15 +15784,28 @@ function Invoke-PackChangeReportImages([string]$Language, $Targets, [string]$Wor
                 New-Item -ItemType Directory -Path $itemDir -Force | Out-Null
                 $kind = 'modified'
                 if (-not $plan.beforePdf) { $kind = 'added' } elseif (-not $plan.afterPdf) { $kind = 'removed' }
-                [void]$items.Add([ordered]@{
+                # 永続の画像フォルダーは読むだけ（pagePairs を渡すと、使う画像はバッチが作業フォルダーへ複製し、
+                # report.html から相対パスで読む）。
+                $beforeCache = $(if ($plan.beforePdf) { Get-PackChangeReportRasterCache $Language $plan.before } else { $null })
+                $afterCache = $(if ($plan.afterPdf) { Get-PackChangeReportRasterCache $Language $plan.after } else { $null })
+                $item = [ordered]@{
                     id = $itemId; beforePdf = [string]$plan.beforePdf; afterPdf = [string]$plan.afterPdf
-                    # 永続の画像フォルダーは渡さない（画像を作業フォルダーへ複製させ、report.html から相対パスで読む）。
-                    beforeRasterDirectory = ''; afterRasterDirectory = ''; beforePageCount = 0; afterPageCount = 0
+                    beforeRasterDirectory = $(if ($null -ne $beforeCache) { [string]$beforeCache.directory } else { '' })
+                    afterRasterDirectory = $(if ($null -ne $afterCache) { [string]$afterCache.directory } else { '' })
+                    beforePageCount = $(if ($null -ne $beforeCache) { [int]$beforeCache.pageCount } else { 0 })
+                    afterPageCount = $(if ($null -ne $afterCache) { [int]$afterCache.pageCount } else { 0 })
                     unchangedPageNumbers = @(); outputDirectory = $itemDir; kind = $kind
-                })
-                $itemByKey[$itemKey] = [pscustomobject]@{ id = $itemId; dir = $itemDir }
+                    pagePairs = (New-Object System.Collections.ArrayList)
+                }
+                [void]$items.Add($item)
+                $itemByKey[$itemKey] = [pscustomobject]@{ id = $itemId; dir = $itemDir; request = $item }
             }
             $plan.item = $itemByKey[$itemKey]
+            # 行の組。変換PDFの無い側は 0（増えた・なくなった側だけの画像）。
+            [void]$plan.item.request.pagePairs.Add([ordered]@{
+                beforePageNumber = $(if ($plan.beforePdf) { [int]$plan.before.pageNumber } else { 0 })
+                afterPageNumber = $(if ($plan.afterPdf) { [int]$plan.after.pageNumber } else { 0 })
+            })
         }
         if ($items.Count -eq 0) { return $result }
         $batch = Invoke-DiffImageBatchGeneration @($items) ([int]$Script:PackChangeReportImageDpi)
@@ -15783,8 +15825,11 @@ function Invoke-PackChangeReportImages([string]$Language, $Targets, [string]$Wor
                 $found = @($pages | Where-Object { (Get-IntDataProperty $_ 'afterPageNumber' 0) -eq [int]$plan.after.pageNumber } | Select-Object -First 1)
                 if ($found.Count -gt 0) { $afterImage = Get-PackChangeReportImageFile ([string]$plan.item.dir) ([string]$plan.item.id) ([string](Get-DataProperty $found[0] 'afterFile' '')) }
             }
-            if ([string]$plan.target.mode -eq 'diff' -and $null -ne $beforeImage -and $null -ne $afterImage) {
-                # 予備の枠は、行と同じ前後のページどうしを比べた結果のときだけ使う。
+            # 予備の枠は、行と同じ前後のページどうしを比べた結果のときだけ使う。原稿のページ数が変わった行は使わない
+            # （シートの途中でページが増減すると、行の組（項目内の順番どうし）は中身のずれた2枚になり、画素の差が
+            # ほぼ全面の枠になる。以前はシート全体の対応付けが別の組を作るので使われなかった。画面の結果があればそちら）。
+            if ([string]$plan.target.mode -eq 'diff' -and $null -ne $beforeImage -and $null -ne $afterImage -and
+                -not [bool](Get-DataProperty $plan.target.row 'partCountChanged' $false)) {
                 $pair = @($pages | Where-Object { (Get-IntDataProperty $_ 'beforePageNumber' 0) -eq [int]$plan.before.pageNumber -and (Get-IntDataProperty $_ 'afterPageNumber' 0) -eq [int]$plan.after.pageNumber } | Select-Object -First 1)
                 if ($pair.Count -gt 0) { $fallback = $pair[0] }
             }

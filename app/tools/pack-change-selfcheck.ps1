@@ -728,22 +728,31 @@ function Resolve-DiffContentPdfPath([string]$Language, [string]$WorkbookId, [str
     [void]$Script:FakePdfCalls.Add(($WorkbookId + '|' + $SnapshotId + '|' + $VersionId + '|' + $SheetName))
     return ('C:\fake\' + $VersionId + '-' + $SheetName + '.pdf')
 }
-# PdfBatchRasterizer の代わり。シートA は2ページ（2ページ目の今回は半分の大きさ＝用紙サイズ違い）、シートN は1ページ。
+# diff-image-batch.ps1 の代わり。pagePairs（行の組）で頼まれたページだけを、頼まれた順に 1, 2, … と番号を振って返す
+# （本物と同じ契約）。シートA の2ページ目の今回は半分の大きさ（用紙サイズ違い）。頼まれた中身は FakeBatchItems に残す。
+$Script:FakeBatchItems = New-Object System.Collections.ArrayList
 function Invoke-DiffImageBatchGeneration($Items, [int]$Dpi = 0) {
     $Script:FakeBatchDpi = $Dpi
+    foreach ($item in @($Items)) { [void]$Script:FakeBatchItems.Add(((ConvertTo-Json -InputObject $item -Depth 10) | ConvertFrom-Json)) }
     if ($Script:FakeBatchMode -eq 'throw') { throw '差分画像の一括生成に失敗しました。' }
     $results = @()
     foreach ($item in @($Items)) {
         $dir = [string]$item.outputDirectory
         $pages = @()
-        if ([string]$item.kind -eq 'modified') {
-            Write-FakePng (Join-Path $dir '0001-b.png') 1000 1400; Write-FakePng (Join-Path $dir '0001-a.png') 1000 1400
-            Write-FakePng (Join-Path $dir '0002-b.png') 1000 1400; Write-FakePng (Join-Path $dir '0002-a.png') 500 700
-            $pages += [pscustomobject]@{ pageNumber = 1; width = 1000; height = 1400; beforePageNumber = 1; afterPageNumber = 1; beforeFile = '0001-b.png'; afterFile = '0001-a.png'; status = 'ready'; regions = @() }
-            $pages += [pscustomobject]@{ pageNumber = 2; width = 1000; height = 1400; beforePageNumber = 2; afterPageNumber = 2; beforeFile = '0002-b.png'; afterFile = '0002-a.png'; status = 'ready'; regions = @([pscustomobject]@{ kind = 'modified'; x = 0.1; y = 0.2; width = 0.3; height = 0.05 }) }
-        } else {
-            Write-FakePng (Join-Path $dir '0001-a.png') 1000 1400
-            $pages += [pscustomobject]@{ pageNumber = 1; width = 1000; height = 1400; beforePageNumber = 0; afterPageNumber = 1; beforeFile = '0001-b.png'; afterFile = '0001-a.png'; status = 'ready'; regions = @() }
+        $number = 0
+        foreach ($pair in @($item.pagePairs)) {
+            $number++
+            $stem = $number.ToString('0000')
+            $b = [int]$pair.beforePageNumber; $a = [int]$pair.afterPageNumber
+            $beforeFile = ''; $afterFile = ''
+            if ($b -gt 0) { $beforeFile = $stem + '-b.png'; Write-FakePng (Join-Path $dir $beforeFile) 1000 1400 }
+            if ($a -gt 0) {
+                $afterFile = $stem + '-a.png'
+                if ([string]$item.kind -eq 'modified' -and $a -eq 2) { Write-FakePng (Join-Path $dir $afterFile) 500 700 } else { Write-FakePng (Join-Path $dir $afterFile) 1000 1400 }
+            }
+            $regions = @()
+            if ($b -eq 2 -and $a -eq 2) { $regions = @([pscustomobject]@{ kind = 'modified'; x = 0.1; y = 0.2; width = 0.3; height = 0.05 }) }
+            $pages += [pscustomobject]@{ pageNumber = $number; width = 1000; height = 1400; beforePageNumber = $b; afterPageNumber = $a; beforeFile = $beforeFile; afterFile = $afterFile; status = 'ready'; regions = @($regions) }
         }
         $results += [pscustomobject]@{ id = [string]$item.id; ok = $true; pages = @($pages) }
     }
@@ -773,12 +782,19 @@ Assert-ChangeTest ([int]$browserRun.meta.reportVersion -eq 2 -and [string]$brows
 Assert-ChangeTest ([string]$browserRun.status.report.detailSource -eq 'browser') 'The made report does not report where its frames came from.'
 Assert-ChangeTest ($browserRun.html.Contains('<li class="item">① 変更: 1,234 → &lt;b&gt;1,240&lt;/b&gt;</li>') -and -not $browserRun.html.Contains('<b>1,240</b>')) 'The detail page does not list the changed text (escaped).'
 Assert-ChangeTest ($browserRun.html.Contains('style="left:10%;top:10%;width:20%;height:10%"') -and $browserRun.html.Contains('style="left:20%;top:20%;width:40%;height:20%"')) 'Browser regions were not converted to the picture of each side (paper size changed).'
-Assert-ChangeTest ($browserRun.html.Contains('<img src="img/i0000/0002-b.png"') -and $browserRun.html.Contains('<img src="img/i0000/0002-a.png"') -and $browserRun.html.Contains('今回だけにあるページ（詳細 p.4）') -and $browserRun.html.Contains('（詳細 p.3）')) 'The detail pages or their page numbers are missing.'
+Assert-ChangeTest ($browserRun.html.Contains('<img src="img/i0000/0001-b.png"') -and $browserRun.html.Contains('<img src="img/i0000/0001-a.png"') -and $browserRun.html.Contains('今回だけにあるページ（詳細 p.4）') -and $browserRun.html.Contains('（詳細 p.3）')) 'The detail pages or their page numbers are missing.'
 Assert-ChangeTest (-not $browserRun.html.Contains('自動で検出した範囲')) 'Browser regions were labelled as automatically detected.'
 # 画像は詳細ページ用の解像度で、記録された版（v7・v8）の変換PDFから作り、lease は作り終えたら外す。
 Assert-ChangeTest ([int]$Script:FakeBatchDpi -eq [int]$Script:PackChangeReportImageDpi) 'The detail pictures were not rendered at the report resolution.'
 Assert-ChangeTest ($Script:FakePdfCalls -contains 'wb_a|s7|v7|シートA' -and $Script:FakePdfCalls -contains 'wb_a|s8|v8|シートA' -and $Script:FakePdfCalls -contains 'wb_a|s8|v8|シートN') "The pictures were not made from the archived versions: $(@($Script:FakePdfCalls) -join ', ')"
 Assert-ChangeTest ((@($Script:FakeLeaseVersions | Sort-Object -Unique) -join ',') -eq 's7|v7,s8|v8' -and [int]$Script:FakeLeaseReleased -eq 2) "The versions were not leased while the pictures were made: $(@($Script:FakeLeaseVersions) -join ',') released=$($Script:FakeLeaseReleased)"
+# 画像化・比較は行の組だけ（シートA は前回 p.2 ↔ 今回 p.2、シートN は今回 p.1 だけ）。シートの全ページは頼まない。
+# 版の解析の画像の記録（visualHashProfile）が無い版は、保存画像を使わずに変換PDFから画像化する。
+$batchA = @($Script:FakeBatchItems | Where-Object { [string]$_.afterPdf -like '*v8-シートA.pdf' } | Select-Object -Last 1)
+$batchN = @($Script:FakeBatchItems | Where-Object { [string]$_.afterPdf -like '*v8-シートN.pdf' } | Select-Object -Last 1)
+Assert-ChangeTest ($batchA.Count -eq 1 -and (@($batchA[0].pagePairs | ForEach-Object { '{0}-{1}' -f $_.beforePageNumber, $_.afterPageNumber }) -join ',') -eq '2-2') "The batch was not asked for the row's page pair only: $(ConvertTo-Json -InputObject $batchA -Depth 6 -Compress)"
+Assert-ChangeTest ($batchN.Count -eq 1 -and [string]$batchN[0].kind -eq 'added' -and (@($batchN[0].pagePairs | ForEach-Object { '{0}-{1}' -f $_.beforePageNumber, $_.afterPageNumber }) -join ',') -eq '0-1') "An added page was not asked as an after-only pair: $(ConvertTo-Json -InputObject $batchN -Depth 6 -Compress)"
+Assert-ChangeTest ([string]$batchA[0].beforeRasterDirectory -eq '' -and [string]$batchA[0].afterRasterDirectory -eq '' -and [int]$batchA[0].beforePageCount -eq 0) 'Saved page pictures were used for versions whose analysis did not record how they were drawn.'
 # 待ち時間の上限に画像の枚数（前回・今回の2枚＋増えたページの1枚）を数える。
 Assert-ChangeTest ([int]$Script:EdgeCalls[$Script:EdgeCalls.Count - 1].timeout -eq (Get-PackChangeReportTimeoutSeconds @($detailJobSummary.pages).Count 3)) 'The report timeout does not count the detail pictures.'
 
@@ -799,6 +815,49 @@ Assert-ChangeTest ([int]$failedImages.meta.detailPageCount -eq 0 -and [string]$f
 Assert-ChangeTest (@($failedImages.status.warnings).Count -eq 1 -and [string]@($failedImages.status.warnings)[0].code -eq 'detail-images' -and [int]$Script:FakeLeaseReleased -eq 8) "The picture failure was not kept as a warning or the leases were not released: released=$($Script:FakeLeaseReleased)"
 $Script:FakeBatchMode = 'ok'
 
+# 版の解析が保存したページ画像（raster-v1）を使うのは、記録が同じ解像度・色・PDFBox で、シートが解析でき、
+# ページ数がわかり、フォルダーがあるときだけ。どれか欠ければ $null（変換PDFから画像化する）。
+function Write-TestRasterHashes([string]$Snapshot, [string]$Version, [hashtable]$Sheets, $HashProfile, [string]$Status = 'ok') {
+    $list = @()
+    foreach ($name in @($Sheets.Keys)) { $list += [ordered]@{ sheetName = [string]$name; status = $Status; pageCount = @($Sheets[$name]).Count; pageHashes = @($Sheets[$name]) } }
+    $value = [ordered]@{ schemaVersion = 1; sheets = @($list) }
+    if ($null -ne $HashProfile) { $value.visualHashProfile = $HashProfile }
+    Write-JsonFile (Join-Path (Get-RenderRecordDir 'ja' 'wb_a' $Snapshot $Version) 'visual-hashes.json') $value
+    $Script:VisualHashCache.Clear()
+}
+function Copy-TestProfile($HashProfile, [string]$Name, $Value) {
+    $copy = [ordered]@{}
+    foreach ($k in @($HashProfile.Keys)) { $copy[$k] = $HashProfile[$k] }
+    $copy[$Name] = $Value
+    return $copy
+}
+$rasterSide = [pscustomobject]@{ workbookId = 'wb_a'; snapshotId = 's7'; versionId = 'v7'; sheetName = 'シートA'; pageNumber = 2 }
+$rasterDir = Get-RenderRasterSheetDir 'ja' 'wb_a' 's7' 'v7' 'シートA'
+$goodProfile = Get-VisualHashProfile
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } $goodProfile
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures were used although the picture folder does not exist.'
+New-Item -ItemType Directory -Path $rasterDir -Force | Out-Null
+Write-FakePng (Join-Path $rasterDir 'page-0001.png') 1000 1400; Write-FakePng (Join-Path $rasterDir 'page-0002.png') 1000 1400
+$rasterCache = Get-PackChangeReportRasterCache 'ja' $rasterSide
+Assert-ChangeTest ($null -ne $rasterCache -and [string]$rasterCache.directory -eq $rasterDir -and [int]$rasterCache.pageCount -eq 2) "Saved page pictures of an analysed version were not offered: $(ConvertTo-Json -InputObject $rasterCache -Compress)"
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } (Copy-TestProfile $goodProfile 'dpi' 150)
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures of another resolution were used.'
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } (Copy-TestProfile $goodProfile 'pdfBoxVersion' 'older')
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures drawn by another PDFBox were used.'
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } (Copy-TestProfile $goodProfile 'colorMode' 'GRAY')
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures of another color mode were used.'
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } $goodProfile 'error'
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures of a sheet that failed analysis were used.'
+Write-TestRasterHashes 's7' 'v7' @{ 'シートB' = @('K1','K2') } $goodProfile
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures of another sheet were used.'
+# 作成ジョブは、使える側だけ保存画像のフォルダーとページ数をバッチに渡す（今回の版 v8 は記録が無いので渡さない）。
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } $goodProfile
+$null = Invoke-DetailReportJob $jobDetails
+$cachedBatch = @($Script:FakeBatchItems | Where-Object { [string]$_.afterPdf -like '*v8-シートA.pdf' } | Select-Object -Last 1)
+Assert-ChangeTest ([string]$cachedBatch[0].beforeRasterDirectory -eq $rasterDir -and [int]$cachedBatch[0].beforePageCount -eq 2 -and [string]$cachedBatch[0].afterRasterDirectory -eq '' -and [int]$cachedBatch[0].afterPageCount -eq 0) "The job did not pass the saved page pictures of the analysed version: $(ConvertTo-Json -InputObject $cachedBatch -Depth 6 -Compress)"
+Write-TestVisualHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') }
+$Script:VisualHashCache.Clear()
+
 # 版 1 の作成済みPDF（ページごとの詳細の無いもの）は、作り直すまで作成済みにしない。
 $detailMetaPath = Join-Path $detailReportDir 'meta.json'
 $detailMeta = Read-JsonFile $detailMetaPath $null
@@ -807,6 +866,25 @@ Assert-ChangeTest ([bool](Get-PackChangeReportState @detailStateArgs $true).exis
 $detailMeta.reportVersion = 1
 Write-JsonFile $detailMetaPath $detailMeta
 Assert-ChangeTest (-not [bool](Get-PackChangeReportState @detailStateArgs $true).exists -and [string](Get-PackChangeReportState @detailStateArgs $true).reason -eq 'outdated') 'A report made before the detail pages (version 1) was still offered.'
+
+# 原稿のページ数が変わった行（シートの途中でページが増えた）は、行の組が中身のずれた2枚になるので、
+# サーバーの予備の枠を使わない（画面の結果が無ければ「特定できませんでした」）。
+New-Item -ItemType Directory -Path (Get-SnapshotDir 'ja' 'wb_a' 's9') -Force | Out-Null
+Write-TestVisualHashes 's9' 'v9' @{ 'シートA' = @('K1','K2X','K3') }
+$build9 = Set-ArchivedOutput 'ja-main' '%PDF-change-9' (New-TestManifest @((New-TestItem 'A' 3))) (New-TestMetadata @{ wb_a = 's9|v9' })
+$grownSummary = Get-PackChangeSummary 'ja' $packId 'main' $build7 $build9
+$grownRow = @($grownSummary.pages | Where-Object { [string]$_.rowKey -eq 'item:A#2' })[0]
+Assert-ChangeTest ((Get-Kinds $grownRow) -eq 'content' -and [bool]$grownRow.partCountChanged) "The grown-sheet fixture is wrong: $(Get-Kinds $grownRow)"
+Invoke-PackChangeReportJobCore ([pscustomobject]@{ jobId = $reportJobId; mode = 'ja'; packId = $packId; targetId = 'main'; fromBuildId = $build7; toBuildId = $build9; statusPath = $reportStatusPath; details = @() })
+$grownState = Read-JsonFile $reportStatusPath $null
+Assert-ChangeTest ([string]$grownState.status -eq 'completed') "The grown-sheet report job failed: $($grownState.message)"
+$grownHtml = [IO.File]::ReadAllText((Join-Path (Get-PackChangeReportDir 'ja' $packId 'main' $build7 $build9) 'report.html'), [Text.Encoding]::UTF8)
+Assert-ChangeTest (-not $grownHtml.Contains('自動で検出した範囲') -and $grownHtml.Contains('変更箇所を特定できませんでした')) 'Server frames were used for a row whose source page count changed.'
+# 描き方の版（profileVersion）が違う解析の画像も使わない。
+Write-TestRasterHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') } (Copy-TestProfile $goodProfile 'profileVersion' ([int]$goodProfile.profileVersion - 1))
+Assert-ChangeTest ($null -eq (Get-PackChangeReportRasterCache 'ja' $rasterSide)) 'Saved page pictures of another visual-hash profile were used.'
+Write-TestVisualHashes 's7' 'v7' @{ 'シートA' = @('K1','K2') }
+$Script:VisualHashCache.Clear()
 
 Write-Output 'pack-change selfcheck ok'
 '@

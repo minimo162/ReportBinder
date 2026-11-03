@@ -1677,7 +1677,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v223', 'style.css?v=20261030_v132']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v224', 'style.css?v=20261030_v132']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1731,7 +1731,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v223' not in html:
+if 'app.js?v=20261030_v224' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1757,7 +1757,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v223' not in html:
+if 'app.js?v=20261030_v224' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3600,9 +3600,19 @@ for needed in ["ConvertTo-PackChangeReportDetails (Get-DataProperty $Job 'detail
         raise SystemExit(f'the change report job must build the detail pages from checked details: {needed}')
 _report_images = _publish_server_function('Invoke-PackChangeReportImages')
 for needed in ['New-PackChangeReportLeases', 'Remove-PackChangeReportLeases', 'Resolve-DiffContentPdfPath', 'Invoke-DiffImageBatchGeneration @($items) ([int]$Script:PackChangeReportImageDpi)',
-               "beforeRasterDirectory = ''", "'beforePageNumber'", "'afterPageNumber'", 'finally']:
+               'pagePairs', 'Get-PackChangeReportRasterCache $Language $plan.before', "'beforePageNumber'", "'afterPageNumber'", 'finally']:
     if needed not in _report_images:
         raise SystemExit(f'the detail pictures must come from the archived versions under a lease: {needed}')
+# 速さ: 行の組（pagePairs）だけを比べ、版の解析が保存したページ画像は、同じ描き方のときだけ読む
+# （振る舞いは pack-change-selfcheck.ps1 と pdf-diff-corpus-selfcheck.ps1 が見る）。組を指定したバッチは、
+# 使う画像を必ず作業フォルダーへ複製する（report.html は作業フォルダーからの相対パスで読む）。
+_raster_cache = _publish_server_function('Get-PackChangeReportRasterCache')
+for needed in ['Get-VisualHashes', '$Script:PackChangeReportImageDpi', "'colorMode'", "'pdfBoxVersion'", "'status'", "'pageCount'", 'Get-RenderRasterSheetDir', '-PathType Container']:
+    if needed not in _raster_cache:
+        raise SystemExit(f'saved page pictures may only be reused when they were drawn the same way: {needed}')
+for needed in ['function Get-RequestedPageMappings', '$copyBefore = $pairsRequested -or', '$copyAfter = $pairsRequested -or']:
+    if needed not in batch_script:
+        raise SystemExit(f'requested page pairs must skip the full alignment and copy the pictures they use: {needed}')
 if 'Get-PreferredHistoryRenderVersion' in _report_images or 'Get-PreferredHistoryRenderVersion' in _publish_server_function('Get-PackChangeReportImageSides'):
     raise SystemExit('the detail pictures must not fall back to the newest render version')
 if _report_images.find('Remove-PackChangeReportLeases') < _report_images.find('finally'):
