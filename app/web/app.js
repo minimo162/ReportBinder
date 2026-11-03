@@ -1098,6 +1098,9 @@ const finalReadinessInFlight = new Map();
 // still in flight.  Keep an epoch so that the old response cannot repaint a
 // "最新" card after the mutation has already made its input stale.
 let finalReadinessEpoch = 0;
+// readiness-failed（変換PDFの置き換え中・ファイルロックなど）の取り直しまでの待ち時間。
+// すぐ取り直すと同じ一時的な失敗に当たり、「確認できませんでした」が一瞬出てから直っていた。
+let finalReadinessRetryDelayMs = 1200;
 // Repaint guards. Entering the final screen re-rendered every block even when
 // the data was identical, so the page visibly redrew ~250ms after it appeared.
 // Keep signatures off the DOM (a dataset attribute would carry the whole HTML).
@@ -1187,9 +1190,16 @@ async function loadFinalReadiness(options){
       for(const volume of failedVolumes)volumes[volume]=Object.assign({},volumes[volume],{loaded:false,readinessRetrying:true});
       state.finalReadiness[requestKey]={volumes,receivedAt:Date.now(),epoch:requestEpoch};
       if(options.render!==false&&activeView==='final'){renderGlobalHeader();renderNavBadges();renderStepBar();renderFinalOverview();renderVolumeLinks();}
-      // この要求を進行中から外してから取り直す（同じ世代の要求として使い回されないように）。
-      if(finalReadinessInFlight.get(requestKey)?.promise===promise)finalReadinessInFlight.delete(requestKey);
-      return loadFinalReadiness({render:options.render,readinessRetried:true});
+      // 一時的な失敗が解けるのを少し待ってから取り直す。待つ間はこの要求を進行中に残し、
+      // 同じ世代の呼び出しには取り直しまで含めたこの要求を返す。
+      return new Promise(resolve=>setTimeout(resolve,finalReadinessRetryDelayMs)).then(()=>{
+        // この要求を進行中から外してから取り直す（同じ世代の要求として使い回されないように）。
+        if(finalReadinessInFlight.get(requestKey)?.promise===promise)finalReadinessInFlight.delete(requestKey);
+        // 待つ間に一式の切り替え・区切り番号の更新があれば、取り直しは新しい読込に任せる
+        // （取り直し待ちの間は finalReadinessLoaded が false なので、次の描画でも読み直す）。
+        if(finalReadinessKey()!==requestKey||requestEpoch!==finalReadinessEpoch)return;
+        return loadFinalReadiness({render:options.render,readinessRetried:true});
+      });
     }
     state.finalReadiness[requestKey]={volumes,receivedAt:Date.now(),epoch:requestEpoch};
     finalPreflightCheckedAt=new Date().toLocaleString('sv-SE',{timeZone:'Asia/Tokyo'});
@@ -6248,14 +6258,21 @@ function applyPageMutationResult(payload){
   // produced the contradictory "ページ構成 0" / "未振り分け 1" view and let a
   // reordered lane continue to read "提出用PDFは最新です".
   const mutationState=payload?.state;
+  const readinessKey=finalReadinessKey();
+  // /api/v2/state はサーバーで確認に失敗した出力先を黙って落とす。欠けた entry を採ると、
+  // その出力先が確認中（既定値）のまま取り直しも起きずに止まるので、採らずに読み直す。
+  let incomingReadiness=mutationState?.finalReadiness&&typeof mutationState.finalReadiness==='object'?Object.assign({},mutationState.finalReadiness):null;
+  if(incomingReadiness&&readinessKey&&Object.prototype.hasOwnProperty.call(incomingReadiness,readinessKey)){
+    const incomingVolumes=incomingReadiness[readinessKey]?.volumes||{};
+    if(activeTargetVolumes().some(volume=>!incomingVolumes[volume]))delete incomingReadiness[readinessKey];
+  }
   if(mutationState&&typeof mutationState==='object'){
     if(mutationState.packProgress&&typeof mutationState.packProgress==='object')state.packProgress=mutationState.packProgress;
-    if(mutationState.finalReadiness&&typeof mutationState.finalReadiness==='object'){
-      state.finalReadiness=Object.assign({},state.finalReadiness||{},mutationState.finalReadiness);
+    if(incomingReadiness){
+      state.finalReadiness=Object.assign({},state.finalReadiness||{},incomingReadiness);
     }
   }
-  const readinessKey=finalReadinessKey();
-  const serverIncludedReadiness=!!(mutationState?.finalReadiness&&readinessKey&&Object.prototype.hasOwnProperty.call(mutationState.finalReadiness,readinessKey));
+  const serverIncludedReadiness=!!(incomingReadiness&&readinessKey&&Object.prototype.hasOwnProperty.call(incomingReadiness,readinessKey));
   if(serverIncludedReadiness)stampFinalReadinessReceived(readinessKey);
   else markFinalReadinessStaleForPageMutation(result.affectedVolumes);
   // 保存が通ったら、次の操作の基準を新しい指紋へ進める。ここを忘れると
