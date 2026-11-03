@@ -1,5 +1,15 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 提出用PDFを開いた最初の描画で「出力先」が一瞬 danger になるのを直した（2026-11-03）
+
+- 目的: #107 のあとも、提出用PDFの画面を開いた最初の描画だけ、出力前チェックの「出力先」が「N件の出力先に解消が必要な問題があります」（danger）になり、すぐ「準備完了」に戻っていた。
+- 原因: 普通の `refresh()`（PDF作成の完了・原稿の登録・登録解除・つなぎ直し・「更新」ボタンなど）は、0ページの一瞬表示を避けるため、前の readiness を引き継ぐだけで読み直していなかった。引き継いだ readiness には PDF作成前の blocker（`stale-content`・`content-missing` など）が残る。一方で原稿の状態は新しくなるので「変換PDF」は ok になり、「出力先」だけが danger になる。`finalReadinessLoaded()` は entry があれば true なので、ほかの描画でも取り直さない。提出用PDFの画面に入ったときの `loadFinalPanels` で初めて読み直され、その前の最初の描画が古い blocker のままだった。ヘッダー・ナビの「提出用PDFを出力できません」も同じ理由で、画面を開くまで残っていた。
+- `refresh()` で描く呼び出しは、区切り番号を進めてから readiness を取り直し、届いてから描くようにした。取り直しの間も引き継いだ entry は残すので、ほかの描画が0ページ・確認中に戻ることはない。`render:false` の呼び出し元（出力完了）は、そのあと自分で `loadFinalPanels({force:true})` をするので、二重には取らない。`authoritativeReadiness` の扱いは今までどおり。
+- 確かめたが原因ではなかったもの: `/api/state` の ecm/bod/dmm の readiness（`CheckOutputExists=$false`）は、公開の一式一覧（`Get-PublicPackList`）が組み込み一式を除くため、画面の `finalReadinessKey()` からは引かれない。`replaceStatePayload` の差し替え・確認中の数え方・readiness-failed の取り直しは #93・#107 で塞がっている。
+- `tests/final-target-readiness-regression.mjs` に、普通の `refresh()` が readiness を1回取り直し、古い blocker のまま描かないこと、取り直しの間は引き継いだ entry を残すこと、`render:false` では取り直さないことを足した（修正を戻すと落ちることを確かめた）。
+- サーバー（PowerShell）・`style.css`・`diff-worker.js` は変えていない。
+- RuntimeVersion `2026.10.30.35`、`app.js` `v20261030_v223` へ更新した。
+
 ## 出力前チェックの「確認できませんでした」の一瞬表示と、構成変更後の確認中の止まりを直した（2026-11-03）
 
 - 目的: 出力先に問題が無いのに、出力前チェックが一瞬「出力先の状態を確認できませんでした」（danger）や確認中になる残りの経路を塞ぐ。レビュー（`rb_preflight_flash_review.md`）の推奨1〜4は #93 で入っていることを現行コードで確かめた（確認中を件数に入れない `renderFinalPreflight`、`replaceStatePayload`、readiness-failed の1回の取り直し、欠けた出力先の扱い）。今回はその残り。
