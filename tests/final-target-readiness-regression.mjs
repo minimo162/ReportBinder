@@ -304,7 +304,9 @@ const flush = () => new Promise(r => setTimeout(r, 0));
 // ---- state をまるごと差し替えても、readiness が届く前に描かない ----
 // /api/state の finalReadiness は ecm/bod/dmm だけで、カスタム一式の readiness が消える。
 // readinessResponses: 呼ばれた順に返す readiness 応答（'error' は通信失敗）。
-function stateHarness(readinessResponses = []) {
+// retryDelayMs: readiness-failed を取り直すまでの待ち時間（本物は1.2秒。テストでは短くする）。
+function stateHarness(readinessResponses = [], { retryDelayMs = 0 } = {}) {
+  const pack = { packId: 'custom1' };
   const calls = [];
   const observed = [];
   const queue = readinessResponses.slice();
@@ -322,7 +324,7 @@ function stateHarness(readinessResponses = []) {
   const env = {
     api, observed, logs,
     configured: () => true,
-    activePackRecord: () => ({ packId: 'custom1' }),
+    activePackRecord: () => pack,
     activePackId: 'custom1', activePreset: 'custom1',
     targetVolume: id => id,
     activeTargetVolumes: () => ['ja-main'],
@@ -341,6 +343,7 @@ function stateHarness(readinessResponses = []) {
   const factory = new Function(...names, [
     'let state = { finalReadiness: { custom1: { volumes: { "ja-main": { status: "built", displayState: "built" } } } } }, finalPreflightCheckedAt = "";',
     'const finalReadinessInFlight = new Map();',
+    `let finalReadinessRetryDelayMs = ${retryDelayMs};`,
     'let finalReadinessEpoch = 0, updateMonitorInFlight = false, renderJobActive = false, activeFinalJobId = "", lastUpdateScanAt = 0, packReviewState = null;',
     // 描画した時点の出力先の状態を記録する。
     'function renderFinalOverview(){ observed.push(volumeReadiness("ja-main")); }',
@@ -355,9 +358,9 @@ function stateHarness(readinessResponses = []) {
     'async ' + extractFunction('loadFinalReadiness'),
     'async ' + extractFunction('scanUpdatesSilently'),
     'async ' + extractFunction('performPackReviewAction'),
-    'return { scanUpdatesSilently, performPackReviewAction, loadFinalReadiness, volume: () => state.finalReadiness.custom1?.volumes?.["ja-main"] };',
+    'return { scanUpdatesSilently, performPackReviewAction, loadFinalReadiness, advanceFinalReadinessEpoch, finalReadinessLoaded, volume: () => state.finalReadiness.custom1?.volumes?.["ja-main"] };',
   ].join('\n'));
-  return { calls, observed, logs, ...factory(...names.map(name => env[name])) };
+  return { calls, observed, logs, switchPack: id => { pack.packId = id; }, ...factory(...names.map(name => env[name])) };
 }
 
 for (const [label, run] of [['scanUpdatesSilently', h => h.scanUpdatesSilently({ withFiles: true })], ['performPackReviewAction', h => h.performPackReviewAction('approve', null)]]) {
@@ -428,6 +431,86 @@ const failed = { targets: { 'ja-main': { readinessError: true, canBuild: false, 
   const h = stateHarness([{ targets: {} }]);
   await h.loadFinalReadiness({ render: false }); await flush();
   assert.equal(h.volume().status, 'built', '取り直しで届けばそのまま使う');
+}
+
+// ---- readiness-failed の取り直しは少し待ってから（すぐ取り直すと同じ一時的な失敗に当たる） ----
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+{
+  assert.match(source, /let finalReadinessRetryDelayMs = [1-9]\d{2,};/, '取り直しまで数百ミリ秒以上待つ');
+  const h = stateHarness([failed], { retryDelayMs: 40 });
+  const done = h.loadFinalReadiness({ render: true });
+  await flush(); await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 1, '待ち時間の前には取り直さない');
+  assert.ok(targetReadinessPending(h.volume()), '待つ間は確認中');
+  assert.ok(!h.finalReadinessLoaded(), '待つ間は未取得として扱う');
+  // 待つ間に同じ世代で読み込んでも、新しい要求を重ねず取り直しを含む要求を使い回す。
+  const again = h.loadFinalReadiness({ render: false });
+  await done; await again; await flush();
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 2, '取り直しは1回だけ');
+  assert.equal(h.volume().status, 'built');
+  assert.ok(h.observed.every(ready => !ready.readinessError || targetReadinessPending(ready)), '取り直しの間に danger を描かない');
+}
+// 待つ間に区切り番号が進んだら、古い世代の取り直しはしない（新しい読込に任せる）。
+{
+  const h = stateHarness([failed], { retryDelayMs: 20 });
+  const done = h.loadFinalReadiness({ render: false });
+  await flush(); await flush();
+  h.advanceFinalReadinessEpoch();
+  await done; await sleep(30);
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 1, '古い世代の取り直しをしない');
+  assert.ok(targetReadinessPending(h.volume()) && !h.finalReadinessLoaded(), '確認中のまま次の読込で取り直せる');
+}
+// 待つ間に一式を切り替えたら、別の一式の readiness を「取り直し済み」として取らない。
+{
+  const h = stateHarness([failed], { retryDelayMs: 20 });
+  const done = h.loadFinalReadiness({ render: false });
+  await flush(); await flush();
+  h.switchPack('custom2');
+  await done; await sleep(30);
+  assert.equal(h.calls.filter(url => url.includes('readiness')).length, 1, '切り替え後の一式を取り直し扱いで読まない');
+}
+
+// ---- 構成の変更の応答に、出力先が欠けた readiness が入っていても確認中で止めない ----
+// /api/v2/state は確認に失敗した出力先を落とす（server.ps1 の Get-V2StatePayload の catch）。
+function mutationHarness() {
+  const hooks = { reloads: 0, staled: [] };
+  const env = {
+    hooks,
+    activePackRecord: () => ({ packId: 'custom1' }),
+    activePreset: 'custom1',
+    activeTargetVolumes: () => ['ja-main', 'ja-appendix'],
+    asArray: value => (Array.isArray(value) ? value : value == null ? [] : [value]),
+    rememberLayoutFingerprint() {}, resolvedPageId: page => String(page?.pageId || ''),
+    renderGlobalHeader() {}, renderNavBadges() {}, renderStepBar() {}, renderSummary() {}, renderDashboardOverview() {},
+    renderFinalOverview() {}, renderPages() {}, renderPageOverview() {}, renderVolumeLinks() {},
+    isModalOpen: () => false, syncPreviewOrganizerControls() {},
+  };
+  const names = Object.keys(env);
+  const factory = new Function(...names, [
+    'let state = { structure: { pages: [] }, finalReadiness: { custom1: { volumes: { "ja-main": { status: "built", displayState: "built", pageCount: 2 }, "ja-appendix": { status: "built", displayState: "built", pageCount: 1 } } } } };',
+    'let finalReadinessEpoch = 0, lastPageBoardRenderSignature = "";',
+    'function stampFinalReadinessReceived(){}',
+    'function markFinalReadinessStaleForPageMutation(volumes){ hooks.staled.push(volumes); }',
+    'function reloadFinalReadinessAfterPageMutation(){ hooks.reloads++; }',
+    extractFunction('finalReadinessKey'),
+    extractFunction('advanceFinalReadinessEpoch'),
+    extractFunction('applyPageMutationResult'),
+    'return { applyPageMutationResult, entry: () => state.finalReadiness.custom1 };',
+  ].join('\n'));
+  return { hooks, ...factory(...names.map(name => env[name])) };
+}
+{
+  const h = mutationHarness();
+  h.applyPageMutationResult({ result: { pages: [], affectedVolumes: ['ja-main'] }, state: { finalReadiness: { custom1: { volumes: { 'ja-main': { status: 'needs-rebuild', displayState: 'needs-rebuild', pageCount: 2 } } } } } });
+  assert.ok(h.entry().volumes['ja-appendix'], '欠けた entry で前の出力先を消さない');
+  assert.equal(h.hooks.reloads, 1, '欠けていたら readiness を読み直す');
+  assert.equal(h.hooks.staled.length, 1, '読み直すまでは古い表示を「再出力が必要」扱いにする');
+}
+{
+  const h = mutationHarness();
+  h.applyPageMutationResult({ result: { pages: [] }, state: { finalReadiness: { custom1: { volumes: { 'ja-main': { status: 'needs-rebuild', displayState: 'needs-rebuild' }, 'ja-appendix': { status: 'built', displayState: 'built' } } } } } });
+  assert.equal(h.entry().volumes['ja-main'].displayState, 'needs-rebuild', 'そろった entry はそのまま採る');
+  assert.equal(h.hooks.reloads, 0, 'そろっていれば読み直さない');
 }
 
 console.log('final target readiness regression ok');

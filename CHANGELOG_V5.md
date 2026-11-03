@@ -1,5 +1,14 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 出力前チェックの「確認できませんでした」の一瞬表示と、構成変更後の確認中の止まりを直した（2026-11-03）
+
+- 目的: 出力先に問題が無いのに、出力前チェックが一瞬「出力先の状態を確認できませんでした」（danger）や確認中になる残りの経路を塞ぐ。レビュー（`rb_preflight_flash_review.md`）の推奨1〜4は #93 で入っていることを現行コードで確かめた（確認中を件数に入れない `renderFinalPreflight`、`replaceStatePayload`、readiness-failed の1回の取り直し、欠けた出力先の扱い）。今回はその残り。
+- readiness-failed の取り直しを、すぐではなく少し（`finalReadinessRetryDelayMs` = 1.2秒）待ってからにした（`loadFinalReadiness`）。readiness-failed は変換PDFの置き換え中・ファイルロックなど一時的な失敗で起きるが、すぐ取り直すと同じ失敗にまた当たり、2回目の失敗として danger を描いてから次の読込で直っていた。待つ間は確認中のまま描き、この要求を進行中に残すので、同じ世代の呼び出しは新しい要求を重ねず取り直しまで含めた要求を待つ。待つ間に一式を切り替えたり区切り番号が進んだりしたら、古い世代の取り直しはせず新しい読込に任せる（取り直し待ちの間は `finalReadinessLoaded` が false なので確認中で止まらない）。2回続けて失敗したら今までどおり danger で件数に入れ、出力も止める。
+- ページ構成の変更の応答（`applyPageMutationResult`）で、`/api/v2/state` の readiness に今の一式の出力先が欠けていたら、その entry を採らずに読み直すようにした。サーバーの `Get-V2StatePayload` は確認に失敗した出力先を `catch {}` で落とすため、欠けた entry を採ると、その出力先が確認中（既定値）のまま取り直しも起きずに止まっていた。そろっている entry は今までどおりそのまま採る。
+- `tests/final-target-readiness-regression.mjs` に、待ち時間の前には取り直さないこと・待つ間は確認中で同じ世代の読込を重ねないこと・待つ間に区切り番号が進んだり一式を切り替えたりしたら古い取り直しをしないこと、構成の変更の応答で出力先が欠けていたら採らずに読み直し、そろっていれば採ることを足した（どちらも修正を戻すと落ちることを確かめた）。
+- サーバー（PowerShell）・`style.css`・`diff-worker.js` は変えていない。three.js／WebGL は使っていない。
+- RuntimeVersion `2026.10.30.34`、`app.js` `v20261030_v222` へ更新した。
+
 ## UI/UXレビューのP0・P1を直した（2026-11-03）
 
 - レビュー本文は `docs/uiux-review.md`、要約は `docs/SUMMARY.md`。
