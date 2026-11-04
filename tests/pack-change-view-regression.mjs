@@ -584,7 +584,7 @@ function extractFunctionWithParams(name) {
 const constLine = name => { const m = source.match(new RegExp(`^const ${name} = .*$`, 'm')); assert.ok(m, `const ${name} is missing`); return m[0]; };
 const collectSource = ['PACK_CHANGE_DETAIL_LIMIT', 'PACK_CHANGE_DETAIL_REGION_LIMIT', 'PACK_CHANGE_DETAIL_BYTES_LIMIT'].map(constLine).join('\n') + '\n'
   + ['diffSheetPageCount', 'diffDetailPath', 'packChangeDetailRange', 'packChangeDetailTargets', 'packChangeDetailGroupKey', 'packChangeDetailMatchesRow',
-    'packChangeDetailPage', 'packChangeDetailEntry', 'packChangeDetailsWithinBudget', 'collectPackChangeReportDetails'].map(extractFunctionWithParams).join('\n');
+    'packChangeDetailPage', 'packChangeDetailRowSheet', 'packChangeDetailEntry', 'packChangeDetailsWithinBudget', 'collectPackChangeReportDetails'].map(extractFunctionWithParams).join('\n');
 function makeCollectContext(extra = {}) {
   const ctx = browserContext({ TextEncoder, ...extra });
   vm.runInContext(stubs + collectSource + `
@@ -640,6 +640,23 @@ const readyDetail = (sheets, cmp = cmpFor(['s1', 'v1'], ['s2', 'v2'])) => ({ sta
   found = ctx.packChangeDetailPage(renamedSheet, changedRow({ toSourcePageNumber: 2 }));
   assert.equal(found.sheet.sheetKey, 'k2'); assert.equal(found.pageIndex, 1);
 
+  // 計算は行の組どうし（前回 fromSheetName の p{from} ↔ 今回 p{to}）を内容の変更として比べる。対応表の kind が
+  // unknown・added だと計算せずにページ全体の枠だけになり、前後のページ番号が違う行は前回の別のページと比べていた。
+  const ambiguous = { sheetKey: 'k9', sheetName: 'S1', afterSheetName: 'S1', beforeSheetName: 'S1', kind: 'unknown', pageCount: 4, beforePages: 3, afterPages: 4, unchangedPageNumbers: [1, 2, 3, 4] };
+  let pinned = ctx.packChangeDetailRowSheet(ambiguous, changedRow({ fromSheetName: 'S1', fromSourcePageNumber: 2, toSourcePageNumber: 3 }), 2);
+  assert.equal(pinned.kind, 'modified', 'an ambiguous sheet mapping must not turn the row into a whole-page box');
+  assert.equal(pinned.pages.length, 3); assert.equal(pinned.pages[0], null);
+  assert.equal(JSON.stringify(pinned.pages[2]), JSON.stringify({ beforePageNumber: 2, afterPageNumber: 3, comparisonKind: 'modified' }), 'the row pair is compared, not the same page number on both sides');
+  assert.equal(pinned.sheetKey, 'k9'); assert.equal(pinned.beforeSheetName, 'S1'); assert.equal(pinned.beforePages, 3);
+  assert.equal(pinned.unchangedPageNumbers.length, 0, 'sheet-level unchanged page numbers do not apply to the row pair');
+  assert.equal(ambiguous.kind, 'unknown', 'the shared comparison info is not modified');
+  // 前回のシートが対応表と違う（差し替え・名前の変更）ときは、行の前回のシートを読み、PDFのキャッシュの鍵を分ける。
+  pinned = ctx.packChangeDetailRowSheet({ ...ambiguous, kind: 'added', beforeSheetName: '' }, changedRow({ fromSheetName: 'Old', fromSourcePageNumber: 5, toSourcePageNumber: 1 }), 0);
+  assert.equal(pinned.kind, 'modified'); assert.equal(pinned.beforeSheetName, 'Old'); assert.equal(pinned.sheetKey, 'k9|Old');
+  assert.equal(pinned.beforePages, 5, 'the before page of another sheet must not be cut by the mapped sheet page count');
+  // 行のページ番号が分からなければ（古い記録）対応表のまま。
+  assert.equal(ctx.packChangeDetailRowSheet(ambiguous, changedRow({ fromSourcePageNumber: 0 }), 0), ambiguous);
+
   // 比較情報の版が行の版と違えば使わない（提出用PDFに入っていない描き直しを変更点にしない）。
   assert.equal(ctx.packChangeDetailMatchesRow(multi, changedRow()), true);
   assert.equal(ctx.packChangeDetailMatchesRow(readyDetail([], cmpFor(['s1', 'v1'], ['s2', 'v3'])), changedRow()), false);
@@ -674,7 +691,7 @@ const readyDetail = (sheets, cmp = cmpFor(['s1', 'v1'], ['s2', 'v2'])) => ({ sta
   const computeCalls = [];
   const results = new Map([[1, { page: { beforePageNumber: 1, afterPageNumber: 1, width: 600, height: 400, status: 'ready', changedRatio: .01, regions: [{ kind: 'modified', x: .1, y: .1, width: .2, height: .05, beforeText: '100', afterText: '110' }] } }]]);
   ctx.computeDiffPageResult = async (sheet, pageIndex, options) => {
-    computeCalls.push({ sheet: sheet.sheetKey, pageIndex, source: options.source });
+    computeCalls.push({ sheet: sheet.sheetKey, pageIndex, source: options.source, page: sheet.pages?.[pageIndex] });
     if (pageIndex === 1) return { page: { analysisFailed: true, regions: [] } };
     return results.get(pageIndex + 1);
   };
@@ -691,6 +708,7 @@ const readyDetail = (sheets, cmp = cmpFor(['s1', 'v1'], ['s2', 'v2'])) => ({ sta
   assert.match(ctx.detailRequests[0].path, /fromVersionId=v1&toVersionId=v2/, 'the comparison info is requested for the exact archived versions');
   assert.equal(computeCalls.length, 2, 'rows whose comparison uses other versions are not computed');
   assert.equal(computeCalls[0].source.workbookId, 'wb_a');
+  assert.equal(JSON.stringify(computeCalls[0].page), JSON.stringify({ beforePageNumber: 1, afterPageNumber: 1, comparisonKind: 'modified' }), 'the computation is pinned to the row pair');
   assert.equal(JSON.stringify(computeCalls[0].source.comparison), JSON.stringify(details.wb_a.comparison), 'the computation reads the exact versions');
   assert.equal(JSON.stringify(collected.map(e => e.rowKey)), JSON.stringify(['item:A#1']), 'failed computations are not sent');
   assert.equal(collected[0].regions[0].afterText, '110');

@@ -3847,6 +3847,31 @@ function buildNumericTextDiffRegions(beforeItems,afterItems,width,height){
 function diffRegionText(value){
   return normalizeDiffPdfText(value).slice(0,DIFF_REGION_TEXT_LIMIT);
 }
+// 文字の付いていない枠（行の増減・ずれ・画素だけの枠・ページ全体の枠）に、枠の中の文字を添える。
+// 増えた枠は今回の文字、なくなった枠は前回の文字。変更・不明の枠は、前後で同じ文字（ずれただけ）を
+// 除いた残りだけを読む順に並べる（残りが無ければ添えない）。変更点PDF用で、表示には使わない。
+function attachDiffRegionChangedText(regions,beforeItems,afterItems,width,height){
+  const inBox=(items,box)=>box?dedupeDiffPdfRowItems(diffPdfTextItemsInBand(items,box,width,height)):[];
+  const readingOrder=items=>[...items].sort((a,b)=>{
+    const ay=Number(a.y||0)+Number(a.height||0)/2,by=Number(b.y||0)+Number(b.height||0)/2;
+    return Math.abs(ay-by)>Math.max(3,Math.min(Number(a.height||0),Number(b.height||0))*.5)?ay-by:Number(a.x||0)-Number(b.x||0);
+  });
+  const join=items=>diffRegionText(readingOrder(items).map(item=>item.text).join(' '));
+  return regions.map(region=>{
+    if(!region||region.beforeText||region.afterText)return region;
+    const kind=String(region.kind||'');
+    const before=kind==='added'?[]:inBox(beforeItems,region.before||region);
+    const after=kind==='removed'?[]:inBox(afterItems,region.after||region);
+    if(kind==='added'||kind==='removed')return {...region,beforeText:join(before),afterText:join(after)};
+    const counts=new Map();
+    for(const item of before){const key=normalizeDiffPdfText(item.text);counts.set(key,(counts.get(key)||0)+1);}
+    const afterOnly=[];
+    for(const item of after){const key=normalizeDiffPdfText(item.text),count=counts.get(key)||0;if(count>0)counts.set(key,count-1);else afterOnly.push(item);}
+    const beforeOnly=[];
+    for(const item of readingOrder(before)){const key=normalizeDiffPdfText(item.text),count=counts.get(key)||0;if(count>0){counts.set(key,count-1);beforeOnly.push(item);}}
+    return {...region,beforeText:join(beforeOnly),afterText:join(afterOnly)};
+  });
+}
 function diffPdfTextItemDistance(before,after,width,height){
   const beforeX=Number(before.x||0)+Number(before.width||0)/2,afterX=Number(after.x||0)+Number(after.width||0)/2;
   const beforeY=Number(before.y||0)+Number(before.height||0)/2,afterY=Number(after.y||0)+Number(after.height||0)/2;
@@ -4085,7 +4110,7 @@ async function computeDiffPageResult(sheet,pageIndex,{isStale=()=>false,onProgre
   // 通常は前後PDFが同じ寸法なので、描画済みCanvasをそのまま解析・表示し、
   // 同じ全面Canvasの再作成とdrawImageを2回分省略する。
   const beforeCanvas=normalizeCanvas(beforeRaw),afterCanvas=normalizeCanvas(afterRaw);
-  let regions=[],status='ready',message=String(mappedPage?.mappingMessage||''),analysis=null,noiseSuppressed=false,analysisFailed=false;
+  let regions=[],status='ready',message=String(mappedPage?.mappingMessage||''),analysis=null,noiseSuppressed=false,analysisFailed=false,textPair=null;
   const exactSame=kind==='unchanged'||(!mappedPage&&asArray(sheet?.unchangedPageNumbers).map(Number).includes(pageNumber));
   if(kind==='added')regions=[fullDiffRegion('added',width,height)];
   else if(kind==='removed')regions=[fullDiffRegion('removed',width,height)];
@@ -4103,7 +4128,7 @@ async function computeDiffPageResult(sheet,pageIndex,{isStale=()=>false,onProgre
         :Promise.resolve(null);
       analysis=await source.analyze(beforeCanvas,afterCanvas,width,height);if(isStale())return null;regions=asArray(analysis.regions);
       progress('PDF内の文字を照合しています。',85);
-      const textPair=await textPromise;
+      textPair=await textPromise;
       const documentTextPair=await documentTextPromise;
       if(isStale())return null;
       if(textPair){
@@ -4117,6 +4142,7 @@ async function computeDiffPageResult(sheet,pageIndex,{isStale=()=>false,onProgre
         }
       }
       if(!regions.length&&!noiseSuppressed){regions=[fullDiffRegion('modified',width,height)];status='unknown';message='変更は検出されましたが位置を絞り込めないため、ページ全体を強調しています。';}
+      if(textPair)regions=attachDiffRegionChangedText(regions,textPair[0],textPair[1],width,height);
     }
     catch(error){regions=[fullDiffRegion('unknown',width,height)];status='unknown';message=userFriendlyError(error.message);analysisFailed=true;}
   }else if(kind==='modified'&&exactSame)message='このページに変更はありません。同じ原稿内の別ページに変更があります。';
@@ -7777,6 +7803,23 @@ function packChangeDetailPage(detail,row){
   }
   return sourcePage<=diffSheetPageCount(sheet)?{sheet,pageIndex:sourcePage-1}:null;
 }
+// 計算に渡すシート。行の組（前回 fromSheetName の fromSourcePageNumber ↔ 今回の toSourcePageNumber）どうしを
+// 内容の変更として比べる。原稿単位の対応表（シートの kind・pages・unchangedPageNumbers）は使わない:
+// 対応を確定できない（unknown）・増えた／なくなったシートだと計算せずにページ全体の枠だけになり、
+// 前後のページ番号が違う行は前回の別のページと比べてしまう（サーバーは前回のページ番号の違う結果を捨てる）。
+// 詳細ページの画像（Get-PackChangeReportImageSides）も行の組で作るので、枠はその2枚の違いと一致する。
+function packChangeDetailRowSheet(sheet,row,pageIndex){
+  const fromPage=Number(row?.fromSourcePageNumber||0),toPage=Number(row?.toSourcePageNumber||0);
+  if(fromPage<=0||toPage<=0)return sheet;
+  const mappedBefore=String(sheet?.beforeSheetName||sheet?.sheetName||''),fromSheetName=String(row?.fromSheetName||'')||mappedBefore;
+  const sameBefore=fromSheetName===mappedBefore;
+  const pages=Array.from({length:pageIndex+1},(_,index)=>index===pageIndex?{beforePageNumber:fromPage,afterPageNumber:toPage,comparisonKind:'modified'}:null);
+  return {...sheet,kind:'modified',beforeSheetName:fromSheetName,afterSheetName:String(row?.sheetName||'')||String(sheet?.afterSheetName||sheet?.sheetName||''),
+    // 前回のシートを差し替えたときは、PDFのキャッシュが対応表の前回のシートと混ざらないよう別の鍵にする。
+    sheetKey:sameBefore?String(sheet?.sheetKey||''):`${String(sheet?.sheetKey||'')}|${fromSheetName}`,
+    beforePages:Math.max(sameBefore?Number(sheet?.beforePages||0):0,fromPage),afterPages:Math.max(Number(sheet?.afterPages||0),toPage),
+    unchangedPageNumbers:[],pages};
+}
 // 送る形。座標は 0〜1（左上を合わせた、前後のうち大きい方の寸法に対する割合）。
 function packChangeDetailEntry(row,sheet,page){
   const round=value=>Math.round(Math.max(0,Math.min(1,Number(value)||0))*100000)/100000;
@@ -7834,7 +7877,7 @@ async function collectPackChangeReportDetails(changes,onProgress=null,{isStale=(
           const found=usable?packChangeDetailPage(detail,row):null;
           if(found){
             try{
-              const result=await compute(found.sheet,found.pageIndex,{isStale,source});
+              const result=await compute(packChangeDetailRowSheet(found.sheet,row,found.pageIndex),found.pageIndex,{isStale,source});
               if(isStale())return null;
               if(result?.page&&!result.page.analysisFailed)details.push(packChangeDetailEntry(row,found.sheet,result.page));
             }catch{}
