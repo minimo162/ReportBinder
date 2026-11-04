@@ -18,7 +18,7 @@ required = [
     'app/tools/pdf-source-adapter-selfcheck.ps1','app/tools/word-source-adapter-selfcheck.ps1','app/tools/word-render-worker.ps1','app/tools/powerpoint-render-worker.ps1','app/tools/create-word-adapter-fixtures.py','app/tools/history-generalization-selfcheck.ps1','app/tools/final-composition-selfcheck.py','app/tools/operational-readiness-selfcheck.ps1',
     'app/tools/create-scale-benchmark-fixtures.py','app/tools/create-scale-benchmark-workbooks.mjs','app/tools/scale-benchmark.ps1','app/tools/ci-selfcheck.ps1','app/tools/history-logic-selfcheck.ps1','app/tools/create-pdf-diff-corpus.py','app/tools/pdf-diff-corpus-selfcheck.ps1','tests/pdf-diff-corpus.mjs','docs/PDF_DIFF_CORPUS.md','app/tools/ci-requirements.txt',
     '.github/workflows/thirdparty-check.yml','.github/workflows/release.yml',
-    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/history-compare-review-regression.mjs','tests/pack-change-view-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','tests/speed-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
+    'tests/diff-regression.mjs','tests/numeric-sheet-selection-regression.py','tests/page-board-lanes-regression.mjs','tests/page-board-save-queue-regression.mjs','tests/spread-diff-regression.mjs','tests/final-target-readiness-regression.mjs','tests/history-compare-review-regression.mjs','tests/pack-change-view-regression.mjs','tests/unregistered-file-sort-regression.mjs','tests/pdf-image-layout-regression.mjs','tests/pdf-image-pane-regression.mjs','tests/sheet-assignment-regression.ps1','tests/speed-regression.ps1','docs/API.md','docs/THIRD_PARTY_SETUP.md','docs/ReportBinder_UIUX改修指示書_V4.md','docs/GENERALIZED_DOCUMENT_PACK_DESIGN.md','docs/OPERATIONS_GUIDE.md','docs/SCALE_BENCHMARK.md','docs/benchmarks/scale-benchmark-windows-20260807.json'
 ]
 missing=[x for x in required if not (root/x).exists()]
 if missing: raise SystemExit('missing: '+', '.join(missing))
@@ -1677,7 +1677,7 @@ _serve_diff = server.split('function Serve-DiffPage', 1)[1].split('\nfunction ',
 for needed in ["fileName -eq 'render.png'", 'Get-RenderRasterSheetDir', "'page-{0:0000}.png'"]:
     if needed not in _serve_diff:
         raise SystemExit(f'direct render-raster serving missing: {needed}')
-for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v225', 'style.css?v=20261030_v132']:
+for needed in ['id="diff-before-regions"', 'id="diff-after-regions"', 'canvas id="diff-before-base"', 'canvas id="diff-after-base"', 'id="diff-export-summary"', 'id="final-preflight-summary"', 'id="final-preflight-list"', 'id="final-preflight-refresh"', 'id="app-exit-button"', 'id="change-source-folder-btn"', 'id="shutdown-screen"', 'id="main-content"', 'id="page-volume-tabs"', 'id="source-next-action"', 'id="app-loading-screen"', 'id="error-actions"', 'id="error-close"', 'app.js?v=20261030_v226', 'style.css?v=20261030_v132']:
     if needed not in html:
         raise SystemExit(f'browser canvas diff markup/cache version missing: {needed}')
 for needed in ['function renderDiffRegionLayer', "document.createElement('span')", 'diff-region-layer',
@@ -1731,7 +1731,7 @@ _fetch_detail = appjs.split('async function fetchDiffDetailResponse', 1)[1].spli
 for needed in ['new AbortController()', 'attempt<2', 'diffDetailResponseCache.delete(key)']:
     if needed not in _fetch_detail:
         raise SystemExit(f'comparison metadata retry/recovery is missing: {needed}')
-if 'app.js?v=20261030_v225' not in html:
+if 'app.js?v=20261030_v226' not in html:
     raise SystemExit('comparison request fix must bump the app cache version')
 
 # 2026-07-31 history selection rendering fixes -------------------------------
@@ -1757,7 +1757,7 @@ if 'function Update-SnapshotSummaryCacheEntry' not in server or 'function Get-Sn
 _publish_cache = server.split('function Publish-LatestComparisonCaches', 1)[1].split('\nfunction ', 1)[0]
 if 'Update-SnapshotSummaryCacheEntry' not in _publish_cache or 'Clear-SnapshotSummaryCache' in _publish_cache:
     raise SystemExit('render completion must keep the snapshot summary cache warm')
-if 'app.js?v=20261030_v225' not in html:
+if 'app.js?v=20261030_v226' not in html:
     raise SystemExit('history rendering fix must bump the app cache version')
 
 # 2026-08-01 per-user local runtime/project architecture ----------------------
@@ -3325,6 +3325,11 @@ if pdf_image_layout_regression.returncode != 0:
 final_target_regression = subprocess.run([_node, str(root / 'tests/final-target-readiness-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
 if final_target_regression.returncode != 0:
     raise SystemExit('final target readiness regression failed: ' + (final_target_regression.stdout + final_target_regression.stderr).strip())
+# 未登録原稿の一覧は表示名のふつうの名前順（ja・数字は数として）。サーバーの文字列順では
+# 「資料10」が「資料2」より前に来た。画面・検索の結果・Shift の範囲選択が同じ並びを使う。
+unregistered_sort_regression = subprocess.run([_node, str(root / 'tests/unregistered-file-sort-regression.mjs')], capture_output=True, text=True, encoding='utf-8')
+if unregistered_sort_regression.returncode != 0:
+    raise SystemExit('unregistered file sort regression failed: ' + (unregistered_sort_regression.stdout + unregistered_sort_regression.stderr).strip())
 # 2026-11-02 変更履歴・比較のレビュー指摘（H1〜H3・M3）--------------------------
 # 登録画面の比較要約は今の変換PDFの比較だけを出す。比較ペアを切り替えた後の古い応答で
 # 差分画面と「確認済み」を上書きしない。ready 以外の差分詳細はキャッシュに残さない。

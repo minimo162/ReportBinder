@@ -2623,9 +2623,20 @@ async function togglePackMenu() {
   // Must run after loadPackAdminPacks(), which rebuilds the list innerHTML.
   if(!menu.classList.contains('hidden')){closePopoverOnFocusOut(menu,closePackMenu);focusFirstIn(menu);}
 }
+// サーバーは relativePath の文字列順（PowerShell の Sort-Object。「資料10」が「資料2」より前）で
+// 返す。画面・検索の結果・Shift の範囲選択がどれもこの並びを使うので、ここで表示名の
+// ふつうの名前順（ページ構成と同じ ja・数字は数として）にそろえる。選択の絞り込みが
+// 選択1件ごとにこの関数を呼ぶので、options 付きの localeCompare（呼ぶたびに照合器を作る。
+// 300件で約30倍遅い）ではなく照合器を1つ使い回す。
+const unregisteredFileCollator=new Intl.Collator('ja',{numeric:true,sensitivity:'base'});
+function compareUnregisteredFiles(a, b) {
+  return unregisteredFileCollator.compare(fileDisplayName(a),fileDisplayName(b))
+    || unregisteredFileCollator.compare(String(a?.relativePath||''),String(b?.relativePath||''))
+    || String(a?.relativePath||'').localeCompare(String(b?.relativePath||''));
+}
 function visibleUnregisteredFiles(files) {
   const registered=new Set(workbooksForActivePreset().map(w=>String(w.relativePath||'').replace(/\\/g,'/').toLowerCase()));
-  return filesForActivePreset(files).filter(f => !registered.has(String(f.relativePath||'').replace(/\\/g,'/').toLowerCase()));
+  return filesForActivePreset(files).filter(f => !registered.has(String(f.relativePath||'').replace(/\\/g,'/').toLowerCase())).sort(compareUnregisteredFiles);
 }
 
 function capturePageBoardScroll() {

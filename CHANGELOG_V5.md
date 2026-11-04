@@ -1,5 +1,14 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 未登録原稿の一覧をふつうの名前順にした（2026-11-04）
+
+- 目的: 原稿の登録画面の「未登録の原稿」の並びが分かりにくかった。
+- 原因: 画面（`visibleUnregisteredFiles`）は登録済みを除くだけで並べ替えず、サーバー（`/api/submission-files` の `Get-SourceCandidates`）の `Sort-Object relativePath, sourceType` の並びをそのまま出していた。数字を文字として比べるので「資料10」が「資料2」より前に来ていた。
+- `compareUnregisteredFiles` を足し、`visibleUnregisteredFiles` が表示名（`fileDisplayName`）の名前順（`localeCompare` の `ja`・`numeric`・`sensitivity:'base'`。ページ構成の並びと同じ）で返すようにした。同じ表示名は `relativePath` で決める。表の行・検索の結果・Shift の範囲選択・「表示中をすべて選択」はどれもこの関数の並びを使うので、画面の順と一致する。`availableFiles` そのものは並べ替えない。選択の絞り込み（一覧の読み直し時）が選択1件ごとにこの関数を呼ぶため、比べるのは `localeCompare` ではなく使い回す `Intl.Collator`（同じ比べ方。300件・全選択で約2.2秒 → 約0.07秒）にした。
+- `tests/unregistered-file-sort-regression.mjs` を足し（修正を戻すと落ちることを確かめた）、`selfcheck.py` から動かす。
+- サーバー（PowerShell）・`style.css` は変えていない。
+- RuntimeVersion `2026.10.30.38`、`app.js` `v20261030_v226` へ更新した。
+
 ## 変更点PDFの枠がページ全体になる・「文字の変化は取り出せませんでした」になるのを減らした（2026-11-04）
 
 - 目的: 変更点PDFの詳細ページで、実際は1か所しか変わっていないのにページ全体が枠になることが多く、枠の文字の一覧がほぼ毎回「文字の変化は取り出せませんでした。画像の枠（…）で確認してください。」になっていた。
