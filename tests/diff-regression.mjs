@@ -31,7 +31,7 @@ const names=['normalizeDiffPdfText','diffRegionText','diffPdfNumericFragments','
   'buildColumnTextRowStructureDiffResult','buildDocumentTextRowStructureDiffResult','buildTextLayoutShiftDiffResult',
   'buildNumericTextDiffResult','diffPdfTextItemDistance','buildTextFragmentDiffResult','diffRegionsOverlap','diffRegionsShareTextRow',
   'diffPdfTextItemsInBand','buildLocalizedTextRowStructureDiffResult','mergeDiffRegionsWithText','diffHasLocalizedRowSignal','selectDiffSemanticResult','diffPdfTextLayoutFingerprint',
-  'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise','diffKindMeta','diffCsvCell','buildDiffSummaryCsv'];
+  'diffRegionOverlapsPdfText','shouldSuppressDiffRasterNoise','attachDiffRegionChangedText','diffKindMeta','diffCsvCell','buildDiffSummaryCsv'];
 const app={Uint8Array,Uint16Array,Math,Number,Array,Map,Set,Object,String,Error};vm.createContext(app);
 vm.runInContext(constants.map(name=>constantSource(appCode,name)).concat(names.map(name=>functionSource(appCode,name))).join('\n'),app);
 const item=(text,x,y,width=60,height=12)=>({text,x,y,width,height});
@@ -504,5 +504,43 @@ assert.equal(await stalePromise,null,'the diff screen drops a page computed for 
 const failingSource=pageApp.newDiffComputeSource({workbookId:'wb_a',comparison:pageComparison,analyze:async()=>{throw new Error('worker stopped');}});
 const failed=await pageApp.computeDiffPageResult(diffSheet,0,{source:failingSource});
 assert.equal(failed.page.analysisFailed,true);assert.equal(failed.page.status,'unknown');
+
+// 文字の付いていない枠（行の増減・画素だけの枠・ページ全体の枠）にも、枠の中で前後の違う文字を添える。
+// 以前は数値・文字片の照合で作った枠にしか文字が無く、変更点PDFが「文字の変化は取り出せませんでした」になっていた。
+{
+  const rows=[];for(let r=0;r<8;r++)rows.push(item(`Item ${r}`,40,40+r*30,90),item(`Note ${r}`,200,40+r*30,90));
+  const inserted=rows.map(value=>value.y>=40+4*30?{...value,y:value.y+30}:{...value}).concat([item('New row',40,160,90),item('Added note',200,160,90)]);
+  const rowResult=app.selectDiffSemanticResult(rows,inserted,600,400,{rowStructureAdjusted:true,alignmentAdjusted:false,fallbackUsed:false},
+    [{kind:'modified',x:.05,y:.38,width:.9,height:.5,confidence:.6}]);
+  assert.equal(rowResult.mode,'row');assert.ok(rowResult.regions.every(region=>!region.beforeText&&!region.afterText),'row boxes come without text');
+  const rowText=app.attachDiffRegionChangedText(rowResult.regions,rows,inserted,600,400);
+  assert.equal(rowText[0].kind,'added');assert.equal(rowText[0].afterText,'New row Added note','an added row carries its own text');assert.equal(rowText[0].beforeText,'');
+  // ページ全体の枠: 前後で同じ文字（ずれただけ）は除き、変わった文字だけを読む順に。
+  const edited=rows.map(value=>({...value,y:value.y+2}));edited[5].text='Note 2b';edited[14].text='Item 7b';
+  const whole={kind:'modified',x:.01,y:.01,width:.98,height:.98};
+  const wholeText=app.attachDiffRegionChangedText([whole],rows,edited,600,400)[0];
+  assert.equal(wholeText.beforeText,'Note 2 Item 7');assert.equal(wholeText.afterText,'Note 2b Item 7b');
+  assert.equal(whole.beforeText,undefined,'the input region is not modified');
+  // ずれただけ（文字が同じ）の枠には添えない。文字のある枠はそのまま。なくなった枠は前回の文字。
+  const shifted=rows.map(value=>({...value,y:value.y+4}));
+  const quiet=app.attachDiffRegionChangedText([whole],rows,shifted,600,400)[0];
+  assert.equal(quiet.beforeText,'');assert.equal(quiet.afterText,'');
+  const kept={kind:'modified',x:0,y:0,width:1,height:1,beforeText:'100',afterText:'110'};
+  assert.equal(app.attachDiffRegionChangedText([kept],rows,edited,600,400)[0],kept);
+  const removed=app.attachDiffRegionChangedText([{kind:'removed',x:.05,y:.08,width:.5,height:.06,before:{x:.05,y:.08,width:.5,height:.06}}],rows,[],600,400)[0];
+  assert.equal(removed.beforeText,'Item 0 Note 0');assert.equal(removed.afterText,'');
+}
+// 計算の流れでも添える: 変わった文字が多すぎて文字の照合が使えず、画素の枠だけになるページ。
+{
+  const saved=[beforeNumbers.slice(),afterNumbers.slice()];
+  beforeNumbers.length=0;afterNumbers.length=0;
+  for(let r=0;r<30;r++){beforeNumbers.push(item(`Label ${r}`,20,10+r*12,80,10),item(String(100+r),300,10+r*12,40,10));afterNumbers.push(item(`Label ${r}`,20,10+r*12,80,10),item(String(500+r),300,10+r*12,40,10));}
+  const imageSource=pageApp.newDiffComputeSource({workbookId:'wb_a',comparison:pageComparison,
+    analyze:async()=>({regions:[{regionId:'browser-r0001',kind:'modified',x:.48,y:.02,width:.1,height:.1,confidence:.7,pixelCount:300}],changedRatio:.01,alignmentAdjusted:false,fallbackUsed:false,rowStructureAdjusted:false})});
+  const imagePage=(await pageApp.computeDiffPageResult(diffSheet,0,{source:imageSource})).page;
+  beforeNumbers.length=0;beforeNumbers.push(...saved[0]);afterNumbers.length=0;afterNumbers.push(...saved[1]);
+  assert.equal(imagePage.regions.length,1);assert.equal(imagePage.regions[0].pixelCount,300,'the pixel box is kept');
+  assert.equal(imagePage.regions[0].beforeText,'100 101 102');assert.equal(imagePage.regions[0].afterText,'500 501 502','a pixel-only box carries the text that changed inside it');
+}
 
 console.log('diff regression tests OK');

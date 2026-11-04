@@ -1,5 +1,16 @@
 ﻿# ReportBinder V5 実装履歴
 
+## 変更点PDFの枠がページ全体になる・「文字の変化は取り出せませんでした」になるのを減らした（2026-11-04）
+
+- 目的: 変更点PDFの詳細ページで、実際は1か所しか変わっていないのにページ全体が枠になることが多く、枠の文字の一覧がほぼ毎回「文字の変化は取り出せませんでした。画像の枠（…）で確認してください。」になっていた。
+- 原因1（ページ全体の枠）: 変更点PDF用の収集（`collectPackChangeReportDetails`）は、行の組（前回 `fromSheetName` の `fromSourcePageNumber` ↔ 今回の `toSourcePageNumber`）ではなく、原稿単位の比較のシートの対応表で計算していた。比較情報（`New-DiffDetailSkeleton`）の `pages` は常に空なので、前後とも「今回のページ番号」のページを比べる。シートの対応が確定できない（`unknown`。同じ区間でシートやページの追加・削除と変更が重なるとき）・増えた／なくなったシートだと、`computeDiffPageResult` は計算せずにページ全体の枠だけを返していた。前後のページ番号が違う行は前回の別のページと比べ、サーバー（`ConvertTo-PackChangeReportDetails`）がその結果を捨てて、文字の無い予備の枠になっていた。
+- 原因2（文字が取り出せない）: 枠に変更前後の文字が付くのは、数値の照合（`numeric`）と文字片の照合（`text-fragment`）で作った枠だけだった。行の増減（`row`）・ずれ（`layout`）・画素だけの枠（`image`、`numeric-supplement` の画素の枠）・ページ全体の枠には文字が無い。変わった数値が多いページ（数値の組が8を超える・文字片が12か所を超える）や行を足したページはここに落ちる。
+- `packChangeDetailRowSheet` を足し、収集は行の組どうしを内容の変更として計算する（対応表の写しの `kind` を `modified`、`pages` をその1組、前回のシートを行の `fromSheetName` にし、シート単位の `unchangedPageNumbers` は使わない。前回のシートが対応表と違うときは PDF のキャッシュの鍵を分ける）。詳細ページの画像（`Get-PackChangeReportImageSides`）も行の組で作っているので、枠はその2枚の違いと一致する。行のページ番号が無い古い記録は今までどおり。差分画面（くわしく見る）は変えていない。
+- `attachDiffRegionChangedText` を足し、`computeDiffPageResult` の最後に、文字の付いていない枠へ枠の中の PDF の文字を添える。増えた枠は今回の文字、なくなった枠は前回の文字、変更・不明の枠は前後で同じ文字（ずれただけ）を除いた残りだけを読む順に並べる（残りが無ければ添えない）。すでに文字のある枠は変えない。表示には使わない（変更点PDF用）。
+- `tests/pack-change-view-regression.mjs` に行の組で計算すること（unknown・added の対応表、前回のシートが違うとき、古い記録）を、`tests/diff-regression.mjs` に行の増減・ページ全体・ずれただけ・なくなった枠の文字と、計算の流れで画素だけの枠に文字が付くことを足した（どちらも修正を戻すと落ちることを確かめた）。`selfcheck.py` に配線の検査を足した。
+- サーバー（PowerShell）・`style.css`・`diff-worker.js` は変えていない。
+- RuntimeVersion `2026.10.30.37`、`app.js` `v20261030_v225` へ更新した。
+
 ## 変更点PDFの作成を速くした（詳細ページの画像を行のページだけで作る・版の解析の画像を使う）（2026-11-03）
 
 - 目的: 変更点PDF（`POST /api/v2/outputs/changes/report`）の作成が遅い。変わったページが1枚でも、そのページを含むシートのページ数に比例して時間がかかっていた。
